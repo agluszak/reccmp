@@ -1,4 +1,4 @@
-# This file can only be imported successfully when run from Ghidra using Ghidrathon.
+# This module can only be imported when running inside a Ghidra Python runtime.
 
 # Disable spurious warnings in vscode / pylance
 # pyright: reportMissingModuleSource=false

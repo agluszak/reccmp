@@ -14,22 +14,24 @@ jobs:
       with:
         python-version: '3.12'
 
+    - uses: astral-sh/setup-uv@v5
+
     - name: Install python libraries
       shell: bash
       run: |
-        pip install -r requirements.txt -r requirements-tests.txt
+        uv sync --locked --group test
 
     - name: Run black
       shell: bash
-      run: black --check .
+      run: uv run black --check .
 
     - name: Run pylint
       shell: bash
-      run: pylint reccmp tests
+      run: uv run pylint reccmp tests
 
     - name: Run mypy
       shell: bash
-      run: mypy ./reccmp ./tests
+      run: uv run mypy ./reccmp ./tests
 
   js-format:
     name: 'Javascript Format'
