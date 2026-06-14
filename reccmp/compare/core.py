@@ -282,6 +282,25 @@ class Compare:
             [t for (t,) in struct.iter_unpack("<L", recomp_table)],
         )
 
+        def resolve_thunk(
+            image_id: ImageId, entity: ReccmpEntity | None
+        ) -> ReccmpEntity | None:
+            """A vtable slot may point at an incremental-link jmp thunk rather than
+            the real function body. Follow the thunk through its ref to the target
+            FUNCTION so a slot pointing through a thunk compares equal to a direct
+            slot. Mirrors the thunk resolution in asm name lookup (replacement.py)."""
+            if entity is None or entity.entity_type != EntityType.THUNK:
+                return entity
+
+            ref_key = "ref_orig" if image_id == ImageId.ORIG else "ref_recomp"
+            ref_addr = entity.get(ref_key)
+            if isinstance(ref_addr, int):
+                target = self._db.get(image_id, ref_addr, exact=True)
+                if target is not None and target.entity_type == EntityType.FUNCTION:
+                    return target
+
+            return entity
+
         def match_text(m: ReccmpEntity | None, raw_addr: int | None = None) -> str:
             """Format the function reference at this vtable index as text.
             If we have not identified this function, we have the option to
@@ -311,8 +330,10 @@ class Compare:
 
         # Now compare each pointer from the two vtables.
         for i, (raw_orig, raw_recomp) in enumerate(raw_addrs):
-            orig = self._db.get(ImageId.ORIG, raw_orig)
-            recomp = self._db.get(ImageId.RECOMP, raw_recomp)
+            orig = resolve_thunk(ImageId.ORIG, self._db.get(ImageId.ORIG, raw_orig))
+            recomp = resolve_thunk(
+                ImageId.RECOMP, self._db.get(ImageId.RECOMP, raw_recomp)
+            )
 
             if (
                 orig is not None
