@@ -34,6 +34,7 @@ from .match_msvc import (
 from .db import EntityDb, ReccmpEntity, ReccmpMatch
 from .diff import DiffReport
 from .lines import LinesDb
+from .thunk_resolve import effective_orig_vtable_size, resolve_vtable_slot
 from .analyze import (
     create_imports,
     create_import_thunks,
@@ -261,7 +262,23 @@ class Compare:
         return compare
 
     def _compare_vtable(self, match: ReccmpMatch) -> EntityCompareResult:
-        vtable_size = match.any_size()
+        orig_size = match.any_size(ImageId.ORIG)
+        recomp_size = match.any_size(ImageId.RECOMP)
+        if orig_size > 0 and recomp_size > 0:
+            vtable_size = min(orig_size, recomp_size)
+        else:
+            vtable_size = match.any_size()
+
+        orig_max = match.max_size(ImageId.ORIG)
+        if orig_max is not None:
+            vtable_size = min(vtable_size, orig_max)
+
+        vtable_size = min(
+            vtable_size,
+            effective_orig_vtable_size(
+                self.orig_bin, match.orig_addr, vtable_size
+            ),
+        )
 
         # The vtable size should always be a multiple of 4 because that
         # is the pointer size. If it is not (for whatever reason)
@@ -279,25 +296,6 @@ class Compare:
             [t for (t,) in struct.iter_unpack("<L", orig_table)],
             [t for (t,) in struct.iter_unpack("<L", recomp_table)],
         )
-
-        def resolve_thunk(
-            image_id: ImageId, entity: ReccmpEntity | None
-        ) -> ReccmpEntity | None:
-            """A vtable slot may point at an incremental-link jmp thunk rather than
-            the real function body. Follow the thunk through its ref to the target
-            FUNCTION so a slot pointing through a thunk compares equal to a direct
-            slot. Mirrors the thunk resolution in asm name lookup (replacement.py)."""
-            if entity is None or entity.entity_type != EntityType.THUNK:
-                return entity
-
-            ref_key = "ref_orig" if image_id == ImageId.ORIG else "ref_recomp"
-            ref_addr = entity.get(ref_key)
-            if isinstance(ref_addr, int):
-                target = self._db.get(image_id, ref_addr, exact=True)
-                if target is not None and target.entity_type == EntityType.FUNCTION:
-                    return target
-
-            return entity
 
         def match_text(m: ReccmpEntity | None, raw_addr: int | None = None) -> str:
             """Format the function reference at this vtable index as text.
@@ -328,9 +326,34 @@ class Compare:
 
         # Now compare each pointer from the two vtables.
         for i, (raw_orig, raw_recomp) in enumerate(raw_addrs):
-            orig = resolve_thunk(ImageId.ORIG, self._db.get(ImageId.ORIG, raw_orig))
-            recomp = resolve_thunk(
-                ImageId.RECOMP, self._db.get(ImageId.RECOMP, raw_recomp)
+            index = f"vtable0x{i*4:02x}"
+            n_entries += 1
+
+            # Orig binaries may contain literal NULL vtable slots (reserved gap).
+            # MSVC cannot emit mid-table NULL entries, so accept any recomp slot.
+            if raw_orig == 0:
+                ratio += 1
+                orig_text.append((index, "0x0 (null slot)"))
+                recomp_text.append(
+                    (
+                        index,
+                        match_text(
+                            resolve_vtable_slot(
+                                self._db,
+                                ImageId.RECOMP,
+                                self.recomp_bin,
+                                raw_recomp,
+                            )
+                        ),
+                    )
+                )
+                continue
+
+            orig = resolve_vtable_slot(
+                self._db, ImageId.ORIG, self.orig_bin, raw_orig
+            )
+            recomp = resolve_vtable_slot(
+                self._db, ImageId.RECOMP, self.recomp_bin, raw_recomp
             )
 
             if (
@@ -340,8 +363,6 @@ class Compare:
             ):
                 ratio += 1
 
-            n_entries += 1
-            index = f"vtable0x{i*4:02x}"
             orig_text.append((index, match_text(orig, raw_orig)))
             recomp_text.append((index, match_text(recomp)))
 
