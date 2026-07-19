@@ -275,9 +275,7 @@ class Compare:
 
         vtable_size = min(
             vtable_size,
-            effective_orig_vtable_size(
-                self.orig_bin, match.orig_addr, vtable_size
-            ),
+            effective_orig_vtable_size(self.orig_bin, match.orig_addr, vtable_size),
         )
 
         # The vtable size should always be a multiple of 4 because that
@@ -349,9 +347,7 @@ class Compare:
                 )
                 continue
 
-            orig = resolve_vtable_slot(
-                self._db, ImageId.ORIG, self.orig_bin, raw_orig
-            )
+            orig = resolve_vtable_slot(self._db, ImageId.ORIG, self.orig_bin, raw_orig)
             recomp = resolve_vtable_slot(
                 self._db, ImageId.RECOMP, self.recomp_bin, raw_recomp
             )
