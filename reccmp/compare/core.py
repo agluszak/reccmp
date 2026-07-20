@@ -229,7 +229,6 @@ class Compare:
         for img_id in (ImageId.ORIG, ImageId.RECOMP):
             set_max_size(self._db, img_id)
 
-        check_vtables(self._db, self.orig_bin)
         match_ref(self._db, self.report)
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)
@@ -285,6 +284,10 @@ class Compare:
             compare.run()
             loaded.store_prepared(compare._prepared_analysis())
         return compare
+
+    def report_vtable_size_warnings(self, name_filter: str | None = None) -> None:
+        """Log oversized-vtable evidence, optionally limited by name."""
+        check_vtables(self._db, self.orig_bin, name_filter)
 
     def _compare_vtable(
         self, match: ReccmpMatch, *, include_diff: bool = True
