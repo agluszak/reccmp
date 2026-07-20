@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 import argparse
@@ -121,6 +121,22 @@ def parse_args() -> argparse.Namespace:
         help="Print assembly diff for specific function (original file's offset)",
     )
     parser.add_argument(
+        "--orig-address",
+        metavar="<offset>",
+        type=virtual_address,
+        action="append",
+        default=[],
+        help="Compare only this original address (repeatable).",
+    )
+    parser.add_argument(
+        "--recomp-address",
+        metavar="<offset>",
+        type=virtual_address,
+        action="append",
+        default=[],
+        help="Compare only this recompiled address (repeatable).",
+    )
+    parser.add_argument(
         "--json",
         metavar="<file>",
         help="Generate JSON file with match summary",
@@ -170,6 +186,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exclude LIBRARY annotations from the analysis",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the local parsed-analysis cache.",
+    )
     argparse_add_logging_args(parser)
 
     args = parser.parse_args()
@@ -214,7 +235,16 @@ def main() -> int:
 
     logging.basicConfig(level=args.loglevel, format="[%(levelname)s] %(message)s")
 
-    compare = Compare.from_target(target)
+    selected = bool(args.orig_address or args.recomp_address)
+    setup_orig_addresses = list(args.orig_address)
+    if args.verbose is not None:
+        setup_orig_addresses.append(args.verbose)
+    compare = Compare.from_target(
+        target,
+        orig_addrs=setup_orig_addresses,
+        recomp_addrs=args.recomp_address,
+        use_cache=not args.no_cache,
+    )
 
     print()
 
@@ -229,12 +259,31 @@ def main() -> int:
         print_match_verbose(match, show_both_addrs=args.print_rec_addr)
         return 0
 
-    ### Compare everything.
+    ### Compare selected entities or everything.
 
-    compared = list(compare.compare_all())
-
+    include_diff = bool(
+        args.dump
+        or args.html is not None
+        or (args.json is not None and not args.json_diet)
+    )
+    compared_iter = (
+        compare.compare_addresses(
+            args.orig_address,
+            args.recomp_address,
+            include_diff=include_diff,
+            include_exact_diff=bool(args.dump),
+        )
+        if selected
+        else compare.compare_all(
+            include_diff=include_diff, include_exact_diff=bool(args.dump)
+        )
+    )
     if args.dump:
-        dump_all_matched_functions(compared)
+        compared_list = list(compared_iter)
+        dump_all_matched_functions(compared_list)
+        compared: Iterable[DiffReport] = compared_list
+    else:
+        compared = compared_iter
 
     report = ReccmpStatusReport(filename=target.original_path.name)
 
@@ -292,6 +341,9 @@ def main() -> int:
 
     if args.html is not None:
         write_html_report(args.html, report, target_icon)
+
+    if selected:
+        return 0
 
     implemented_funcs = function_count
 
