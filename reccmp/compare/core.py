@@ -272,7 +272,9 @@ class Compare:
         compare.run()
         return compare
 
-    def _compare_vtable(self, match: ReccmpMatch) -> EntityCompareResult:
+    def _compare_vtable(
+        self, match: ReccmpMatch, *, include_diff: bool = True
+    ) -> EntityCompareResult:
         orig_size = match.any_size(ImageId.ORIG)
         recomp_size = match.any_size(ImageId.RECOMP)
         if orig_size > 0 and recomp_size > 0:
@@ -382,10 +384,14 @@ class Compare:
         ).get_opcodes()
 
         return EntityCompareResult(
-            diff=RawDiffOutput(
-                codes=opcodes,
-                orig_inst=orig_text,
-                recomp_inst=recomp_text,
+            diff=(
+                RawDiffOutput(
+                    codes=opcodes,
+                    orig_inst=orig_text,
+                    recomp_inst=recomp_text,
+                )
+                if include_diff
+                else RawDiffOutput()
             ),
             match_ratio=ratio,
             analysis=(
@@ -395,7 +401,13 @@ class Compare:
             ),
         )
 
-    def _compare_match(self, match: ReccmpMatch) -> DiffReport | None:
+    def _compare_match(
+        self,
+        match: ReccmpMatch,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> DiffReport | None:
         """Router for comparison type"""
 
         if match.size is None or match.any_size() == 0:
@@ -411,11 +423,15 @@ class Compare:
         if match.entity_type in (EntityType.FUNCTION, EntityType.VTORDISP):
             # Thunks are excluded from comparison. They always match 100% because
             # they are paired up using the destination of their JMP instruction.
-            result = self.function_comparator.compare_function(match)
+            result = self.function_comparator.compare_function(
+                match,
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
             output_type = EntityType.FUNCTION
 
         elif match.entity_type == EntityType.VTABLE:
-            result = self._compare_vtable(match)
+            result = self._compare_vtable(match, include_diff=include_diff)
             output_type = EntityType.VTABLE
 
         else:
@@ -456,27 +472,81 @@ class Compare:
     def get_variables(self) -> Iterator[ReccmpMatch]:
         return self._db.get_matches_by_type(EntityType.DATA)
 
-    def compare_address(self, addr: int) -> DiffReport | None:
+    def compare_address(
+        self,
+        addr: int,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> DiffReport | None:
         match = self._db.get_one_match(addr)
         if match is None:
             return None
 
-        return self._compare_match(match)
+        return self._compare_match(
+            match,
+            include_diff=include_diff,
+            include_exact_diff=include_exact_diff,
+        )
 
-    def compare_all(self) -> Iterable[DiffReport]:
+    def compare_addresses(
+        self,
+        orig_addrs: Iterable[int] = (),
+        recomp_addrs: Iterable[int] = (),
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> Iterable[DiffReport]:
+        """Compare a selected set of matches from either address space.
+
+        A match requested through both address spaces is emitted once, ordered
+        by original address. Unknown and non-comparable addresses are omitted.
+        """
+        selected: dict[int, ReccmpMatch] = {}
+        for addr in orig_addrs:
+            match = self._db.get_one_match(addr)
+            if match is not None:
+                selected[match.orig_addr] = match
+        for addr in recomp_addrs:
+            entity = self._db.get(ImageId.RECOMP, addr)
+            if isinstance(entity, ReccmpMatch):
+                selected[entity.orig_addr] = entity
+
+        for orig_addr in sorted(selected):
+            diff = self._compare_match(
+                selected[orig_addr],
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
+            if diff is not None:
+                yield diff
+
+    def compare_all(
+        self, *, include_diff: bool = True, include_exact_diff: bool = True
+    ) -> Iterable[DiffReport]:
         for match in self._db.get_matches():
-            diff = self._compare_match(match)
+            diff = self._compare_match(
+                match,
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
             if diff is not None:
                 yield diff
 
-    def compare_functions(self) -> Iterable[DiffReport]:
+    def compare_functions(
+        self, *, include_diff: bool = True, include_exact_diff: bool = True
+    ) -> Iterable[DiffReport]:
         for match in self.get_functions():
-            diff = self._compare_match(match)
+            diff = self._compare_match(
+                match,
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
             if diff is not None:
                 yield diff
 
-    def compare_vtables(self) -> Iterable[DiffReport]:
+    def compare_vtables(self, *, include_diff: bool = True) -> Iterable[DiffReport]:
         for match in self.get_vtables():
-            diff = self._compare_match(match)
+            diff = self._compare_match(match, include_diff=include_diff)
             if diff is not None:
                 yield diff
