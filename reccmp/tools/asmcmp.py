@@ -19,6 +19,7 @@ from reccmp.utils import (
 )
 
 from reccmp.compare import Compare
+from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 from reccmp.compare.diff import DiffReport, raw_diff_to_udiff
 from reccmp.compare.report import (
     ReccmpStatusReport,
@@ -50,6 +51,21 @@ def gen_json(json_file: str, json_str: str):
         f.write(json_str)
 
 
+def triage_status_note(analysis: ComparisonAnalysis) -> str | None:
+    """A one-line reminder of what a triage status means, so the semantics
+    travel with the output and a reader does not misread the result. Returned
+    for the two statuses that are routinely misread; None for `exact` (needs no
+    gloss) and `mismatch` (the actionable case, whose diff speaks for itself)."""
+    if analysis.status == ComparisonStatus.EFFECTIVE:
+        return "effective: proved semantically harmless — no action needed"
+    if analysis.status == ComparisonStatus.INCONCLUSIVE:
+        return (
+            "inconclusive: verifier could not prove either outcome — "
+            "NOT evidence of a source defect; investigate verifier/metadata/alignment"
+        )
+    return None
+
+
 def print_match_verbose(match: DiffReport, show_both_addrs: bool = False):
     percenttext = percent_string(match.effective_ratio, match.is_effective_match)
 
@@ -61,6 +77,8 @@ def print_match_verbose(match: DiffReport, show_both_addrs: bool = False):
     grouped_diff = match.match_type != EntityType.VTABLE
     udiff = raw_diff_to_udiff(match.result.diff, grouped=grouped_diff)
 
+    note = triage_status_note(match.result.analysis)
+
     if match.effective_ratio == 1.0:
         ok_text = reccmp.color.Fore.GREEN + "✨ OK! ✨" + reccmp.color.Style.RESET_ALL
         if match.ratio == 1.0:
@@ -69,7 +87,8 @@ def print_match_verbose(match: DiffReport, show_both_addrs: bool = False):
             print_combined_diff(udiff, show_both_addrs)
 
             print(
-                f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior).\n\n{ok_text}\n\n"
+                f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior)."
+                f"\n{note}\n\n{ok_text}\n\n"
             )
 
     else:
@@ -78,6 +97,8 @@ def print_match_verbose(match: DiffReport, show_both_addrs: bool = False):
         print(
             f"\n{match.name} is only {percenttext} similar to the original, diff above"
         )
+        if note is not None:
+            print(note)
 
 
 def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = False):
