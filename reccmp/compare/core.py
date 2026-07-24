@@ -8,6 +8,7 @@ from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
 from reccmp.compare.diagnosis import ComparisonAnalysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
+from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.functions import FunctionComparator
 from reccmp.formats import (
     Image,
@@ -101,6 +102,7 @@ class Compare:
         data_sources: list[TextFile] | None = None,
         project_aliases: ProjectAliases | None = None,
         codebase: DecompCodebase | None = None,
+        equivalence_sources: list[TextFile] | None = None,
     ):
         self.orig_bin = orig_bin
         self.recomp_bin = recomp_bin
@@ -121,6 +123,11 @@ class Compare:
         else:
             self.data_sources = []
 
+        self.equivalence_sources = (
+            equivalence_sources if isinstance(equivalence_sources, list) else []
+        )
+        self.equivalence_groups = parse_equivalence_groups(self.equivalence_sources)
+
         self._lines_db = LinesDb()
         self._db = EntityDb()
 
@@ -136,6 +143,7 @@ class Compare:
             self.recomp_bin,
             self.report,
             self.types,
+            equivalence_groups=self.equivalence_groups,
         )
 
     def _configure_function_nodes(self) -> None:
@@ -164,6 +172,7 @@ class Compare:
             self.recomp_bin,
             self.report,
             self.types,
+            equivalence_groups=self.equivalence_groups,
         )
         self._configure_function_nodes()
 
@@ -276,6 +285,7 @@ class Compare:
             code_files=loaded.code_files,
             project_aliases=loaded.project_aliases,
             codebase=loaded.codebase,
+            equivalence_sources=loaded.equivalence_sources,
         )
         prepared = loaded.load_prepared()
         if prepared is not None:
@@ -288,6 +298,19 @@ class Compare:
     def report_vtable_size_warnings(self, name_filter: str | None = None) -> None:
         """Log oversized-vtable evidence, optionally limited by name."""
         check_vtables(self._db, self.orig_bin, name_filter)
+
+    def _orig_addrs_equivalent(
+        self, orig_addr: int | None, recomp_orig_addr: int | None
+    ) -> bool:
+        """True when both original addresses belong to the same proven
+        equivalence group (fold islands / duplicate COMDATs)."""
+        if not self.equivalence_groups:
+            return False
+        if orig_addr is None or recomp_orig_addr is None:
+            return False
+        return canonical_orig_addr(
+            self.equivalence_groups, orig_addr
+        ) == canonical_orig_addr(self.equivalence_groups, recomp_orig_addr)
 
     def _compare_vtable(
         self, match: ReccmpMatch, *, include_diff: bool = True
@@ -385,7 +408,10 @@ class Compare:
             if (
                 orig is not None
                 and recomp is not None
-                and orig.recomp_addr == recomp.recomp_addr
+                and (
+                    orig.recomp_addr == recomp.recomp_addr
+                    or self._orig_addrs_equivalent(orig.orig_addr, recomp.orig_addr)
+                )
             ):
                 ratio += 1
 
