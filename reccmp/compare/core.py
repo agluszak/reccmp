@@ -29,6 +29,7 @@ from .match_msvc import (
     match_static_variables,
     match_variables,
     match_strings,
+    classify_exact_string_aliases,
     match_ref,
     match_imports,
     match_seh,
@@ -51,6 +52,8 @@ from .analyze import (
     match_entry,
     match_exports,
     import_sections,
+    normalize_original_zero_size_data,
+    classify_exact_vtable_aliases,
 )
 from .ingest import (
     load_cvdump,
@@ -210,11 +213,13 @@ class Compare:
         )
 
         load_data_sources(self._db, self.data_sources)
+        normalize_original_zero_size_data(self._db, self.orig_bin)
 
         # Match using PDB and annotation data
         match_symbols(self._db, self.report, truncate=True)
         match_functions(self._db, self.report, truncate=True)
         match_vtables(self._db, self.report)
+        classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         match_static_variables(self._db, self.report)
         match_variables(self._db, self.report)
         match_lines(self._db, self._lines_db, self.report)
@@ -262,6 +267,7 @@ class Compare:
             complete_partial_strings(self._db, img_id, binfile, self.bin_encoding)
 
         match_strings(self._db, self.report)
+        classify_exact_string_aliases(self._db)
 
     @classmethod
     def from_target(
