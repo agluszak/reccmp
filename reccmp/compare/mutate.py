@@ -6,6 +6,7 @@ import logging
 from reccmp.analysis.crt_startup import (
     detect_crt_startup_arrays,
     create_crt_matches,
+    find_initializer_atexit_helpers,
     get_crt_function_name,
 )
 from reccmp.cvdump.demangler import (
@@ -90,7 +91,78 @@ def unique_names_for_overloaded_functions(db: EntityDb):
                 batch.set(ImageId.RECOMP, func.recomp_addr, computed_name=new_name)
 
 
+def _match_crt_atexit_helpers(
+    db: EntityDb,
+    orig_bin: PEImage,
+    recomp_bin: PEImage,
+    *,
+    crt_orig,
+    crt_recomp,
+    matches: list[tuple[int, int]],
+):
+    orig_initializers = {
+        addr
+        for _, array in crt_orig
+        if array is not None
+        for addr in array.functions
+        if db.exists(ImageId.ORIG, addr)
+    }
+    recomp_initializers = {
+        addr
+        for _, array in crt_recomp
+        if array is not None
+        for addr in array.functions
+        if db.exists(ImageId.RECOMP, addr)
+    }
+    orig_helpers = find_initializer_atexit_helpers(
+        db, ImageId.ORIG, orig_bin, iter(orig_initializers)
+    )
+    recomp_helpers = find_initializer_atexit_helpers(
+        db, ImageId.RECOMP, recomp_bin, iter(recomp_initializers)
+    )
+
+    helper_edges: set[tuple[int, int]] = set()
+    for orig_initializer, recomp_initializer in matches:
+        orig_registered = orig_helpers.get(orig_initializer, ())
+        recomp_registered = recomp_helpers.get(recomp_initializer, ())
+        if len(orig_registered) == 1 and len(recomp_registered) == 1:
+            helper_edges.add((orig_registered[0], recomp_registered[0]))
+
+    orig_degree: dict[int, int] = {}
+    recomp_degree: dict[int, int] = {}
+    for orig_helper, recomp_helper in helper_edges:
+        orig_degree[orig_helper] = orig_degree.get(orig_helper, 0) + 1
+        recomp_degree[recomp_helper] = recomp_degree.get(recomp_helper, 0) + 1
+    with db.batch() as batch:
+        for orig_helper, recomp_helper in sorted(helper_edges):
+            if orig_degree[orig_helper] != 1 or recomp_degree[recomp_helper] != 1:
+                continue
+            orig_entity = db.get(ImageId.ORIG, orig_helper, exact=True)
+            recomp_entity = db.get(ImageId.RECOMP, recomp_helper, exact=True)
+            if (
+                orig_entity is not None
+                and recomp_entity is not None
+                and not orig_entity.matched
+                and not recomp_entity.matched
+            ):
+                batch.match(orig_helper, recomp_helper)
+
+
 def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
+    # Startup arrays are structural evidence, not a function-boundary oracle. Only
+    # enrich/match addresses that another source (inventory or PDB) already declared;
+    # otherwise large retail CRT ranges would manufacture hundreds of anonymous
+    # original functions and turn link-surface evidence into headline noise.
+    known_orig = {
+        entity.orig_addr
+        for entity in db.all(ImageId.ORIG)
+        if entity.orig_addr is not None
+    }
+    known_recomp = {
+        entity.recomp_addr
+        for entity in db.all(ImageId.RECOMP)
+        if entity.recomp_addr is not None
+    }
     crt_orig = tuple(detect_crt_startup_arrays(db, ImageId.ORIG, orig_bin))
     crt_recomp = tuple(detect_crt_startup_arrays(db, ImageId.RECOMP, recomp_bin))
 
@@ -104,10 +176,16 @@ def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
         if orig_array and recomp_array:
             matches.extend(create_crt_matches(orig_array, recomp_array))
 
+    matches = [
+        (orig_addr, recomp_addr)
+        for orig_addr, recomp_addr in matches
+        if orig_addr in known_orig and recomp_addr in known_recomp
+    ]
+
     with db.batch() as batch:
-        for image_id, crt_arrays in (
-            (ImageId.ORIG, crt_orig),
-            (ImageId.RECOMP, crt_recomp),
+        for image_id, crt_arrays, known_addrs in (
+            (ImageId.ORIG, crt_orig, known_orig),
+            (ImageId.RECOMP, crt_recomp, known_recomp),
         ):
             for array_type, array in crt_arrays:
                 if array is None:
@@ -116,6 +194,8 @@ def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
                 name = get_crt_function_name(array_type)
 
                 for addr in array.functions.keys():
+                    if addr not in known_addrs:
+                        continue
                     batch.set(
                         image_id,
                         addr,
@@ -123,7 +203,7 @@ def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
                         name=name,
                     )
 
-                    if addr in array.thunks:
+                    if addr in array.thunks and array.thunks[addr] in known_addrs:
                         thunk_addr = array.thunks[addr]
                         batch.set(
                             image_id,
@@ -134,3 +214,12 @@ def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
 
         for orig_addr, recomp_addr in matches:
             batch.match(orig_addr, recomp_addr)
+
+    _match_crt_atexit_helpers(
+        db,
+        orig_bin,
+        recomp_bin,
+        crt_orig=crt_orig,
+        crt_recomp=crt_recomp,
+        matches=matches,
+    )

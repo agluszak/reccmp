@@ -109,85 +109,67 @@ def match_functions(
     *,
     truncate: bool = False,
 ):
-    # addr->symbol map. Used later in error message for non-unique match.
+    """Match functions by name only when the identity is unique on both sides."""
     recomp_symbols: dict[int, str] = {}
-
     name_index = EntityIndex()
 
-    # TODO: We allow a match if entity_type is null.
-    # This can be removed if we can more confidently declare a symbol is a function
-    # when adding from the PDB.
     for ent in db.unmatched(ImageId.RECOMP):
         symbol = ent.get("symbol")
         name = ent.get("name")
         if ent.get("type") and ent.get("type") != EntityType.FUNCTION:
             continue
-
         if not name:
             continue
-
-        # Truncate function name to 255 chars for older MSVC. See also: Warning C4786.
         if truncate:
             name = name[:255]
         name = _match_name(name)
-
         assert ent.recomp_addr is not None
         name_index.add(name, ent.recomp_addr)
-
-        # Get the symbol for the error message later.
         if symbol is not None:
             recomp_symbols[ent.recomp_addr] = symbol
 
-    # Report if the name used in the match is not unique.
-    # If the name list contained multiple addresses at the start,
-    # we should report even for the last address in the list.
-    non_unique_names = set()
+    orig_entities = [
+        ent
+        for ent in db.unmatched(ImageId.ORIG)
+        if ent.get("type") == EntityType.FUNCTION and ent.get("name")
+    ]
+    orig_name_counts: dict[str, int] = {}
+    normalized_names: dict[int, str] = {}
+    for ent in orig_entities:
+        assert ent.orig_addr is not None
+        name = ent.get("name")
+        assert isinstance(name, str)
+        if truncate:
+            name = name[:255]
+        name = _match_name(name)
+        normalized_names[ent.orig_addr] = name
+        orig_name_counts[name] = orig_name_counts.get(name, 0) + 1
 
     with db.batch() as batch:
-        for ent in db.unmatched(ImageId.ORIG):
-            name = ent.get("name")
-            if ent.get("type") != EntityType.FUNCTION:
-                continue
-
-            if not name:
-                continue
-
+        for ent in orig_entities:
             assert ent.orig_addr is not None
-
-            # Repeat the truncate and normalization for our match search
-            if truncate:
-                name = name[:255]
-            name = _match_name(name)
-
-            if name in name_index:
-                recomp_addr = name_index.pop(name)
-                # If match was not unique
-                if name in name_index:
-                    non_unique_names.add(name)
-
-                # If this name was ever matched non-uniquely
-                if name in non_unique_names:
-                    matched_symbol = recomp_symbols.get(recomp_addr, "None")
-                    other_symbols = [
-                        recomp_symbols.get(recomp_addr, "None")
-                        for recomp_addr in name_index.get(name)
-                    ]
-                    report(
-                        ReccmpEvent.AMBIGUOUS_MATCH,
-                        ent.orig_addr,
-                        msg=f"Ambiguous match 0x{ent.orig_addr:x} on name '{name}' to\n"
-                        + f"'{matched_symbol}'\n"
-                        + "Other candidates:\n"
-                        + ",\n".join(f"'{candidate}'" for candidate in other_symbols),
-                    )
-
-                batch.match(ent.orig_addr, recomp_addr)
-            else:
+            name = normalized_names[ent.orig_addr]
+            candidates = name_index.get(name)
+            if not candidates:
                 report(
                     ReccmpEvent.NO_MATCH,
                     ent.orig_addr,
                     msg=f"Failed to match function at 0x{ent.orig_addr:x} with name '{name}'",
                 )
+                continue
+
+            if orig_name_counts[name] != 1 or len(candidates) != 1:
+                symbols = [recomp_symbols.get(addr, "None") for addr in candidates]
+                report(
+                    ReccmpEvent.AMBIGUOUS_MATCH,
+                    ent.orig_addr,
+                    msg=f"Ambiguous function name '{name}' has "
+                    f"{orig_name_counts[name]} original and {len(candidates)} recomp candidates:\n"
+                    + ",\n".join(f"'{symbol}'" for symbol in symbols),
+                )
+                continue
+
+            batch.match(ent.orig_addr, name_index.pop(name))
 
 
 def _find_vtable_match(
@@ -417,6 +399,27 @@ def match_strings(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
                 )
 
 
+def classify_exact_string_aliases(db: EntityDb) -> None:
+    """Record side-local duplicate strings once a unique canonical pair exists."""
+    canonical: dict[tuple[EntityType, str], set[int]] = {}
+    for canonical_entity in db.get_matches():
+        entity_type = canonical_entity.get("type")
+        text = canonical_entity.get("name")
+        if entity_type in (EntityType.STRING, EntityType.WIDECHAR) and text:
+            canonical.setdefault((entity_type, text), set()).add(
+                canonical_entity.orig_addr
+            )
+
+    for image_id in (ImageId.ORIG, ImageId.RECOMP):
+        for candidate in tuple(db.unexplained(image_id)):
+            entity_type = candidate.get("type")
+            text = candidate.get("name")
+            identities = canonical.get((entity_type, text), set())
+            addr = candidate.addr(image_id)
+            if addr is not None and len(identities) == 1:
+                db.set_alias(image_id, addr, next(iter(identities)))
+
+
 def match_lines(
     db: EntityDb,
     lines: LinesDb,
@@ -523,3 +526,107 @@ def match_imports(db: EntityDb):
             if orig_addr is not None:
                 assert isinstance(ent.recomp_addr, int)
                 batch.match(orig_addr, ent.recomp_addr)
+
+
+def _seh_side_key(img_id: ImageId, field: str) -> str:
+    side = "orig" if img_id == ImageId.ORIG else "recomp"
+    return f"seh_{field}_{side}"
+
+
+def match_seh(db: EntityDb):
+    """Pair VC5 SEH metadata through an already-paired owning function.
+
+    Generic ``__ehhandler``/``__ehfuncinfo`` names deliberately play no role.
+    An owner must have exactly one structurally recovered handler on each side.
+    Unwind actions are paired only when their target state is unique on both
+    sides and neither action is shared by another state.
+    """
+    handlers_by_owner: dict[ImageId, dict[int, list[int]]] = {
+        ImageId.ORIG: {},
+        ImageId.RECOMP: {},
+    }
+
+    for img_id in (ImageId.ORIG, ImageId.RECOMP):
+        owner_key = _seh_side_key(img_id, "owner")
+        for entity in db.unmatched(img_id):
+            owner = entity.get(owner_key)
+            addr = entity.addr(img_id)
+            if isinstance(owner, int) and isinstance(addr, int):
+                handlers_by_owner[img_id].setdefault(owner, []).append(addr)
+
+    with db.batch() as batch:
+        for owner in db.get_matches_by_type(EntityType.FUNCTION):
+            orig_handlers = handlers_by_owner[ImageId.ORIG].get(owner.orig_addr, [])
+            recomp_handlers = handlers_by_owner[ImageId.RECOMP].get(
+                owner.recomp_addr, []
+            )
+            if len(orig_handlers) != 1 or len(recomp_handlers) != 1:
+                continue
+
+            orig_handler_addr = orig_handlers[0]
+            recomp_handler_addr = recomp_handlers[0]
+            orig_handler = db.get(ImageId.ORIG, orig_handler_addr)
+            recomp_handler = db.get(ImageId.RECOMP, recomp_handler_addr)
+            if orig_handler is None or recomp_handler is None:
+                continue
+
+            orig_funcinfo_addr = orig_handler.get(
+                _seh_side_key(ImageId.ORIG, "funcinfo")
+            )
+            recomp_funcinfo_addr = recomp_handler.get(
+                _seh_side_key(ImageId.RECOMP, "funcinfo")
+            )
+            if not isinstance(orig_funcinfo_addr, int) or not isinstance(
+                recomp_funcinfo_addr, int
+            ):
+                continue
+
+            orig_funcinfo = db.get(ImageId.ORIG, orig_funcinfo_addr)
+            recomp_funcinfo = db.get(ImageId.RECOMP, recomp_funcinfo_addr)
+            if orig_funcinfo is None or recomp_funcinfo is None:
+                continue
+
+            batch.match(orig_handler_addr, recomp_handler_addr)
+            batch.match(orig_funcinfo_addr, recomp_funcinfo_addr)
+
+            orig_unwinds = orig_funcinfo.get(_seh_side_key(ImageId.ORIG, "unwinds"), ())
+            recomp_unwinds = recomp_funcinfo.get(
+                _seh_side_key(ImageId.RECOMP, "unwinds"), ()
+            )
+            orig_by_state: dict[int, list[int]] = {}
+            recomp_by_state: dict[int, list[int]] = {}
+            for unwind in orig_unwinds:
+                if unwind.action_addr:
+                    orig_by_state.setdefault(unwind.target_state, []).append(
+                        unwind.action_addr
+                    )
+            for unwind in recomp_unwinds:
+                if unwind.action_addr:
+                    recomp_by_state.setdefault(unwind.target_state, []).append(
+                        unwind.action_addr
+                    )
+
+            orig_actions = [
+                addr for addresses in orig_by_state.values() for addr in addresses
+            ]
+            recomp_actions = [
+                addr for addresses in recomp_by_state.values() for addr in addresses
+            ]
+            for state in orig_by_state.keys() & recomp_by_state.keys():
+                orig_addrs = orig_by_state[state]
+                recomp_addrs = recomp_by_state[state]
+                if len(orig_addrs) != 1 or len(recomp_addrs) != 1:
+                    continue
+
+                orig_action = orig_addrs[0]
+                recomp_action = recomp_addrs[0]
+                if (
+                    orig_actions.count(orig_action) != 1
+                    or recomp_actions.count(recomp_action) != 1
+                ):
+                    continue
+                if (
+                    db.get(ImageId.ORIG, orig_action) is not None
+                    and db.get(ImageId.RECOMP, recomp_action) is not None
+                ):
+                    batch.match(orig_action, recomp_action)

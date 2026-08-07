@@ -13,6 +13,7 @@ from reccmp.compare.match_msvc import (
     match_vtables,
     match_ref,
     match_imports,
+    classify_exact_string_aliases,
 )
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 
@@ -167,9 +168,8 @@ def test_match_functions_no_match_report(db, report):
     report.assert_called_with(ReccmpEvent.NO_MATCH, 123, msg=ANY)
 
 
-def test_match_function_stable_order(db):
-    """If name is not unique, match according to orig and recomp address order.
-    i.e. insertion order does not matter"""
+def test_match_function_ambiguous_order_is_not_a_pairing_identity(db):
+    """Duplicate names stay unmatched instead of pairing by address order."""
     with db.batch() as batch:
         # Descending order
         batch.set(ImageId.ORIG, 101, name="hello", type=EntityType.FUNCTION)
@@ -179,8 +179,10 @@ def test_match_function_stable_order(db):
 
     match_functions(db)
 
-    assert db.get(ImageId.ORIG, 100).recomp_addr == 500
-    assert db.get(ImageId.ORIG, 101).recomp_addr == 501
+    assert db.get(ImageId.ORIG, 100).recomp_addr is None
+    assert db.get(ImageId.ORIG, 101).recomp_addr is None
+    assert db.get(ImageId.RECOMP, 500).orig_addr is None
+    assert db.get(ImageId.RECOMP, 501).orig_addr is None
 
 
 def test_match_functions_type_null(db):
@@ -212,8 +214,8 @@ def test_match_functions_ambiguous(db, report):
     report.assert_any_call(ReccmpEvent.AMBIGUOUS_MATCH, 100, msg=ANY)
     report.assert_any_call(ReccmpEvent.AMBIGUOUS_MATCH, 101, msg=ANY)
 
-    # Should match regardless
-    assert db.count() == 2
+    # Ambiguous names are evidence only, never an address-order identity.
+    assert db.count() == 4
 
 
 def test_match_functions_ignore_already_matched(db, report):
@@ -940,3 +942,27 @@ def test_match_imports(db: EntityDb):
     e = db.get(ImageId.ORIG, 200)
     assert e is not None
     assert e.recomp_addr == 200
+
+
+def test_classify_exact_string_aliases_requires_unique_canonical(db):
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x1000, type=EntityType.STRING, name="same")
+        batch.set(ImageId.RECOMP, 0x2000, type=EntityType.STRING, name="same")
+        batch.match(0x1000, 0x2000)
+        batch.set(ImageId.ORIG, 0x1010, type=EntityType.STRING, name="same")
+        batch.set(ImageId.RECOMP, 0x2010, type=EntityType.STRING, name="same")
+        batch.set(ImageId.ORIG, 0x1100, type=EntityType.STRING, name="ambiguous")
+        batch.set(ImageId.RECOMP, 0x2100, type=EntityType.STRING, name="ambiguous")
+        batch.match(0x1100, 0x2100)
+        batch.set(ImageId.ORIG, 0x1110, type=EntityType.STRING, name="ambiguous")
+        batch.set(ImageId.RECOMP, 0x2110, type=EntityType.STRING, name="ambiguous")
+        batch.match(0x1110, 0x2110)
+        batch.set(ImageId.ORIG, 0x1120, type=EntityType.STRING, name="ambiguous")
+
+    classify_exact_string_aliases(db)
+
+    assert [entity.orig_addr for entity, _ in db.get_aliases(ImageId.ORIG)] == [0x1010]
+    assert [entity.recomp_addr for entity, _ in db.get_aliases(ImageId.RECOMP)] == [
+        0x2010
+    ]
+    assert db.alias_canonical_orig(ImageId.ORIG, 0x1120) is None

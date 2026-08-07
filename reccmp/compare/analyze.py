@@ -3,6 +3,7 @@ These functions update the entity database based on analysis of the binary files
 """
 
 import logging
+import re
 import struct
 from reccmp.formats import Image, PEImage
 from reccmp.formats.exceptions import (
@@ -16,6 +17,7 @@ from reccmp.analysis import (
     find_import_thunks,
     find_vtordisp,
     find_eh_handlers,
+    find_exception_registrations,
     is_likely_latin1,
 )
 from .db import EntityDb, entity_name_from_string
@@ -84,25 +86,74 @@ def create_analysis_floats(db: EntityDb, img_id: ImageId, binfile: PEImage):
                 )
 
 
+def _seh_side_key(img_id: ImageId, field: str) -> str:
+    side = "orig" if img_id == ImageId.ORIG else "recomp"
+    return f"seh_{field}_{side}"
+
+
+def _find_exception_owner(
+    db: EntityDb, img_id: ImageId, registration_addr: int
+) -> int | None:
+    """Relate a registration site to a function only near its entry point."""
+    owner = None
+    for entity in db.all(img_id):
+        addr = entity.addr(img_id)
+        assert addr is not None
+        if addr > registration_addr:
+            break
+        if entity.get("type") == EntityType.FUNCTION:
+            owner = addr
+
+    # VC5's inline form can do a few loads between entry and ``push handler``.
+    if owner is None or registration_addr - owner > 32:
+        return None
+    return owner
+
+
 def create_seh_entities(db: EntityDb, img_id: ImageId, binfile: PEImage):
-    """Create entities for the SEH (structured exception handling)
-    handler and funcinfo struct. For images without a relocation table,
-    this will allow us to replace the addresses for both items."""
+    """Create SEH entities and record their structural relationships."""
+    handlers = tuple(find_eh_handlers(binfile))
+    registrations: dict[int, list[int]] = {}
+    for registration in find_exception_registrations(binfile, handlers):
+        registrations.setdefault(registration.handler_addr, []).append(
+            registration.addr
+        )
+
     with db.batch() as batch:
-        for handler_addr, funcinfo in find_eh_handlers(binfile):
+        for handler_addr, funcinfo in handlers:
+            handler_fields = {
+                _seh_side_key(img_id, "funcinfo"): funcinfo.addr,
+            }
+            sites = registrations.get(handler_addr, [])
+            if len(sites) == 1:
+                owner = _find_exception_owner(db, img_id, sites[0])
+                if owner is not None:
+                    handler_fields[_seh_side_key(img_id, "owner")] = owner
+
             # Using names derived from symbols in .cpp.s generated asm.
             batch.set(
                 img_id,
                 handler_addr,
                 type=EntityType.LABEL,
                 name="__ehhandler",
+                **handler_fields,
             )
-            batch.set(
-                img_id,
-                funcinfo.addr,
-                type=EntityType.DATA,
-                name="__ehfuncinfo",
-            )
+            if img_id == ImageId.ORIG:
+                batch.set(
+                    img_id,
+                    funcinfo.addr,
+                    type=EntityType.DATA,
+                    name="__ehfuncinfo",
+                    seh_unwinds_orig=tuple(funcinfo.unwinds),
+                )
+            else:
+                batch.set(
+                    img_id,
+                    funcinfo.addr,
+                    type=EntityType.DATA,
+                    name="__ehfuncinfo",
+                    seh_unwinds_recomp=tuple(funcinfo.unwinds),
+                )
 
             for unwind in funcinfo.unwinds:
                 if unwind.action_addr != 0:
@@ -135,8 +186,16 @@ def create_import_thunks(db: EntityDb, image_id: ImageId, binfile: Image):
     if not isinstance(binfile, PEImage):
         return
 
+    function_starts = {
+        addr
+        for entity in db.get_all()
+        if entity.get("type") == EntityType.FUNCTION
+        and entity.size(image_id) == 6
+        and (addr := entity.addr(image_id)) is not None
+    }
+
     with db.batch() as batch:
-        for thunk in find_import_thunks(binfile):
+        for thunk in find_import_thunks(binfile, function_starts):
             batch.set(
                 image_id,
                 thunk.addr,
@@ -293,3 +352,115 @@ def complete_partial_strings(
                     image_id.name.lower(),
                     addr,
                 )
+
+
+def normalize_original_zero_size_data(db: EntityDb, binfile: PEImage) -> None:
+    """Retype structurally proven zero-size inventory rows conservatively.
+
+    Ghidra exports may describe interior code labels, E9 islands and named vtables as
+    generic DATA. Function containment, exact opcodes and pointer-run/name agreement
+    are sufficient type evidence; all other rows remain DATA for manual xref work.
+    """
+    functions: list[tuple[int, int]] = []
+    code_ranges = [region.range for region in binfile.get_code_regions()]
+    for entity in db.all(ImageId.ORIG):
+        if entity.get("type") != EntityType.FUNCTION:
+            continue
+        addr = entity.orig_addr
+        size = entity.size(ImageId.ORIG)
+        if addr is not None and size is not None and size > 0:
+            functions.append((addr, addr + size))
+    functions.sort()
+
+    def containing_function(addr: int) -> bool:
+        for start, end in functions:
+            if start >= addr:
+                return False
+            if addr < end:
+                return True
+        return False
+
+    def in_code(addr: int) -> bool:
+        return any(addr in region for region in code_ranges)
+
+    with db.batch() as batch:
+        for entity in tuple(db.unmatched(ImageId.ORIG)):
+            if entity.get("type") != EntityType.DATA or entity.size(ImageId.ORIG):
+                continue
+            addr = entity.orig_addr
+            if addr is None:
+                continue
+            if containing_function(addr):
+                batch.set(ImageId.ORIG, addr, type=EntityType.LABEL)
+                continue
+
+            if in_code(addr):
+                raw = binfile.read(addr, 5)
+                if raw[0] == 0xE9:
+                    target = addr + 5 + int.from_bytes(raw[1:5], "little", signed=True)
+                    batch.set(
+                        ImageId.ORIG,
+                        addr,
+                        type=EntityType.THUNK,
+                        size=5,
+                        skip=True,
+                    )
+                    batch.set_ref(ImageId.ORIG, addr, ref=target)
+                continue
+
+            name = entity.best_name() or ""
+            match = re.fullmatch(r"(.+?)::(?:'vftable'|vftable)", name)
+            if match is None:
+                continue
+            slot_count = 0
+            for offset in range(0, 1024, 4):
+                (target,) = struct.unpack("<I", binfile.read(addr + offset, 4))
+                if not in_code(target):
+                    break
+                slot_count += 1
+            if slot_count >= 3:
+                batch.set(
+                    ImageId.ORIG,
+                    addr,
+                    type=EntityType.VTABLE,
+                    name=match.group(1),
+                    size=slot_count * 4,
+                )
+
+
+def classify_exact_vtable_aliases(
+    db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage
+) -> None:
+    """Record exact duplicate vtable emissions against a unique canonical pair."""
+    for image_id, binfile in (
+        (ImageId.ORIG, orig_bin),
+        (ImageId.RECOMP, recomp_bin),
+    ):
+        canonical: dict[tuple[str, bytes], set[int]] = {}
+        for canonical_entity in db.get_matches_by_type(EntityType.VTABLE):
+            addr = canonical_entity.addr(image_id)
+            size = canonical_entity.size(image_id)
+            name = canonical_entity.best_name()
+            if addr is None or size is None or size <= 0 or name is None:
+                continue
+            try:
+                raw = bytes(binfile.read(addr, size))
+            except (InvalidVirtualAddressError, InvalidVirtualReadError):
+                continue
+            canonical.setdefault((name, raw), set()).add(canonical_entity.orig_addr)
+
+        for candidate in tuple(db.unexplained(image_id)):
+            if candidate.get("type") != EntityType.VTABLE:
+                continue
+            addr = candidate.addr(image_id)
+            size = candidate.size(image_id)
+            name = candidate.best_name()
+            if addr is None or size is None or size <= 0 or name is None:
+                continue
+            try:
+                raw = bytes(binfile.read(addr, size))
+            except (InvalidVirtualAddressError, InvalidVirtualReadError):
+                continue
+            identities = canonical.get((name, raw), set())
+            if len(identities) == 1:
+                db.set_alias(image_id, addr, next(iter(identities)))
