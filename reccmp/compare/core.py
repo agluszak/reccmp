@@ -31,6 +31,7 @@ from .match_msvc import (
     match_strings,
     match_ref,
     match_imports,
+    match_seh,
 )
 from .db import EntityDb, ReccmpEntity, ReccmpMatch
 from .lines import LinesDb
@@ -238,6 +239,7 @@ class Compare:
         for img_id in (ImageId.ORIG, ImageId.RECOMP):
             set_max_size(self._db, img_id)
 
+        match_seh(self._db)
         match_ref(self._db, self.report)
         self.function_comparator.discover_unpaired_function_bodies()
         unique_names_for_overloaded_functions(self._db)
