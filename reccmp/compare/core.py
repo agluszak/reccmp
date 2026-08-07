@@ -239,6 +239,7 @@ class Compare:
             set_max_size(self._db, img_id)
 
         match_ref(self._db, self.report)
+        self.function_comparator.discover_unpaired_function_bodies()
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)
 
@@ -562,6 +563,20 @@ class Compare:
 
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
+
+    def get_unmatched(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
+        """Raw unmatched inventory, including proven duplicate bodies."""
+        return self._db.unmatched(image_id)
+
+    def get_unexplained(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
+        """Unmatched inventory excluding proven duplicate bodies."""
+        return self._db.unexplained(image_id)
+
+    def get_aliases(
+        self, image_id: ImageId
+    ) -> Iterator[tuple[ReccmpEntity, ReccmpMatch]]:
+        """Proven side-local duplicates and their canonical pairs."""
+        return self._db.get_aliases(image_id)
 
     def get_vtables(self) -> Iterator[ReccmpMatch]:
         return self._db.get_matches_by_type(EntityType.VTABLE)
