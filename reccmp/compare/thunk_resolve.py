@@ -37,13 +37,26 @@ def is_plausible_vtable_target(binfile: Image, addr: int) -> bool:
     if addr < 0x10000:
         return False
     try:
-        data = binfile.read(addr, 1)
+        data = binfile.read(addr, 2)
     except (InvalidVirtualAddressError, InvalidVirtualReadError):
         return False
     if not data:
         return False
-    # Executable mapping or incremental-link stub opcode.
-    return data[0] in (0xE9, 0x55, 0x6A, 0x83, 0x8B, 0xC3, 0x33, 0x56, 0x57, 0x51, 0x53)
+    # Executable mapping, incremental-link stub opcode, or an x86 absolute
+    # indirect jump through the import address table (FF 25).
+    return data[:2] == b"\xff\x25" or data[0] in (
+        0xE9,
+        0x55,
+        0x6A,
+        0x83,
+        0x8B,
+        0xC3,
+        0x33,
+        0x56,
+        0x57,
+        0x51,
+        0x53,
+    )
 
 
 def effective_orig_vtable_size(binfile: Image, orig_addr: int, read_size: int) -> int:
