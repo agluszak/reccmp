@@ -50,6 +50,7 @@ def is_plausible_vtable_target(binfile: Image, addr: int) -> bool:
         0x6A,
         0x83,
         0x8B,
+        0xC2,
         0xC3,
         0x33,
         0x56,

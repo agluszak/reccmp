@@ -105,6 +105,13 @@ def main():
             show_vtable_diff(udiff, args.verbose)
             print()
 
+    if vtable_count == 0:
+        if args.filter:
+            logger.error("No vtables matched filter %r", args.filter)
+        else:
+            logger.error("No vtables found")
+        return 1
+
     print_summary(vtable_count, problem_count)
 
     # Now compare adjuster thunk functions, if there are any.
