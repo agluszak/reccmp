@@ -40,6 +40,11 @@ symbol-table indices. `CoffObject.contribution` selects a symbol's bytes and
 relocations; `reccmp.compare.exact.compare_object_to_original` compares that
 contribution. Data-only translation units are valid objects, not empty failures.
 
+For exact paired contributions, `original_absolute_relocation_targets` in the
+same module maps DIR32 operands back to COFF symbols, accounting for addends.
+These are diagnostic observations to reconcile with other references, not
+independent proof of the original targets' identities.
+
 The comparison masks i386 DIR32, DIR32NB and REL32 operands and original PE base
 relocations. Unsupported relocation types in the selected extent are rejected.
 This result establishes masked byte identity only: it does not establish equal

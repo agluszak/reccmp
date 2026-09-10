@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from reccmp.formats.coff import CoffObject, CoffRelocation, parse_coff_object
+from reccmp.formats.coff import (
+    CoffObject,
+    CoffRelocation,
+    CoffSymbol,
+    parse_coff_object,
+)
 from reccmp.formats.pe import PEImage
 
 RELOCATION_TYPES = frozenset({0x06, 0x07, 0x14})
@@ -39,6 +44,15 @@ class ExactComparison:
     @property
     def exact(self) -> bool:
         return self.status == "exact"
+
+
+@dataclass(frozen=True)
+class OriginalRelocationTarget:
+    """A COFF symbol mapped through an original absolute relocation operand."""
+
+    symbol: CoffSymbol
+    offset: int
+    address: int
 
 
 def _source_name(name: str) -> str:
@@ -126,6 +140,35 @@ def mask_relocations(body: bytes, offsets: Iterable[int]) -> bytes:
         if 0 <= offset and offset + 4 <= len(masked):
             masked[offset : offset + 4] = b"\0\0\0\0"
     return bytes(masked)
+
+
+def original_absolute_relocation_targets(
+    original: PEImage, obj: CoffObject, symbol: str, address: int, size: int
+) -> tuple[OriginalRelocationTarget, ...]:
+    """Infer DIR32 targets from an exact paired code or data contribution.
+
+    The caller supplies the original identity and independent extent. Subtract
+    each COFF operand's addend from its paired original operand, modulo 2**32.
+    These observations are not independent proof of target identity or meaning;
+    reconcile them with other references before assigning original symbols.
+    """
+    if not compare_object_to_original(original, obj, symbol, address, size).exact:
+        raise ValueError("Relocation targets require an exact paired contribution")
+    contribution = obj.contribution(symbol)
+    symbols = {item.index: item for item in obj.symbols}
+    targets = []
+    for relocation in contribution.relocations:
+        if relocation.type != 0x06 or relocation.offset >= size:
+            continue
+        offset = relocation.offset
+        addend = int.from_bytes(contribution.data[offset : offset + 4], "little")
+        value = int.from_bytes(original.read(address + offset, 4), "little")
+        targets.append(
+            OriginalRelocationTarget(
+                symbols[relocation.symbol_index], offset, (value - addend) & 0xFFFFFFFF
+            )
+        )
+    return tuple(targets)
 
 
 def stable_ranges(length: int, offsets: Iterable[int]) -> list[tuple[int, int]]:
