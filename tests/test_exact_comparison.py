@@ -1,11 +1,25 @@
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+import struct
+
+import pytest
+
 from reccmp.compare.exact import (
     compare_relocation_masked,
     mask_relocations,
+    original_absolute_relocation_targets,
+    parse_coff_functions,
     stable_ranges,
 )
-from reccmp.formats.coff import parse_coff_object
-from reccmp.compare.exact import parse_coff_functions
-import struct
+from reccmp.formats.coff import (
+    CoffObject,
+    CoffRelocation,
+    CoffSection,
+    CoffSymbol,
+    parse_coff_object,
+)
+from reccmp.formats.pe import PEImage
 
 
 def test_relocation_masked_exact_comparison_reports_mode() -> None:
@@ -88,3 +102,40 @@ def test_static_function_auxiliary_extent_preserves_nop_and_alias(tmp_path) -> N
     assert obj.contribution("_local").data == b"\x55\xc3\x90"
     assert obj.contribution("_alias").data == b"\x55\xc3\x90\xcc"
     assert {f.name for f in parse_coff_functions(path)} == {"local", "alias"}
+
+
+@pytest.mark.parametrize("addend", [12, -8])
+def test_original_absolute_target_accounts_for_addend_and_symbol_index(addend) -> None:
+    body = b"\xa1" + struct.pack("<I", addend & 0xFFFFFFFF) + b"\xc3"
+    source = CoffSymbol(0, "_read", 0, 1, 0x20, 2, (bytes(18),))
+    target = CoffSymbol(2, "_global", 0, 0, 0, 2, ())
+    obj = CoffObject(
+        Path("read.obj"),
+        (
+            CoffSection(
+                1, ".text", len(body), body, 0x60000020, (CoffRelocation(1, 2, 6),)
+            ),
+        ),
+        (source, target),
+    )
+    linked = b"\xa1" + struct.pack("<I", 0x402000 + addend) + b"\xc3"
+    original = cast(
+        PEImage,
+        SimpleNamespace(
+            read=lambda address, size: linked[
+                address - 0x401000 : address - 0x401000 + size
+            ],
+            relocations={0x401001},
+        ),
+    )
+    observations = original_absolute_relocation_targets(
+        original, obj, "_read", 0x401000, 6
+    )
+    assert len(observations) == 1
+    assert observations[0].symbol is target
+    assert observations[0].offset == 1
+    assert observations[0].address == 0x402000
+
+    linked = b"\x90" + linked[1:]
+    with pytest.raises(ValueError, match="exact paired contribution"):
+        original_absolute_relocation_targets(original, obj, "_read", 0x401000, 6)
