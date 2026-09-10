@@ -2,7 +2,9 @@
 
 from datetime import datetime
 from pathlib import Path
+from dataclasses import asdict
 import argparse
+import json
 import logging
 import os
 
@@ -18,6 +20,10 @@ from reccmp.utils import (
 )
 
 from reccmp.compare import Compare
+from reccmp.compare.exact import compare_object_to_original
+from reccmp.formats.coff import parse_coff_object
+from reccmp.formats.detect import detect_image
+from reccmp.formats.pe import PEImage
 from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
@@ -39,6 +45,7 @@ from reccmp.project.detect import (
     RecCmpProjectException,
     argparse_add_project_target_args,
     argparse_parse_project_target,
+    RecCmpProject,
 )
 
 logger = logging.getLogger()
@@ -174,6 +181,19 @@ def parse_args() -> argparse.Namespace:
     )
     argparse_add_project_target_args(parser)
     parser.add_argument(
+        "--object",
+        type=Path,
+        help="Compare a COFF contribution without a recompiled PE or PDB",
+    )
+    parser.add_argument(
+        "--symbol", help="Exact COFF linker symbol for --object (including decoration)"
+    )
+    parser.add_argument(
+        "--size",
+        type=lambda value: int(value, 0),
+        help="Independently known original extent for --object",
+    )
+    parser.add_argument(
         "--total",
         "-T",
         metavar="<count>",
@@ -260,6 +280,29 @@ def parse_args() -> argparse.Namespace:
     argparse_add_logging_args(parser)
 
     args = parser.parse_args()
+    if args.object is not None:
+        if (
+            not args.symbol
+            or args.size is None
+            or args.size <= 0
+            or len(args.orig_address) != 1
+        ):
+            parser.error(
+                "--object requires --symbol, positive --size and one --orig-address"
+            )
+        if any(
+            (
+                args.verbose is not None,
+                args.recomp_address,
+                args.html,
+                args.svg,
+                args.diff,
+                args.dump,
+            )
+        ):
+            parser.error("--object does not use executable diff/report options")
+    elif args.symbol is not None or args.size is not None:
+        parser.error("--symbol and --size require --object")
     argparse_parse_logging(args)
 
     return args
@@ -304,8 +347,46 @@ def dump_all_matched_functions(report: ReccmpStatusReport):
                         f.write(f"        : {line}\n")
 
 
+def compare_object(args: argparse.Namespace) -> int:
+    """Run the object view without requiring any recompiled linker output."""
+    original_path = (
+        RecCmpProject.from_directory(Path.cwd()).targets[args.target].original_path
+        if args.target
+        else args.paths_target.original_path
+    )
+    if original_path is None:
+        raise ValueError("The selected target has no original binary")
+    original = detect_image(original_path)
+    if not isinstance(original, PEImage):
+        raise ValueError("Object comparison currently supports i386 PE originals")
+    result = compare_object_to_original(
+        original,
+        parse_coff_object(args.object),
+        args.symbol,
+        args.orig_address[0],
+        args.size,
+    )
+    output = json.dumps(
+        {
+            "object": str(args.object),
+            "symbol": args.symbol,
+            "original_address": args.orig_address[0],
+            **asdict(result),
+        },
+        indent=2,
+    )
+    if args.json:
+        gen_json(args.json, output)
+    if not args.silent:
+        print(output)
+    return 0 if result.exact else 1
+
+
 def main() -> int:
     args = parse_args()
+
+    if args.object is not None:
+        return compare_object(args)
 
     try:
         target = argparse_parse_project_target(args)
