@@ -1,8 +1,9 @@
 import pytest
 from reccmp.types import EntityType, ImageId
 from reccmp.cvdump.types import CvdumpTypeKey
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.asm.replacement import (
+    canonical_callee_name,
     create_name_lookup,
     NameReplacementProtocol,
 )
@@ -293,6 +294,44 @@ def test_decorated_symbol_defines_duplicate_body_callee_identity(db: EntityDb):
     assert orig is not None and recomp is not None
     assert "symbol:" in orig
     assert orig == recomp
+
+
+def test_matched_pair_uses_canonical_original_identity_over_local_symbols(
+    db: EntityDb,
+):
+    """A proven match outranks either side's local decorated symbol.
+
+    The original and recompiled binaries can spell the same imported callee
+    differently while reccmp has already proven the pair. Both sides must emit
+    the same canonical-identity callee, not their own local symbol."""
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x100, name="CanonicalImport", type=EntityType.IMPORT)
+
+    orig = ReccmpMatch(
+        0x100,
+        0x500,
+        {
+            "name": "RetailImport",
+            "symbol": "?srAssertFail@@YAXPBD0J0ZZ",
+            "type": EntityType.IMPORT,
+        },
+    )
+    recomp = ReccmpMatch(
+        0x100,
+        0x500,
+        {
+            "name": "LocalImport",
+            "symbol": "__imp_?srAssertFail@@YAXPBD0J0@Z",
+            "type": EntityType.IMPORT,
+        },
+    )
+
+    orig_name = canonical_callee_name(db, ImageId.ORIG, orig)
+    recomp_name = canonical_callee_name(db, ImageId.RECOMP, recomp)
+
+    assert orig_name is not None
+    assert orig_name == recomp_name
+    assert "[CALLEE orig:100]" in orig_name
 
 
 def test_import_without_name(db):
