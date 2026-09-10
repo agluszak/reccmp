@@ -1,18 +1,20 @@
-"""Relocation-masked exact comparison for function bodies in COFF objects."""
+"""Relocation-masked comparison of COFF contributions against an original PE."""
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
+
+from reccmp.formats.coff import CoffObject, CoffRelocation, parse_coff_object
+from reccmp.formats.pe import PEImage
 
 RELOCATION_TYPES = frozenset({0x06, 0x07, 0x14})
 
 
 @dataclass(frozen=True)
 class CoffFunction:
-    """One external i386 COFF function and its contributing relocations."""
+    """One i386 COFF function and its contributing relocations."""
 
     name: str
     body: bytes
@@ -39,18 +41,6 @@ class ExactComparison:
         return self.status == "exact"
 
 
-def coff_name(data: bytes, raw: bytes, string_table: int) -> str:
-    """Decode an inline or string-table COFF name."""
-    if raw[:4] == b"\0\0\0\0":
-        offset = struct.unpack_from("<I", raw, 4)[0]
-        return (
-            data[string_table + offset :]
-            .split(b"\0", 1)[0]
-            .decode("utf-8", errors="replace")
-        )
-    return raw[:8].rstrip(b"\0").decode("utf-8", errors="replace")
-
-
 def _source_name(name: str) -> str:
     value = name.removeprefix("_")
     if "@" in value and value.rsplit("@", 1)[-1].isdigit():
@@ -59,101 +49,75 @@ def _source_name(name: str) -> str:
 
 
 def parse_coff_functions(path: Path) -> list[CoffFunction]:
-    """Parse external function COMDATs from an i386 COFF object.
+    """Compatibility function view of the complete object, including statics.
 
-    A function body stops at the next external function symbol or the end of
-    its section.  Alignment padding is removed, while associated jump-table
-    bytes remain available for callers that know the PDB function extent.
+    Do not strip bytes which could be code or data. Callers supply an original
+    extent when comparing; section alignment is not a function-size oracle.
+    A data-only object legitimately returns an empty function view.
     """
-    # pylint: disable=too-many-locals
-
-    data = path.read_bytes()
-    if len(data) < 20:
-        raise RuntimeError(f"COFF object is too short: {path}")
-    (
-        machine,
-        section_count,
-        _timestamp,
-        symbol_table,
-        symbol_count,
-        optional_size,
-        _flags,
-    ) = struct.unpack_from("<HHIIIHH", data, 0)
-    if machine != 0x14C or optional_size != 0:
-        raise RuntimeError(f"not an i386 COFF object: {path}")
-    string_table = symbol_table + symbol_count * 18
-    sections: dict[int, dict[str, Any]] = {}
-    section_offset = 20
-    for index in range(1, section_count + 1):
-        header = data[section_offset : section_offset + 40]
-        name = coff_name(data, header[:8], string_table)
-        (
-            size,
-            raw_offset,
-            relocation_offset,
-            _lines,
-            relocation_count,
-            _line_count,
-            _attrs,
-        ) = struct.unpack_from("<IIIIHHI", header, 16)
-        sections[index] = {
-            "name": name,
-            "data": data[raw_offset : raw_offset + size] if raw_offset else b"",
-            "relocations": [
-                struct.unpack_from("<IIH", data, relocation_offset + position * 10)
-                for position in range(relocation_count)
-            ],
-        }
-        section_offset += 40
-
-    symbols: list[tuple[str, int, int, int, int]] = []
-    symbol_index = 0
-    while symbol_index < symbol_count:
-        raw = data[
-            symbol_table + symbol_index * 18 : symbol_table + symbol_index * 18 + 18
-        ]
-        name = coff_name(data, raw, string_table)
-        value, section, symbol_type, storage, auxiliary_count = struct.unpack_from(
-            "<IhHBB", raw, 8
-        )
-        symbols.append((name, value, section, symbol_type, storage))
-        symbol_index += 1 + auxiliary_count
-
+    obj = parse_coff_object(path)
     functions: list[CoffFunction] = []
-    by_section: dict[int, list[tuple[str, int]]] = {}
-    for name, value, section, symbol_type, storage in symbols:
-        if (
-            section > 0
-            and storage == 2
-            and symbol_type == 0x20
-            and sections[section]["name"].startswith(".text")
-        ):
-            by_section.setdefault(section, []).append((name, value))
-    for section_index, entries in sorted(by_section.items()):
-        section = sections[section_index]
-        entries.sort(key=lambda item: (item[1], item[0]))
-        for position, (name, start) in enumerate(entries):
-            end = (
-                entries[position + 1][1]
-                if position + 1 < len(entries)
-                else len(section["data"])
+    for symbol in obj.symbols:
+        if not symbol.is_function or symbol.storage_class not in (2, 3):
+            continue
+        contribution = obj.contribution(symbol.name)
+        offsets = _contribution_relocations(
+            contribution.relocations, len(contribution.data)
+        )
+        functions.append(
+            CoffFunction(
+                _source_name(symbol.name),
+                contribution.data,
+                offsets,
+                source_object=str(path),
             )
-            body = section["data"][start:end].rstrip(b"\x90")
-            if not body:
-                continue
-            offsets = tuple(
-                sorted(
-                    address - start
-                    for address, _symbol, kind in section["relocations"]
-                    if kind in RELOCATION_TYPES and start <= address <= end - 4
-                )
-            )
-            functions.append(
-                CoffFunction(_source_name(name), body, offsets, source_object=str(path))
-            )
-    if not functions:
-        raise RuntimeError(f"COFF object exposes no external .text functions: {path}")
+        )
     return sorted(functions, key=lambda item: item.name.casefold())
+
+
+def _contribution_relocations(
+    relocations: Iterable[CoffRelocation], size: int
+) -> tuple[int, ...]:
+    offsets = []
+    for relocation in relocations:
+        if relocation.offset >= size or relocation.type == 0:
+            continue
+        if relocation.type not in RELOCATION_TYPES:
+            raise ValueError(f"Unsupported i386 relocation type {relocation.type:#x}")
+        if relocation.offset < 0 or relocation.offset + 4 > size:
+            raise ValueError("Comparison extent cuts a COFF relocation operand")
+        offsets.append(relocation.offset)
+    return tuple(sorted(set(offsets)))
+
+
+def compare_object_to_original(
+    original: PEImage, obj: CoffObject, symbol: str, address: int, size: int
+) -> ExactComparison:
+    """Compare a code or data contribution at an independently known extent.
+
+    This proves only relocation-masked byte identity, not relocation target
+    identity, source syntax, function ownership, or semantic equivalence.
+    Static functions and globals work without extraction from an archive or
+    retention in a linked comparison executable.
+    """
+    if size <= 0:
+        raise ValueError("An independently known positive original extent is required")
+    contribution = obj.contribution(symbol)
+    offsets = _contribution_relocations(
+        contribution.relocations, min(size, len(contribution.data))
+    )
+    original_offsets = tuple(
+        r - address for r in original.relocations if address <= r < address + size
+    )
+    if any(offset + 4 > size for offset in original_offsets):
+        raise ValueError("Comparison extent cuts a PE relocation operand")
+    return compare_relocation_masked(
+        original.read(address, size),
+        contribution.data,
+        original_relocations=original_offsets,
+        recompiled_relocations=offsets,
+        size=size,
+    )
 
 
 def mask_relocations(body: bytes, offsets: Iterable[int]) -> bytes:
@@ -198,8 +162,10 @@ def compare_relocation_masked(
     comparable = original[:original_size]
     candidate = recompiled[:original_size]
     ranges = stable_ranges(original_size, offsets)
-    exact = recompiled_size >= original_size and all(
-        comparable[start:end] == candidate[start:end] for start, end in ranges
+    exact = (
+        len(original) >= original_size > 0
+        and recompiled_size >= original_size
+        and all(comparable[start:end] == candidate[start:end] for start, end in ranges)
     )
     return ExactComparison(
         status="exact" if exact else "different",
