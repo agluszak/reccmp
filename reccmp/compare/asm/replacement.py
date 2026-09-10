@@ -67,7 +67,16 @@ def canonical_callee_name(
             canonical_entity = configured_entity
 
     symbol = canonical_entity.get("symbol") or entity.get("symbol")
-    if configured_alias and canonical_orig is not None:
+    if canonical_orig is not None and (
+        configured_alias or entity.matched or canonical_entity.matched
+    ):
+        # A proven pair (or a configured equivalence-group alias) is a stronger
+        # identity than either side's local decorated symbol: the two images can
+        # spell the same callee differently while a match proves they are one
+        # entity. Resolve display through the canonical original entity too.
+        original_entity = db.get(ImageId.ORIG, canonical_orig, exact=True)
+        if original_entity is not None:
+            canonical_entity = original_entity
         identity = f"orig:{canonical_orig:x}"
         display = canonical_entity.match_name() or entity.match_name()
     elif symbol:
@@ -76,9 +85,7 @@ def canonical_callee_name(
     elif entity.entity_type == EntityType.IMPORT:
         identity = f"import:{canonical_entity.best_name() or entity.best_name()}"
         display = canonical_entity.match_name() or entity.match_name()
-    elif canonical_orig is not None and (
-        entity.matched or canonical_entity.matched or entity.addr(image_id) is None
-    ):
+    elif canonical_orig is not None and entity.addr(image_id) is None:
         identity = f"orig:{canonical_orig:x}"
         display = canonical_entity.match_name() or entity.match_name()
     else:
