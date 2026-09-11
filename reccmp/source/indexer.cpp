@@ -20,9 +20,10 @@
 // instantiations, and it has no single-step desugaring.
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
-// `{"record":"class",...}` or `{"record":"size-assertion",...}`. Deduplication
-// across translation units, marker binding, asserted sizes and vtable addresses
-// stay in reccmp, which owns them.
+// `{"record":"variable",...}`, `{"record":"class",...}` or
+// `{"record":"size-assertion",...}`. Deduplication across translation units,
+// marker binding, asserted sizes and vtable addresses stay in reccmp, which
+// owns them.
 
 #include <cstdlib>
 #include <memory>
@@ -245,6 +246,67 @@ class Indexer {
     return hasThis(semanticKind) ? "__thiscall" : "__cdecl";
   }
 
+  // Linkage as computed by Clang, spelled for the index. Consumers that join
+  // declarations across translation units need the raw internal linkage, not
+  // the formal one: entities in an anonymous namespace are formally external
+  // but TU-local, and unrelated TU-local `static` definitions must never be
+  // joined by their shared spelling.
+  static std::string linkageName(Linkage linkage) {
+    switch (linkage) {
+      case NoLinkage:
+        return "none";
+      case InternalLinkage:
+        return "internal";
+      case UniqueExternalLinkage:
+        return "unique-external";
+      case VisibleNoLinkage:
+        return "visible-none";
+      case ModuleInternalLinkage:
+        return "module-internal";
+      case ModuleLinkage:
+        return "module";
+      case ExternalLinkage:
+        return "external";
+    }
+    return "invalid";
+  }
+
+  // The storage class as written in the source. Whether a declaration is
+  // TU-local is decided by the computed linkage above, not by this spelling:
+  // a `constexpr` global has no storage class but still has internal linkage.
+  static std::string storageClassName(StorageClass storage) {
+    switch (storage) {
+      case SC_None:
+        return "none";
+      case SC_Extern:
+        return "extern";
+      case SC_Static:
+        return "static";
+      case SC_PrivateExtern:
+        return "private-extern";
+      case SC_Auto:
+        return "auto";
+      case SC_Register:
+        return "register";
+    }
+    return "invalid";
+  }
+
+  // A namespace-scope `int x;` without an initializer is only a tentative
+  // definition under C linkage rules; it still defines common storage, so the
+  // index ranks it above a pure declaration but below an initialized one.
+  static std::string definitionKindName(VarDecl::DefinitionKind kind) {
+    switch (kind) {
+      case VarDecl::DeclarationOnly:
+        return "declaration";
+      case VarDecl::TentativeDefinition:
+        return "tentative";
+      case VarDecl::Definition:
+        return "definition";
+    }
+    return "invalid";
+  }
+
   std::string sourceSignature(const FunctionDecl* function, llvm::StringRef qualifiedName,
                               llvm::StringRef semanticKind, llvm::StringRef returnType,
                               llvm::StringRef convention) const {
@@ -341,6 +403,8 @@ class Indexer {
         {"qualified_name", qualifiedName},
         {"semantic_kind", semanticKind},
 		{"calling_convention", convention},
+		{"linkage", linkageName(function->getLinkageInternal())},
+		{"storage_class", storageClassName(function->getStorageClass())},
 		{"source_signature",
 		 sourceSignature(function, qualifiedName, semanticKind, returnType, convention)},
 		 {"parameter_references", std::move(parameterReferences)},
@@ -361,6 +425,36 @@ class Indexer {
          function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed()},
     };
     emit(std::move(record));
+  }
+
+  // One variable definition or declaration. Parameters are VarDecls too,
+  // but they never reach this emitter: the walker filters them out, along
+  // with implicit declarations such as a function body's `__func__`.
+  // Mangling a variable in a dependent context is meaningless, so those fall
+  // back to a qualified signature identity, mirroring uninstantiated
+  // template patterns for functions.
+  void emitVariable(const VarDecl* variable, const Location& location) {
+    const DeclContext* context = variable->getDeclContext();
+    std::string scope = scopeOf(context);
+    std::string qualifiedName = qualify(scope, variable->getNameAsString());
+    std::string type = typeName(variable->getType());
+    std::string mangled;
+    if (!context->isDependentContext()) mangled = names_.getName(variable);
+    std::string semanticId = mangled;
+    if (semanticId.empty()) semanticId = "VarDecl:" + qualifiedName + "(" + type + ")";
+    emit(llvm::json::Object{
+        {"record", "variable"},
+        {"semantic_id", semanticId},
+        {"qualified_name", qualifiedName},
+        {"type", type},
+        {"linkage", linkageName(variable->getLinkageInternal())},
+        {"storage_class", storageClassName(variable->getStorageClass())},
+        {"definition_kind",
+         definitionKindName(variable->isThisDeclarationADefinition())},
+        {"source_file", relative(location.file)},
+        {"line", location.line},
+        {"end_line", location.endLine},
+    });
   }
 
   static bool isVirtual(const FunctionDecl* function) {
@@ -473,6 +567,11 @@ class Indexer {
     } else if (const auto* function = dyn_cast<FunctionDecl>(declaration)) {
       if (indexed && !function->isImplicit() && !function->getNameAsString().empty()) {
         emitDeclaration(function, location);
+      }
+    } else if (const auto* variable = dyn_cast<VarDecl>(declaration)) {
+      if (indexed && !variable->isImplicit() && !isa<ParmVarDecl>(variable) &&
+          !variable->getNameAsString().empty()) {
+        emitVariable(variable, location);
       }
     } else if (const auto* assertion = dyn_cast<StaticAssertDecl>(declaration)) {
       if (indexed) emitSizeAssertion(assertion, scope);

@@ -256,3 +256,39 @@ def test_source_index_combines_distinct_marker_targets(tmp_path: Path) -> None:
         (0x1000, "One"),
         (0x2000, "Two"),
     ]
+
+
+def test_source_index_filters_variables_and_conflicts_by_target(tmp_path: Path) -> None:
+    from reccmp.source import SourceCollector, SourceIndex
+
+    first = tmp_path / "first.cpp"
+    first.write_text("int gShared;\n", encoding="utf-8")
+    second = tmp_path / "second.cpp"
+    second.write_text("int gOther;\n", encoding="utf-8")
+
+    def variable(name: str, path: Path, definition_kind: str = "definition") -> dict:
+        return {
+            "record": "variable",
+            "semantic_id": f"_{name}",
+            "qualified_name": name,
+            "type": "int",
+            "linkage": "external",
+            "storage_class": "none",
+            "definition_kind": definition_kind,
+            "source_file": path.name,
+            "line": 1,
+            "end_line": 1,
+        }
+
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(variable("gShared", first))
+    collector.collect_record(variable("gOther", second))
+    collector.collect_record(
+        {**variable("gShared", second, "declaration"), "type": "long"}
+    )
+
+    index = SourceIndex.from_collector(tmp_path, "FIRST", [first], collector)
+
+    assert [item.qualified_name for item in index.variables] == ["gShared"]
+    assert len(index.conflicts) == 1
+    assert index.conflicts[0].semantic_id == "_gShared"

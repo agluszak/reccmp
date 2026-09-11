@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 
 from reccmp.parser.marker import ProjectAliases
 from .index import SourceCollector, SourceIndex, SourceIndexError, ast_command
+from .variables import SourceConflict, SourceVariable
 
 _SOURCE = Path(__file__).with_name("indexer.cpp")
 _COMPILE = (
@@ -251,10 +252,24 @@ def collect_compile_database(
             )
             for target, paths in targets.items()
         ]
+        # All portions share one collector, so the same record object may pass
+        # several targets' filters; keep the first of each identity. Separate
+        # collectors (one link namespace each) must instead keep every winner,
+        # so cross-namespace disagreements stay visible to consistency gates.
+        variables: dict[str, SourceVariable] = {}
+        for part in indexes:
+            for item in part.variables:
+                variables.setdefault(item.semantic_id, item)
+        conflicts: dict[tuple[str, str], SourceConflict] = {}
+        for part in indexes:
+            for item in part.conflicts:
+                conflicts.setdefault((item.record_kind, item.semantic_id), item)
         result_index = SourceIndex(
             declarations=(item for part in indexes for item in part.declarations),
             classes=(item for part in indexes for item in part.classes),
             markers=(item for part in indexes for item in part.markers),
+            variables=variables.values(),
+            conflicts=conflicts.values(),
         )
         result_index.write(projection)
         stamp.write_text(digest, encoding="utf-8")

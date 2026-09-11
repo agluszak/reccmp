@@ -31,8 +31,11 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
     for path, target in zip(sources, ("FIRST", "SECOND")):
         path.write_text(
             '#include "owner.h"\n'
+            "extern int gShared;\n"
+            "static int gLocal = 1;\n"
+            f"int g{target} = 0;\n"
             f"// FUNCTION: {target} 0x00401000\n"
-            f"int {target}() {{ return 0; }}\n",
+            f"int {target}() {{ return gShared + gLocal + g{target}; }}\n",
             encoding="utf-8",
         )
     sources[2].write_text(
@@ -78,6 +81,19 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
     assert [field.pointer_depth for field in index.classes[0].fields] == [2, 1, 0, 0]
     assert index.functions_by_address(target="FIRST")[0x401000].name == "FIRST"
     assert index.functions_by_address(target="SECOND")[0x401000].name == "SECOND"
+    variables = {item.qualified_name: item for item in index.variables}
+    assert variables["gFIRST"].definition_kind == "definition"
+    assert variables["gFIRST"].is_external
+    assert variables["gShared"].definition_kind == "declaration"
+    assert variables["gShared"].is_external
+    assert variables["gLocal"].linkage == "internal"
+    assert not variables["gLocal"].is_external
+    # Matching TU-local `static` spellings and repeated `extern` declarations
+    # are not disagreements.
+    assert not index.conflicts
+    declaration = index.functions_by_address(target="FIRST")[0x401000].declaration
+    assert declaration is not None
+    assert declaration.linkage == "external"
     assert (
         SourceIndex.from_dict(json.loads(json.dumps(index.to_dict()))).to_dict()
         == index.to_dict()
