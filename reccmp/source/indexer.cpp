@@ -144,6 +144,17 @@ class Indexer {
     return QualType::getAsString(desugared != spelled ? desugared : spelled, policy_);
   }
 
+  // The canonical spelling of a type, for identities compared across
+  // translation units. Single-step desugaring preserves typedef and elaborated
+  // spellings (`W8NavigatorAttachment *` vs `struct W8NavigatorAttachment *`),
+  // which describe one type and must compare equal; the canonical spelling
+  // dissolves both. Display strings such as source signatures keep the
+  // spelled form.
+  std::string canonicalName(QualType type) const {
+    if (type.isNull()) return "";
+    return QualType::getAsString(type.getCanonicalType().split(), policy_);
+  }
+
   // Pointer layers peeled from the outside of the desugared type, so the
   // depth comes from the type structure rather than counting `*` in a
   // spelling. A reference, array or function type on the outside stops the
@@ -233,7 +244,7 @@ class Indexer {
   std::vector<std::string> parameterTypes(const FunctionDecl* function) const {
     std::vector<std::string> parameters;
     for (const ParmVarDecl* parameter : function->parameters()) {
-      parameters.push_back(typeName(parameter->getType()));
+      parameters.push_back(canonicalName(parameter->getType()));
     }
     return parameters;
   }
@@ -387,18 +398,22 @@ class Indexer {
     } else if (isa<CXXDestructorDecl>(function)) {
       semanticKind = "destructor";
     } else if (isMember) {
-      semanticKind =
-          function->getStorageClass() == SC_Static ? "static_method" : "instance_method";
+      semanticKind = function->getCanonicalDecl()->getStorageClass() == SC_Static
+                         ? "static_method"
+                         : "instance_method";
     } else {
       semanticKind = scope.empty() ? "free_function" : "namespace_function";
     }
 
     std::string functionType = typeName(function->getType());
+    // The record's compared identity dissolves typedef and elaborated
+    // spellings; the display signature keeps the spelled form.
     std::string returnType;
+    std::string spelledReturn;
     if (semanticKind != "constructor" && semanticKind != "destructor") {
-      returnType = llvm::StringRef(functionType).take_until([](char c) { return c == '('; })
-                       .trim()
-                       .str();
+      returnType = canonicalName(function->getReturnType());
+      spelledReturn =
+          llvm::StringRef(functionType).take_until([](char c) { return c == '('; }).trim().str();
     }
 
     std::vector<std::string> parameters = parameterTypes(function);
@@ -440,7 +455,7 @@ class Indexer {
 		{"linkage", linkageName(function->getLinkageInternal())},
 		{"storage_class", storageClassName(function->getStorageClass())},
 		{"source_signature",
-		 sourceSignature(function, qualifiedName, semanticKind, returnType, convention)},
+		 sourceSignature(function, qualifiedName, semanticKind, spelledReturn, convention)},
 		 {"parameter_references", std::move(parameterReferences)},
 		 {"parameter_reference_forms", std::move(parameterReferenceForms)},
         {"return_type", returnType},
@@ -471,7 +486,7 @@ class Indexer {
     const DeclContext* context = variable->getDeclContext();
     std::string scope = scopeOf(context);
     std::string qualifiedName = qualify(scope, variable->getNameAsString());
-    std::string type = typeName(variable->getType());
+    std::string type = canonicalName(variable->getType());
     std::string mangled;
     if (!context->isDependentContext()) mangled = names_.getName(variable);
     std::string semanticId = mangled;
