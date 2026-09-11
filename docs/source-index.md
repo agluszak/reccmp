@@ -21,10 +21,12 @@ index.write(repo / "build/source-index.json")
 owners = index.functions_by_address(target="GAME")
 ```
 
-The collector currently builds against the Linux LLVM 14 development libraries
-(`clang++`, `/usr/lib/llvm-14`, `libclang-cpp.so.14`, and `libLLVM-14.so.1`).
-Its C++ source ships in the Python package; the executable stays in the project's
-disposable cache. Native commands use each compile entry's working directory.
+The collector currently builds against the Linux LLVM 19 development libraries
+(`clang++`, `/usr/lib/llvm-19`, `libclang-cpp.so.19`, and `libLLVM-19.so.1`),
+which is what Debian trixie ships. Its C++ source ships in the Python package;
+the executable stays in the project's disposable cache. `RECCMP_LLVM_VERSION`
+overrides the LLVM release for images that ship another one. Native commands use
+each compile entry's working directory.
 For container compile databases, pass `container_image`, `mounts={host_path:
 "/container/path"}`, and `compilation_root=Path("/container/repo")`. The whole
 batch runs in one container with the supplied mounts read-only. `clang` optionally

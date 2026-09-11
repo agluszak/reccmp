@@ -18,12 +18,16 @@ from .index import SourceCollector, SourceIndex, SourceIndexError, ast_command
 from .variables import SourceConflict, SourceVariable
 
 _SOURCE = Path(__file__).with_name("indexer.cpp")
+# The LLVM development libraries in the collector image. Debian stable moves
+# this every few years (bookworm shipped 14, trixie ships 19); the default
+# tracks stable and RECCMP_LLVM_VERSION overrides it for other images.
+_LLVM_VERSION = os.environ.get("RECCMP_LLVM_VERSION", "19")
 _COMPILE = (
     "clang++ -O2 -std=c++17 -fno-rtti -fno-exceptions"
     " -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
-    " -I/usr/lib/llvm-14/include {source} -o {output}"
-    " /usr/lib/llvm-14/lib/libclang-cpp.so.14"
-    " /usr/lib/x86_64-linux-gnu/libLLVM-14.so.1"
+    f" -I/usr/lib/llvm-{_LLVM_VERSION}/include {{source}} -o {{output}}"
+    f" /usr/lib/llvm-{_LLVM_VERSION}/lib/libclang-cpp.so.{_LLVM_VERSION}"
+    f" /usr/lib/x86_64-linux-gnu/libLLVM-{_LLVM_VERSION}.so.1"
 )
 
 

@@ -951,7 +951,7 @@ class SourceIndex:
 
         A container image runs the whole batch in one container; mounts describe
         the paths already used by its compile database. Native collection uses
-        each entry's working directory. The image/host needs Clang and LLVM 14
+        each entry's working directory. The image/host needs Clang and LLVM 19
         development libraries. Cache inputs must include every header dependency.
         """
         # Delay the execution backend until collection is requested. The record

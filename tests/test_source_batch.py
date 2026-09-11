@@ -1,4 +1,4 @@
-"""Exercise the actual collector with an explicitly selected LLVM 14 image."""
+"""Exercise the actual collector with an explicitly selected LLVM 19 image."""
 
 import json
 import os
@@ -13,7 +13,7 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
     image = os.environ.get("RECCMP_SOURCE_TEST_IMAGE")
     if not image:
         pytest.skip(
-            "set RECCMP_SOURCE_TEST_IMAGE to an image with LLVM 14 development libraries"
+            "set RECCMP_SOURCE_TEST_IMAGE to an image with LLVM 19 development libraries"
         )
     repository = tmp_path / "source with spaces"
     repository.mkdir()
