@@ -19,6 +19,10 @@ class SourceVariable:
     source_file: str
     line: int
     end_line: int
+    # The link namespace (reccmp target) this record belongs to. Unmangled C
+    # symbols with the same spelling can be unrelated across separate binaries,
+    # so consistency must join on (target, semantic_id), never the spelling.
+    target: str | None = None
 
     @property
     def signature(self) -> tuple[str, ...]:
@@ -56,3 +60,4 @@ class SourceConflict:
     qualified_name: str
     record_kind: str
     variants: tuple[SourceConflictVariant, ...]
+    target: str | None = None
