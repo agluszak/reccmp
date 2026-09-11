@@ -325,14 +325,16 @@ def collect_compile_database(
         # several targets' filters; keep the first of each identity. Separate
         # collectors (one link namespace each) must instead keep every winner,
         # so cross-namespace disagreements stay visible to consistency gates.
-        variables: dict[str, SourceVariable] = {}
+        variables: dict[tuple[str | None, str], SourceVariable] = {}
         for part in indexes:
             for item in part.variables:
-                variables.setdefault(item.semantic_id, item)
-        conflicts: dict[tuple[str, str], SourceConflict] = {}
+                variables.setdefault((item.target, item.semantic_id), item)
+        conflicts: dict[tuple[str | None, str, str], SourceConflict] = {}
         for part in indexes:
             for item in part.conflicts:
-                conflicts.setdefault((item.record_kind, item.semantic_id), item)
+                conflicts.setdefault(
+                    (item.target, item.record_kind, item.semantic_id), item
+                )
         result_index = SourceIndex(
             declarations=(item for part in indexes for item in part.declarations),
             classes=(item for part in indexes for item in part.classes),

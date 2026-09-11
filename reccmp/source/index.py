@@ -63,6 +63,10 @@ class SourceDeclaration:
     parameter_reference_forms: tuple[str, ...] = ()
     linkage: str = ""
     storage_class: str = ""
+    # The link namespace (reccmp target) this declaration belongs to, so the
+    # cross-TU gate joins on (target, semantic_id) rather than a spelling that
+    # may be unrelated across separate binaries.
+    target: str | None = None
 
     @property
     def prototype(self) -> str:
@@ -617,6 +621,7 @@ def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:
         semantic_id=str(values["semantic_id"]),
         qualified_name=str(values["qualified_name"]),
         record_kind=str(values["record_kind"]),
+        target=values.get("target"),
         variants=tuple(
             SourceConflictVariant(
                 signature=tuple(variant.get("signature") or ()),
@@ -722,17 +727,32 @@ class SourceIndex:
             for path in source_paths
         }
         declarations = tuple(
-            item
+            replace(item, target=target)
             for item in collector.declarations.values()
             if item.source_file in source_files
         )
         variables = tuple(
-            item
+            replace(item, target=target)
             for item in collector.variables.values()
             if item.source_file in source_files
         )
+        # Keep only this namespace's spellings of a contested symbol. The
+        # collector sees every translation unit, so a conflict can carry a
+        # variant that belongs to a different binary; filtering by location
+        # keeps the record a genuine same-namespace disagreement.
         conflicts = tuple(
-            conflict
+            replace(
+                conflict,
+                target=target,
+                variants=tuple(
+                    variant
+                    for variant in conflict.variants
+                    if any(
+                        location.rsplit(":", 1)[0] in source_files
+                        for location in variant.locations
+                    )
+                ),
+            )
             for conflict in collector.conflicts.values()
             if any(
                 location.rsplit(":", 1)[0] in source_files
