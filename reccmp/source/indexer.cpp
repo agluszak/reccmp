@@ -230,7 +230,8 @@ class Indexer {
 
   // A dependent declaration has no mangled name, so the index falls back to the
   // declaration kind plus the written signature - the identity reccmp uses for
-  // an uninstantiated template pattern.
+  // an uninstantiated template pattern. Constness is part of that identity:
+  // the const and non-const overloads of one accessor share everything else.
   std::string semanticId(const FunctionDecl* function, llvm::StringRef qualifiedName,
                          const std::vector<std::string>& parameters) const {
     bool manglable =
@@ -239,9 +240,13 @@ class Indexer {
       std::string mangled = names_.getName(function);
       if (!mangled.empty()) return mangled;
     }
+    std::string suffix;
+    if (const auto* method = dyn_cast<CXXMethodDecl>(function); method && method->isConst()) {
+      suffix = " const";
+    }
     // Qualified, because a FunctionDecl is both a Decl and a DeclContext.
     return (llvm::Twine(function->Decl::getDeclKindName()) + "Decl:" + qualifiedName + "(" +
-            join(parameters, ",") + ")")
+            join(parameters, ",") + ")" + suffix)
         .str();
   }
 
