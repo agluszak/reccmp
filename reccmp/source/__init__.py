@@ -11,15 +11,19 @@ from .index import (
     SourceCollector,
     ast_command,
 )
+from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [
     "SourceBaseVtable",
     "SourceClass",
+    "SourceConflict",
+    "SourceConflictVariant",
     "SourceDeclaration",
     "SourceField",
     "SourceIndex",
     "SourceIndexError",
     "SourceMarker",
     "SourceCollector",
+    "SourceVariable",
     "ast_command",
 ]

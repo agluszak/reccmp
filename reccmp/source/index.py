@@ -1,9 +1,9 @@
 """Join reccmp markers to semantic declarations from the Clang AST.
 
 The marker parser owns annotation syntax and addresses. Clang owns C++ names,
-function kinds, types, class membership, inheritance, and virtual declarations.
-This module only joins those two models by source location and writes disposable
-JSON projections for downstream tools.
+function and variable kinds, types, linkage, class membership, inheritance,
+and virtual declarations. This module only joins those two models by source
+location and writes disposable JSON projections for downstream tools.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from reccmp.formats import TextFile
 from reccmp.parser.codebase import DecompCodebase
 from reccmp.parser.marker import MarkerType, ProjectAliases
+from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _FUNCTION_KINDS = {
     "FunctionDecl",
@@ -60,6 +61,8 @@ class SourceDeclaration:
     source_signature: str | None = None
     parameter_references: tuple[bool, ...] = ()
     parameter_reference_forms: tuple[str, ...] = ()
+    linkage: str = ""
+    storage_class: str = ""
 
     @property
     def prototype(self) -> str:
@@ -67,6 +70,28 @@ class SourceDeclaration:
         parameters = ", ".join(self.parameter_types) or "void"
         prefix = f"{self.return_type} " if self.return_type else ""
         return f"{prefix}{self.qualified_name}({parameters})"
+
+    @property
+    def is_external(self) -> bool:
+        """Genuinely cross-TU linkage. Internal, unique-external (anonymous
+        namespace) and unlinked declarations never join across units."""
+        return self.linkage == "external"
+
+    @property
+    def signature(self) -> tuple[str, ...]:
+        """The type identity a cross-TU consistency gate compares, linkage
+        included. Two TU-local `static` definitions share their unmangled
+        spelling but never the same linkage as an external declaration of
+        that name, so linkage is part of the identity rather than a filter
+        applied later.
+        """
+        return (
+            self.semantic_kind,
+            self.calling_convention,
+            self.return_type,
+            *self.parameter_types,
+            self.linkage,
+        )
 
 
 @dataclass(frozen=True)
@@ -301,12 +326,17 @@ def _is_virtual(node: dict[str, Any]) -> bool:
     )
 
 
+_VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
+
+
 class SourceCollector:
     def __init__(self, repository: Path, compilation_root: Path | None = None) -> None:
         self.repository = repository.resolve()
         self.compilation_root = compilation_root
         self.contexts: dict[str, tuple[str, bool]] = {}
         self.declarations: dict[str, SourceDeclaration] = {}
+        self.variables: dict[str, SourceVariable] = {}
+        self.conflicts: dict[tuple[str, str], SourceConflict] = {}
         self.classes: dict[str, SourceClass] = {}
         self.size_assertions: dict[str, int] = {}
         self.current_file = ""
@@ -320,18 +350,33 @@ class SourceCollector:
     def collect_record(self, record: Mapping[str, Any]) -> None:
         """Merge one compiler record without mutating the caller's document.
 
-        Definitions replace declarations; the first located class wins.
-        Conflicting size assertions are errors, independent of input order.
+        Definitions replace declarations, and an initialized definition beats a
+        tentative one; the first located class wins. A record that disagrees
+        with the kept winner about its type identity is retained as a conflict
+        instead of being silently dropped. Conflicting size assertions are
+        errors, independent of input order.
         """
         values = dict(record)
         kind = values.pop("record")
         if kind == "declaration":
             declaration = _declaration_from_dict(values)
             previous = self.declarations.get(declaration.semantic_id)
+            if previous is not None:
+                self._note_conflict("declaration", previous, declaration)
             if previous is None or (
                 declaration.is_definition and not previous.is_definition
             ):
                 self.declarations[declaration.semantic_id] = declaration
+        elif kind == "variable":
+            variable = _variable_from_dict(values)
+            previous = self.variables.get(variable.semantic_id)
+            if previous is not None:
+                self._note_conflict("variable", previous, variable)
+            if previous is None or (
+                _VARIABLE_RANK.get(variable.definition_kind, 0)
+                > _VARIABLE_RANK.get(previous.definition_kind, 0)
+            ):
+                self.variables[variable.semantic_id] = variable
         elif kind == "class":
             source_class = _class_from_dict(values)
             previous_class = self.classes.get(source_class.semantic_id)
@@ -351,6 +396,39 @@ class SourceCollector:
             raise SourceIndexError(
                 f"the source indexer emitted an unknown record: {kind!r}"
             )
+
+    def _note_conflict(
+        self,
+        record_kind: str,
+        previous: SourceDeclaration | SourceVariable,
+        incoming: SourceDeclaration | SourceVariable,
+    ) -> None:
+        """Retain a type disagreement the winner-takes-all merge would hide.
+
+        Identical spellings never conflict, however often headers repeat them.
+        Only the first location of each spelling is retained; gates show a
+        bounded sample per spelling, and the first sighting already identifies
+        the disagreeing side.
+        """
+        if previous.signature == incoming.signature:
+            return
+        key = (record_kind, previous.semantic_id)
+        conflict = self.conflicts.get(key)
+        variants = list(conflict.variants) if conflict is not None else []
+        for record in (previous, incoming):
+            if not any(variant.signature == record.signature for variant in variants):
+                variants.append(
+                    SourceConflictVariant(
+                        signature=record.signature,
+                        locations=(f"{record.source_file}:{record.line}",),
+                    )
+                )
+        self.conflicts[key] = SourceConflict(
+            semantic_id=previous.semantic_id,
+            qualified_name=previous.qualified_name,
+            record_kind=record_kind,
+            variants=tuple(variants),
+        )
 
     def collect(self, document: dict[str, Any], main_file: Path) -> None:
         self._collect_contexts(document, "")
@@ -530,6 +608,25 @@ def _declaration_from_dict(values: Mapping[str, Any]) -> SourceDeclaration:
     return SourceDeclaration(**data)
 
 
+def _variable_from_dict(values: Mapping[str, Any]) -> SourceVariable:
+    return SourceVariable(**dict(values))
+
+
+def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:
+    return SourceConflict(
+        semantic_id=str(values["semantic_id"]),
+        qualified_name=str(values["qualified_name"]),
+        record_kind=str(values["record_kind"]),
+        variants=tuple(
+            SourceConflictVariant(
+                signature=tuple(variant.get("signature") or ()),
+                locations=tuple(variant.get("locations") or ()),
+            )
+            for variant in values.get("variants") or ()
+        ),
+    )
+
+
 def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     return SourceClass(
         **{
@@ -553,6 +650,8 @@ class SourceIndex:
         declarations: Iterable[SourceDeclaration],
         classes: Iterable[SourceClass],
         markers: Iterable[SourceMarker],
+        variables: Iterable[SourceVariable] = (),
+        conflicts: Iterable[SourceConflict] = (),
     ) -> None:
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
@@ -561,6 +660,8 @@ class SourceIndex:
         self.markers = tuple(
             sorted(markers, key=lambda item: (item.address, item.source_file))
         )
+        self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
+        self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
 
     @classmethod
     def from_ast_documents(
@@ -624,6 +725,20 @@ class SourceIndex:
             item
             for item in collector.declarations.values()
             if item.source_file in source_files
+        )
+        variables = tuple(
+            item
+            for item in collector.variables.values()
+            if item.source_file in source_files
+        )
+        conflicts = tuple(
+            conflict
+            for conflict in collector.conflicts.values()
+            if any(
+                location.rsplit(":", 1)[0] in source_files
+                for variant in conflict.variants
+                for location in variant.locations
+            )
         )
         by_location: dict[tuple[str, int], list[SourceDeclaration]] = {}
         for declaration in declarations:
@@ -752,12 +867,18 @@ class SourceIndex:
                 )
             classes[index] = replace(source_class, vtable_address=vtable_symbol.offset)
 
-        return cls(declarations=declarations, classes=classes, markers=markers)
+        return cls(
+            declarations=declarations,
+            classes=classes,
+            markers=markers,
+            variables=variables,
+            conflicts=conflicts,
+        )
 
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records."""
-        if document.get("schema") != "reccmp-source-index-v1":
+        if document.get("schema") != "reccmp-source-index-v2":
             raise SourceIndexError("unsupported source-index schema")
         return cls(
             declarations=(
@@ -776,6 +897,12 @@ class SourceIndex:
                     }
                 )
                 for item in document["markers"]
+            ),
+            variables=(
+                _variable_from_dict(item) for item in document.get("variables", ())
+            ),
+            conflicts=(
+                _conflict_from_dict(item) for item in document.get("conflicts", ())
             ),
         )
 
@@ -849,10 +976,12 @@ class SourceIndex:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "reccmp-source-index-v1",
+            "schema": "reccmp-source-index-v2",
             "markers": [asdict(item) for item in self.markers],
             "declarations": [asdict(item) for item in self.declarations],
             "classes": [asdict(item) for item in self.classes],
+            "variables": [asdict(item) for item in self.variables],
+            "conflicts": [asdict(item) for item in self.conflicts],
         }
 
     def write(self, path: Path) -> None:

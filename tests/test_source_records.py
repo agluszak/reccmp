@@ -121,3 +121,174 @@ def test_the_index_command_keeps_the_build_arguments_and_drops_the_ast_dump() ->
     assert not any(
         argument.startswith("/Fo") or argument == "/c" for argument in command
     )
+
+
+VARIABLE = {
+    "record": "variable",
+    "semantic_id": "_gThing",
+    "qualified_name": "gThing",
+    "type": "Foo *",
+    "linkage": "external",
+    "storage_class": "none",
+    "definition_kind": "declaration",
+    "source_file": "src/wiz8/a.cpp",
+    "line": 3,
+    "end_line": 3,
+}
+
+
+def test_variable_rank_prefers_initialized_definitions() -> None:
+    from reccmp.source import SourceCollector
+
+    collector = SourceCollector(Path("/repo"))
+    collector.collect_records(_records(VARIABLE))
+    collector.collect_records(
+        _records(
+            {
+                **VARIABLE,
+                "definition_kind": "tentative",
+                "source_file": "src/wiz8/b.cpp",
+            }
+        )
+    )
+    kept = collector.variables["_gThing"]
+    assert kept.definition_kind == "tentative"
+
+    collector.collect_records(
+        _records(
+            {
+                **VARIABLE,
+                "definition_kind": "definition",
+                "source_file": "src/wiz8/c.cpp",
+            }
+        )
+    )
+    assert collector.variables["_gThing"].definition_kind == "definition"
+
+    # A later tentative definition does not displace the initialized one.
+    collector.collect_records(
+        _records(
+            {
+                **VARIABLE,
+                "definition_kind": "tentative",
+                "source_file": "src/wiz8/d.cpp",
+            }
+        )
+    )
+    assert collector.variables["_gThing"].source_file == "src/wiz8/c.cpp"
+    assert not collector.conflicts
+
+
+def test_conflicting_global_spellings_are_retained() -> None:
+    from reccmp.source import SourceCollector
+
+    collector = SourceCollector(Path("/repo"))
+    collector.collect_records(_records(VARIABLE))
+    collector.collect_records(
+        _records(
+            {
+                **VARIABLE,
+                "type": "int",
+                "definition_kind": "definition",
+                "source_file": "src/wiz8/b.cpp",
+            }
+        )
+    )
+
+    # The definition still wins the merged index, but the disagreement survives.
+    assert collector.variables["_gThing"].type == "int"
+    (conflict,) = collector.conflicts.values()
+    assert conflict.semantic_id == "_gThing"
+    assert conflict.record_kind == "variable"
+    assert [
+        (variant.signature, variant.locations) for variant in conflict.variants
+    ] == [
+        (("Foo *", "external"), ("src/wiz8/a.cpp:3",)),
+        (("int", "external"), ("src/wiz8/b.cpp:3",)),
+    ]
+
+
+def test_identical_header_spellings_do_not_conflict() -> None:
+    from reccmp.source import SourceCollector
+
+    collector = SourceCollector(Path("/repo"))
+    for unit in ("a.cpp", "b.cpp", "c.cpp"):
+        collector.collect_records(
+            _records({**VARIABLE, "source_file": f"src/wiz8/{unit}"})
+        )
+    assert not collector.conflicts
+    assert collector.variables["_gThing"].source_file == "src/wiz8/a.cpp"
+
+
+def test_static_and_external_linkage_conflict() -> None:
+    from reccmp.source import SourceCollector
+
+    collector = SourceCollector(Path("/repo"))
+    collector.collect_records(
+        _records(
+            {
+                "record": "declaration",
+                "semantic_id": "_helper",
+                "qualified_name": "helper",
+                "semantic_kind": "free_function",
+                "calling_convention": "__cdecl",
+                "return_type": "void",
+                "parameter_types": [],
+                "owning_class": None,
+                "has_this": False,
+                "is_virtual": False,
+                "source_file": "src/wiz8/a.c",
+                "line": 10,
+                "end_line": 12,
+                "is_definition": True,
+                "linkage": "internal",
+                "storage_class": "static",
+            }
+        )
+    )
+    collector.collect_records(
+        _records(
+            {
+                "record": "declaration",
+                "semantic_id": "_helper",
+                "qualified_name": "helper",
+                "semantic_kind": "free_function",
+                "calling_convention": "__cdecl",
+                "return_type": "void",
+                "parameter_types": [],
+                "owning_class": None,
+                "has_this": False,
+                "is_virtual": False,
+                "source_file": "src/wiz8/b.c",
+                "line": 4,
+                "end_line": 4,
+                "is_definition": False,
+                "linkage": "external",
+                "storage_class": "none",
+            }
+        )
+    )
+    assert len(collector.conflicts) == 1
+
+
+def test_conflicts_survive_a_json_round_trip() -> None:
+    from reccmp.source import SourceCollector, SourceIndex
+
+    collector = SourceCollector(Path("/repo"))
+    collector.collect_records(_records(VARIABLE))
+    collector.collect_records(
+        _records({**VARIABLE, "type": "int", "definition_kind": "definition"})
+    )
+    index = SourceIndex(
+        declarations=(),
+        classes=(),
+        markers=(),
+        variables=collector.variables.values(),
+        conflicts=collector.conflicts.values(),
+    )
+    import json
+
+    revived = SourceIndex.from_dict(json.loads(json.dumps(index.to_dict())))
+    assert revived.to_dict() == index.to_dict()
+    assert revived.variables[0].is_external
+    assert revived.variables[0].definition_kind == "definition"

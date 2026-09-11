@@ -39,18 +39,24 @@ failures include the translation unit and diagnostics. Empty successful output i
 valid. Writing an unchanged index preserves its file timestamp.
 
 Records retain compiler-owned source signatures, parameter reference forms, and
-field pointer depth (arrays and references are not peeled). Markers retain their
+field pointer depth (arrays and references are not peeled). Declarations carry
+their computed linkage and written storage class; variables carry their
+canonical type, linkage, storage class, and definition kind. Markers retain their
 target and folded status. `SourceIndex.from_dict()` reads the JSON projection back
 into these same types; `functions_by_address(target=...)` selects the unfolded
 owner and refuses ambiguous ownership. Use `marker.declaration` for function
 semantics and `marker.name` for either a declaration or a named non-body emission.
 
 For already-collected data, `SourceCollector.collect_record()` accepts one
-declaration, class, or size-assertion record; `collect_records()` accepts NDJSON.
-Definitions replace declarations, the first located class wins, and conflicting
+declaration, variable, class, or size-assertion record; `collect_records()`
+accepts NDJSON. Definitions replace declarations, an initialized definition
+beats a tentative one, and the first located class wins. A record that
+disagrees with the kept winner about its type identity is retained as a
+conflict rather than dropped, so cross-TU consistency gates can report the
+writer/reader disagreement that deduplication would otherwise hide; conflicting
 size assertions are errors. Neither method mutates the supplied record.
-`SourceIndex.from_collector()` performs the marker join. `ast_command()` exposes
-the compile-argument normalization used by the direct-record collector.
+`SourceIndex.from_collector()` performs the marker join. `ast_command()`
+exposes the compile-argument normalization used by the direct-record collector.
 
 Run `RECCMP_SOURCE_TEST_IMAGE=<image> uv run --group test pytest
 tests/test_source_batch.py` to exercise actual compilation, multi-target ownership,
