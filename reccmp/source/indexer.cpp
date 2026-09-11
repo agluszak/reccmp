@@ -52,7 +52,12 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Config/llvm-config.h"
+#if LLVM_VERSION_MAJOR >= 19
+#include "llvm/TargetParser/Host.h"
+#else
 #include "llvm/Support/Host.h"
+#endif
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
@@ -66,7 +71,14 @@ using namespace clang;
 std::string repositoryPrefix;
 llvm::StringRef kRepositoryPrefix;
 
-bool inRepository(llvm::StringRef path) { return path.startswith(kRepositoryPrefix); }
+// LLVM 19 renamed StringRef::startswith to starts_with.
+bool inRepository(llvm::StringRef path) {
+#if LLVM_VERSION_MAJOR >= 19
+  return path.starts_with(kRepositoryPrefix);
+#else
+  return path.startswith(kRepositoryPrefix);
+#endif
+}
 
 std::string relative(llvm::StringRef path) {
   return inRepository(path) ? path.drop_front(kRepositoryPrefix.size()).str() : path.str();
@@ -252,6 +264,27 @@ class Indexer {
   // but TU-local, and unrelated TU-local `static` definitions must never be
   // joined by their shared spelling.
   static std::string linkageName(Linkage linkage) {
+    // LLVM 19 scoped the Linkage enum and shortened its enumerators; the
+    // emitted spellings stay version-independent so the index schema does not
+    // move with the toolchain.
+#if LLVM_VERSION_MAJOR >= 19
+    switch (linkage) {
+      case Linkage::Invalid:
+        return "invalid";
+      case Linkage::None:
+        return "none";
+      case Linkage::Internal:
+        return "internal";
+      case Linkage::UniqueExternal:
+        return "unique-external";
+      case Linkage::VisibleNone:
+        return "visible-none";
+      case Linkage::Module:
+        return "module";
+      case Linkage::External:
+        return "external";
+    }
+#else
     switch (linkage) {
       case NoLinkage:
         return "none";
@@ -268,6 +301,7 @@ class Indexer {
       case ExternalLinkage:
         return "external";
     }
+#endif
     return "invalid";
   }
 
