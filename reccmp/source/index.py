@@ -15,7 +15,7 @@ import json
 import shlex
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from reccmp.formats import TextFile
 from reccmp.parser.codebase import DecompCodebase
@@ -343,6 +343,15 @@ class SourceCollector:
         self.conflicts: dict[tuple[str, str], SourceConflict] = {}
         self.classes: dict[str, SourceClass] = {}
         self.size_assertions: dict[str, int] = {}
+        # The global maps above keep one winner per semantic identity, which is
+        # all a single link namespace needs. A batch spanning several binaries
+        # must instead keep every translation unit's own record, because an
+        # unmangled spelling such as `_DllMain@12` can be unrelated across
+        # them. These per-file maps retain each spelling so `from_collector`
+        # can select one namespace's records without re-parsing the unit.
+        self.declarations_by_file: dict[tuple[str, str], SourceDeclaration] = {}
+        self.variables_by_file: dict[tuple[str, str], SourceVariable] = {}
+        self.classes_by_file: dict[tuple[str, str], SourceClass] = {}
         self.current_file = ""
 
     def collect_records(self, records: str) -> None:
@@ -371,6 +380,12 @@ class SourceCollector:
                 declaration.is_definition and not previous.is_definition
             ):
                 self.declarations[declaration.semantic_id] = declaration
+            file_key = (declaration.source_file, declaration.semantic_id)
+            file_previous = self.declarations_by_file.get(file_key)
+            if file_previous is None or (
+                declaration.is_definition and not file_previous.is_definition
+            ):
+                self.declarations_by_file[file_key] = declaration
         elif kind == "variable":
             variable = _variable_from_dict(values)
             previous = self.variables.get(variable.semantic_id)
@@ -381,6 +396,13 @@ class SourceCollector:
                 > _VARIABLE_RANK.get(previous.definition_kind, 0)
             ):
                 self.variables[variable.semantic_id] = variable
+            file_key = (variable.source_file, variable.semantic_id)
+            file_previous = self.variables_by_file.get(file_key)
+            if file_previous is None or (
+                _VARIABLE_RANK.get(variable.definition_kind, 0)
+                > _VARIABLE_RANK.get(file_previous.definition_kind, 0)
+            ):
+                self.variables_by_file[file_key] = variable
         elif kind == "class":
             source_class = _class_from_dict(values)
             previous_class = self.classes.get(source_class.semantic_id)
@@ -388,6 +410,10 @@ class SourceCollector:
                 not previous_class.line and source_class.line
             ):
                 self.classes[source_class.semantic_id] = source_class
+            file_key = (source_class.source_file, source_class.semantic_id)
+            file_previous = self.classes_by_file.get(file_key)
+            if file_previous is None or (not file_previous.line and source_class.line):
+                self.classes_by_file[file_key] = source_class
         elif kind == "size-assertion":
             name, size = values["qualified_name"], values["asserted_size"]
             previous_size = self.size_assertions.get(name)
@@ -523,6 +549,12 @@ class SourceCollector:
                 not class_previous.line and source_class.line
             ):
                 self.classes[source_class.semantic_id] = source_class
+            class_key = (source_class.source_file, source_class.semantic_id)
+            class_file_previous = self.classes_by_file.get(class_key)
+            if class_file_previous is None or (
+                not class_file_previous.line and source_class.line
+            ):
+                self.classes_by_file[class_key] = source_class
 
         if kind in _FUNCTION_KINDS and name and not node.get("isImplicit"):
             context = self.contexts.get(str(node.get("parentDeclContextId") or ""))
@@ -555,6 +587,13 @@ class SourceCollector:
                 declaration.is_definition and not declaration_previous.is_definition
             ):
                 self.declarations[declaration.semantic_id] = declaration
+            declaration_key = (declaration.source_file, declaration.semantic_id)
+            declaration_file_previous = self.declarations_by_file.get(declaration_key)
+            if declaration_file_previous is None or (
+                declaration.is_definition
+                and not declaration_file_previous.is_definition
+            ):
+                self.declarations_by_file[declaration_key] = declaration
 
         assertion = _size_assertion(node, scope)
         if assertion is not None:
@@ -646,6 +685,27 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     )
 
 
+def _select_namespace_records(
+    records: Mapping[tuple[str, str], Any],
+    source_files: set[str],
+    rank: Callable[[Any], int],
+) -> tuple[Any, ...]:
+    """One best record per semantic identity among the files a namespace owns.
+
+    The collector retains every translation unit's spelling so a batch can span
+    several binaries. Selecting by source file reproduces the old single-target
+    winner choice without re-parsing any unit.
+    """
+    best: dict[str, Any] = {}
+    for (source_file, semantic_id), record in records.items():
+        if source_file not in source_files:
+            continue
+        previous = best.get(semantic_id)
+        if previous is None or rank(record) > rank(previous):
+            best[semantic_id] = record
+    return tuple(best.values())
+
+
 class SourceIndex:
     """Canonical marker plus Clang semantic source index."""
 
@@ -728,13 +788,19 @@ class SourceIndex:
         }
         declarations = tuple(
             replace(item, target=target)
-            for item in collector.declarations.values()
-            if item.source_file in source_files
+            for item in _select_namespace_records(
+                collector.declarations_by_file,
+                source_files,
+                lambda item: 1 if item.is_definition else 0,
+            )
         )
         variables = tuple(
             replace(item, target=target)
-            for item in collector.variables.values()
-            if item.source_file in source_files
+            for item in _select_namespace_records(
+                collector.variables_by_file,
+                source_files,
+                lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
+            )
         )
         # Keep only this namespace's spellings of a contested symbol. The
         # collector sees every translation unit, so a conflict can carry a
@@ -803,11 +869,13 @@ class SourceIndex:
                 )
             )
 
-        classes = [
-            item
-            for item in collector.classes.values()
-            if item.source_file in source_files
-        ]
+        classes = list(
+            _select_namespace_records(
+                collector.classes_by_file,
+                source_files,
+                lambda item: 1 if item.line else 0,
+            )
+        )
         classes = [
             replace(
                 item,

@@ -39,6 +39,7 @@
 #include "clang/AST/Mangle.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
@@ -48,6 +49,8 @@
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -672,16 +675,34 @@ class Indexer {
 
 class IndexConsumer : public ASTConsumer {
  public:
+  explicit IndexConsumer(CompilerInstance& instance) : instance_(instance) {}
+
   void HandleTranslationUnit(ASTContext& context) override {
     Indexer(context, llvm::outs()).run();
+    // The translation unit's transitive include set is the dependency list a
+    // per-unit cache needs. `DetailedRecord` makes the preprocessor retain it.
+    llvm::json::Array dependencies;
+    for (const FileEntry* file : instance_.getPreprocessor().getIncludedFiles()) {
+      const llvm::StringRef path = file->tryGetRealPathName();
+      if (!path.empty()) dependencies.push_back(path.str());
+    }
+    llvm::outs() << llvm::json::Value(llvm::json::Object{
+                        {"record", "dependency"},
+                        {"files", std::move(dependencies)},
+                    })
+                 << "\n";
     llvm::outs().flush();
   }
+
+ private:
+  CompilerInstance& instance_;
 };
 
 class IndexAction : public ASTFrontendAction {
  public:
-  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
-    return std::make_unique<IndexConsumer>();
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& instance,
+                                                 llvm::StringRef) override {
+    return std::make_unique<IndexConsumer>(instance);
   }
 };
 
@@ -753,6 +774,10 @@ int main(int argc, const char** argv) {
   if (!CompilerInvocation::CreateFromArgs(*invocation, compile->getArguments(), diagnostics)) {
     return 1;
   }
+  // Retain the include set so the record consumer can emit it as a dependency
+  // list; this also makes the preprocessor print its own -H list to stderr,
+  // which the batch only reads when a unit fails.
+  invocation->getPreprocessorOpts().DetailedRecord = true;
   CompilerInstance instance;
   instance.setInvocation(std::move(invocation));
   instance.createDiagnostics(&printer, /*ShouldOwnClient=*/false);

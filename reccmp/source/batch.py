@@ -242,10 +242,95 @@ def collect_compile_database(
             binary_stamp.write_text(binary_digest, encoding="utf-8")
 
         collector = SourceCollector(repository, Path(root))
+        # Per-translation-unit caching: each unit's records are keyed by the
+        # command and its own contents, and validated against the include set
+        # the indexer reported on the previous run. A changed unit reindexes
+        # alone; an unchanged unit is reused even when a sibling changed.
+        environment = hashlib.sha256()
+        environment.update(
+            json.dumps(
+                (
+                    root,
+                    clang,
+                    binary_digest,
+                    {str(path): value for path, value in mounts.items()},
+                    aliases,
+                ),
+                sort_keys=True,
+            ).encode()
+        )
+        for path in sorted(implementation):
+            environment.update(path.read_bytes())
+        environment_digest = environment.hexdigest()
+
+        def host_path(guest: str) -> Path | None:
+            for host, mount_guest in sorted(
+                mounts.items(), key=lambda item: len(item[1]), reverse=True
+            ):
+                trimmed = mount_guest.rstrip("/")
+                if guest == trimmed:
+                    return host
+                if guest.startswith(trimmed + "/"):
+                    return host / guest[len(trimmed) + 1 :]
+            return None
+
+        tu_cache = cache / "tu"
+
+        def deps_digest(deps: list[str]) -> str | None:
+            digest = hashlib.sha256()
+            for raw in sorted(deps):
+                path = Path(raw)
+                if not path.is_file():
+                    return None
+                digest.update(str(path).encode() + b"\0" + path.read_bytes() + b"\0")
+            return digest.hexdigest()
+
+        def identity_of(entry: dict) -> str | None:
+            host = host_path(str(entry.get("file", "")))
+            if host is None or not host.is_file():
+                return None
+            digest = hashlib.sha256()
+            digest.update(environment_digest.encode() + b"\0")
+            digest.update(
+                shlex.join(
+                    record_command(entry, "/reccmp-cache/indexer", clang)
+                ).encode()
+                + b"\0"
+            )
+            digest.update(host.read_bytes())
+            return digest.hexdigest()
+
+        def cached_records(identity: str | None) -> str | None:
+            if not identity:
+                return None
+            meta_path = tu_cache / f"{identity}.json"
+            ndjson_path = tu_cache / f"{identity}.ndjson"
+            if not meta_path.is_file() or not ndjson_path.is_file():
+                return None
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except ValueError:
+                return None
+            if deps_digest(list(meta.get("deps") or [])) != meta.get("deps_digest"):
+                return None
+            return ndjson_path.read_text(encoding="utf-8")
+
         with tempfile.TemporaryDirectory(prefix="batch-", dir=cache) as raw:
             scratch = Path(raw)
-            if container_image and database:
-                for index, entry in enumerate(database):
+            identities: dict[int, str | None] = {}
+            fresh: list[int] = []
+            for index, entry in enumerate(database):
+                identity = None if force else identity_of(entry)
+                identities[index] = identity
+                records = cached_records(identity)
+                if records is None:
+                    fresh.append(index)
+                    continue
+                (scratch / f"{index:05d}.ndjson").write_text(records, encoding="utf-8")
+                (scratch / f"{index:05d}.status").write_text("0", encoding="utf-8")
+            if container_image and fresh:
+                for index in fresh:
+                    entry = database[index]
                     command = shlex.join(
                         record_command(entry, "/reccmp-cache/indexer", clang)
                     )
@@ -277,10 +362,10 @@ def collect_compile_database(
                         f"printf '%s\\n' /reccmp-batch/*.sh | xargs -P {parallelism} -n 1 /bin/sh",
                     ]
                 )
-            elif database:
+            elif fresh:
 
-                def emit(unit):
-                    index, entry = unit
+                def emit(index: int) -> None:
+                    entry = database[index]
                     with (
                         (scratch / f"{index:05d}.ndjson").open("w") as out,
                         (scratch / f"{index:05d}.err").open("w") as err,
@@ -296,7 +381,7 @@ def collect_compile_database(
                     (scratch / f"{index:05d}.status").write_text(str(result.returncode))
 
                 with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                    list(executor.map(emit, enumerate(database)))
+                    list(executor.map(emit, fresh))
             for index, entry in enumerate(database):
                 status = scratch / f"{index:05d}.status"
                 if not status.is_file() or status.read_text().strip() != "0":
@@ -309,12 +394,34 @@ def collect_compile_database(
                     raise SourceIndexError(
                         f"the source indexer failed on {entry['file']}: {detail}"
                     )
-                with (scratch / f"{index:05d}.ndjson").open(
-                    encoding="utf-8"
-                ) as records:
-                    for line in records:
-                        if line.strip():
-                            collector.collect_record(json.loads(line))
+                text = (scratch / f"{index:05d}.ndjson").read_text(encoding="utf-8")
+                if index in fresh and identities.get(index):
+                    deps: list[str] = []
+                    for line in text.splitlines():
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        if record.get("record") == "dependency":
+                            deps = [str(path) for path in record.get("files") or []]
+                            break
+                    if deps and deps_digest(deps) is not None:
+                        tu_cache.mkdir(parents=True, exist_ok=True)
+                        (tu_cache / f"{identities[index]}.ndjson").write_text(
+                            text, encoding="utf-8"
+                        )
+                        (tu_cache / f"{identities[index]}.json").write_text(
+                            json.dumps(
+                                {"deps": deps, "deps_digest": deps_digest(deps)}
+                            ),
+                            encoding="utf-8",
+                        )
+                for line in text.splitlines():
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    if record.get("record") == "dependency":
+                        continue
+                    collector.collect_record(record)
         indexes = [
             SourceIndex.from_collector(
                 repository, target, paths, collector, aliases=aliases
