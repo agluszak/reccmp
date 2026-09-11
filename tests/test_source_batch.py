@@ -29,13 +29,17 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
     )
     sources = [repository / name for name in ("first.cpp", "second.cpp", "empty.cpp")]
     for path, target in zip(sources, ("FIRST", "SECOND")):
+        # The same automatic `scratch` with different types in both units must
+        # never meet: function locals have no cross-TU identity.
+        local_type = "int" if target == "FIRST" else "long"
         path.write_text(
             '#include "owner.h"\n'
             "extern int gShared;\n"
             "static int gLocal = 1;\n"
             f"int g{target} = 0;\n"
             f"// FUNCTION: {target} 0x00401000\n"
-            f"int {target}() {{ return gShared + gLocal + g{target}; }}\n",
+            f"int {target}() {{ {local_type} scratch = 0; "
+            f"return gShared + gLocal + g{target} + (int)scratch; }}\n",
             encoding="utf-8",
         )
     sources[2].write_text(
@@ -88,6 +92,7 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
     assert variables["gShared"].is_external
     assert variables["gLocal"].linkage == "internal"
     assert not variables["gLocal"].is_external
+    assert "scratch" not in variables
     # Matching TU-local `static` spellings and repeated `extern` declarations
     # are not disagreements.
     assert not index.conflicts

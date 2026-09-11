@@ -148,11 +148,15 @@ class Indexer {
   // translation units. Single-step desugaring preserves typedef and elaborated
   // spellings (`W8NavigatorAttachment *` vs `struct W8NavigatorAttachment *`),
   // which describe one type and must compare equal; the canonical spelling
-  // dissolves both. Display strings such as source signatures keep the
-  // spelled form.
+  // dissolves both. The printing policy suppresses the tag keyword in C++
+  // but keeps it in C, so the keyword is forced back on: a Windows HANDLE
+  // parameter must spell identically whether the including TU is C or C++.
+  // Display strings such as source signatures keep the spelled form.
   std::string canonicalName(QualType type) const {
     if (type.isNull()) return "";
-    return QualType::getAsString(type.getCanonicalType().split(), policy_);
+    PrintingPolicy canonical(policy_);
+    canonical.SuppressTagKeyword = false;
+    return QualType::getAsString(type.getCanonicalType().split(), canonical);
   }
 
   // Pointer layers peeled from the outside of the desugared type, so the
@@ -618,7 +622,12 @@ class Indexer {
         emitDeclaration(function, location);
       }
     } else if (const auto* variable = dyn_cast<VarDecl>(declaration)) {
+      // Function-local variables have no cross-TU identity: an automatic
+      // `int x` in one function and a `UINT32 x` in another share the bare
+      // `_x` spelling with no linkage, and must never meet in a consistency
+      // gate. Static locals are scoped to their function the same way.
       if (indexed && !variable->isImplicit() && !isa<ParmVarDecl>(variable) &&
+          !variable->getDeclContext()->isFunctionOrMethod() &&
           !variable->getNameAsString().empty()) {
         emitVariable(variable, location);
       }
