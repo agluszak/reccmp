@@ -134,6 +134,10 @@ class SourceClass:
     asserted_size: int | None = None
     vtable_address: int | None = None
     base_vtables: tuple[SourceBaseVtable, ...] = ()
+    # The link namespace this definition belongs to. A template can be
+    # instantiated in headers owned by separate binaries, so class identity is
+    # (target, semantic_id) just like the declaration and variable records.
+    target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -869,13 +873,14 @@ class SourceIndex:
                 )
             )
 
-        classes = list(
-            _select_namespace_records(
+        classes = [
+            replace(item, target=target)
+            for item in _select_namespace_records(
                 collector.classes_by_file,
                 source_files,
                 lambda item: 1 if item.line else 0,
             )
-        )
+        ]
         classes = [
             replace(
                 item,
