@@ -3,8 +3,7 @@ from pathlib import Path
 
 import pytest
 from reccmp.source.index import SourceIndexError
-from reccmp.source import SourceCollector, SourceIndex
-from reccmp.source.batch import record_command
+from reccmp.source import SourceCollector, SourceIndex, record_command
 
 DECLARATION = {
     "record": "declaration",

@@ -1,32 +1,19 @@
 // Emit the source-index records for one translation unit directly from Clang's
-// AST, instead of serialising that AST to JSON and rebuilding the same records
-// in Python.
+// AST. Partitioning by link namespace / TU, winner selection, conflicts, marker
+// binding, asserted sizes and vtable addresses stay in reccmp, which owns them.
 //
-// The measurement that motivates this: clang's own `-ast-dump=json` costs under
-// 0.4s for a unit here, but produces ~32 MB, and the 147 units together came to
-// 3.7 GB. Loading that back cost ~23s of json.loads and ~35s of tree walking -
-// roughly fifty times what compiling the same sources costs. Almost all of it is
-// declarations from VC6, Windows and CRT headers that the index discards: on one
-// unit, 85 of 492 top-level declarations carried 84% of the bytes. Emitting the
-// records from the AST filters by file before any serialisation happens, and the
-// 147 units together come to ~40 MB.
-//
-// This walks the AST with the same interfaces `-ast-dump=json` uses - the same
-// traversal order over template patterns and their specializations, the same
-// single-step type desugaring, the same mangled names from ASTNameGenerator, the
-// same presumed locations. libclang was tried first and cannot express two of
-// those: it does not visit implicit template instantiations, and it has no
-// single-step desugaring.
+// Single-TU mode writes NDJSON to stdout. Batch mode (`--batch <manifest.jsonl>`)
+// indexes many units in one process so LLVM target initialization happens once.
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
-// `{"record":"variable",...}`, `{"record":"class",...}` or
-// `{"record":"size-assertion",...}`. Partitioning by link namespace / TU,
-// winner selection, conflicts, marker binding, asserted sizes and vtable
-// addresses stay in reccmp, which owns them.
+// `{"record":"variable",...}`, `{"record":"class",...}`,
+// `{"record":"size-assertion",...}` or `{"record":"dependency",...}`.
 
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "clang/AST/ASTConsumer.h"
@@ -50,20 +37,18 @@
 #include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Config/llvm-config.h"
-#if LLVM_VERSION_MAJOR >= 19
-#include "llvm/TargetParser/Host.h"
-#else
-#include "llvm/Support/Host.h"
-#endif
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 
 namespace {
 
@@ -73,14 +58,7 @@ using namespace clang;
 std::string repositoryPrefix;
 llvm::StringRef kRepositoryPrefix;
 
-// LLVM 19 renamed StringRef::startswith to starts_with.
-bool inRepository(llvm::StringRef path) {
-#if LLVM_VERSION_MAJOR >= 19
-  return path.starts_with(kRepositoryPrefix);
-#else
-  return path.startswith(kRepositoryPrefix);
-#endif
-}
+bool inRepository(llvm::StringRef path) { return path.starts_with(kRepositoryPrefix); }
 
 std::string relative(llvm::StringRef path) {
   return inRepository(path) ? path.drop_front(kRepositoryPrefix.size()).str() : path.str();
@@ -105,6 +83,11 @@ struct Location {
   unsigned endLine = 0;
 };
 
+struct CachedFile {
+  bool indexed = false;
+  std::string absolute;
+};
+
 class Indexer {
  public:
   Indexer(ASTContext& context, llvm::raw_ostream& out)
@@ -117,19 +100,40 @@ class Indexer {
   void run() { walkContext(context_.getTranslationUnitDecl(), ""); }
 
  private:
+  // One normalized absolute path and repository membership per FileID. System
+  // headers contribute thousands of decls; without this cache each one would
+  // re-run make_absolute / remove_dots only to be rejected by the prefix check.
+  const CachedFile& fileInfo(SourceLocation expansionBegin) const {
+    FileID id = sources_.getFileID(expansionBegin);
+    if (!id.isValid()) {
+      static const CachedFile kInvalid;
+      return kInvalid;
+    }
+    auto existing = files_.find(id);
+    if (existing != files_.end()) return existing->second;
+
+    CachedFile cached;
+    PresumedLoc presumed = sources_.getPresumedLoc(expansionBegin);
+    if (presumed.isValid()) {
+      llvm::SmallString<256> path(presumed.getFilename());
+      llvm::sys::fs::make_absolute(path);
+      llvm::sys::path::remove_dots(path, true);
+      cached.absolute = path.str().str();
+      cached.indexed = inRepository(cached.absolute);
+    }
+    return files_.try_emplace(id, std::move(cached)).first->second;
+  }
+
   // A declaration's own file decides whether it is indexed at all, so the cost
-  // of a toolchain header is one prefix compare rather than a serialised node.
+  // of a toolchain header is one FileID lookup rather than a serialised node.
   Location locate(const Decl* declaration) const {
     Location location;
     SourceRange range = declaration->getSourceRange();
-    PresumedLoc begin = sources_.getPresumedLoc(sources_.getExpansionLoc(range.getBegin()));
-    if (begin.isValid()) {
-      llvm::SmallString<256> path(begin.getFilename());
-      llvm::sys::fs::make_absolute(path);
-      llvm::sys::path::remove_dots(path, true);
-      location.file = path.str().str();
-      location.line = begin.getLine();
-    }
+    SourceLocation beginLoc = sources_.getExpansionLoc(range.getBegin());
+    const CachedFile& file = fileInfo(beginLoc);
+    location.file = file.absolute;
+    PresumedLoc begin = sources_.getPresumedLoc(beginLoc);
+    if (begin.isValid()) location.line = begin.getLine();
     PresumedLoc end = sources_.getPresumedLoc(sources_.getExpansionLoc(range.getEnd()));
     location.endLine = end.isValid() ? end.getLine() : location.line;
     return location;
@@ -282,10 +286,6 @@ class Indexer {
   // but TU-local, and unrelated TU-local `static` definitions must never be
   // joined by their shared spelling.
   static std::string linkageName(Linkage linkage) {
-    // LLVM 19 scoped the Linkage enum and shortened its enumerators; the
-    // emitted spellings stay version-independent so the index schema does not
-    // move with the toolchain.
-#if LLVM_VERSION_MAJOR >= 19
     switch (linkage) {
       case Linkage::Invalid:
         return "invalid";
@@ -302,24 +302,6 @@ class Indexer {
       case Linkage::External:
         return "external";
     }
-#else
-    switch (linkage) {
-      case NoLinkage:
-        return "none";
-      case InternalLinkage:
-        return "internal";
-      case UniqueExternalLinkage:
-        return "unique-external";
-      case VisibleNoLinkage:
-        return "visible-none";
-      case ModuleInternalLinkage:
-        return "module-internal";
-      case ModuleLinkage:
-        return "module";
-      case ExternalLinkage:
-        return "external";
-    }
-#endif
     return "invalid";
   }
 
@@ -426,45 +408,45 @@ class Indexer {
     std::vector<std::string> parameters = parameterTypes(function);
     llvm::json::Array parameterTypes;
     for (const std::string& parameter : parameters) parameterTypes.push_back(parameter);
-	llvm::json::Array parameterReferences;
-	llvm::json::Array parameterReferenceForms;
-	for (const ParmVarDecl* parameter : function->parameters()) {
-	  QualType original = parameter->getOriginalType();
-	  parameterReferences.push_back(original->isReferenceType());
-	  std::string kind = "value";
-	  QualType referred;
-	  if (const auto* reference = original->getAs<LValueReferenceType>()) {
-	    referred = reference->getPointeeType();
-	    if (referred->isPointerType()) kind = "lvalue-reference-to-pointer";
-	    else if (referred->isArrayType()) kind = "lvalue-reference-to-array";
-	    else if (referred->isFunctionType()) kind = "lvalue-reference-to-function";
-	    else kind = "lvalue-reference-to-object";
-	  } else if (const auto* reference = original->getAs<RValueReferenceType>()) {
-	    referred = reference->getPointeeType();
-	    if (referred->isPointerType()) kind = "rvalue-reference-to-pointer";
-	    else if (referred->isArrayType()) kind = "rvalue-reference-to-array";
-	    else if (referred->isFunctionType()) kind = "rvalue-reference-to-function";
-	    else kind = "rvalue-reference-to-object";
-	  }
-	  parameterReferenceForms.push_back(llvm::json::Object{
-	      {"kind", kind},
-	      {"const", !referred.isNull() && referred.isConstQualified()},
-	  });
-	}
+    llvm::json::Array parameterReferences;
+    llvm::json::Array parameterReferenceForms;
+    for (const ParmVarDecl* parameter : function->parameters()) {
+      QualType original = parameter->getOriginalType();
+      parameterReferences.push_back(original->isReferenceType());
+      std::string kind = "value";
+      QualType referred;
+      if (const auto* reference = original->getAs<LValueReferenceType>()) {
+        referred = reference->getPointeeType();
+        if (referred->isPointerType()) kind = "lvalue-reference-to-pointer";
+        else if (referred->isArrayType()) kind = "lvalue-reference-to-array";
+        else if (referred->isFunctionType()) kind = "lvalue-reference-to-function";
+        else kind = "lvalue-reference-to-object";
+      } else if (const auto* reference = original->getAs<RValueReferenceType>()) {
+        referred = reference->getPointeeType();
+        if (referred->isPointerType()) kind = "rvalue-reference-to-pointer";
+        else if (referred->isArrayType()) kind = "rvalue-reference-to-array";
+        else if (referred->isFunctionType()) kind = "rvalue-reference-to-function";
+        else kind = "rvalue-reference-to-object";
+      }
+      parameterReferenceForms.push_back(llvm::json::Object{
+          {"kind", kind},
+          {"const", !referred.isNull() && referred.isConstQualified()},
+      });
+    }
 
-	std::string convention = callingConvention(functionType, semanticKind);
+    std::string convention = callingConvention(functionType, semanticKind);
     llvm::json::Object record{
         {"record", "declaration"},
         {"semantic_id", semanticId(function, qualifiedName)},
         {"qualified_name", qualifiedName},
         {"semantic_kind", semanticKind},
-		{"calling_convention", convention},
-		{"linkage", linkageName(function->getLinkageInternal())},
-		{"storage_class", storageClassName(function->getStorageClass())},
-		{"source_signature",
-		 sourceSignature(function, qualifiedName, semanticKind, spelledReturn, convention)},
-		 {"parameter_references", std::move(parameterReferences)},
-		 {"parameter_reference_forms", std::move(parameterReferenceForms)},
+        {"calling_convention", convention},
+        {"linkage", linkageName(function->getLinkageInternal())},
+        {"storage_class", storageClassName(function->getStorageClass())},
+        {"source_signature",
+         sourceSignature(function, qualifiedName, semanticKind, spelledReturn, convention)},
+        {"parameter_references", std::move(parameterReferences)},
+        {"parameter_reference_forms", std::move(parameterReferenceForms)},
         {"return_type", returnType},
         {"parameter_types", std::move(parameterTypes)},
         {"owning_class", isMember ? llvm::json::Value(scope) : llvm::json::Value(nullptr)},
@@ -613,8 +595,19 @@ class Indexer {
     std::string part = component(declaration);
     if (!part.empty()) childScope = qualify(scope, part);
 
-    Location location = locate(declaration);
-    bool indexed = inRepository(location.file);
+    SourceLocation beginLoc =
+        sources_.getExpansionLoc(declaration->getSourceRange().getBegin());
+    const CachedFile& file = fileInfo(beginLoc);
+    bool indexed = file.indexed;
+    Location location;
+    if (indexed) {
+      location.file = file.absolute;
+      PresumedLoc begin = sources_.getPresumedLoc(beginLoc);
+      if (begin.isValid()) location.line = begin.getLine();
+      PresumedLoc end =
+          sources_.getPresumedLoc(sources_.getExpansionLoc(declaration->getSourceRange().getEnd()));
+      location.endLine = end.isValid() ? end.getLine() : location.line;
+    }
 
     if (const auto* record = dyn_cast<CXXRecordDecl>(declaration)) {
       if (indexed && record->isCompleteDefinition() && record->getIdentifier()) {
@@ -666,90 +659,114 @@ class Indexer {
   mutable ASTNameGenerator names_;
   llvm::raw_ostream& out_;
   llvm::DenseSet<const Decl*> visited_;
+  mutable llvm::DenseMap<FileID, CachedFile> files_;
 };
 
 class IndexConsumer : public ASTConsumer {
  public:
-  explicit IndexConsumer(CompilerInstance& instance) : instance_(instance) {}
+  IndexConsumer(CompilerInstance& instance, llvm::raw_ostream& out)
+      : instance_(instance), out_(out) {}
 
   void HandleTranslationUnit(ASTContext& context) override {
-    Indexer(context, llvm::outs()).run();
+    Indexer(context, out_).run();
     // The translation unit's transitive include set is the dependency list a
-    // per-unit cache needs. `DetailedRecord` makes the preprocessor retain it.
+    // per-unit cache needs. The preprocessor tracks it independently of any
+    // DetailedRecord / PreprocessingRecord.
     llvm::json::Array dependencies;
     for (const FileEntry* file : instance_.getPreprocessor().getIncludedFiles()) {
       const llvm::StringRef path = file->tryGetRealPathName();
       if (!path.empty()) dependencies.push_back(path.str());
     }
-    llvm::outs() << llvm::json::Value(llvm::json::Object{
-                        {"record", "dependency"},
-                        {"files", std::move(dependencies)},
-                    })
-                 << "\n";
-    llvm::outs().flush();
+    out_ << llvm::json::Value(llvm::json::Object{
+                {"record", "dependency"},
+                {"files", std::move(dependencies)},
+            })
+         << "\n";
+    out_.flush();
   }
 
  private:
   CompilerInstance& instance_;
+  llvm::raw_ostream& out_;
 };
 
 class IndexAction : public ASTFrontendAction {
  public:
+  explicit IndexAction(llvm::raw_ostream& out) : out_(out) {}
+
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& instance,
                                                  llvm::StringRef) override {
-    return std::make_unique<IndexConsumer>(instance);
+    return std::make_unique<IndexConsumer>(instance, out_);
   }
+
+ private:
+  llvm::raw_ostream& out_;
 };
 
-}  // namespace
+class ChangeDirectory {
+ public:
+  explicit ChangeDirectory(llvm::StringRef directory) {
+    if (std::error_code ec = llvm::sys::fs::current_path(previous_)) {
+      error_ = ec;
+      return;
+    }
+    if (std::error_code ec = llvm::sys::fs::set_current_path(directory)) {
+      error_ = ec;
+      previous_.clear();
+      return;
+    }
+    active_ = true;
+  }
 
-int main(int argc, const char** argv) {
-  const char* root = std::getenv("RECCMP_SOURCE_ROOT");
-  if (!root) {
-    llvm::errs() << "RECCMP_SOURCE_ROOT is required\\n";
-    return 2;
+  ~ChangeDirectory() {
+    if (active_) llvm::sys::fs::set_current_path(previous_);
   }
-  repositoryPrefix = root;
-  if (repositoryPrefix.back() != '/') repositoryPrefix += '/';
-  kRepositoryPrefix = repositoryPrefix;
-  if (argc < 3) {
-    llvm::errs() << "usage: indexer <clang-cl driver command line...>\n";
-    return 2;
+
+  std::error_code error() const { return error_; }
+
+ private:
+  llvm::SmallString<256> previous_;
+  std::error_code error_;
+  bool active_ = false;
+};
+
+// Index one clang-cl driver command line, writing NDJSON records to `out`.
+// Diagnostics go to `diagnostics`. LLVM targets must already be initialized.
+int indexOneTranslationUnit(llvm::ArrayRef<const char*> argv, llvm::raw_ostream& out,
+                            llvm::raw_ostream& diagnostics) {
+  if (argv.empty()) {
+    diagnostics << "indexer: empty driver command line\n";
+    return 1;
   }
+
   // The compile database records clang-cl command lines, so the driver has to
   // select cl mode the same way the real build selects it - from the program
   // name - before it parses anything else. Passing the mode the name implies as
   // an option states it where the driver cannot mistake it.
   driver::ParsedClangName parsedName =
-      driver::ToolChain::getTargetAndModeFromProgramName(argv[1]);
-  std::vector<const char*> arguments{argv[1]};
+      driver::ToolChain::getTargetAndModeFromProgramName(argv[0]);
+  std::vector<const char*> arguments{argv[0]};
   if (parsedName.DriverMode) arguments.push_back(parsedName.DriverMode);
-  arguments.insert(arguments.end(), argv + 2, argv + argc);
-
-  // The VC6 headers contain MS-style inline assembly, which Sema refuses to
-  // accept unless the target's assembly parser is registered.
-  llvm::InitializeAllTargetInfos();
-  llvm::InitializeAllTargetMCs();
-  llvm::InitializeAllAsmParsers();
+  arguments.insert(arguments.end(), argv.begin() + 1, argv.end());
 
   llvm::IntrusiveRefCntPtr<DiagnosticOptions> diagnosticOptions(new DiagnosticOptions());
-  TextDiagnosticPrinter printer(llvm::errs(), diagnosticOptions.get());
+  TextDiagnosticPrinter printer(diagnostics, diagnosticOptions.get());
   llvm::IntrusiveRefCntPtr<DiagnosticIDs> diagnosticIds(new DiagnosticIDs());
-  DiagnosticsEngine diagnostics(diagnosticIds, diagnosticOptions, &printer,
-                                /*ShouldOwnClient=*/false);
+  DiagnosticsEngine engine(diagnosticIds, diagnosticOptions, &printer,
+                           /*ShouldOwnClient=*/false);
 
   // The resource directory comes from the resolved executable, which is what
   // clang's own main does: /usr/bin/clang-cl is a symlink, and the builtin
   // headers sit next to its target.
   llvm::SmallString<128> executable(arguments[0]);
   llvm::sys::fs::real_path(arguments[0], executable, /*expand_tilde=*/false);
-  driver::Driver theDriver(executable, llvm::sys::getDefaultTargetTriple(), diagnostics);
+  driver::Driver theDriver(executable, llvm::sys::getDefaultTargetTriple(), engine);
   theDriver.setTargetAndMode(parsedName);
   theDriver.setCheckInputsExist(false);
 
   std::unique_ptr<driver::Compilation> compilation(theDriver.BuildCompilation(arguments));
-  if (!compilation || diagnostics.hasErrorOccurred()) {
-    llvm::errs() << "indexer: the driver rejected the command line\n";
+  if (!compilation || engine.hasErrorOccurred()) {
+    diagnostics << "indexer: the driver rejected the command line\n";
     return 1;
   }
   const driver::Command* compile = nullptr;
@@ -761,24 +778,143 @@ int main(int argc, const char** argv) {
     }
   }
   if (!compile) {
-    llvm::errs() << "indexer: the command line produced no compilation job\n";
+    diagnostics << "indexer: the command line produced no compilation job\n";
     return 1;
   }
 
   auto invocation = std::make_shared<CompilerInvocation>();
-  if (!CompilerInvocation::CreateFromArgs(*invocation, compile->getArguments(), diagnostics)) {
+  if (!CompilerInvocation::CreateFromArgs(*invocation, compile->getArguments(), engine)) {
     return 1;
   }
-  // Retain the include set so the record consumer can emit it as a dependency
-  // list; this also makes the preprocessor print its own -H list to stderr,
-  // which the batch only reads when a unit fails.
-  invocation->getPreprocessorOpts().DetailedRecord = true;
   CompilerInstance instance;
   instance.setInvocation(std::move(invocation));
   instance.createDiagnostics(&printer, /*ShouldOwnClient=*/false);
   if (!instance.hasDiagnostics()) return 1;
 
-  IndexAction action;
+  IndexAction action(out);
   if (!instance.ExecuteAction(action)) return 1;
   return instance.getDiagnostics().hasErrorOccurred() ? 1 : 0;
+}
+
+int runBatch(llvm::StringRef manifestPath) {
+  auto buffer = llvm::MemoryBuffer::getFile(manifestPath);
+  if (!buffer) {
+    llvm::errs() << "indexer: cannot read manifest " << manifestPath << ": "
+                 << buffer.getError().message() << "\n";
+    return 1;
+  }
+
+  bool failed = false;
+  llvm::StringRef remaining = buffer.get()->getBuffer();
+  while (!remaining.empty()) {
+    auto [line, rest] = remaining.split('\n');
+    remaining = rest;
+    line = line.trim();
+    if (line.empty()) continue;
+
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(line);
+    if (!parsed) {
+      llvm::errs() << "indexer: bad manifest line: "
+                   << llvm::toString(parsed.takeError()) << "\n";
+      failed = true;
+      continue;
+    }
+    llvm::json::Object* object = parsed->getAsObject();
+    if (!object) {
+      llvm::errs() << "indexer: manifest line is not a JSON object\n";
+      failed = true;
+      continue;
+    }
+    std::optional<llvm::StringRef> directory = object->getString("directory");
+    std::optional<llvm::StringRef> output = object->getString("output");
+    llvm::json::Array* arguments = object->getArray("arguments");
+    if (!directory || !output || !arguments || arguments->empty()) {
+      llvm::errs() << "indexer: manifest line needs directory, output, and arguments\n";
+      failed = true;
+      continue;
+    }
+
+    std::vector<std::string> storage;
+    storage.reserve(arguments->size());
+    for (const llvm::json::Value& value : *arguments) {
+      std::optional<llvm::StringRef> argument = value.getAsString();
+      if (!argument) {
+        llvm::errs() << "indexer: argument list must be strings\n";
+        storage.clear();
+        break;
+      }
+      storage.emplace_back(argument->str());
+    }
+    if (storage.empty()) {
+      failed = true;
+      continue;
+    }
+    std::vector<const char*> argv;
+    argv.reserve(storage.size());
+    for (const std::string& argument : storage) argv.push_back(argument.c_str());
+    llvm::StringRef mainFile = storage.back();
+
+    ChangeDirectory cwd(*directory);
+    if (cwd.error()) {
+      llvm::errs() << "indexer: " << mainFile << ": cannot chdir to " << *directory << ": "
+                   << cwd.error().message() << "\n";
+      failed = true;
+      continue;
+    }
+
+    std::error_code ec;
+    llvm::raw_fd_ostream fileOut(*output, ec, llvm::sys::fs::OF_Text);
+    if (ec) {
+      llvm::errs() << "indexer: " << mainFile << ": cannot write " << *output << ": "
+                   << ec.message() << "\n";
+      failed = true;
+      continue;
+    }
+
+    std::string diagnosticText;
+    llvm::raw_string_ostream diagnosticStream(diagnosticText);
+    int status = indexOneTranslationUnit(argv, fileOut, diagnosticStream);
+    fileOut.close();
+    if (status == 0) continue;
+
+    llvm::sys::fs::remove(*output);
+    llvm::errs() << "indexer: " << mainFile << ":\n" << diagnosticText;
+    failed = true;
+  }
+  return failed ? 1 : 0;
+}
+
+}  // namespace
+
+int main(int argc, const char** argv) {
+  const char* root = std::getenv("RECCMP_SOURCE_ROOT");
+  if (!root) {
+    llvm::errs() << "RECCMP_SOURCE_ROOT is required\n";
+    return 2;
+  }
+  repositoryPrefix = root;
+  if (repositoryPrefix.back() != '/') repositoryPrefix += '/';
+  kRepositoryPrefix = repositoryPrefix;
+
+  // The VC6 headers contain MS-style inline assembly, which Sema refuses to
+  // accept unless the target's assembly parser is registered. Done once so
+  // batch workers do not repeat it per translation unit.
+  llvm::InitializeAllTargetInfos();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmParsers();
+
+  if (argc >= 2 && llvm::StringRef(argv[1]) == "--batch") {
+    if (argc != 3) {
+      llvm::errs() << "usage: indexer --batch <manifest.jsonl>\n";
+      return 2;
+    }
+    return runBatch(argv[2]);
+  }
+  if (argc < 3) {
+    llvm::errs() << "usage: indexer <clang-cl driver command line...>\n"
+                 << "       indexer --batch <manifest.jsonl>\n";
+    return 2;
+  }
+  return indexOneTranslationUnit(llvm::ArrayRef(argv + 1, argv + argc), llvm::outs(),
+                                 llvm::errs());
 }
