@@ -14,16 +14,15 @@
 // This walks the AST with the same interfaces `-ast-dump=json` uses - the same
 // traversal order over template patterns and their specializations, the same
 // single-step type desugaring, the same mangled names from ASTNameGenerator, the
-// same presumed locations - so the emitted records are the ones reccmp's own
-// collector would have derived from the JSON. libclang was tried first and
-// cannot express two of those: it does not visit implicit template
-// instantiations, and it has no single-step desugaring.
+// same presumed locations. libclang was tried first and cannot express two of
+// those: it does not visit implicit template instantiations, and it has no
+// single-step desugaring.
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
 // `{"record":"variable",...}`, `{"record":"class",...}` or
-// `{"record":"size-assertion",...}`. Deduplication across translation units,
-// marker binding, asserted sizes and vtable addresses stay in reccmp, which
-// owns them.
+// `{"record":"size-assertion",...}`. Partitioning by link namespace / TU,
+// winner selection, conflicts, marker binding, asserted sizes and vtable
+// addresses stay in reccmp, which owns them.
 
 #include <cstdlib>
 #include <memory>
@@ -232,24 +231,20 @@ class Indexer {
   }
 
   // A dependent declaration has no mangled name, so the index falls back to the
-  // declaration kind plus the written signature - the identity reccmp uses for
-  // an uninstantiated template pattern. Constness is part of that identity:
-  // the const and non-const overloads of one accessor share everything else.
-  std::string semanticId(const FunctionDecl* function, llvm::StringRef qualifiedName,
-                         const std::vector<std::string>& parameters) const {
+  // declaration kind, qualified name, and canonical function type — the identity
+  // reccmp uses for an uninstantiated template pattern. The canonical type
+  // carries cv-qualifiers, ref-qualifiers, and variadic-ness in one signature,
+  // so overloads that differ only there do not collide.
+  std::string semanticId(const FunctionDecl* function, llvm::StringRef qualifiedName) const {
     bool manglable =
         !function->isDependentContext() && !function->getDescribedFunctionTemplate();
     if (manglable) {
       std::string mangled = names_.getName(function);
       if (!mangled.empty()) return mangled;
     }
-    std::string suffix;
-    if (const auto* method = dyn_cast<CXXMethodDecl>(function); method && method->isConst()) {
-      suffix = " const";
-    }
     // Qualified, because a FunctionDecl is both a Decl and a DeclContext.
-    return (llvm::Twine(function->Decl::getDeclKindName()) + "Decl:" + qualifiedName + "(" +
-            join(parameters, ",") + ")" + suffix)
+    return (llvm::Twine(function->Decl::getDeclKindName()) + "Decl:" + qualifiedName + ":" +
+            canonicalName(function->getType()))
         .str();
   }
 
@@ -460,7 +455,7 @@ class Indexer {
 	std::string convention = callingConvention(functionType, semanticKind);
     llvm::json::Object record{
         {"record", "declaration"},
-        {"semantic_id", semanticId(function, qualifiedName, parameters)},
+        {"semantic_id", semanticId(function, qualifiedName)},
         {"qualified_name", qualifiedName},
         {"semantic_kind", semanticKind},
 		{"calling_convention", convention},
@@ -475,6 +470,7 @@ class Indexer {
         {"owning_class", isMember ? llvm::json::Value(scope) : llvm::json::Value(nullptr)},
         {"has_this", hasThis(semanticKind)},
         {"is_virtual", isVirtual(function)},
+        {"is_variadic", function->isVariadic()},
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
@@ -547,9 +543,8 @@ class Indexer {
     for (const Decl* member : record->decls()) {
       const auto* function = dyn_cast<FunctionDecl>(member);
       if (!function || !isVirtual(function)) continue;
-      std::vector<std::string> parameters = parameterTypes(function);
       virtuals.push_back(
-          semanticId(function, qualify(qualifiedName, function->getNameAsString()), parameters));
+          semanticId(function, qualify(qualifiedName, function->getNameAsString())));
     }
 
     emit(llvm::json::Object{
