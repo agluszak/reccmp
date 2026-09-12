@@ -8,7 +8,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 # pylint: disable=too-many-instance-attributes
 class SourceVariable:
-    """One semantic variable declaration or definition emitted by Clang."""
+    """One semantic variable declaration or definition emitted by Clang.
+
+    Only external-linkage variables are collected: TU-local storage has no
+    legitimate cross-unit writer/reader disagreement for the consistency gate.
+    """
 
     semantic_id: str
     qualified_name: str
@@ -19,9 +23,9 @@ class SourceVariable:
     source_file: str
     line: int
     end_line: int
-    # The link namespace (reccmp target) this record belongs to. Unmangled C
-    # symbols with the same spelling can be unrelated across separate binaries,
-    # so consistency must join on (target, semantic_id), never the spelling.
+    # Compilation unit that observed this variable (repo-relative main file).
+    unit_id: str = ""
+    # Link namespace (reccmp target) assigned when observations are partitioned.
     target: str | None = None
 
     @property
@@ -38,7 +42,7 @@ class SourceVariable:
 
 @dataclass(frozen=True)
 class SourceConflictVariant:
-    """One spelling of a contested symbol and where it was first seen."""
+    """One spelling of a contested symbol and where it was observed."""
 
     signature: tuple[str, ...]
     locations: tuple[str, ...]
@@ -46,14 +50,12 @@ class SourceConflictVariant:
 
 @dataclass(frozen=True)
 class SourceConflict:
-    """One symbol whose collected declarations disagree about its type.
+    """One symbol whose observations inside a link namespace disagree.
 
-    Deduplication keeps one winning record per identity (a definition beats a
-    declaration, an initialized definition beats a tentative one), so the
-    merged index alone cannot show that two units disagreed: an unmangled
-    ``_gThing`` carries no type in the symbol. The collector therefore retains
-    every distinct spelling it saw, and cross-TU consistency gates report these
-    instead of re-deriving them from the winners.
+    Conflicts are derived after partitioning observations by target: each
+    distinct signature retained among that namespace's units becomes a variant.
+    Deduplication still keeps one winning record per identity, but the
+    disagreement is not a side-channel of a global merge.
     """
 
     semantic_id: str

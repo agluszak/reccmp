@@ -14,7 +14,6 @@ index = SourceIndex.from_compile_database(
     repo,
     repo / "build/compile_commands.json",
     {"GAME": list((repo / "src").rglob("*.cpp")) + list((repo / "include").rglob("*.h"))},
-    cache_inputs=[repo / "src", repo / "include"],
     jobs=4,
 )
 index.write(repo / "build/source-index.json")
@@ -32,33 +31,36 @@ For container compile databases, pass `container_image`, `mounts={host_path:
 batch runs in one container with the supplied mounts read-only. `clang` optionally
 overrides the compiler named in the database. No emitter or plugin hooks exist.
 
-`cache_inputs` must cover all headers and other dependencies used by the commands,
-including external header roots. File contents, compile arguments, marker paths,
-collector implementation, and the actual image ID invalidate the cache. Without
-explicit dependency inputs only the collector executable is cached. `force=True`
-refreshes the index. Concurrent builders serialize through the cache lock; compiler
-failures include the translation unit and diagnostics. Empty successful output is
-valid. Writing an unchanged index preserves its file timestamp.
+Each translation unit is cached by its compile command, source contents,
+container/compiler identity, and the dependency set Clang reports. Host paths
+are remapped through `mounts`; toolchain includes are covered by the image
+identity and are not hashed on the host. Validated TU artifacts are aggregated
+into the final index. `force=True` refreshes every unit. Concurrent builders
+serialize through the cache lock; compiler failures include the translation unit
+and diagnostics. Empty successful output is valid. Writing an unchanged index
+preserves its file timestamp.
 
 Records retain compiler-owned source signatures, parameter reference forms, and
 field pointer depth (arrays and references are not peeled). Declarations carry
-their computed linkage and written storage class; variables carry their
-canonical type, linkage, storage class, and definition kind. Markers retain their
-target and folded status. `SourceIndex.from_dict()` reads the JSON projection back
-into these same types; `functions_by_address(target=...)` selects the unfolded
-owner and refuses ambiguous ownership. Use `marker.declaration` for function
-semantics and `marker.name` for either a declaration or a named non-body emission.
+their computed linkage, written storage class, and whether they are variadic;
+variables carry their canonical type, linkage, storage class, and definition
+kind. Only external-linkage variables are indexed. Markers retain their target
+and folded status. `SourceIndex.from_dict()` reads the JSON projection back into
+these same types; `functions_by_address(target=...)` selects the unfolded owner
+and refuses ambiguous ownership. Use `marker.declaration` for function semantics
+and `marker.name` for either a declaration or a named non-body emission.
 
 For already-collected data, `SourceCollector.collect_record()` accepts one
-declaration, variable, class, or size-assertion record; `collect_records()`
-accepts NDJSON. Definitions replace declarations, an initialized definition
-beats a tentative one, and the first located class wins. A record that
-disagrees with the kept winner about its type identity is retained as a
-conflict rather than dropped, so cross-TU consistency gates can report the
-writer/reader disagreement that deduplication would otherwise hide; conflicting
-size assertions are errors. Neither method mutates the supplied record.
-`SourceIndex.from_collector()` performs the marker join. `ast_command()`
-exposes the compile-argument normalization used by the direct-record collector.
+declaration, variable, class, or size-assertion observation tagged with its
+translation unit; `collect_records()` accepts NDJSON. Observations are not
+merged while they arrive. `SourceCollector.derive()` / `SourceIndex.from_collector()`
+partition by link namespace (the TUs owned by a target), group external entities
+by `semantic_id` and non-external functions by `(unit_id, semantic_id)`, then
+derive winners and conflicts. Definitions replace declarations, an initialized
+definition beats a tentative one, and the first located class wins. Conflicting
+size assertions inside one namespace are errors. Neither method mutates the
+supplied record. `ast_command()` exposes the compile-argument normalization used
+by the direct-record collector.
 
 Run `RECCMP_SOURCE_TEST_IMAGE=<image> uv run --group test pytest
 tests/test_source_batch.py` to exercise actual compilation, multi-target ownership,

@@ -1,0 +1,39 @@
+name: Source collector
+
+on: [push, pull_request]
+
+jobs:
+  collector:
+    name: Clang collector (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - uses: astral-sh/setup-uv@v5
+
+    - name: Build pinned LLVM 19 collector image
+      run: |
+        docker build -t reccmp-source-test - <<'EOF'
+        FROM debian:trixie-slim
+        RUN apt-get update \
+          && apt-get install -y --no-install-recommends \
+            clang \
+            llvm-19-dev \
+            libclang-19-dev \
+            libclang-cpp19-dev \
+            ca-certificates \
+          && rm -rf /var/lib/apt/lists/*
+        EOF
+
+    - name: Install python libraries
+      run: uv sync --locked --group test
+
+    - name: Run collector integration test
+      env:
+        RECCMP_SOURCE_TEST_IMAGE: reccmp-source-test
+      run: uv run pytest tests/test_source_batch.py -q --tb=short

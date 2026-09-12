@@ -75,26 +75,28 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
             mounts={repository: "/repo"},
             compilation_root=Path("/repo"),
             cache_dir=cache,
-            cache_inputs=[header, *sources],
             jobs=2,
         )
 
     index = collect()
-    assert len(index.classes) == 1
-    assert index.classes[0].asserted_size == 20
-    assert [field.pointer_depth for field in index.classes[0].fields] == [2, 1, 0, 0]
+    owners = [item for item in index.classes if item.qualified_name == "Owner"]
+    assert len(owners) == 2
+    assert {item.target for item in owners} == {"FIRST", "SECOND"}
+    assert all(item.asserted_size == 20 for item in owners)
+    assert [field.pointer_depth for field in owners[0].fields] == [2, 1, 0, 0]
     assert index.functions_by_address(target="FIRST")[0x401000].name == "FIRST"
     assert index.functions_by_address(target="SECOND")[0x401000].name == "SECOND"
-    variables = {item.qualified_name: item for item in index.variables}
-    assert variables["gFIRST"].definition_kind == "definition"
-    assert variables["gFIRST"].is_external
-    assert variables["gShared"].definition_kind == "declaration"
-    assert variables["gShared"].is_external
-    assert variables["gLocal"].linkage == "internal"
-    assert not variables["gLocal"].is_external
-    assert "scratch" not in variables
-    # Matching TU-local `static` spellings and repeated `extern` declarations
-    # are not disagreements.
+    variables = {
+        (item.target, item.qualified_name): item for item in index.variables
+    }
+    assert variables[("FIRST", "gFIRST")].definition_kind == "definition"
+    assert variables[("FIRST", "gFIRST")].is_external
+    assert variables[("FIRST", "gShared")].definition_kind == "declaration"
+    assert variables[("FIRST", "gShared")].is_external
+    assert variables[("SECOND", "gSECOND")].is_external
+    # TU-local statics are not collected for the cross-TU consistency gate.
+    assert not any(item.qualified_name == "gLocal" for item in index.variables)
+    assert "scratch" not in {item.qualified_name for item in index.variables}
     assert not index.conflicts
     declaration = index.functions_by_address(target="FIRST")[0x401000].declaration
     assert declaration is not None
@@ -103,15 +105,22 @@ def test_container_batch_records_cache_and_errors(tmp_path: Path) -> None:
         SourceIndex.from_dict(json.loads(json.dumps(index.to_dict()))).to_dict()
         == index.to_dict()
     )
-    stamp = cache / "inputs.sha256"
-    before = stamp.stat().st_mtime_ns
+    tu_cache = cache / "tu"
+    assert tu_cache.is_dir()
+    before = sorted(path.stat().st_mtime_ns for path in tu_cache.glob("*.ndjson"))
+    assert before
     assert collect().to_dict() == index.to_dict()
-    assert stamp.stat().st_mtime_ns == before
+    after = sorted(path.stat().st_mtime_ns for path in tu_cache.glob("*.ndjson"))
+    assert after == before
     header.write_text(
         header.read_text().replace("**pointers", "*pointers"), encoding="utf-8"
     )
-    assert collect().classes[0].fields[0].pointer_depth == 1
-    assert stamp.stat().st_mtime_ns != before
+    refreshed = collect()
+    assert all(
+        item.fields[0].pointer_depth == 1
+        for item in refreshed.classes
+        if item.qualified_name == "Owner"
+    )
     sources[0].write_text("this is not valid C++;\n", encoding="utf-8")
     with pytest.raises(SourceIndexError, match="first.cpp"):
         collect()

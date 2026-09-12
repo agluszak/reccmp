@@ -4,6 +4,10 @@ The marker parser owns annotation syntax and addresses. Clang owns C++ names,
 function and variable kinds, types, linkage, class membership, inheritance,
 and virtual declarations. This module only joins those two models by source
 location and writes disposable JSON projections for downstream tools.
+
+Compiler records arrive as per-TU observations. Link-namespace partitioning,
+winner selection, and conflict derivation happen after collection — never by
+globally collapsing bare ``semantic_id`` values first.
 """
 
 from __future__ import annotations
@@ -15,25 +19,14 @@ import json
 import shlex
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from reccmp.formats import TextFile
 from reccmp.parser.codebase import DecompCodebase
 from reccmp.parser.marker import MarkerType, ProjectAliases
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
-_FUNCTION_KINDS = {
-    "FunctionDecl",
-    "CXXMethodDecl",
-    "CXXConstructorDecl",
-    "CXXDestructorDecl",
-    "CXXConversionDecl",
-}
-_RECORD_KINDS = {
-    "CXXRecordDecl",
-    "ClassTemplateSpecializationDecl",
-}
-_SCOPE_KINDS = _RECORD_KINDS | {"NamespaceDecl"}
+_VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
 
 
 class SourceIndexError(ValueError):
@@ -63,15 +56,20 @@ class SourceDeclaration:
     parameter_reference_forms: tuple[str, ...] = ()
     linkage: str = ""
     storage_class: str = ""
-    # The link namespace (reccmp target) this declaration belongs to, so the
-    # cross-TU gate joins on (target, semantic_id) rather than a spelling that
-    # may be unrelated across separate binaries.
+    is_variadic: bool = False
+    # Compilation unit that observed this declaration (repo-relative main file).
+    # External entities share one identity across units; non-external ones are
+    # distinct per unit even when their unmangled spelling collides.
+    unit_id: str = ""
+    # Link namespace (reccmp target) assigned when observations are partitioned.
     target: str | None = None
 
     @property
     def prototype(self) -> str:
         """Render compiler-owned types for display, not ABI synchronization."""
         parameters = ", ".join(self.parameter_types) or "void"
+        if self.is_variadic:
+            parameters = f"{parameters}, ..." if self.parameter_types else "..."
         prefix = f"{self.return_type} " if self.return_type else ""
         return f"{prefix}{self.qualified_name}({parameters})"
 
@@ -83,19 +81,22 @@ class SourceDeclaration:
 
     @property
     def signature(self) -> tuple[str, ...]:
-        """The type identity a cross-TU consistency gate compares, linkage
-        included. Two TU-local `static` definitions share their unmangled
-        spelling but never the same linkage as an external declaration of
-        that name, so linkage is part of the identity rather than a filter
-        applied later.
-        """
+        """The type identity a cross-TU consistency gate compares."""
         return (
             self.semantic_kind,
             self.calling_convention,
             self.return_type,
             *self.parameter_types,
             self.linkage,
+            "..." if self.is_variadic else "",
         )
+
+    @property
+    def merge_key(self) -> tuple[str, ...]:
+        """Identity used when grouping observations inside one link namespace."""
+        if self.is_external:
+            return (self.semantic_id,)
+        return (self.unit_id, self.semantic_id)
 
 
 @dataclass(frozen=True)
@@ -134,9 +135,7 @@ class SourceClass:
     asserted_size: int | None = None
     vtable_address: int | None = None
     base_vtables: tuple[SourceBaseVtable, ...] = ()
-    # The link namespace this definition belongs to. A template can be
-    # instantiated in headers owned by separate binaries, so class identity is
-    # (target, semantic_id) just like the declaration and variable records.
+    unit_id: str = ""
     target: str | None = None
 
 
@@ -164,322 +163,78 @@ class SourceMarker:
 
 
 @dataclass(frozen=True)
-class _Location:
-    file: str
-    line: int
-    end_line: int
+class _SizeAssertion:
+    unit_id: str
+    qualified_name: str
+    asserted_size: int
 
 
-def _location_part(value: dict[str, Any]) -> dict[str, Any]:
-    for key in ("expansionLoc", "spellingLoc"):
-        nested = value.get(key)
-        if isinstance(nested, dict):
-            return nested
-    return value
+@dataclass(frozen=True)
+class _NamespaceRecords:
+    """Winners and conflicts derived inside one link namespace."""
 
-
-def _location(node: dict[str, Any], fallback_file: str) -> _Location:
-    location = _location_part(node.get("loc") or {})
-    start = _location_part((node.get("range") or {}).get("begin") or {})
-    end = _location_part((node.get("range") or {}).get("end") or {})
-    source_file = str(start.get("file") or location.get("file") or fallback_file)
-    line = int(start.get("line") or location.get("line") or 0)
-    return _Location(source_file, line, int(end.get("line") or line))
-
-
-def _explicit_file(node: dict[str, Any]) -> str:
-    location = _location_part(node.get("loc") or {})
-    start = _location_part((node.get("range") or {}).get("begin") or {})
-    return str(start.get("file") or location.get("file") or "")
-
-
-def _qualified(scope: str, name: str) -> str:
-    return f"{scope}::{name}" if scope else name
-
-
-def _scope_component(node: dict[str, Any]) -> str:
-    name = str(node.get("name") or "")
-    if node.get("kind") != "ClassTemplateSpecializationDecl":
-        return name
-    arguments = []
-    for child in node.get("inner", ()):
-        if child.get("kind") != "TemplateArgument":
-            continue
-        argument_type = _canonical_type(child)
-        value = child.get("value")
-        arguments.append(argument_type or str(value or ""))
-    rendered = ", ".join(argument for argument in arguments if argument)
-    return f"{name}<{rendered}>" if rendered else name
-
-
-def _canonical_type(node: dict[str, Any]) -> str:
-    type_info = node.get("type") or {}
-    return str(type_info.get("desugaredQualType") or type_info.get("qualType") or "")
-
-
-def _return_type(node: dict[str, Any]) -> str:
-    if node.get("kind") in {"CXXConstructorDecl", "CXXDestructorDecl"}:
-        return ""
-    function_type = _canonical_type(node)
-    return function_type.split("(", 1)[0].strip()
-
-
-def _parameters(node: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(
-        _canonical_type(child)
-        for child in node.get("inner", ())
-        if child.get("kind") == "ParmVarDecl"
-    )
-
-
-def _is_definition(node: dict[str, Any]) -> bool:
-    if node.get("isThisDeclarationADefinition"):
-        return True
-    return any(
-        child.get("kind") in {"CompoundStmt", "CXXTryStmt"}
-        for child in node.get("inner", ())
-    )
-
-
-def _descendants(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    yield node
-    for child in node.get("inner", ()):
-        yield from _descendants(child)
-
-
-def _size_assertion(node: dict[str, Any], scope: str) -> tuple[str, int] | None:
-    if node.get("kind") != "StaticAssertDecl":
-        return None
-    expression = next(
-        (
-            child
-            for child in node.get("inner", ())
-            if child.get("kind") == "BinaryOperator"
-        ),
-        None,
-    )
-    if expression is None or expression.get("opcode") != "==":
-        return None
-    size_of = next(
-        (
-            child
-            for child in _descendants(expression)
-            if child.get("kind") == "UnaryExprOrTypeTraitExpr"
-            and child.get("name") == "sizeof"
-            and (child.get("argType") or {}).get("qualType")
-        ),
-        None,
-    )
-    literal = next(
-        (
-            child
-            for child in _descendants(expression)
-            if child.get("kind") == "IntegerLiteral" and child.get("value") is not None
-        ),
-        None,
-    )
-    if size_of is None or literal is None:
-        return None
-    class_name = str(size_of["argType"]["qualType"])
-    if "::" not in class_name and scope:
-        class_name = _qualified(scope, class_name)
-    return class_name, int(str(literal["value"]), 0)
-
-
-def _semantic_kind(node: dict[str, Any], owning_class: str | None, scope: str) -> str:
-    kind = node.get("kind")
-    if kind == "CXXConstructorDecl":
-        return "constructor"
-    if kind == "CXXDestructorDecl":
-        return "destructor"
-    if owning_class is not None:
-        return (
-            "static_method"
-            if node.get("storageClass") == "static"
-            else "instance_method"
-        )
-    return "namespace_function" if scope else "free_function"
-
-
-def _calling_convention(node: dict[str, Any], semantic_kind: str) -> str:
-    explicit = str(node.get("callingConvention") or node.get("callingConv") or "")
-    function_type = _canonical_type(node)
-    combined = f"{explicit} {function_type}".lower()
-    for spelling in ("thiscall", "stdcall", "fastcall", "vectorcall", "cdecl"):
-        if spelling in combined:
-            return f"__{spelling}"
-    # On the x86 MS ABI this is a compiler consequence of the semantic kind,
-    # not an inference from punctuation in a source spelling.
-    return (
-        "__thiscall"
-        if semantic_kind in {"constructor", "destructor", "instance_method"}
-        else "__cdecl"
-    )
-
-
-def _semantic_id(node: dict[str, Any], qualified_name: str) -> str:
-    mangled = node.get("mangledName")
-    if mangled:
-        return str(mangled)
-    signature = ",".join(_parameters(node))
-    return f"{node.get('kind')}:{qualified_name}({signature})"
-
-
-def _is_virtual(node: dict[str, Any]) -> bool:
-    """Clang marks introducing virtuals directly and overrides with an attribute."""
-
-    return bool(node.get("virtual")) or any(
-        child.get("kind") in {"OverrideAttr", "FinalAttr"}
-        for child in node.get("inner", ())
-    )
-
-
-_VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
+    declarations: tuple[SourceDeclaration, ...]
+    variables: tuple[SourceVariable, ...]
+    classes: tuple[SourceClass, ...]
+    conflicts: tuple[SourceConflict, ...]
+    size_assertions: dict[str, int]
 
 
 class SourceCollector:
+    """Accumulate per-TU compiler observations without merging them.
+
+    Call ``derive()`` (or ``SourceIndex.from_collector``) to partition by link
+    namespace, group entities, and produce winners plus conflicts.
+    """
+
     def __init__(self, repository: Path, compilation_root: Path | None = None) -> None:
         self.repository = repository.resolve()
         self.compilation_root = compilation_root
-        self.contexts: dict[str, tuple[str, bool]] = {}
-        self.declarations: dict[str, SourceDeclaration] = {}
-        self.variables: dict[str, SourceVariable] = {}
-        self.conflicts: dict[tuple[str, str], SourceConflict] = {}
-        self.classes: dict[str, SourceClass] = {}
-        self.size_assertions: dict[str, int] = {}
-        # The global maps above keep one winner per semantic identity, which is
-        # all a single link namespace needs. A batch spanning several binaries
-        # must instead keep every translation unit's own record, because an
-        # unmangled spelling such as `_DllMain@12` can be unrelated across
-        # them. These per-file maps retain each spelling so `from_collector`
-        # can select one namespace's records without re-parsing the unit.
-        self.declarations_by_file: dict[tuple[str, str], SourceDeclaration] = {}
-        self.variables_by_file: dict[tuple[str, str], SourceVariable] = {}
-        self.classes_by_file: dict[tuple[str, str], SourceClass] = {}
-        self.current_file = ""
+        self.declarations: list[SourceDeclaration] = []
+        self.variables: list[SourceVariable] = []
+        self.classes: list[SourceClass] = []
+        self.size_assertions: list[_SizeAssertion] = []
 
-    def collect_records(self, records: str) -> None:
+    def collect_records(self, records: str, *, unit_id: str = "") -> None:
         """Consume a compiler's newline-delimited JSON output."""
         for line in records.splitlines():
             if line.strip():
-                self.collect_record(json.loads(line))
+                self.collect_record(json.loads(line), unit_id=unit_id)
 
-    def collect_record(self, record: Mapping[str, Any]) -> None:
-        """Merge one compiler record without mutating the caller's document.
+    def collect_record(self, record: Mapping[str, Any], *, unit_id: str = "") -> None:
+        """Store one compiler observation without collapsing identities.
 
-        Definitions replace declarations, and an initialized definition beats a
-        tentative one; the first located class wins. A record that disagrees
-        with the kept winner about its type identity is retained as a conflict
-        instead of being silently dropped. Conflicting size assertions are
-        errors, independent of input order.
+        Non-external variables are dropped: the compiler already checks them
+        inside their translation unit, and they have no legitimate cross-TU
+        writer/reader disagreement to report. Conflicting size assertions are
+        checked only after partitioning by link namespace.
         """
         values = dict(record)
         kind = values.pop("record")
+        if kind == "dependency":
+            return
         if kind == "declaration":
-            declaration = _declaration_from_dict(values)
-            previous = self.declarations.get(declaration.semantic_id)
-            if previous is not None:
-                self._note_conflict("declaration", previous, declaration)
-            if previous is None or (
-                declaration.is_definition and not previous.is_definition
-            ):
-                self.declarations[declaration.semantic_id] = declaration
-            file_key = (declaration.source_file, declaration.semantic_id)
-            file_previous = self.declarations_by_file.get(file_key)
-            if file_previous is None or (
-                declaration.is_definition and not file_previous.is_definition
-            ):
-                self.declarations_by_file[file_key] = declaration
+            declaration = _declaration_from_dict({**values, "unit_id": unit_id})
+            self.declarations.append(declaration)
         elif kind == "variable":
-            variable = _variable_from_dict(values)
-            previous = self.variables.get(variable.semantic_id)
-            if previous is not None:
-                self._note_conflict("variable", previous, variable)
-            if previous is None or (
-                _VARIABLE_RANK.get(variable.definition_kind, 0)
-                > _VARIABLE_RANK.get(previous.definition_kind, 0)
-            ):
-                self.variables[variable.semantic_id] = variable
-            file_key = (variable.source_file, variable.semantic_id)
-            file_previous = self.variables_by_file.get(file_key)
-            if file_previous is None or (
-                _VARIABLE_RANK.get(variable.definition_kind, 0)
-                > _VARIABLE_RANK.get(file_previous.definition_kind, 0)
-            ):
-                self.variables_by_file[file_key] = variable
+            variable = _variable_from_dict({**values, "unit_id": unit_id})
+            if not variable.is_external:
+                return
+            self.variables.append(variable)
         elif kind == "class":
-            source_class = _class_from_dict(values)
-            previous_class = self.classes.get(source_class.semantic_id)
-            if previous_class is None or (
-                not previous_class.line and source_class.line
-            ):
-                self.classes[source_class.semantic_id] = source_class
-            file_key = (source_class.source_file, source_class.semantic_id)
-            file_previous = self.classes_by_file.get(file_key)
-            if file_previous is None or (not file_previous.line and source_class.line):
-                self.classes_by_file[file_key] = source_class
+            self.classes.append(_class_from_dict({**values, "unit_id": unit_id}))
         elif kind == "size-assertion":
-            name, size = values["qualified_name"], values["asserted_size"]
-            previous_size = self.size_assertions.get(name)
-            if previous_size is not None and previous_size != size:
-                raise SourceIndexError(
-                    f"{name} has conflicting size assertions: {previous_size:#x} and {size:#x}"
+            self.size_assertions.append(
+                _SizeAssertion(
+                    unit_id=unit_id,
+                    qualified_name=str(values["qualified_name"]),
+                    asserted_size=int(values["asserted_size"]),
                 )
-            self.size_assertions[name] = size
+            )
         else:
             raise SourceIndexError(
                 f"the source indexer emitted an unknown record: {kind!r}"
             )
-
-    def _note_conflict(
-        self,
-        record_kind: str,
-        previous: SourceDeclaration | SourceVariable,
-        incoming: SourceDeclaration | SourceVariable,
-    ) -> None:
-        """Retain a type disagreement the winner-takes-all merge would hide.
-
-        Identical spellings never conflict, however often headers repeat them.
-        Only the first location of each spelling is retained; gates show a
-        bounded sample per spelling, and the first sighting already identifies
-        the disagreeing side.
-        """
-        if previous.signature == incoming.signature:
-            return
-        key = (record_kind, previous.semantic_id)
-        conflict = self.conflicts.get(key)
-        variants = list(conflict.variants) if conflict is not None else []
-        for record in (previous, incoming):
-            if not any(variant.signature == record.signature for variant in variants):
-                variants.append(
-                    SourceConflictVariant(
-                        signature=record.signature,
-                        locations=(f"{record.source_file}:{record.line}",),
-                    )
-                )
-        self.conflicts[key] = SourceConflict(
-            semantic_id=previous.semantic_id,
-            qualified_name=previous.qualified_name,
-            record_kind=record_kind,
-            variants=tuple(variants),
-        )
-
-    def collect(self, document: dict[str, Any], main_file: Path) -> None:
-        self._collect_contexts(document, "")
-        self.current_file = str(main_file.resolve())
-        self._walk(document, "", str(main_file.resolve()))
-
-    def _collect_contexts(self, node: dict[str, Any], scope: str) -> None:
-        kind = node.get("kind")
-        name = _scope_component(node)
-        child_scope = scope
-        if kind in _SCOPE_KINDS and name:
-            child_scope = _qualified(scope, name)
-            node_id = node.get("id")
-            if node_id:
-                self.contexts[str(node_id)] = (child_scope, kind in _RECORD_KINDS)
-        for child in node.get("inner", ()):
-            self._collect_contexts(child, child_scope)
 
     def _relative(self, source_file: str) -> str:
         path = Path(source_file)
@@ -495,123 +250,135 @@ class SourceCollector:
         except ValueError:
             return path.as_posix()
 
-    def _walk(self, node: dict[str, Any], scope: str, fallback_file: str) -> None:
-        kind = node.get("kind")
-        name = str(node.get("name") or "")
-        scope_name = _scope_component(node)
-        explicit_file = _explicit_file(node)
-        if explicit_file:
-            self.current_file = explicit_file
-        location = _location(node, self.current_file or fallback_file)
-        child_scope = scope
-        if kind in _SCOPE_KINDS and scope_name:
-            child_scope = _qualified(scope, scope_name)
+    def unit_id_for(self, main_file: str | Path) -> str:
+        """Repo-relative identity of a translation unit's main file."""
+        return self._relative(str(main_file))
 
-        if kind in _RECORD_KINDS and name and node.get("completeDefinition"):
-            qualified_name = child_scope
-            bases = tuple(
-                str(
-                    (base.get("type") or {}).get("desugaredQualType")
-                    or (base.get("type") or {}).get("qualType")
-                    or ""
+    def derive(
+        self,
+        *,
+        target: str | None = None,
+        unit_ids: set[str] | None = None,
+    ) -> _NamespaceRecords:
+        """Partition observations, then derive winners and conflicts.
+
+        An observation belongs to the namespace when its compilation unit is in
+        ``unit_ids``. When ``unit_ids`` is omitted, every observation is kept
+        (single-namespace fixtures and tests).
+        """
+
+        def belongs(unit_id: str) -> bool:
+            return unit_ids is None or unit_id in unit_ids
+
+        declarations = [item for item in self.declarations if belongs(item.unit_id)]
+        variables = [item for item in self.variables if belongs(item.unit_id)]
+        classes = [item for item in self.classes if belongs(item.unit_id)]
+        assertions = [item for item in self.size_assertions if belongs(item.unit_id)]
+
+        derived_declarations, declaration_conflicts = _derive_entities(
+            declarations,
+            key=lambda item: item.merge_key,
+            rank=lambda item: 1 if item.is_definition else 0,
+            record_kind="declaration",
+            target=target,
+        )
+        derived_variables, variable_conflicts = _derive_entities(
+            variables,
+            key=lambda item: (item.semantic_id,),
+            rank=lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
+            record_kind="variable",
+            target=target,
+        )
+        derived_classes = _derive_classes(classes, target=target)
+        size_assertions = _derive_size_assertions(assertions)
+
+        return _NamespaceRecords(
+            declarations=derived_declarations,
+            variables=derived_variables,
+            classes=tuple(
+                replace(
+                    item,
+                    asserted_size=size_assertions.get(item.qualified_name),
                 )
-                for base in node.get("bases", ())
-            )
-            virtuals = tuple(
-                _semantic_id(
-                    child, _qualified(qualified_name, str(child.get("name") or ""))
-                )
-                for child in node.get("inner", ())
-                if child.get("kind") in _FUNCTION_KINDS and _is_virtual(child)
-            )
-            fields = tuple(
-                SourceField(
-                    name=str(child.get("name")),
-                    type=str(
-                        (child.get("type") or {}).get("desugaredQualType")
-                        or (child.get("type") or {}).get("qualType")
-                        or ""
+                for item in derived_classes
+            ),
+            conflicts=declaration_conflicts + variable_conflicts,
+            size_assertions=size_assertions,
+        )
+
+
+def _derive_entities(
+    observations: Sequence[Any],
+    *,
+    key,
+    rank,
+    record_kind: str,
+    target: str | None,
+) -> tuple[tuple[Any, ...], tuple[SourceConflict, ...]]:
+    """Group observations by merge key, pick a winner, retain type conflicts."""
+    groups: dict[tuple[str, ...], list[Any]] = {}
+    for item in observations:
+        groups.setdefault(key(item), []).append(item)
+
+    winners: list[Any] = []
+    conflicts: list[SourceConflict] = []
+    for group in groups.values():
+        winner = group[0]
+        for item in group[1:]:
+            if rank(item) > rank(winner):
+                winner = item
+        winners.append(replace(winner, target=target) if target is not None else winner)
+
+        variants: dict[tuple[str, ...], list[str]] = {}
+        for item in group:
+            location = f"{item.source_file}:{item.line}"
+            variants.setdefault(item.signature, [])
+            if location not in variants[item.signature]:
+                variants[item.signature].append(location)
+        if len(variants) > 1:
+            sample = group[0]
+            conflicts.append(
+                SourceConflict(
+                    semantic_id=sample.semantic_id,
+                    qualified_name=sample.qualified_name,
+                    record_kind=record_kind,
+                    variants=tuple(
+                        SourceConflictVariant(
+                            signature=signature,
+                            locations=tuple(locations),
+                        )
+                        for signature, locations in variants.items()
                     ),
-                    source_file=self._relative(_location(child, location.file).file),
-                    line=_location(child, location.file).line,
+                    target=target,
                 )
-                for child in node.get("inner", ())
-                if child.get("kind") == "FieldDecl" and child.get("name")
             )
-            source_class = SourceClass(
-                semantic_id=f"record:{qualified_name}",
-                qualified_name=qualified_name,
-                bases=bases,
-                fields=fields,
-                virtual_declarations=virtuals,
-                source_file=self._relative(location.file),
-                line=location.line,
-                end_line=location.end_line,
-            )
-            class_previous = self.classes.get(source_class.semantic_id)
-            if class_previous is None or (
-                not class_previous.line and source_class.line
-            ):
-                self.classes[source_class.semantic_id] = source_class
-            class_key = (source_class.source_file, source_class.semantic_id)
-            class_file_previous = self.classes_by_file.get(class_key)
-            if class_file_previous is None or (
-                not class_file_previous.line and source_class.line
-            ):
-                self.classes_by_file[class_key] = source_class
+    return tuple(winners), tuple(conflicts)
 
-        if kind in _FUNCTION_KINDS and name and not node.get("isImplicit"):
-            context = self.contexts.get(str(node.get("parentDeclContextId") or ""))
-            semantic_scope = context[0] if context else scope
-            owning_class = semantic_scope if context and context[1] else None
-            if owning_class is None and kind != "FunctionDecl":
-                owning_class = scope or None
-            qualified_name = _qualified(semantic_scope, name)
-            semantic_kind = _semantic_kind(
-                node, owning_class, semantic_scope if owning_class is None else ""
-            )
-            declaration = SourceDeclaration(
-                semantic_id=_semantic_id(node, qualified_name),
-                qualified_name=qualified_name,
-                semantic_kind=semantic_kind,
-                calling_convention=_calling_convention(node, semantic_kind),
-                return_type=_return_type(node),
-                parameter_types=_parameters(node),
-                owning_class=owning_class,
-                has_this=semantic_kind
-                in {"constructor", "destructor", "instance_method"},
-                is_virtual=_is_virtual(node),
-                source_file=self._relative(location.file),
-                line=location.line,
-                end_line=location.end_line,
-                is_definition=_is_definition(node),
-            )
-            declaration_previous = self.declarations.get(declaration.semantic_id)
-            if declaration_previous is None or (
-                declaration.is_definition and not declaration_previous.is_definition
-            ):
-                self.declarations[declaration.semantic_id] = declaration
-            declaration_key = (declaration.source_file, declaration.semantic_id)
-            declaration_file_previous = self.declarations_by_file.get(declaration_key)
-            if declaration_file_previous is None or (
-                declaration.is_definition
-                and not declaration_file_previous.is_definition
-            ):
-                self.declarations_by_file[declaration_key] = declaration
 
-        assertion = _size_assertion(node, scope)
-        if assertion is not None:
-            class_name, asserted_size = assertion
-            previous_size = self.size_assertions.get(class_name)
-            if previous_size is not None and previous_size != asserted_size:
-                raise SourceIndexError(
-                    f"{class_name} has conflicting size assertions: "
-                    f"{previous_size:#x} and {asserted_size:#x}"
-                )
-            self.size_assertions[class_name] = asserted_size
+def _derive_classes(
+    observations: Sequence[SourceClass], *, target: str | None
+) -> tuple[SourceClass, ...]:
+    best: dict[str, SourceClass] = {}
+    for item in observations:
+        previous = best.get(item.semantic_id)
+        if previous is None or (not previous.line and item.line):
+            best[item.semantic_id] = (
+                replace(item, target=target) if target is not None else item
+            )
+    return tuple(best.values())
 
-        for child in node.get("inner", ()):
-            self._walk(child, child_scope, fallback_file)
+
+def _derive_size_assertions(assertions: Sequence[_SizeAssertion]) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for item in assertions:
+        previous = sizes.get(item.qualified_name)
+        if previous is not None and previous != item.asserted_size:
+            raise SourceIndexError(
+                f"{item.qualified_name} has conflicting size assertions: "
+                f"{previous:#x} and {item.asserted_size:#x}"
+            )
+        sizes[item.qualified_name] = item.asserted_size
+    return sizes
 
 
 def _command_arguments(entry: dict[str, Any]) -> list[str]:
@@ -689,27 +456,6 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     )
 
 
-def _select_namespace_records(
-    records: Mapping[tuple[str, str], Any],
-    source_files: set[str],
-    rank: Callable[[Any], int],
-) -> tuple[Any, ...]:
-    """One best record per semantic identity among the files a namespace owns.
-
-    The collector retains every translation unit's spelling so a batch can span
-    several binaries. Selecting by source file reproduces the old single-target
-    winner choice without re-parsing any unit.
-    """
-    best: dict[str, Any] = {}
-    for (source_file, semantic_id), record in records.items():
-        if source_file not in source_files:
-            continue
-        previous = best.get(semantic_id)
-        if previous is None or rank(record) > rank(previous):
-            best[semantic_id] = record
-    return tuple(best.values())
-
-
 class SourceIndex:
     """Canonical marker plus Clang semantic source index."""
 
@@ -733,48 +479,6 @@ class SourceIndex:
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
 
     @classmethod
-    def from_ast_documents(
-        cls,
-        repository: Path,
-        target: str,
-        source_paths: Sequence[Path],
-        documents: Sequence[tuple[dict[str, Any], Path]],
-        *,
-        aliases: ProjectAliases | None = None,
-    ) -> "SourceIndex":
-        collector = SourceCollector(repository)
-        for document, main_file in documents:
-            collector.collect(document, main_file)
-
-        return cls.from_collector(
-            repository, target, source_paths, collector, aliases=aliases
-        )
-
-    @classmethod
-    def from_ast_documents_targets(
-        cls,
-        repository: Path,
-        targets: Mapping[str, Sequence[Path]],
-        documents: Sequence[tuple[dict[str, Any], Path]],
-        *,
-        aliases: ProjectAliases | None = None,
-    ) -> "SourceIndex":
-        """Bind several marker targets against one already-emitted Clang AST."""
-
-        collector = SourceCollector(repository)
-        for document, main_file in documents:
-            collector.collect(document, main_file)
-        indexes = [
-            cls.from_collector(repository, target, paths, collector, aliases=aliases)
-            for target, paths in targets.items()
-        ]
-        return cls(
-            declarations=(item for index in indexes for item in index.declarations),
-            classes=(item for index in indexes for item in index.classes),
-            markers=(item for index in indexes for item in index.markers),
-        )
-
-    @classmethod
     def from_collector(
         cls,
         repository: Path,
@@ -782,54 +486,23 @@ class SourceIndex:
         source_paths: Sequence[Path],
         collector: SourceCollector,
         *,
+        unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
+        """Derive one link namespace from collected observations, then join markers.
+
+        ``unit_ids`` names the translation units that belong to this namespace
+        (repo-relative main files). When omitted, every observation is treated
+        as belonging to ``target`` — appropriate for fixtures that never ran a
+        multi-target batch.
+        """
         files = tuple(TextFile.from_files(source_paths))
         codebase = DecompCodebase(files, target, aliases=aliases)
-        source_files = {
-            path.resolve().relative_to(repository.resolve()).as_posix()
-            for path in source_paths
-        }
-        declarations = tuple(
-            replace(item, target=target)
-            for item in _select_namespace_records(
-                collector.declarations_by_file,
-                source_files,
-                lambda item: 1 if item.is_definition else 0,
-            )
-        )
-        variables = tuple(
-            replace(item, target=target)
-            for item in _select_namespace_records(
-                collector.variables_by_file,
-                source_files,
-                lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
-            )
-        )
-        # Keep only this namespace's spellings of a contested symbol. The
-        # collector sees every translation unit, so a conflict can carry a
-        # variant that belongs to a different binary; filtering by location
-        # keeps the record a genuine same-namespace disagreement.
-        conflicts = tuple(
-            replace(
-                conflict,
-                target=target,
-                variants=tuple(
-                    variant
-                    for variant in conflict.variants
-                    if any(
-                        location.rsplit(":", 1)[0] in source_files
-                        for location in variant.locations
-                    )
-                ),
-            )
-            for conflict in collector.conflicts.values()
-            if any(
-                location.rsplit(":", 1)[0] in source_files
-                for variant in conflict.variants
-                for location in variant.locations
-            )
-        )
+        namespace = collector.derive(target=target, unit_ids=unit_ids)
+        declarations = namespace.declarations
+        variables = namespace.variables
+        conflicts = namespace.conflicts
+
         by_location: dict[tuple[str, int], list[SourceDeclaration]] = {}
         for declaration in declarations:
             if declaration.is_definition:
@@ -873,21 +546,7 @@ class SourceIndex:
                 )
             )
 
-        classes = [
-            replace(item, target=target)
-            for item in _select_namespace_records(
-                collector.classes_by_file,
-                source_files,
-                lambda item: 1 if item.line else 0,
-            )
-        ]
-        classes = [
-            replace(
-                item,
-                asserted_size=collector.size_assertions.get(item.qualified_name),
-            )
-            for item in classes
-        ]
+        classes = list(namespace.classes)
         class_by_location = {
             (item.source_file, item.line): index for index, item in enumerate(classes)
         }
@@ -931,6 +590,7 @@ class SourceIndex:
                     line=vtable_symbol.line_number,
                     end_line=vtable_symbol.line_number,
                     vtable_address=vtable_symbol.offset,
+                    target=target,
                 )
                 classes.append(source_class)
                 class_by_name[source_class.qualified_name] = len(classes) - 1
@@ -1036,7 +696,6 @@ class SourceIndex:
         mounts: Mapping[Path, str] | None = None,
         compilation_root: Path | None = None,
         cache_dir: Path | None = None,
-        cache_inputs: Sequence[Path] = (),
         force: bool = False,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
@@ -1045,7 +704,7 @@ class SourceIndex:
         A container image runs the whole batch in one container; mounts describe
         the paths already used by its compile database. Native collection uses
         each entry's working directory. The image/host needs Clang and LLVM 19
-        development libraries. Cache inputs must include every header dependency.
+        development libraries. Per-TU dependency digests invalidate the cache.
         """
         # Delay the execution backend until collection is requested. The record
         # model remains importable without a Linux compiler environment.
@@ -1062,7 +721,6 @@ class SourceIndex:
             mounts=mounts,
             compilation_root=compilation_root,
             cache_dir=cache_dir,
-            cache_inputs=cache_inputs,
             force=force,
             aliases=aliases,
         )

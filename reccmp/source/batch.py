@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import fcntl
 import glob
 import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 from typing import Mapping, Sequence
@@ -34,18 +34,22 @@ _COMPILE = (
 
 
 def _pick_library(candidates: list[str]) -> str | None:
-    """One deterministic library from probe hits: the LLVM tree first, then
-    the multiarch directory, most specific SONAME suffix in each."""
+    """Prefer the versioned LLVM tree; otherwise the matching multiarch SONAME."""
     trees = sorted(path for path in candidates if f"/llvm-{_LLVM_VERSION}/" in path)
     if trees:
         return trees[-1]
+    versioned = sorted(
+        path for path in candidates if f".so.{_LLVM_VERSION}" in path or f"-{_LLVM_VERSION}." in path
+    )
+    if versioned:
+        return versioned[-1]
     multiarch = sorted(candidates)
     return multiarch[-1] if multiarch else None
 
 
 def _collector_libraries(container_image: str | None) -> tuple[str, str, str]:
     """Locate the headers and shared objects the collector builds against."""
-    include = f"/usr/lib/llvm-{_LLVM_VERSION}/include"
+    default_include = f"/usr/lib/llvm-{_LLVM_VERSION}/include"
     patterns = (
         f"/usr/lib/llvm-{_LLVM_VERSION}/lib/libclang-cpp.so.*",
         "/usr/lib/x86_64-linux-gnu/libclang-cpp.so.*",
@@ -53,6 +57,17 @@ def _collector_libraries(container_image: str | None) -> tuple[str, str, str]:
         "/usr/lib/x86_64-linux-gnu/libLLVM*.so*",
     )
     if container_image is None:
+        include = default_include
+        config = shutil.which(f"llvm-config-{_LLVM_VERSION}")
+        if config:
+            probed = subprocess.run(
+                [config, "--includedir"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probed.returncode == 0 and probed.stdout.strip():
+                include = probed.stdout.strip()
         hits = [
             match
             for pattern in patterns
@@ -60,6 +75,9 @@ def _collector_libraries(container_image: str | None) -> tuple[str, str, str]:
             if os.path.isfile(match)
         ]
     else:
+        # Expand each glob independently so a missing pattern does not make
+        # `ls` fail before the others are inspected. Prefer llvm-config when
+        # the image ships it for this LLVM version.
         probe = _run(
             [
                 "docker",
@@ -71,10 +89,26 @@ def _collector_libraries(container_image: str | None) -> tuple[str, str, str]:
                 "/bin/sh",
                 container_image,
                 "-c",
-                f"ls -d {' '.join(patterns)} 2>/dev/null",
+                (
+                    f'include=$(llvm-config-{_LLVM_VERSION} --includedir 2>/dev/null || true); '
+                    f'libdir=$(llvm-config-{_LLVM_VERSION} --libdir 2>/dev/null || true); '
+                    f'printf "INCLUDE:%s\\n" "${{include:-{default_include}}}"; '
+                    f'if [ -n "$libdir" ]; then '
+                    f'ls -d "$libdir"/libclang-cpp.so.* "$libdir"/libLLVM*.so* 2>/dev/null || true; '
+                    f"fi; "
+                    + "".join(
+                        f"ls -d {pattern} 2>/dev/null || true; " for pattern in patterns
+                    )
+                ),
             ]
         )
-        hits = [line for line in probe.stdout.split() if ".so" in line]
+        include = default_include
+        hits = []
+        for line in probe.stdout.splitlines():
+            if line.startswith("INCLUDE:"):
+                include = line.partition(":")[2] or default_include
+            else:
+                hits.extend(part for part in line.split() if ".so" in part)
     clang_cpp = _pick_library([hit for hit in hits if "libclang-cpp" in hit])
     llvm = _pick_library(
         [hit for hit in hits if "libclang-cpp" not in hit and "libLLVM" in hit]
@@ -106,6 +140,15 @@ def _run(command: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
     return result
 
 
+def _lock_exclusive(lock_file) -> None:
+    """Advisory exclusive lock; no-op where fcntl is unavailable (Windows)."""
+    try:
+        import fcntl
+    except ImportError:
+        return
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+
 # Execution options describe the compile environment directly, without a plugin layer.
 # pylint: disable=too-many-arguments,too-many-locals
 def collect_compile_database(
@@ -119,7 +162,6 @@ def collect_compile_database(
     mounts: Mapping[Path, str] | None,
     compilation_root: Path | None,
     cache_dir: Path | None,
-    cache_inputs: Sequence[Path],
     force: bool,
     aliases: ProjectAliases | None,
 ) -> SourceIndex:
@@ -131,7 +173,7 @@ def collect_compile_database(
     # Serialize builders sharing a cache so a cancelled or concurrent rebuild
     # cannot expose a partially-written executable or JSON projection.
     with (cache / "lock").open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _lock_exclusive(lock)
         database = json.loads(compilation_database.read_text(encoding="utf-8"))
         if jobs is not None and jobs < 1:
             raise ValueError("source index jobs must be positive")
@@ -146,46 +188,6 @@ def collect_compile_database(
             (_COMPILE + _LLVM_VERSION + compiler_identity).encode()
             + _SOURCE.read_bytes()
         ).hexdigest()
-        fingerprint = hashlib.sha256()
-        options = (
-            database,
-            root,
-            clang,
-            binary_digest,
-            {str(path): value for path, value in mounts.items()},
-            {key: [str(path) for path in paths] for key, paths in targets.items()},
-            aliases,
-        )
-        fingerprint.update(json.dumps(options, sort_keys=True).encode())
-        implementation = [
-            *_SOURCE.parent.glob("*.py"),
-            *(_SOURCE.parents[1] / "parser").glob("*.py"),
-        ]
-        for path in sorted(implementation):
-            fingerprint.update(path.read_bytes())
-        inputs = {path for paths in targets.values() for path in paths}
-        for path in cache_inputs:
-            if path.is_dir():
-                inputs.update(item for item in path.rglob("*") if item.is_file())
-            else:
-                inputs.add(path)
-        for path in sorted(inputs):
-            fingerprint.update(str(path).encode() + b"\0" + path.read_bytes() + b"\0")
-        digest = fingerprint.hexdigest()
-        stamp = cache / "inputs.sha256"
-        projection = cache / "source-index.json"
-        # No header list means dependencies are unknown; don't cache a potentially
-        # stale index. The compiled collector itself can still be reused.
-        if (
-            cache_inputs
-            and not force
-            and projection.is_file()
-            and stamp.is_file()
-            and stamp.read_text() == digest
-        ):
-            return SourceIndex.from_dict(
-                json.loads(projection.read_text(encoding="utf-8"))
-            )
 
         binary = cache / "indexer"
         binary_stamp = cache / "indexer.sha256"
@@ -242,10 +244,14 @@ def collect_compile_database(
             binary_stamp.write_text(binary_digest, encoding="utf-8")
 
         collector = SourceCollector(repository, Path(root))
-        # Per-translation-unit caching: each unit's records are keyed by the
-        # command and its own contents, and validated against the include set
-        # the indexer reported on the previous run. A changed unit reindexes
-        # alone; an unchanged unit is reused even when a sibling changed.
+        # Per-translation-unit cache: command + source + container/compiler
+        # identity + compiler-reported dependency hashes. Validated TU
+        # artifacts are aggregated into the final index; there is no separate
+        # whole-tree content fingerprint for agents to maintain.
+        implementation = [
+            *_SOURCE.parent.glob("*.py"),
+            *(_SOURCE.parents[1] / "parser").glob("*.py"),
+        ]
         environment = hashlib.sha256()
         environment.update(
             json.dumps(
@@ -255,6 +261,7 @@ def collect_compile_database(
                     binary_digest,
                     {str(path): value for path, value in mounts.items()},
                     aliases,
+                    {key: sorted(str(path) for path in paths) for key, paths in targets.items()},
                 ),
                 sort_keys=True,
             ).encode()
@@ -264,6 +271,9 @@ def collect_compile_database(
         environment_digest = environment.hexdigest()
 
         def host_path(guest: str) -> Path | None:
+            if not mounts:
+                path = Path(guest)
+                return path if path.is_file() else None
             for host, mount_guest in sorted(
                 mounts.items(), key=lambda item: len(item[1]), reverse=True
             ):
@@ -274,15 +284,40 @@ def collect_compile_database(
                     return host / guest[len(trimmed) + 1 :]
             return None
 
+        def dependency_host_path(raw: str) -> Path | None:
+            """Map a compiler-reported dependency onto the host filesystem.
+
+            Dependencies from the container/toolchain itself are covered by
+            container image identity, so they are not hashed on the host.
+            """
+            mapped = host_path(raw)
+            if mapped is not None:
+                return mapped
+            return None
+
+        file_digests: dict[Path, bytes] = {}
+
+        def file_digest(path: Path) -> bytes:
+            cached = file_digests.get(path)
+            if cached is not None:
+                return cached
+            digest = path.read_bytes()
+            file_digests[path] = digest
+            return digest
+
         tu_cache = cache / "tu"
 
         def deps_digest(deps: list[str]) -> str | None:
             digest = hashlib.sha256()
             for raw in sorted(deps):
-                path = Path(raw)
+                path = dependency_host_path(raw)
+                if path is None:
+                    continue
                 if not path.is_file():
                     return None
-                digest.update(str(path).encode() + b"\0" + path.read_bytes() + b"\0")
+                digest.update(
+                    str(path).encode() + b"\0" + file_digest(path) + b"\0"
+                )
             return digest.hexdigest()
 
         def identity_of(entry: dict) -> str | None:
@@ -297,7 +332,7 @@ def collect_compile_database(
                 ).encode()
                 + b"\0"
             )
-            digest.update(host.read_bytes())
+            digest.update(file_digest(host))
             return digest.hexdigest()
 
         def cached_records(identity: str | None) -> str | None:
@@ -315,11 +350,27 @@ def collect_compile_database(
                 return None
             return ndjson_path.read_text(encoding="utf-8")
 
+        # Which translation units belong to each link namespace: the TU's main
+        # file is listed among that target's source paths (marker ownership).
+        target_units: dict[str, set[str]] = {}
+        for target, paths in targets.items():
+            target_units[target] = {
+                collector.unit_id_for(path)
+                for path in paths
+                if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".c++"}
+                or path.name.endswith((".C", ".CC", ".CPP"))
+            }
+            # Also accept any listed path as a potential main file — projects
+            # may mark ownership with exact compile-entry paths.
+            target_units[target].update(collector.unit_id_for(path) for path in paths)
+
         with tempfile.TemporaryDirectory(prefix="batch-", dir=cache) as raw:
             scratch = Path(raw)
             identities: dict[int, str | None] = {}
             fresh: list[int] = []
+            unit_ids_by_index: dict[int, str] = {}
             for index, entry in enumerate(database):
+                unit_ids_by_index[index] = collector.unit_id_for(entry["file"])
                 identity = None if force else identity_of(entry)
                 identities[index] = identity
                 records = cached_records(identity)
@@ -404,34 +455,35 @@ def collect_compile_database(
                         if record.get("record") == "dependency":
                             deps = [str(path) for path in record.get("files") or []]
                             break
-                    if deps and deps_digest(deps) is not None:
+                    digest = deps_digest(deps)
+                    if digest is not None:
                         tu_cache.mkdir(parents=True, exist_ok=True)
                         (tu_cache / f"{identities[index]}.ndjson").write_text(
                             text, encoding="utf-8"
                         )
                         (tu_cache / f"{identities[index]}.json").write_text(
-                            json.dumps(
-                                {"deps": deps, "deps_digest": deps_digest(deps)}
-                            ),
+                            json.dumps({"deps": deps, "deps_digest": digest}),
                             encoding="utf-8",
                         )
+                unit_id = unit_ids_by_index[index]
                 for line in text.splitlines():
                     if not line.strip():
                         continue
                     record = json.loads(line)
                     if record.get("record") == "dependency":
                         continue
-                    collector.collect_record(record)
+                    collector.collect_record(record, unit_id=unit_id)
         indexes = [
             SourceIndex.from_collector(
-                repository, target, paths, collector, aliases=aliases
+                repository,
+                target,
+                paths,
+                collector,
+                unit_ids=target_units[target],
+                aliases=aliases,
             )
             for target, paths in targets.items()
         ]
-        # All portions share one collector, so the same record object may pass
-        # several targets' filters; keep the first of each identity. Separate
-        # collectors (one link namespace each) must instead keep every winner,
-        # so cross-namespace disagreements stay visible to consistency gates.
         variables: dict[tuple[str | None, str], SourceVariable] = {}
         for part in indexes:
             for item in part.variables:
@@ -442,13 +494,24 @@ def collect_compile_database(
                 conflicts.setdefault(
                     (item.target, item.record_kind, item.semantic_id), item
                 )
+        # Classes are namespaced by target: the same header under different
+        # macros can produce distinct layouts per binary.
+        classes: dict[tuple[str | None, str], object] = {}
+        for part in indexes:
+            for item in part.classes:
+                classes.setdefault((item.target, item.semantic_id), item)
+        declarations: dict[tuple[str | None, tuple[str, ...]], object] = {}
+        for part in indexes:
+            for item in part.declarations:
+                declarations.setdefault(
+                    (item.target, item.merge_key), item
+                )
         result_index = SourceIndex(
-            declarations=(item for part in indexes for item in part.declarations),
-            classes=(item for part in indexes for item in part.classes),
+            declarations=declarations.values(),
+            classes=classes.values(),
             markers=(item for part in indexes for item in part.markers),
             variables=variables.values(),
             conflicts=conflicts.values(),
         )
-        result_index.write(projection)
-        stamp.write_text(digest, encoding="utf-8")
+        result_index.write(cache / "source-index.json")
         return result_index
