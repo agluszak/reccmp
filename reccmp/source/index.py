@@ -2,8 +2,8 @@
 
 The marker parser owns annotation syntax and addresses. Clang owns C++ names,
 function and variable kinds, types, linkage, class membership, inheritance,
-and virtual declarations. This module only joins those two models by source
-location and writes disposable JSON projections for downstream tools.
+and virtual declarations. This module joins those two models by source location
+and writes disposable JSON projections for downstream tools.
 
 Compiler records arrive as per-TU observations. Link-namespace partitioning,
 winner selection, and conflict derivation happen after collection — never by
@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, TextIO
 
 from reccmp.formats import TextFile
 from reccmp.parser.codebase import DecompCodebase
@@ -27,6 +27,7 @@ from reccmp.parser.marker import MarkerType, ProjectAliases
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
+_SCHEMA = "reccmp-source-index-v3"
 
 
 class SourceIndexError(ValueError):
@@ -57,11 +58,7 @@ class SourceDeclaration:
     linkage: str = ""
     storage_class: str = ""
     is_variadic: bool = False
-    # Compilation unit that observed this declaration (repo-relative main file).
-    # External entities share one identity across units; non-external ones are
-    # distinct per unit even when their unmangled spelling collides.
     unit_id: str = ""
-    # Link namespace (reccmp target) assigned when observations are partitioned.
     target: str | None = None
 
     @property
@@ -75,8 +72,7 @@ class SourceDeclaration:
 
     @property
     def is_external(self) -> bool:
-        """Genuinely cross-TU linkage. Internal, unique-external (anonymous
-        namespace) and unlinked declarations never join across units."""
+        """Genuinely cross-TU linkage."""
         return self.linkage == "external"
 
     @property
@@ -107,7 +103,6 @@ class SourceField:
     type: str
     source_file: str
     line: int
-
     pointer_depth: int | None = None
 
 
@@ -180,53 +175,42 @@ class _NamespaceRecords:
     size_assertions: dict[str, int]
 
 
-class SourceCollector:
-    """Accumulate per-TU compiler observations without merging them.
+@dataclass
+class TranslationUnitRecords:
+    """Raw compiler observations from one translation unit.
 
-    Call ``derive()`` (or ``SourceIndex.from_collector``) to partition by link
-    namespace, group entities, and produce winners plus conflicts.
+    No winner selection or conflict tracking happens here — that is derived
+    after observations are grouped by link namespace.
     """
 
-    def __init__(self, repository: Path, compilation_root: Path | None = None) -> None:
-        self.repository = repository.resolve()
-        self.compilation_root = compilation_root
-        self.declarations: list[SourceDeclaration] = []
-        self.variables: list[SourceVariable] = []
-        self.classes: list[SourceClass] = []
-        self.size_assertions: list[_SizeAssertion] = []
+    unit_id: str
+    declarations: list[SourceDeclaration] = field(default_factory=list)
+    variables: list[SourceVariable] = field(default_factory=list)
+    classes: list[SourceClass] = field(default_factory=list)
+    size_assertions: list[_SizeAssertion] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
 
-    def collect_records(self, records: str, *, unit_id: str = "") -> None:
-        """Consume a compiler's newline-delimited JSON output."""
-        for line in records.splitlines():
-            if line.strip():
-                self.collect_record(json.loads(line), unit_id=unit_id)
-
-    def collect_record(self, record: Mapping[str, Any], *, unit_id: str = "") -> None:
-        """Store one compiler observation without collapsing identities.
-
-        Non-external variables are dropped: the compiler already checks them
-        inside their translation unit, and they have no legitimate cross-TU
-        writer/reader disagreement to report. Conflicting size assertions are
-        checked only after partitioning by link namespace.
-        """
+    def add(self, record: Mapping[str, Any]) -> None:
+        """Store one compiler observation from this unit."""
         values = dict(record)
         kind = values.pop("record")
         if kind == "dependency":
+            self.dependencies = [str(path) for path in values.get("files") or ()]
             return
         if kind == "declaration":
-            declaration = _declaration_from_dict({**values, "unit_id": unit_id})
-            self.declarations.append(declaration)
+            self.declarations.append(
+                _declaration_from_dict({**values, "unit_id": self.unit_id})
+            )
         elif kind == "variable":
-            variable = _variable_from_dict({**values, "unit_id": unit_id})
-            if not variable.is_external:
-                return
-            self.variables.append(variable)
+            variable = _variable_from_dict({**values, "unit_id": self.unit_id})
+            if variable.is_external:
+                self.variables.append(variable)
         elif kind == "class":
-            self.classes.append(_class_from_dict({**values, "unit_id": unit_id}))
+            self.classes.append(_class_from_dict({**values, "unit_id": self.unit_id}))
         elif kind == "size-assertion":
             self.size_assertions.append(
                 _SizeAssertion(
-                    unit_id=unit_id,
+                    unit_id=self.unit_id,
                     qualified_name=str(values["qualified_name"]),
                     asserted_size=int(values["asserted_size"]),
                 )
@@ -236,74 +220,110 @@ class SourceCollector:
                 f"the source indexer emitted an unknown record: {kind!r}"
             )
 
-    def _relative(self, source_file: str) -> str:
-        path = Path(source_file)
-        if self.compilation_root is not None:
-            try:
-                suffix = path.relative_to(self.compilation_root)
-            except ValueError:
-                pass
-            else:
-                path = self.repository / suffix
+    @classmethod
+    def load(cls, path: Path, unit_id: str) -> "TranslationUnitRecords":
+        """Stream one NDJSON artifact into a TU record set."""
+        unit = cls(unit_id=unit_id)
+        with path.open(encoding="utf-8") as handle:
+            unit.extend_stream(handle)
+        return unit
+
+    def extend_stream(self, handle: TextIO) -> None:
+        for line in handle:
+            if line.strip():
+                self.add(json.loads(line))
+
+
+def relative_unit_id(
+    repository: Path, main_file: str | Path, compilation_root: Path | None = None
+) -> str:
+    """Repo-relative identity of a translation unit's main file."""
+    path = Path(main_file)
+    if compilation_root is not None:
         try:
-            return path.resolve().relative_to(self.repository).as_posix()
+            path = repository / path.relative_to(compilation_root)
         except ValueError:
-            return path.as_posix()
+            pass
+    try:
+        return path.resolve().relative_to(repository.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def derive_namespace(
+    units: Sequence[TranslationUnitRecords],
+    *,
+    target: str | None = None,
+    unit_ids: set[str] | None = None,
+) -> _NamespaceRecords:
+    """Partition TU observations, then derive winners and conflicts."""
+
+    def belongs(unit_id: str) -> bool:
+        return unit_ids is None or unit_id in unit_ids
+
+    selected = [unit for unit in units if belongs(unit.unit_id)]
+    declarations = [item for unit in selected for item in unit.declarations]
+    variables = [item for unit in selected for item in unit.variables]
+    classes = [item for unit in selected for item in unit.classes]
+    assertions = [item for unit in selected for item in unit.size_assertions]
+
+    derived_declarations, declaration_conflicts = _derive_entities(
+        declarations,
+        key=lambda item: item.merge_key,
+        rank=lambda item: 1 if item.is_definition else 0,
+        record_kind="declaration",
+        target=target,
+    )
+    derived_variables, variable_conflicts = _derive_entities(
+        variables,
+        key=lambda item: (item.semantic_id,),
+        rank=lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
+        record_kind="variable",
+        target=target,
+    )
+    derived_classes = _derive_classes(classes, target=target)
+    size_assertions = _derive_size_assertions(assertions)
+    return _NamespaceRecords(
+        declarations=derived_declarations,
+        variables=derived_variables,
+        classes=tuple(
+            replace(item, asserted_size=size_assertions.get(item.qualified_name))
+            for item in derived_classes
+        ),
+        conflicts=declaration_conflicts + variable_conflicts,
+        size_assertions=size_assertions,
+    )
+
+
+# Test/fixture helper: accumulate observations across units without merging.
+class SourceCollector:
+    """Fixture helper that gathers ``TranslationUnitRecords`` by unit id."""
+
+    def __init__(self, repository: Path, compilation_root: Path | None = None) -> None:
+        self.repository = repository.resolve()
+        self.compilation_root = compilation_root
+        self.units: dict[str, TranslationUnitRecords] = {}
 
     def unit_id_for(self, main_file: str | Path) -> str:
-        """Repo-relative identity of a translation unit's main file."""
-        return self._relative(str(main_file))
+        return relative_unit_id(self.repository, main_file, self.compilation_root)
+
+    def collect_record(self, record: Mapping[str, Any], *, unit_id: str = "") -> None:
+        self.units.setdefault(unit_id, TranslationUnitRecords(unit_id)).add(record)
+
+    def collect_records(self, records: str, *, unit_id: str = "") -> None:
+        for line in records.splitlines():
+            if line.strip():
+                self.collect_record(json.loads(line), unit_id=unit_id)
+
+    @property
+    def variables(self) -> list[SourceVariable]:
+        return [item for unit in self.units.values() for item in unit.variables]
 
     def derive(
-        self,
-        *,
-        target: str | None = None,
-        unit_ids: set[str] | None = None,
+        self, *, target: str | None = None, unit_ids: set[str] | None = None
     ) -> _NamespaceRecords:
-        """Partition observations, then derive winners and conflicts.
-
-        An observation belongs to the namespace when its compilation unit is in
-        ``unit_ids``. When ``unit_ids`` is omitted, every observation is kept
-        (single-namespace fixtures and tests).
-        """
-
-        def belongs(unit_id: str) -> bool:
-            return unit_ids is None or unit_id in unit_ids
-
-        declarations = [item for item in self.declarations if belongs(item.unit_id)]
-        variables = [item for item in self.variables if belongs(item.unit_id)]
-        classes = [item for item in self.classes if belongs(item.unit_id)]
-        assertions = [item for item in self.size_assertions if belongs(item.unit_id)]
-
-        derived_declarations, declaration_conflicts = _derive_entities(
-            declarations,
-            key=lambda item: item.merge_key,
-            rank=lambda item: 1 if item.is_definition else 0,
-            record_kind="declaration",
-            target=target,
-        )
-        derived_variables, variable_conflicts = _derive_entities(
-            variables,
-            key=lambda item: (item.semantic_id,),
-            rank=lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
-            record_kind="variable",
-            target=target,
-        )
-        derived_classes = _derive_classes(classes, target=target)
-        size_assertions = _derive_size_assertions(assertions)
-
-        return _NamespaceRecords(
-            declarations=derived_declarations,
-            variables=derived_variables,
-            classes=tuple(
-                replace(
-                    item,
-                    asserted_size=size_assertions.get(item.qualified_name),
-                )
-                for item in derived_classes
-            ),
-            conflicts=declaration_conflicts + variable_conflicts,
-            size_assertions=size_assertions,
+        return derive_namespace(
+            tuple(self.units.values()), target=target, unit_ids=unit_ids
         )
 
 
@@ -315,7 +335,6 @@ def _derive_entities(
     record_kind: str,
     target: str | None,
 ) -> tuple[tuple[Any, ...], tuple[SourceConflict, ...]]:
-    """Group observations by merge key, pick a winner, retain type conflicts."""
     groups: dict[tuple[str, ...], list[Any]] = {}
     for item in observations:
         groups.setdefault(key(item), []).append(item)
@@ -344,8 +363,7 @@ def _derive_entities(
                     record_kind=record_kind,
                     variants=tuple(
                         SourceConflictVariant(
-                            signature=signature,
-                            locations=tuple(locations),
+                            signature=signature, locations=tuple(locations)
                         )
                         for signature, locations in variants.items()
                     ),
@@ -388,11 +406,12 @@ def _command_arguments(entry: dict[str, Any]) -> list[str]:
     return shlex.split(str(entry["command"]), posix=True)
 
 
-def ast_command(
-    entry: dict[str, Any], clang: str | None, command_prefix: Sequence[str]
+def record_command(
+    entry: dict[str, Any], indexer: str, clang: str | None = None
 ) -> list[str]:
+    """Normalize a compile-database entry into an indexer driver command."""
     arguments = _command_arguments(entry)
-    compiler = [clang or arguments[0]] if not command_prefix else list(command_prefix)
+    compiler = clang or arguments[0]
     filtered: list[str] = []
     skip_next = False
     for argument in arguments[1:]:
@@ -411,14 +430,20 @@ def ast_command(
         separator = filtered.index("--")
     except ValueError:
         separator = len(filtered)
-    ast_options = ["-fsyntax-only", "-Xclang", "-ast-dump=json"]
-    return [*compiler, *filtered[:separator], *ast_options, *filtered[separator:]]
+    return [
+        indexer,
+        compiler,
+        *filtered[:separator],
+        "-fsyntax-only",
+        *filtered[separator:],
+    ]
 
 
 def _declaration_from_dict(values: Mapping[str, Any]) -> SourceDeclaration:
     data = dict(values)
     for key in ("parameter_types", "parameter_references", "parameter_reference_forms"):
         data[key] = tuple(data.get(key) or ())
+    data.pop("declaration_key", None)
     return SourceDeclaration(**data)
 
 
@@ -456,6 +481,139 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     )
 
 
+def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
+    """Serialize a marker with a declaration key instead of a nested copy."""
+    payload = {
+        "address": marker.address,
+        "marker_kind": marker.marker_kind,
+        "source_file": marker.source_file,
+        "line": marker.line,
+        "marker_name": marker.marker_name,
+        "folded": marker.folded,
+        "target": marker.target,
+        "declaration_key": None,
+    }
+    if marker.declaration is not None:
+        payload["declaration_key"] = [
+            marker.declaration.target,
+            marker.declaration.semantic_id,
+        ]
+    return payload
+
+
+def _join_markers(
+    repository: Path,
+    target: str,
+    source_paths: Sequence[Path],
+    namespace: _NamespaceRecords,
+    *,
+    aliases: ProjectAliases | None,
+) -> tuple[list[SourceClass], list[SourceMarker]]:
+    files = tuple(TextFile.from_files(source_paths))
+    codebase = DecompCodebase(files, target, aliases=aliases)
+    declarations = namespace.declarations
+    by_location: dict[tuple[str, int], list[SourceDeclaration]] = {}
+    for declaration in declarations:
+        if declaration.is_definition:
+            by_location.setdefault(
+                (declaration.source_file, declaration.line), []
+            ).append(declaration)
+
+    markers: list[SourceMarker] = []
+    for method_symbol in (
+        *codebase.iter_line_functions(),
+        *codebase.iter_name_functions(),
+    ):
+        relative = (
+            Path(method_symbol.filename)
+            .resolve()
+            .relative_to(repository.resolve())
+            .as_posix()
+        )
+        candidates = by_location.get((relative, method_symbol.line_number), [])
+        marker_declaration: SourceDeclaration | None = None
+        if method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}:
+            if len(candidates) != 1:
+                raise SourceIndexError(
+                    f"{relative}:{method_symbol.line_number}: {method_symbol.type.name} "
+                    f"0x{method_symbol.offset:08x} "
+                    f"binds to {len(candidates)} function definitions"
+                )
+            marker_declaration = candidates[0]
+        markers.append(
+            SourceMarker(
+                address=method_symbol.offset,
+                marker_kind=method_symbol.type.name,
+                source_file=relative,
+                line=method_symbol.line_number,
+                declaration=marker_declaration,
+                folded=method_symbol.is_folded,
+                target=target,
+                marker_name=(
+                    method_symbol.name if marker_declaration is None else None
+                ),
+            )
+        )
+
+    classes = list(namespace.classes)
+    class_by_location = {
+        (item.source_file, item.line): index for index, item in enumerate(classes)
+    }
+    class_by_name = {item.qualified_name: index for index, item in enumerate(classes)}
+    for vtable_symbol in codebase.iter_vtables():
+        relative = (
+            Path(vtable_symbol.filename)
+            .resolve()
+            .relative_to(repository.resolve())
+            .as_posix()
+        )
+        key = (relative, vtable_symbol.line_number)
+        index = class_by_location.get(key)
+        if index is None:
+            index = class_by_name.get(vtable_symbol.name)
+        if index is None:
+            source_class = SourceClass(
+                semantic_id=f"record:{vtable_symbol.name}",
+                qualified_name=vtable_symbol.name,
+                bases=(),
+                fields=(),
+                virtual_declarations=(),
+                source_file=relative,
+                line=vtable_symbol.line_number,
+                end_line=vtable_symbol.line_number,
+                vtable_address=vtable_symbol.offset,
+                target=target,
+            )
+            classes.append(source_class)
+            class_by_name[source_class.qualified_name] = len(classes) - 1
+            continue
+        source_class = classes[index]
+        base_class = vtable_symbol.base_class
+        class_names = {
+            source_class.qualified_name,
+            source_class.qualified_name.rsplit("::", 1)[-1],
+        }
+        if base_class is not None and base_class not in class_names:
+            base_vtable = SourceBaseVtable(vtable_symbol.offset, base_class)
+            if base_vtable in source_class.base_vtables:
+                raise SourceIndexError(
+                    f"{relative}:{vtable_symbol.line_number}: duplicate VTABLE marker "
+                    f"for base {base_class}"
+                )
+            classes[index] = replace(
+                source_class,
+                base_vtables=(*source_class.base_vtables, base_vtable),
+            )
+            continue
+        if source_class.vtable_address is not None:
+            raise SourceIndexError(
+                f"{relative}:{vtable_symbol.line_number}: class has more than one "
+                "primary VTABLE marker"
+            )
+        classes[index] = replace(source_class, vtable_address=vtable_symbol.offset)
+    return classes, markers
+
+
 class SourceIndex:
     """Canonical marker plus Clang semantic source index."""
 
@@ -479,6 +637,30 @@ class SourceIndex:
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
 
     @classmethod
+    def from_units(
+        cls,
+        repository: Path,
+        target: str,
+        source_paths: Sequence[Path],
+        units: Sequence[TranslationUnitRecords],
+        *,
+        unit_ids: set[str] | None = None,
+        aliases: ProjectAliases | None = None,
+    ) -> "SourceIndex":
+        """Derive one link namespace from TU observations, then join markers."""
+        namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+        classes, markers = _join_markers(
+            repository, target, source_paths, namespace, aliases=aliases
+        )
+        return cls(
+            declarations=namespace.declarations,
+            classes=classes,
+            markers=markers,
+            variables=namespace.variables,
+            conflicts=namespace.conflicts,
+        )
+
+    @classmethod
     def from_collector(
         cls,
         repository: Path,
@@ -489,168 +671,43 @@ class SourceIndex:
         unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
-        """Derive one link namespace from collected observations, then join markers.
-
-        ``unit_ids`` names the translation units that belong to this namespace
-        (repo-relative main files). When omitted, every observation is treated
-        as belonging to ``target`` — appropriate for fixtures that never ran a
-        multi-target batch.
-        """
-        files = tuple(TextFile.from_files(source_paths))
-        codebase = DecompCodebase(files, target, aliases=aliases)
-        namespace = collector.derive(target=target, unit_ids=unit_ids)
-        declarations = namespace.declarations
-        variables = namespace.variables
-        conflicts = namespace.conflicts
-
-        by_location: dict[tuple[str, int], list[SourceDeclaration]] = {}
-        for declaration in declarations:
-            if declaration.is_definition:
-                by_location.setdefault(
-                    (declaration.source_file, declaration.line), []
-                ).append(declaration)
-
-        markers: list[SourceMarker] = []
-        for method_symbol in (
-            *codebase.iter_line_functions(),
-            *codebase.iter_name_functions(),
-        ):
-            relative = (
-                Path(method_symbol.filename)
-                .resolve()
-                .relative_to(repository.resolve())
-                .as_posix()
-            )
-            candidates = by_location.get((relative, method_symbol.line_number), [])
-            marker_declaration: SourceDeclaration | None = None
-            if method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}:
-                if len(candidates) != 1:
-                    raise SourceIndexError(
-                        f"{relative}:{method_symbol.line_number}: {method_symbol.type.name} "
-                        f"0x{method_symbol.offset:08x} "
-                        f"binds to {len(candidates)} function definitions"
-                    )
-                marker_declaration = candidates[0]
-            markers.append(
-                SourceMarker(
-                    address=method_symbol.offset,
-                    marker_kind=method_symbol.type.name,
-                    source_file=relative,
-                    line=method_symbol.line_number,
-                    declaration=marker_declaration,
-                    folded=method_symbol.is_folded,
-                    target=target,
-                    marker_name=(
-                        method_symbol.name if marker_declaration is None else None
-                    ),
-                )
-            )
-
-        classes = list(namespace.classes)
-        class_by_location = {
-            (item.source_file, item.line): index for index, item in enumerate(classes)
-        }
-        class_by_name = {
-            item.qualified_name: index for index, item in enumerate(classes)
-        }
-        for vtable_symbol in codebase.iter_vtables():
-            relative = (
-                Path(vtable_symbol.filename)
-                .resolve()
-                .relative_to(repository.resolve())
-                .as_posix()
-            )
-            key = (relative, vtable_symbol.line_number)
-            index = class_by_location.get(key)
-            if index is None:
-                # Template-specialization vtables are commonly accounted for by
-                # a standalone class comment instead of a repeated source
-                # declaration:
-                #
-                #   // VTABLE: TARGET 0x1234
-                #   // class Vector<Element *>
-                #
-                # The marker parser already recovers that qualified class name.
-                # Bind it to Clang's canonical specialization rather than
-                # attaching it positionally to the next class definition.
-                index = class_by_name.get(vtable_symbol.name)
-            if index is None:
-                # A standalone specialization annotation need not be named by
-                # any explicit source declaration. Preserve that reviewed
-                # identity as an annotation-owned record; if Clang did emit the
-                # specialization, the name lookup above retains its bases,
-                # fields, virtual declarations, and source extent instead.
-                source_class = SourceClass(
-                    semantic_id=f"record:{vtable_symbol.name}",
-                    qualified_name=vtable_symbol.name,
-                    bases=(),
-                    fields=(),
-                    virtual_declarations=(),
-                    source_file=relative,
-                    line=vtable_symbol.line_number,
-                    end_line=vtable_symbol.line_number,
-                    vtable_address=vtable_symbol.offset,
-                    target=target,
-                )
-                classes.append(source_class)
-                class_by_name[source_class.qualified_name] = len(classes) - 1
-                continue
-            source_class = classes[index]
-            base_class = vtable_symbol.base_class
-            class_names = {
-                source_class.qualified_name,
-                source_class.qualified_name.rsplit("::", 1)[-1],
-            }
-            if base_class is not None and base_class not in class_names:
-                base_vtable = SourceBaseVtable(vtable_symbol.offset, base_class)
-                if base_vtable in source_class.base_vtables:
-                    raise SourceIndexError(
-                        f"{relative}:{vtable_symbol.line_number}: duplicate VTABLE marker "
-                        f"for base {base_class}"
-                    )
-                classes[index] = replace(
-                    source_class,
-                    base_vtables=(*source_class.base_vtables, base_vtable),
-                )
-                continue
-            if source_class.vtable_address is not None:
-                raise SourceIndexError(
-                    f"{relative}:{vtable_symbol.line_number}: class has more than one "
-                    "primary VTABLE marker"
-                )
-            classes[index] = replace(source_class, vtable_address=vtable_symbol.offset)
-
-        return cls(
-            declarations=declarations,
-            classes=classes,
-            markers=markers,
-            variables=variables,
-            conflicts=conflicts,
+        """Derive from a fixture ``SourceCollector`` (tests)."""
+        return cls.from_units(
+            repository,
+            target,
+            source_paths,
+            tuple(collector.units.values()),
+            unit_ids=unit_ids,
+            aliases=aliases,
         )
 
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records."""
-        if document.get("schema") != "reccmp-source-index-v2":
+        schema = document.get("schema")
+        if schema not in {_SCHEMA, "reccmp-source-index-v2"}:
             raise SourceIndexError("unsupported source-index schema")
+        declarations = tuple(
+            _declaration_from_dict(item) for item in document["declarations"]
+        )
+        by_key = {(item.target, item.semantic_id): item for item in declarations}
+        markers: list[SourceMarker] = []
+        for item in document["markers"]:
+            values = dict(item)
+            if "declaration_key" in values:
+                key = values.pop("declaration_key")
+                values.pop("declaration", None)
+                declaration = by_key.get(tuple(key)) if key else None
+            elif values.get("declaration"):
+                declaration = _declaration_from_dict(values.pop("declaration"))
+            else:
+                values.pop("declaration", None)
+                declaration = None
+            markers.append(SourceMarker(**values, declaration=declaration))
         return cls(
-            declarations=(
-                _declaration_from_dict(item) for item in document["declarations"]
-            ),
+            declarations=declarations,
             classes=(_class_from_dict(item) for item in document["classes"]),
-            markers=(
-                SourceMarker(
-                    **{
-                        **item,
-                        "declaration": (
-                            _declaration_from_dict(item["declaration"])
-                            if item.get("declaration")
-                            else None
-                        ),
-                    }
-                )
-                for item in document["markers"]
-            ),
+            markers=markers,
             variables=(
                 _variable_from_dict(item) for item in document.get("variables", ())
             ),
@@ -683,7 +740,6 @@ class SourceIndex:
         return functions
 
     @classmethod
-    # pylint: disable=too-many-arguments
     def from_compile_database(
         cls,
         repository: Path,
@@ -692,22 +748,17 @@ class SourceIndex:
         *,
         clang: str | None = None,
         jobs: int | None = None,
-        container_image: str | None = None,
-        mounts: Mapping[Path, str] | None = None,
-        compilation_root: Path | None = None,
         cache_dir: Path | None = None,
         force: bool = False,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
-        """Collect direct AST records in parallel, once for all marker targets.
+        """Collect direct AST records natively, once for all marker targets.
 
-        A container image runs the whole batch in one container; mounts describe
-        the paths already used by its compile database. Native collection uses
-        each entry's working directory. The image/host needs Clang and LLVM 19
-        development libraries. Per-TU dependency digests invalidate the cache.
+        Expects to run in the same filesystem as the compile database (typically
+        inside the pinned analysis image). ``RECCMP_SOURCE_INDEXER`` or
+        ``reccmp-source-indexer`` on ``PATH`` supplies a prebuilt collector;
+        otherwise the collector is built once into ``cache_dir`` against LLVM 19.
         """
-        # Delay the execution backend until collection is requested. The record
-        # model remains importable without a Linux compiler environment.
         # pylint: disable=import-outside-toplevel
         from .batch import collect_compile_database
 
@@ -717,9 +768,6 @@ class SourceIndex:
             targets,
             clang=clang,
             jobs=jobs,
-            container_image=container_image,
-            mounts=mounts,
-            compilation_root=compilation_root,
             cache_dir=cache_dir,
             force=force,
             aliases=aliases,
@@ -727,8 +775,8 @@ class SourceIndex:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "reccmp-source-index-v2",
-            "markers": [asdict(item) for item in self.markers],
+            "schema": _SCHEMA,
+            "markers": [_marker_projection(item) for item in self.markers],
             "declarations": [asdict(item) for item in self.declarations],
             "classes": [asdict(item) for item in self.classes],
             "variables": [asdict(item) for item in self.variables],
@@ -737,6 +785,7 @@ class SourceIndex:
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        content = json.dumps(self.to_dict(), indent=2) + "\n"
-        if not path.is_file() or path.read_text(encoding="utf-8") != content:
-            path.write_text(content, encoding="utf-8")
+        content = json.dumps(self.to_dict(), separators=(",", ":")) + "\n"
+        encoded = content.encode("utf-8")
+        if not path.is_file() or path.read_bytes() != encoded:
+            path.write_bytes(encoded)

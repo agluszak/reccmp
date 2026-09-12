@@ -1,0 +1,22 @@
+FROM debian:trixie-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    clang \
+    llvm-19-dev \
+    libclang-19-dev \
+    libclang-cpp19-dev \
+    ca-certificates \
+    curl \
+  && ln -sf /usr/bin/clang-19 /usr/bin/clang-cl \
+  && rm -rf /var/lib/apt/lists/*
+COPY reccmp/source/indexer.cpp /tmp/indexer.cpp
+RUN clang++ -O2 -std=c++17 -fno-rtti -fno-exceptions \
+      -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS \
+      -I/usr/lib/llvm-19/include /tmp/indexer.cpp \
+      -o /usr/local/bin/reccmp-source-indexer \
+      /usr/lib/llvm-19/lib/libclang-cpp.so.19.1 \
+      /usr/lib/llvm-19/lib/libLLVM.so.19.1 \
+  && rm /tmp/indexer.cpp
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+ENV RECCMP_SOURCE_INDEXER=/usr/local/bin/reccmp-source-indexer

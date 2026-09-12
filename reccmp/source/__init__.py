@@ -3,19 +3,21 @@
 from .index import (
     SourceBaseVtable,
     SourceClass,
+    SourceCollector,
     SourceDeclaration,
     SourceField,
     SourceIndex,
     SourceIndexError,
     SourceMarker,
-    SourceCollector,
-    ast_command,
+    TranslationUnitRecords,
+    record_command,
 )
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [
     "SourceBaseVtable",
     "SourceClass",
+    "SourceCollector",
     "SourceConflict",
     "SourceConflictVariant",
     "SourceDeclaration",
@@ -23,7 +25,7 @@ __all__ = [
     "SourceIndex",
     "SourceIndexError",
     "SourceMarker",
-    "SourceCollector",
     "SourceVariable",
-    "ast_command",
+    "TranslationUnitRecords",
+    "record_command",
 ]
