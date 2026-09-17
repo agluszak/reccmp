@@ -12,6 +12,9 @@ from .diagnosis import (
     ComparisonDifference,
     ComparisonStatus,
     DifferenceSide,
+    EquivalenceLevel,
+    StackPermutationEntry,
+    derive_equivalence_level,
 )
 from .diff import (
     CombinedDiffOutput,
@@ -61,6 +64,10 @@ class ReccmpComparedEntity:
     """True if this entity had no fixed recomp address across the
     samples combined by reccmp-aggregate."""
 
+    stack_permutation: tuple[StackPermutationEntry, ...] = ()
+    accuracy_modulo_stack: float | None = None
+    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
+
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies
 
@@ -82,6 +89,11 @@ class ReccmpComparedEntity:
         """Per-function diagnostic similarity, never an aggregate score."""
         return self.analysis.semantic_similarity
 
+    def refresh_equivalence_level(self) -> None:
+        self.equivalence_level = derive_equivalence_level(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+        )
 
 class ReccmpStatusReport:
     filename: str
@@ -319,6 +331,9 @@ class JSONEntityVersion1:
     diff: CombinedDiffOutput | None = None
     # EntityType as int. Older reports do not include this field.
     type: int | None = None
+    accuracy_modulo_stack: float | None = None
+    stack_permutation: list[dict[str, object]] | None = None
+    equivalence_level: str | None = None
 
 
 class JSONReportVersion1(BaseModel):
@@ -444,6 +459,20 @@ def _serialize_version_1(
                 library=entity.is_library,
                 diff=(get_udiff_for_entity(entity) if diff_included else None),
                 type=int(entity.type) if entity.type is not None else None,
+                accuracy_modulo_stack=entity.accuracy_modulo_stack,
+                stack_permutation=(
+                    [
+                        {
+                            "orig": entry.orig,
+                            "recomp": entry.recomp,
+                            **({"symbol": entry.symbol} if entry.symbol else {}),
+                        }
+                        for entry in entity.stack_permutation
+                    ]
+                    if entity.stack_permutation
+                    else None
+                ),
+                equivalence_level=entity.equivalence_level.value,
             )
         )
 
@@ -501,10 +530,50 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             udiff=e.diff,
             report_diff=e.diff,
             recomp_addr_varies=various,
+            accuracy_modulo_stack=e.accuracy_modulo_stack,
+            stack_permutation=_parse_stack_permutation(e.stack_permutation),
+            equivalence_level=_parse_equivalence_level(
+                e.equivalence_level, analysis, e.accuracy_modulo_stack
+            ),
         )
 
     report.update_function_count()
     return report
+
+
+def _parse_stack_permutation(
+    value: list[dict[str, object]] | None,
+) -> tuple[StackPermutationEntry, ...]:
+    if not value:
+        return ()
+    entries: list[StackPermutationEntry] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ReccmpReportDeserializeError
+        orig = item.get("orig")
+        recomp = item.get("recomp")
+        symbol = item.get("symbol")
+        if not isinstance(orig, str) or not isinstance(recomp, str):
+            raise ReccmpReportDeserializeError
+        if symbol is not None and not isinstance(symbol, str):
+            raise ReccmpReportDeserializeError
+        entries.append(StackPermutationEntry(orig, recomp, symbol))
+    return tuple(entries)
+
+
+def _parse_equivalence_level(
+    value: str | None,
+    analysis: ComparisonAnalysis,
+    accuracy_modulo_stack: float | None,
+) -> EquivalenceLevel:
+    if value is not None:
+        try:
+            return EquivalenceLevel(value)
+        except ValueError as ex:
+            raise ReccmpReportDeserializeError from ex
+    return derive_equivalence_level(
+        analysis, accuracy_modulo_stack=accuracy_modulo_stack
+    )
 
 
 def _parse_report_diff(value: object) -> CombinedDiffOutput | None:

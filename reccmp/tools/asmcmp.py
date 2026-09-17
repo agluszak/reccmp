@@ -24,7 +24,11 @@ from reccmp.compare.exact import compare_object_to_original
 from reccmp.formats.coff import parse_coff_object
 from reccmp.formats.detect import detect_image
 from reccmp.formats.pe import PEImage
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    EquivalenceLevel,
+)
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.compare.report import (
@@ -103,6 +107,48 @@ def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
     return "\n".join(lines)
 
 
+def mismatch_source_pin_text(match: ReccmpComparedEntity) -> str | None:
+    """First recomp source line attached to a structured mismatch, if any."""
+    difference = match.analysis.difference
+    if difference is None:
+        return None
+    facts = difference.recomp.facts
+    path = facts.get("source_path")
+    line = facts.get("source_line")
+    if isinstance(path, str) and isinstance(line, int):
+        return f"probable first source-level discrepancy: {path}:{line}"
+    return None
+
+
+def stack_layout_text(match: ReccmpComparedEntity) -> str | None:
+    """Human-readable stack permutation / modulo-stack score."""
+    if not match.stack_permutation and match.accuracy_modulo_stack is None:
+        return None
+    lines: list[str] = []
+    if match.accuracy_modulo_stack is not None:
+        raw = percent_string(match.accuracy)
+        modulo = percent_string(match.accuracy_modulo_stack)
+        lines.append(f"{raw} raw / {modulo} modulo stack allocation")
+    if match.stack_permutation:
+        lines.append("stack permutation:")
+        for entry in match.stack_permutation:
+            if entry.orig == entry.recomp:
+                continue
+            symbol = f"  {entry.symbol}" if entry.symbol else ""
+            lines.append(f"    {entry.orig} -> {entry.recomp}{symbol}")
+    return "\n".join(lines) if lines else None
+
+
+def equivalence_level_text(match: ReccmpComparedEntity) -> str | None:
+    level = match.equivalence_level
+    if level in (
+        EquivalenceLevel.EXACT_INSTRUCTIONS,
+        EquivalenceLevel.UNKNOWN_DIFFERENCE,
+    ):
+        return None
+    return f"equivalence: {level.value.replace('_', ' ')}"
+
+
 def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = False):
     percenttext = percent_string(match.effective_accuracy, match.is_effective_match)
 
@@ -130,6 +176,12 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
                 f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior)."
                 f"\n{note}\n\n{ok_text}\n\n"
             )
+            stack = stack_layout_text(match)
+            if stack is not None:
+                print(stack)
+            level = equivalence_level_text(match)
+            if level is not None:
+                print(level)
 
     else:
         print_combined_diff(udiff, show_both_addrs)
@@ -140,6 +192,15 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             print(
                 f"\n{match.name} is only {percenttext} similar to the original, diff above"
             )
+        stack = stack_layout_text(match)
+        if stack is not None:
+            print(stack)
+        level = equivalence_level_text(match)
+        if level is not None:
+            print(level)
+        source_pin = mismatch_source_pin_text(match)
+        if source_pin is not None:
+            print(source_pin)
         diagnostic = inconclusive_diagnostic_text(match.analysis)
         if diagnostic is not None:
             print(diagnostic)
@@ -163,8 +224,20 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         semantic = semantic_similarity_text(match)
         if semantic is not None:
             print(f"  {match.name} ({addrs}) has {semantic}")
+        elif (
+            match.accuracy_modulo_stack is not None
+            and match.accuracy_modulo_stack > match.accuracy
+        ):
+            raw = percent_string(match.accuracy)
+            modulo = percent_string(match.accuracy_modulo_stack)
+            print(
+                f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack"
+            )
         else:
             print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
+        level = equivalence_level_text(match)
+        if level is not None and match.effective_accuracy < 1.0:
+            print(f"    {level}")
 
 
 def parse_args() -> argparse.Namespace:

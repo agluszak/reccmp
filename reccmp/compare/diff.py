@@ -2,7 +2,13 @@ import dataclasses
 from typing import Iterable, Sequence
 from typing_extensions import NotRequired, TypedDict
 from reccmp.difflib import DiffOpcode, get_grouped_opcodes
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    EquivalenceLevel,
+    StackPermutationEntry,
+    derive_equivalence_level,
+)
 
 CombinedDiffInput = list[tuple[str, str]]
 
@@ -21,11 +27,19 @@ class EntityCompareResult:
     analysis: ComparisonAnalysis = dataclasses.field(
         default_factory=lambda: ComparisonAnalysis.inconclusive("analysis_limit")
     )
+    stack_permutation: tuple[StackPermutationEntry, ...] = ()
+    accuracy_modulo_stack: float | None = None
+    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     @property
     def is_effective_match(self) -> bool:
         return self.analysis.status == ComparisonStatus.EFFECTIVE
 
+    def refresh_equivalence_level(self) -> None:
+        self.equivalence_level = derive_equivalence_level(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+        )
 
 class MatchingOrMismatchingBlock(TypedDict):
     # I tried a union and narrowing, but this does not work in mypy - see https://github.com/python/mypy/issues/11080

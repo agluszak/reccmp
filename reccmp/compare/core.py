@@ -594,6 +594,9 @@ class Compare:
             is_stub=match.get("stub", False),
             is_library=match.get("library", False),
             rdiff=result.diff,
+            stack_permutation=result.stack_permutation,
+            accuracy_modulo_stack=result.accuracy_modulo_stack,
+            equivalence_level=result.equivalence_level,
         )
 
     ## Public API

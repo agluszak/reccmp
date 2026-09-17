@@ -21,6 +21,57 @@ class ComparisonStatus(Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class EquivalenceLevel(Enum):
+    """Graded claims about how two instruction streams relate.
+
+    Stronger levels mean a tighter claim.  These are intentionally separate from
+    ``ComparisonStatus``: a proved EFFECTIVE match still carries the specific
+    entropy class that justified the proof, and a non-proof stack collapse is
+    reported as STACK_LAYOUT_EQUIVALENT rather than as a semantic proof.
+    """
+
+    EXACT_INSTRUCTIONS = "exact_instructions"
+    STACK_LAYOUT_EQUIVALENT = "stack_layout_equivalent"
+    REGISTER_ALLOCATION_EQUIVALENT = "register_allocation_equivalent"
+    INSTRUCTION_SCHEDULING_EQUIVALENT = "instruction_scheduling_equivalent"
+    CFG_LAYOUT_EQUIVALENT = "cfg_layout_equivalent"
+    KNOWN_INLINE_EQUIVALENT = "known_inline_equivalent"
+    UNKNOWN_DIFFERENCE = "unknown_difference"
+
+
+def derive_equivalence_level(
+    analysis: "ComparisonAnalysis",
+    *,
+    accuracy_modulo_stack: float | None = None,
+) -> EquivalenceLevel:
+    """Map a structured analysis (plus optional stack score) onto the lattice."""
+    if analysis.status == ComparisonStatus.EXACT:
+        return EquivalenceLevel.EXACT_INSTRUCTIONS
+
+    if analysis.status == ComparisonStatus.EFFECTIVE:
+        reasons = set(analysis.effective_reasons)
+        if reasons & {"condition_inversion"}:
+            return EquivalenceLevel.CFG_LAYOUT_EQUIVALENT
+        if reasons & {"instruction_reorder", "commutative_order", "load_folding"}:
+            return EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
+        if reasons & {"register_allocation", "callee_save_substitution"}:
+            return EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
+        if reasons <= {"frame_slot_layout", "padding", "dead_operation"} and (
+            "frame_slot_layout" in reasons
+        ):
+            return EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
+        if "folded_symbol_alias" in reasons:
+            return EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
+        if "frame_slot_layout" in reasons:
+            return EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
+        return EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
+
+    if accuracy_modulo_stack is not None and accuracy_modulo_stack >= 1.0:
+        return EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
+
+    return EquivalenceLevel.UNKNOWN_DIFFERENCE
+
+
 EFFECTIVE_REASON_ORDER = (
     "register_allocation",
     "frame_slot_layout",
@@ -83,6 +134,15 @@ def normalize_effective_reasons(reasons) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"Unknown effective reasons: {sorted(unknown)}")
     return tuple(reason for reason in EFFECTIVE_REASON_ORDER if reason in values)
+
+
+@dataclass(frozen=True)
+class StackPermutationEntry:
+    """One orig → recomp local slot correspondence."""
+
+    orig: str
+    recomp: str
+    symbol: str | None = None
 
 
 @dataclass(frozen=True)

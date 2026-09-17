@@ -19,12 +19,22 @@ from reccmp.compare.asm.replacement import (
 )
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
-from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonDifference,
+    ComparisonStatus,
+    DifferenceSide,
+    FactValue,
+)
+from reccmp.compare.asm.ir import instruction_match_key
+from reccmp.compare.stack_layout import analyze_stack_layout
+from reccmp.compare.inlines import InlineHit, find_inline_expansions
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.cvinfo import CvdumpTypeKey, CvdumpTypeMap
 from reccmp.cvdump.demangler import parse_function_signature
+from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpKeyError, CvdumpTypesParser
 from reccmp.types import EntityType
 from reccmp.formats.exceptions import (
@@ -177,6 +187,59 @@ class FunctionComparator:
             return None
         return f"{path_line_pair[0].name}:{path_line_pair[1]}"
 
+    def _source_facts_of_recomp_addr(
+        self, recomp_addr: int | None
+    ) -> dict[str, FactValue]:
+        if recomp_addr is None:
+            return {}
+        path_line_pair = self.lines_db.find_line_of_recomp_address(recomp_addr)
+        if path_line_pair is None:
+            return {}
+        return {
+            "source_path": path_line_pair[0].name,
+            "source_line": path_line_pair[1],
+        }
+
+    def _enrich_side_with_source(self, side: DifferenceSide) -> DifferenceSide:
+        """Attach PDB line info when the side address is a recomp VA."""
+        extra = self._source_facts_of_recomp_addr(side.address)
+        if not extra:
+            return side
+        facts = {**side.facts, **extra}
+        return DifferenceSide(side.instruction_index, side.address, facts)
+
+    def _enrich_analysis_with_source(
+        self, analysis: ComparisonAnalysis
+    ) -> ComparisonAnalysis:
+        """Pin mismatch / inconclusive locations to recomp source lines."""
+        if analysis.status == ComparisonStatus.MISMATCH and analysis.difference is not None:
+            diff = analysis.difference
+            enriched = ComparisonDifference(
+                diff.kind,
+                diff.orig,
+                self._enrich_side_with_source(diff.recomp),
+            )
+            return ComparisonAnalysis.mismatch(
+                enriched, semantic_similarity=analysis.semantic_similarity
+            )
+        if (
+            analysis.status == ComparisonStatus.INCONCLUSIVE
+            and analysis.inconclusive_location is not None
+        ):
+            return ComparisonAnalysis.inconclusive(
+                analysis.inconclusive_reason or "analysis_limit",
+                self._enrich_side_with_source(analysis.inconclusive_location),
+            )
+        return analysis
+
+    def _fn_symbol_entry(self, match: ReccmpMatch | None) -> SymbolsEntry | None:
+        if match is None:
+            return None
+        node = self.func_nodes.get(match.recomp_addr)
+        if node is None:
+            return None
+        return node.symbol_entry
+
     def compare_function(
         self,
         match: ReccmpMatch,
@@ -260,6 +323,7 @@ class FunctionComparator:
                 result,
                 analysis=ComparisonAnalysis.effective(("folded_symbol_alias",)),
             )
+            result.refresh_equivalence_level()
 
         return result
 
@@ -739,12 +803,15 @@ class FunctionComparator:
         orig_meta: list[InstructionMeta | None] | None = None,
         recomp_meta: list[InstructionMeta | None] | None = None,
     ) -> EntityCompareResult:
-        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         # Detach addresses from asm lines for the text diff.
         orig_asm = [x[1] for x in orig]
         recomp_asm = [x[1] for x in recomp]
 
-        diff = SequenceMatcherWithPins(orig_asm, recomp_asm, split_points)
+        # Align on structured IR keys; display strings stay for printing/scoring UI.
+        orig_keys = [instruction_match_key(line) for line in orig_asm]
+        recomp_keys = [instruction_match_key(line) for line in recomp_asm]
+        diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
 
         ratio = diff.ratio()
         opcodes = diff.get_opcodes()
@@ -792,8 +859,12 @@ class FunctionComparator:
                 recomp_meta=recomp_meta,
             )
 
+        analysis = self._enrich_analysis_with_source(analysis)
+
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
-            return EntityCompareResult(match_ratio=ratio, analysis=analysis)
+            result = EntityCompareResult(match_ratio=ratio, analysis=analysis)
+            result.refresh_equivalence_level()
+            return result
 
         # Convert the addresses to hex string for the diff output
         orig_for_printing = [
@@ -814,14 +885,60 @@ class FunctionComparator:
             for line_index, (addr, instruction) in enumerate(recomp)
         ]
 
-        return EntityCompareResult(
-            diff=RawDiffOutput(
-                codes=opcodes,
-                orig_inst=orig_for_printing,
-                recomp_inst=recomp_for_printing,
-            ),
+        rdiff = RawDiffOutput(
+            codes=opcodes,
+            orig_inst=orig_for_printing,
+            recomp_inst=recomp_for_printing,
+        )
+
+        stack_layout = None
+        if ratio < 1.0:
+            stack_layout = analyze_stack_layout(
+                rdiff,
+                orig_asm,
+                recomp_asm,
+                fn_symbol=self._fn_symbol_entry(match),
+            )
+
+        result = EntityCompareResult(
+            diff=rdiff,
             match_ratio=ratio,
             analysis=analysis,
+            stack_permutation=(
+                stack_layout.permutation if stack_layout is not None else ()
+            ),
+            accuracy_modulo_stack=(
+                stack_layout.accuracy_modulo_stack if stack_layout is not None else None
+            ),
+        )
+        result.refresh_equivalence_level()
+        return result
+
+    def find_inlines(self, helper: ReccmpMatch) -> list[InlineHit]:
+        """Search original functions for probable expansions of ``helper``'s body."""
+        helper_size = helper.size(ImageId.RECOMP)
+        if helper_size is None or helper_size <= 0:
+            return []
+        helper_fp = self._alias_fingerprint(
+            ImageId.RECOMP, helper.recomp_addr, helper_size
+        )
+        if helper_fp is None:
+            return []
+
+        hosts: list[tuple[int, str, int]] = []
+        for entity in self.db.get_functions():
+            if entity.orig_addr == helper.orig_addr:
+                continue
+            size = entity.size(ImageId.ORIG)
+            if size is None or size <= helper_size:
+                continue
+            name = entity.best_name() or f"sub_{entity.orig_addr:x}"
+            hosts.append((entity.orig_addr, name, size))
+
+        return find_inline_expansions(
+            helper_fp,
+            hosts,
+            lambda addr, size: self._alias_fingerprint(ImageId.ORIG, addr, size),
         )
 
     def _collect_line_annotations(self, recomp: AsmExcerpt) -> list[ReccmpMatch]:

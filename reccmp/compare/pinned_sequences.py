@@ -1,21 +1,24 @@
 from itertools import pairwise
 import itertools
-from typing import Iterable, Iterator, Sequence
+from typing import Hashable, Iterable, Iterator, Sequence
 from reccmp.difflib import DiffOpcode, SequenceMatcher, get_grouped_opcodes
 
 
 class SequenceMatcherWithPins:
     """
-    Finds the differences between two string sequences, where some associations (pins) between
+    Finds the differences between two sequences, where some associations (pins) between
     the lines are known. The result format is compatible with `difflib.SequenceMatcher`.
+
+    Elements may be display strings or structured IR match keys; equality is whatever
+    the element type defines. Display formatting stays with the caller.
 
     Note that `pinned_lines` must consist of non-decreasing, valid indices into `a` and `b`.
     """
 
     def __init__(
         self,
-        a: Sequence[str],
-        b: Sequence[str],
+        a: Sequence[Hashable],
+        b: Sequence[Hashable],
         pinned_lines: Iterable[tuple[int, int]],
     ):
         valid_pinned_lines = (
