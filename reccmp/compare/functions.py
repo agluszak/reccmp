@@ -29,6 +29,7 @@ from reccmp.compare.diagnosis import (
 from reccmp.compare.asm.ir import instruction_match_key
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
+    Fingerprint,
     HelperCatalogEntry,
     InlineHit,
     InlineLayoutResult,
@@ -162,6 +163,7 @@ class FunctionComparator:
             {}
         )
         self._helper_catalog: list[HelperCatalogEntry] | None = None
+        self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -384,36 +386,88 @@ class FunctionComparator:
             cache[cache_key] = fingerprint
         return fingerprint
 
+    def _helper_entry_for_match(
+        self, entity: ReccmpMatch
+    ) -> HelperCatalogEntry | None:
+        """Lazily fingerprint one paired helper (memoized in the catalog map)."""
+        cache = getattr(self, "_helper_by_orig", None)
+        if cache is None:
+            self._helper_by_orig = {}
+            cache = self._helper_by_orig
+        if entity.orig_addr in cache:
+            return cache[entity.orig_addr]
+
+        recomp_size = entity.size(ImageId.RECOMP)
+        if recomp_size is None or recomp_size <= 0:
+            cache[entity.orig_addr] = None
+            return None
+        try:
+            raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
+        except (InvalidVirtualAddressError, InvalidVirtualReadError):
+            cache[entity.orig_addr] = None
+            return None
+        excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
+        fingerprint = asm_fingerprint_from_lines([line for _, line in excerpt])
+        needle = strip_helper_epilog(fingerprint)
+        if len(needle) < 3:
+            cache[entity.orig_addr] = None
+            return None
+        name = entity.best_name() or f"sub_{entity.orig_addr:x}"
+        entry = HelperCatalogEntry(
+            orig_addr=entity.orig_addr,
+            recomp_addr=entity.recomp_addr,
+            name=name,
+            fingerprint=needle,
+            byte_size=recomp_size,
+        )
+        cache[entity.orig_addr] = entry
+        return entry
+
+    def _resolve_helper_from_call_identities(
+        self, identities: set[str]
+    ) -> HelperCatalogEntry | None:
+        """Map sanitized call-operand identities to a paired helper."""
+        for entity in self.db.get_functions():
+            name = entity.best_name() or ""
+            candidates = {
+                name,
+                f"{entity.orig_addr:#x}",
+                f"{entity.recomp_addr:#x}",
+                f"{entity.orig_addr:x}",
+                f"{entity.recomp_addr:x}",
+            }
+            if not (identities & candidates) and not any(
+                name and name in identity for identity in identities
+            ):
+                continue
+            return self._helper_entry_for_match(entity)
+        return None
+
     def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
-        """Build (once) the set of paired helpers usable as inline needles."""
+        """Full catalog for ``find-inlines`` only — not used on the hot compare path."""
         if self._helper_catalog is not None:
             return self._helper_catalog
 
         catalog: list[HelperCatalogEntry] = []
+        freq: dict[Fingerprint, int] = {}
         for entity in self.db.get_functions():
-            recomp_size = entity.size(ImageId.RECOMP)
-            if recomp_size is None or recomp_size <= 0:
+            entry = self._helper_entry_for_match(entity)
+            if entry is None:
                 continue
-            try:
-                raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
-            except (InvalidVirtualAddressError, InvalidVirtualReadError):
-                continue
-            # Same sanitization as host compare streams so symbol names align.
-            excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-            fingerprint = asm_fingerprint_from_lines([line for _, line in excerpt])
-            needle = strip_helper_epilog(fingerprint)
-            if len(needle) < 3:
-                continue
-            name = entity.best_name() or f"sub_{entity.orig_addr:x}"
-            catalog.append(
-                HelperCatalogEntry(
-                    orig_addr=entity.orig_addr,
-                    recomp_addr=entity.recomp_addr,
-                    name=name,
-                    fingerprint=needle,
-                    byte_size=recomp_size,
-                )
+            catalog.append(entry)
+            freq[entry.fingerprint] = freq.get(entry.fingerprint, 0) + 1
+        # Attach inverse-frequency uniqueness.
+        catalog = [
+            HelperCatalogEntry(
+                orig_addr=entry.orig_addr,
+                recomp_addr=entry.recomp_addr,
+                name=entry.name,
+                fingerprint=entry.fingerprint,
+                byte_size=entry.byte_size,
+                uniqueness=1.0 / freq[entry.fingerprint],
             )
+            for entry in catalog
+        ]
         catalog.sort(key=lambda entry: len(entry.fingerprint), reverse=True)
         self._helper_catalog = catalog
         return catalog
@@ -424,17 +478,36 @@ class FunctionComparator:
         orig_asm: list[str],
         recomp_asm: list[str],
     ) -> InlineLayoutResult | None:
-        catalog = self._ensure_helper_catalog()
-        if not catalog:
+        """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
+        from reccmp.compare.inlines import find_call_sites
+
+        orig_fp = asm_fingerprint_from_lines(orig_asm)
+        recomp_fp = asm_fingerprint_from_lines(recomp_asm)
+        helpers_by_orig: dict[int, HelperCatalogEntry] = {}
+        for fingerprint in (orig_fp, recomp_fp):
+            for _index, identities in find_call_sites(fingerprint):
+                helper = self._resolve_helper_from_call_identities(identities)
+                if helper is None or helper.orig_addr == match.orig_addr:
+                    continue
+                helpers_by_orig[helper.orig_addr] = helper
+        if not helpers_by_orig:
             return None
-        host_len = max(len(orig_asm), len(recomp_asm))
+
+        # Uniqueness among the call-referenced helpers only.
+        freq: dict[Fingerprint, int] = {}
+        for entry in helpers_by_orig.values():
+            freq[entry.fingerprint] = freq.get(entry.fingerprint, 0) + 1
         helpers = [
-            entry
-            for entry in catalog
-            if entry.orig_addr != match.orig_addr and len(entry.fingerprint) < host_len
+            HelperCatalogEntry(
+                orig_addr=entry.orig_addr,
+                recomp_addr=entry.recomp_addr,
+                name=entry.name,
+                fingerprint=entry.fingerprint,
+                byte_size=entry.byte_size,
+                uniqueness=1.0 / freq[entry.fingerprint],
+            )
+            for entry in helpers_by_orig.values()
         ]
-        if not helpers:
-            return None
         result = analyze_inline_layout(
             orig_asm,
             recomp_asm,

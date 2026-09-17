@@ -27,6 +27,7 @@ from reccmp.formats.pe import PEImage
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
+    DiagnosticNormalization,
     EquivalenceLevel,
 )
 from reccmp.compare.db import ReccmpEntity
@@ -166,14 +167,25 @@ def inline_layout_text(match: ReccmpComparedEntity) -> str | None:
 
 
 def equivalence_level_text(match: ReccmpComparedEntity) -> str | None:
-    level = match.equivalence_level
-    if level in (
+    """Deprecated: prefer diagnostic_normalizations_text."""
+    return diagnostic_normalizations_text(match)
+
+
+def diagnostic_normalizations_text(match: ReccmpComparedEntity) -> str | None:
+    """Render non-proof diagnostic tags without claiming equivalence."""
+    tags = match.diagnostic_normalizations
+    if not tags and match.equivalence_level not in (
         EquivalenceLevel.EXACT_INSTRUCTIONS,
         EquivalenceLevel.UNKNOWN_DIFFERENCE,
     ):
+        # Legacy reports may only have equivalence_level.
+        legacy = match.equivalence_level.value.replace("_equivalent", "")
+        if legacy in {tag.value for tag in DiagnosticNormalization}:
+            tags = (DiagnosticNormalization(legacy),)
+    if not tags:
         return None
-    return f"equivalence: {level.value.replace('_', ' ')}"
-
+    joined = ", ".join(tag.value.replace("_", " ") for tag in tags)
+    return f"diagnostic normalizations: {joined}"
 
 def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = False):
     percenttext = percent_string(match.effective_accuracy, match.is_effective_match)

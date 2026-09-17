@@ -598,6 +598,7 @@ class Compare:
             accuracy_modulo_stack=result.accuracy_modulo_stack,
             inline_expansions=result.inline_expansions,
             accuracy_modulo_inline=result.accuracy_modulo_inline,
+            diagnostic_normalizations=result.diagnostic_normalizations,
             equivalence_level=result.equivalence_level,
         )
 

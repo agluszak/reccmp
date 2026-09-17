@@ -7,6 +7,7 @@ diagnostic proposals — not automatic semantic proofs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Hashable, Literal, Sequence
 
@@ -62,6 +63,9 @@ class HelperCatalogEntry:
     name: str
     fingerprint: Fingerprint  # epilog already stripped
     byte_size: int
+    # How many helpers share this exact fingerprint across the catalog.
+    # Used as an inverse-frequency confidence weight (1.0 = unique).
+    uniqueness: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,8 @@ class _Span:
     helper_orig: int
     prefer_call: bool
     confidence: float
+    call_index: int | None = None
+    occurrence: int = 0  # which body/call pairing slot
 
 
 def strip_helper_epilog(fingerprint: Fingerprint) -> Fingerprint:
@@ -101,22 +107,61 @@ def _subsequence_index(haystack: Fingerprint, needle: Fingerprint) -> int | None
 
 
 def select_nonoverlapping(spans: Sequence[_Span]) -> list[_Span]:
-    """Greedy non-overlapping selection: longer, call-backed, higher confidence first."""
-    ordered = sorted(
-        spans,
-        key=lambda s: (s.length, s.prefer_call, s.confidence, -s.offset),
-        reverse=True,
-    )
+    """Weighted interval selection: prefer call-backed, unique, longer spans.
+
+    Uses the classic weighted-interval DP ordered by interval end.
+    """
+    if not spans:
+        return []
+    ordered = sorted(spans, key=lambda s: (s.offset + s.length, s.offset))
+    n = len(ordered)
+    # p(i) = rightmost j < i that does not overlap i
+    prev: list[int] = [-1] * n
+    for i, span in enumerate(ordered):
+        for j in range(i - 1, -1, -1):
+            if ordered[j].offset + ordered[j].length <= span.offset:
+                prev[i] = j
+                break
+
+    def weight(span: _Span) -> float:
+        return span.confidence + (1.0 if span.prefer_call else 0.0) + span.length * 0.01
+
+    best = [0.0] * n
+    take = [False] * n
+    for i, span in enumerate(ordered):
+        alone = weight(span) + (best[prev[i]] if prev[i] >= 0 else 0.0)
+        skip = best[i - 1] if i else 0.0
+        if alone >= skip:
+            best[i] = alone
+            take[i] = True
+        else:
+            best[i] = skip
+
     chosen: list[_Span] = []
-    occupied: list[tuple[int, int]] = []
-    for span in ordered:
-        end = span.offset + span.length
-        if any(not (end <= a or span.offset >= b) for a, b in occupied):
-            continue
-        chosen.append(span)
-        occupied.append((span.offset, end))
+    i = n - 1
+    while i >= 0:
+        if take[i]:
+            chosen.append(ordered[i])
+            i = prev[i]
+        else:
+            i -= 1
     chosen.sort(key=lambda s: s.offset)
     return chosen
+
+
+def call_operand_identities(operand: str) -> set[str]:
+    """Canonical identity tokens extractable from a sanitized call operand."""
+    text = operand.strip()
+    # Drop trailing entity annotations: "Foo (FUNCTION)"
+    text = re.sub(r"\s+\((?:DATA|STRING|FLOAT|FUNCTION|IMPORT)\)$", "", text)
+    identities = {text}
+    # Bare hex address
+    if text.lower().startswith("0x"):
+        try:
+            identities.add(f"{int(text, 16):#x}")
+        except ValueError:
+            pass
+    return identities
 
 
 def elide_spans(
@@ -204,6 +249,41 @@ def asm_fingerprint_from_lines(lines: Sequence[str]) -> Fingerprint:
     return tuple(result)
 
 
+def find_call_sites(
+    fingerprint: Fingerprint,
+) -> list[tuple[int, set[str]]]:
+    """Return ``(index, identity_set)`` for every call in ``fingerprint``."""
+    sites: list[tuple[int, set[str]]] = []
+    for i, (mnemonic, operand) in enumerate(fingerprint):
+        if mnemonic == "call":
+            sites.append((i, call_operand_identities(operand)))
+    return sites
+
+
+def find_call_indices_for_helper(
+    fingerprint: Fingerprint, helper: HelperCatalogEntry
+) -> list[int]:
+    """Call indices that resolve to ``helper`` by name or address identity."""
+    wanted = {
+        helper.name,
+        f"{helper.orig_addr:#x}",
+        f"{helper.recomp_addr:#x}",
+        f"{helper.orig_addr:x}",
+        f"{helper.recomp_addr:x}",
+    }
+    # Also accept demangled/decorated substrings via exact identity match only.
+    indices: list[int] = []
+    for index, identities in find_call_sites(fingerprint):
+        if identities & wanted:
+            indices.append(index)
+            continue
+        # Substring match on the rendered name as a last resort for decorated
+        # forms that still contain the helper's best_name.
+        if any(helper.name and helper.name in identity for identity in identities):
+            indices.append(index)
+    return indices
+
+
 def find_call_indices_in_fingerprint(
     fingerprint: Fingerprint, helper_names: Sequence[str]
 ) -> list[int]:
@@ -215,8 +295,9 @@ def find_call_indices_in_fingerprint(
     for i, (mnemonic, operand) in enumerate(fingerprint):
         if mnemonic != "call":
             continue
+        identities = call_operand_identities(operand)
         for name in needles:
-            if name in operand:
+            if name in identities or any(name in identity for identity in identities):
                 indices.append(i)
                 break
     return indices
@@ -229,6 +310,21 @@ def find_call_indices(lines: Sequence[str], helper_names: Sequence[str]) -> list
     )
 
 
+
+def _inline_confidence(
+    helper: HelperCatalogEntry, host_len: int, *, call_backed: bool
+) -> float:
+    """Confidence from uniqueness and relative size — not host_len alone."""
+    if host_len <= 0 or not helper.fingerprint:
+        return 0.0
+    length_factor = min(1.0, len(helper.fingerprint) / 8.0)
+    coverage = len(helper.fingerprint) / host_len
+    score = helper.uniqueness * (0.5 * length_factor + 0.5 * coverage)
+    if call_backed:
+        score = min(1.0, score + 0.25)
+    return round(score, 4)
+
+
 def find_inline_expansions(
     helper_fingerprint: Fingerprint,
     hosts: Sequence[tuple[int, str, int]],
@@ -236,12 +332,7 @@ def find_inline_expansions(
     *,
     min_helper_ops: int = 3,
 ) -> list[InlineHit]:
-    """Search host functions for contiguous expansions of ``helper_fingerprint``.
-
-    ``hosts`` entries are ``(addr, name, size)``.  Hosts whose fingerprint is
-    shorter than or equal to the helper are skipped (they cannot contain it as
-    a strict expansion).
-    """
+    """Search host functions for contiguous expansions of ``helper_fingerprint``."""
     needle = strip_helper_epilog(helper_fingerprint)
     if len(needle) < min_helper_ops:
         return []
@@ -252,30 +343,42 @@ def find_inline_expansions(
         host_fp = fingerprint_of(addr, size)
         if host_fp is None or len(host_fp) <= helper_len:
             continue
-        offset = _subsequence_index(host_fp, needle)
-        if offset is None:
-            continue
-        confidence = helper_len / len(host_fp)
-        hits.append(
-            InlineHit(
-                host_addr=addr,
-                host_name=name,
-                match_offset=offset,
-                match_length=helper_len,
-                confidence=confidence,
+        for offset in find_fingerprint_spans(host_fp, needle):
+            # uniqueness unknown here; length/coverage only
+            confidence = min(1.0, helper_len / 8.0) * 0.5 + 0.5 * (
+                helper_len / len(host_fp)
             )
-        )
-    hits.sort(key=lambda h: (-h.confidence, h.host_addr))
+            hits.append(
+                InlineHit(
+                    host_addr=addr,
+                    host_name=name,
+                    match_offset=offset,
+                    match_length=helper_len,
+                    confidence=round(confidence, 4),
+                )
+            )
+    hits.sort(key=lambda h: (-h.confidence, h.host_addr, h.match_offset))
     return hits
 
 
-@dataclass
-class _HelperPlan:
-    entry: HelperCatalogEntry
-    orig_span: tuple[int, int] | None = None
-    recomp_span: tuple[int, int] | None = None
-    orig_call: int | None = None
-    recomp_call: int | None = None
+@dataclass(frozen=True)
+class _Pairing:
+    helper: HelperCatalogEntry
+    orig_span: tuple[int, int] | None
+    recomp_span: tuple[int, int] | None
+    orig_call: int | None
+    recomp_call: int | None
+    confidence: float
+
+    @property
+    def kind(self) -> str:
+        if self.orig_span and self.recomp_span:
+            return "both"
+        if self.orig_span and self.recomp_call is not None:
+            return "orig_inline"
+        if self.recomp_span and self.orig_call is not None:
+            return "recomp_inline"
+        return "none"
 
 
 def analyze_inline_layout(
@@ -286,157 +389,195 @@ def analyze_inline_layout(
     min_helper_ops: int = 3,
     exclude_orig_addrs: Sequence[int] = (),
 ) -> InlineLayoutResult:
-    """Detect CALL↔inline asymmetries and score the streams after collapsing them."""
+    """Detect CALL↔inline asymmetries; handle every occurrence of each helper."""
     orig_fp = asm_fingerprint_from_lines(orig_asm)
     recomp_fp = asm_fingerprint_from_lines(recomp_asm)
     if not orig_fp or not recomp_fp:
         return InlineLayoutResult()
 
-    # Fingerprint lines skip jump/data tables, so indices must map back carefully.
-    # For sanitized CODE-only excerpts (the common case) indices align 1:1 with
-    # asm lines.  When tables are present, fall back to line-index search on the
-    # raw asm fingerprint built only from instruction-shaped lines — we still
-    # use the same filtered stream for SequenceMatcher keys below.
-    orig_keys = list(orig_fp)
-    recomp_keys = list(recomp_fp)
-
     excluded = set(exclude_orig_addrs)
-    plans: list[_HelperPlan] = []
+    pairings: list[_Pairing] = []
+
     for helper in helpers:
         if helper.orig_addr in excluded:
             continue
         needle = helper.fingerprint
         if len(needle) < min_helper_ops:
             continue
-        if len(needle) >= len(orig_fp) and len(needle) >= len(recomp_fp):
+        if len(needle) >= max(len(orig_fp), len(recomp_fp)):
             continue
 
-        names = [helper.name]
-        plan = _HelperPlan(entry=helper)
         orig_starts = find_fingerprint_spans(orig_fp, needle)
         recomp_starts = find_fingerprint_spans(recomp_fp, needle)
-        if orig_starts:
-            plan.orig_span = (orig_starts[0], len(needle))
-        if recomp_starts:
-            plan.recomp_span = (recomp_starts[0], len(needle))
-        plan.orig_call = next(
-            iter(find_call_indices_in_fingerprint(orig_fp, names)), None
-        )
-        plan.recomp_call = next(
-            iter(find_call_indices_in_fingerprint(recomp_fp, names)), None
-        )
+        orig_calls = find_call_indices_for_helper(orig_fp, helper)
+        recomp_calls = find_call_indices_for_helper(recomp_fp, helper)
 
-        interesting = False
-        if plan.orig_span and plan.recomp_call is not None and plan.recomp_span is None:
-            interesting = True
-        elif plan.recomp_span and plan.orig_call is not None and plan.orig_span is None:
-            interesting = True
-        elif plan.orig_span and plan.recomp_span:
-            interesting = True
-        if interesting:
-            plans.append(plan)
+        both_n = min(len(orig_starts), len(recomp_starts))
+        for i in range(both_n):
+            pairings.append(
+                _Pairing(
+                    helper,
+                    (orig_starts[i], len(needle)),
+                    (recomp_starts[i], len(needle)),
+                    None,
+                    None,
+                    _inline_confidence(helper, len(orig_fp), call_backed=False),
+                )
+            )
 
-    if not plans:
+        # Remaining orig bodies ↔ recomp CALLs
+        remaining_orig = orig_starts[both_n:]
+        for i, start in enumerate(remaining_orig):
+            if i >= len(recomp_calls):
+                break
+            pairings.append(
+                _Pairing(
+                    helper,
+                    (start, len(needle)),
+                    None,
+                    None,
+                    recomp_calls[i],
+                    _inline_confidence(helper, len(orig_fp), call_backed=True),
+                )
+            )
+
+        # Remaining recomp bodies ↔ orig CALLs
+        remaining_recomp = recomp_starts[both_n:]
+        for i, start in enumerate(remaining_recomp):
+            if i >= len(orig_calls):
+                break
+            pairings.append(
+                _Pairing(
+                    helper,
+                    None,
+                    (start, len(needle)),
+                    orig_calls[i],
+                    None,
+                    _inline_confidence(helper, len(recomp_fp), call_backed=True),
+                )
+            )
+
+    if not pairings:
         return InlineLayoutResult()
 
-    # Resolve overlapping spans per side.
-    orig_span_objs = [
+    # Build occupancy spans for WIS on each side independently, then keep
+    # pairings whose body spans survived (CALL-only side has no body span).
+    orig_spans = [
         _Span(
-            plan.orig_span[0],
-            plan.orig_span[1],
-            plan.entry.orig_addr,
-            prefer_call=plan.recomp_call is not None,
-            confidence=plan.orig_span[1] / max(len(orig_fp), 1),
+            p.orig_span[0],
+            p.orig_span[1],
+            p.helper.orig_addr,
+            prefer_call=p.recomp_call is not None,
+            confidence=p.confidence,
+            call_index=p.recomp_call,
         )
-        for plan in plans
-        if plan.orig_span is not None
+        for p in pairings
+        if p.orig_span is not None
     ]
-    recomp_span_objs = [
+    recomp_spans = [
         _Span(
-            plan.recomp_span[0],
-            plan.recomp_span[1],
-            plan.entry.orig_addr,
-            prefer_call=plan.orig_call is not None,
-            confidence=plan.recomp_span[1] / max(len(recomp_fp), 1),
+            p.recomp_span[0],
+            p.recomp_span[1],
+            p.helper.orig_addr,
+            prefer_call=p.orig_call is not None,
+            confidence=p.confidence,
+            call_index=p.orig_call,
         )
-        for plan in plans
-        if plan.recomp_span is not None
+        for p in pairings
+        if p.recomp_span is not None
     ]
-    kept_orig = {(s.helper_orig, s.offset) for s in select_nonoverlapping(orig_span_objs)}
-    kept_recomp = {
-        (s.helper_orig, s.offset) for s in select_nonoverlapping(recomp_span_objs)
-    }
+    kept_orig = {(s.helper_orig, s.offset) for s in select_nonoverlapping(orig_spans)}
+    kept_recomp = {(s.helper_orig, s.offset) for s in select_nonoverlapping(recomp_spans)}
 
     expansions: list[InlineExpansionEvidence] = []
     orig_elide: list[tuple[int, int, Hashable]] = []
     recomp_elide: list[tuple[int, int, Hashable]] = []
     orig_collapse: list[tuple[int, Hashable]] = []
     recomp_collapse: list[tuple[int, Hashable]] = []
+    used_orig_calls: set[int] = set()
+    used_recomp_calls: set[int] = set()
 
-    for plan in plans:
-        helper = plan.entry
+    # Prefer call-backed pairings first, then both-inline.
+    ordered = sorted(
+        pairings,
+        key=lambda p: (
+            0 if p.kind in ("orig_inline", "recomp_inline") else 1,
+            -p.confidence,
+            -(p.orig_span or p.recomp_span or (0, 0))[1],
+        ),
+    )
+
+    for pairing in ordered:
+        helper = pairing.helper
         placeholder: Hashable = ("inline", helper.orig_addr)
-        orig_kept = (
-            plan.orig_span is not None
-            and (helper.orig_addr, plan.orig_span[0]) in kept_orig
-        )
-        recomp_kept = (
-            plan.recomp_span is not None
-            and (helper.orig_addr, plan.recomp_span[0]) in kept_recomp
-        )
-
-        if orig_kept and plan.recomp_call is not None and not recomp_kept:
-            assert plan.orig_span is not None
-            orig_elide.append((*plan.orig_span, placeholder))
-            recomp_collapse.append((plan.recomp_call, placeholder))
-            expansions.append(
-                InlineExpansionEvidence(
-                    helper_name=helper.name,
-                    helper_orig_addr=helper.orig_addr,
-                    helper_recomp_addr=helper.recomp_addr,
-                    side="orig",
-                    match_offset=plan.orig_span[0],
-                    match_length=plan.orig_span[1],
-                    counterpart="call",
-                    counterpart_offset=plan.recomp_call,
-                    confidence=plan.orig_span[1] / max(len(orig_fp), 1),
-                )
-            )
-        elif recomp_kept and plan.orig_call is not None and not orig_kept:
-            assert plan.recomp_span is not None
-            recomp_elide.append((*plan.recomp_span, placeholder))
-            orig_collapse.append((plan.orig_call, placeholder))
-            expansions.append(
-                InlineExpansionEvidence(
-                    helper_name=helper.name,
-                    helper_orig_addr=helper.orig_addr,
-                    helper_recomp_addr=helper.recomp_addr,
-                    side="recomp",
-                    match_offset=plan.recomp_span[0],
-                    match_length=plan.recomp_span[1],
-                    counterpart="call",
-                    counterpart_offset=plan.orig_call,
-                    confidence=plan.recomp_span[1] / max(len(recomp_fp), 1),
-                )
-            )
-        elif orig_kept and recomp_kept:
-            assert plan.orig_span is not None and plan.recomp_span is not None
-            orig_elide.append((*plan.orig_span, placeholder))
-            recomp_elide.append((*plan.recomp_span, placeholder))
+        if pairing.kind == "both":
+            assert pairing.orig_span and pairing.recomp_span
+            if (helper.orig_addr, pairing.orig_span[0]) not in kept_orig:
+                continue
+            if (helper.orig_addr, pairing.recomp_span[0]) not in kept_recomp:
+                continue
+            # Mark consumed so a later CALL pairing cannot reuse these offsets.
+            kept_orig.discard((helper.orig_addr, pairing.orig_span[0]))
+            kept_recomp.discard((helper.orig_addr, pairing.recomp_span[0]))
+            orig_elide.append((*pairing.orig_span, placeholder))
+            recomp_elide.append((*pairing.recomp_span, placeholder))
             expansions.append(
                 InlineExpansionEvidence(
                     helper_name=helper.name,
                     helper_orig_addr=helper.orig_addr,
                     helper_recomp_addr=helper.recomp_addr,
                     side="both",
-                    match_offset=plan.orig_span[0],
-                    match_length=plan.orig_span[1],
+                    match_offset=pairing.orig_span[0],
+                    match_length=pairing.orig_span[1],
                     counterpart="inline",
-                    counterpart_offset=plan.recomp_span[0],
-                    confidence=min(
-                        plan.orig_span[1] / max(len(orig_fp), 1),
-                        plan.recomp_span[1] / max(len(recomp_fp), 1),
-                    ),
+                    counterpart_offset=pairing.recomp_span[0],
+                    confidence=pairing.confidence,
+                )
+            )
+        elif pairing.kind == "orig_inline":
+            assert pairing.orig_span and pairing.recomp_call is not None
+            if (helper.orig_addr, pairing.orig_span[0]) not in kept_orig:
+                continue
+            if pairing.recomp_call in used_recomp_calls:
+                continue
+            kept_orig.discard((helper.orig_addr, pairing.orig_span[0]))
+            used_recomp_calls.add(pairing.recomp_call)
+            orig_elide.append((*pairing.orig_span, placeholder))
+            recomp_collapse.append((pairing.recomp_call, placeholder))
+            expansions.append(
+                InlineExpansionEvidence(
+                    helper_name=helper.name,
+                    helper_orig_addr=helper.orig_addr,
+                    helper_recomp_addr=helper.recomp_addr,
+                    side="orig",
+                    match_offset=pairing.orig_span[0],
+                    match_length=pairing.orig_span[1],
+                    counterpart="call",
+                    counterpart_offset=pairing.recomp_call,
+                    confidence=pairing.confidence,
+                )
+            )
+        elif pairing.kind == "recomp_inline":
+            assert pairing.recomp_span and pairing.orig_call is not None
+            if (helper.orig_addr, pairing.recomp_span[0]) not in kept_recomp:
+                continue
+            if pairing.orig_call in used_orig_calls:
+                continue
+            kept_recomp.discard((helper.orig_addr, pairing.recomp_span[0]))
+            used_orig_calls.add(pairing.orig_call)
+            recomp_elide.append((*pairing.recomp_span, placeholder))
+            orig_collapse.append((pairing.orig_call, placeholder))
+            expansions.append(
+                InlineExpansionEvidence(
+                    helper_name=helper.name,
+                    helper_orig_addr=helper.orig_addr,
+                    helper_recomp_addr=helper.recomp_addr,
+                    side="recomp",
+                    match_offset=pairing.recomp_span[0],
+                    match_length=pairing.recomp_span[1],
+                    counterpart="call",
+                    counterpart_offset=pairing.orig_call,
+                    confidence=pairing.confidence,
                 )
             )
 
@@ -444,8 +585,8 @@ def analyze_inline_layout(
         return InlineLayoutResult()
 
     modulo = accuracy_after_inline_elision(
-        orig_keys,
-        recomp_keys,
+        list(orig_fp),
+        list(recomp_fp),
         orig_elide=orig_elide,
         recomp_elide=recomp_elide,
         orig_collapse=orig_collapse,

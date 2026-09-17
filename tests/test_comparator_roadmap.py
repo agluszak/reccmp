@@ -7,7 +7,9 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
+    DiagnosticNormalization,
     EquivalenceLevel,
+    derive_diagnostic_normalizations,
     derive_equivalence_level,
 )
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
@@ -100,44 +102,47 @@ def test_derive_equivalence_level_lattice():
         derive_equivalence_level(ComparisonAnalysis.exact())
         == EquivalenceLevel.EXACT_INSTRUCTIONS
     )
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.effective({"register_allocation"})
+    ) == (DiagnosticNormalization.REGISTER_ALLOCATION,)
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.effective({"frame_slot_layout"})
+    ) == (DiagnosticNormalization.STACK_LAYOUT,)
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.effective({"folded_symbol_alias"})
+    ) == (DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,)
+    # folded_symbol must never be reported as known_inline
     assert (
         derive_equivalence_level(
-            ComparisonAnalysis.effective({"register_allocation"})
+            ComparisonAnalysis.effective({"folded_symbol_alias"})
         )
-        == EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
+        == EquivalenceLevel.FOLDED_SYMBOL_ALIAS
+    )
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.inconclusive("analysis_limit"),
+        accuracy_modulo_stack=1.0,
+    ) == (DiagnosticNormalization.STACK_LAYOUT,)
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.inconclusive("analysis_limit"),
+        accuracy_modulo_inline=1.0,
+    ) == (DiagnosticNormalization.KNOWN_INLINE,)
+    assert derive_diagnostic_normalizations(
+        ComparisonAnalysis.inconclusive("analysis_limit"),
+        accuracy_modulo_stack=1.0,
+        accuracy_modulo_inline=1.0,
+    ) == (
+        DiagnosticNormalization.STACK_LAYOUT,
+        DiagnosticNormalization.KNOWN_INLINE,
     )
     assert (
-        derive_equivalence_level(
-            ComparisonAnalysis.effective({"frame_slot_layout"})
+        derive_diagnostic_normalizations(
+            ComparisonAnalysis.inconclusive("analysis_limit")
         )
-        == EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
+        == ()
     )
-    assert (
-        derive_equivalence_level(
-            ComparisonAnalysis.inconclusive("analysis_limit"),
-            accuracy_modulo_stack=1.0,
-        )
-        == EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
-    )
-    assert (
-        derive_equivalence_level(
-            ComparisonAnalysis.inconclusive("analysis_limit"),
-            accuracy_modulo_inline=1.0,
-        )
-        == EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
-    )
-    assert (
-        derive_equivalence_level(
-            ComparisonAnalysis.inconclusive("analysis_limit"),
-            accuracy_modulo_stack=1.0,
-            accuracy_modulo_inline=1.0,
-        )
-        == EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
-    )
-    assert (
-        derive_equivalence_level(ComparisonAnalysis.inconclusive("analysis_limit"))
-        == EquivalenceLevel.UNKNOWN_DIFFERENCE
-    )
+    # Non-proof tags must not use the word "equivalent" in their values.
+    for tag in DiagnosticNormalization:
+        assert "equivalent" not in tag.value
 
 
 def test_strip_helper_epilog_drops_trailing_ret():
@@ -203,12 +208,6 @@ def test_accuracy_after_inline_elision_call_vs_body():
 def test_analyze_inline_layout_call_vs_inline():
     from reccmp.compare.inlines import HelperCatalogEntry, analyze_inline_layout
 
-    helper_lines = [
-        "mov eax, ecx",
-        "add eax, 1",
-        "imul eax, 2",
-        "ret",
-    ]
     orig = [
         "push ebx",
         "mov eax, ecx",
@@ -232,6 +231,7 @@ def test_analyze_inline_layout_call_vs_inline():
                 ("imul", "eax, 2"),
             ),
             byte_size=16,
+            uniqueness=1.0,
         )
     ]
     result = analyze_inline_layout(orig, recomp, helpers)
@@ -240,6 +240,40 @@ def test_analyze_inline_layout_call_vs_inline():
     assert result.expansions[0].helper_name == "Foo::setX"
     assert result.expansions[0].side == "orig"
     assert result.expansions[0].counterpart == "call"
+
+
+def test_analyze_inline_layout_repeated_calls():
+    from reccmp.compare.inlines import HelperCatalogEntry, analyze_inline_layout
+
+    body = [
+        "mov eax, ecx",
+        "add eax, 1",
+        "imul eax, 2",
+    ]
+    orig = ["push ebx", *body, "nop", *body, "pop ebx"]
+    recomp = [
+        "push ebx",
+        "call Foo::setX",
+        "nop",
+        "call Foo::setX",
+        "pop ebx",
+    ]
+    helpers = [
+        HelperCatalogEntry(
+            orig_addr=0x100,
+            recomp_addr=0x200,
+            name="Foo::setX",
+            fingerprint=tuple(
+                (line.partition(" ")[0], line.partition(" ")[2]) for line in body
+            ),
+            byte_size=16,
+            uniqueness=1.0,
+        )
+    ]
+    result = analyze_inline_layout(orig, recomp, helpers)
+    assert result.accuracy_modulo_inline == 1.0
+    assert len(result.expansions) == 2
+    assert {e.counterpart_offset for e in result.expansions} == {1, 3}
 
 
 def test_enrich_mismatch_side_preserves_kind():
