@@ -596,6 +596,8 @@ class Compare:
             rdiff=result.diff,
             stack_permutation=result.stack_permutation,
             accuracy_modulo_stack=result.accuracy_modulo_stack,
+            inline_expansions=result.inline_expansions,
+            accuracy_modulo_inline=result.accuracy_modulo_inline,
             equivalence_level=result.equivalence_level,
         )
 

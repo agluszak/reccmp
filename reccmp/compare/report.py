@@ -22,6 +22,7 @@ from .diff import (
     RawDiffOutput,
     raw_diff_to_udiff,
 )
+from .inlines import InlineExpansionEvidence
 
 
 def format_address(addr: int) -> str:
@@ -66,6 +67,8 @@ class ReccmpComparedEntity:
 
     stack_permutation: tuple[StackPermutationEntry, ...] = ()
     accuracy_modulo_stack: float | None = None
+    inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
+    accuracy_modulo_inline: float | None = None
     equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     def is_matched(self) -> bool:
@@ -93,6 +96,7 @@ class ReccmpComparedEntity:
         self.equivalence_level = derive_equivalence_level(
             self.analysis,
             accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
         )
 
 class ReccmpStatusReport:
@@ -333,6 +337,8 @@ class JSONEntityVersion1:
     type: int | None = None
     accuracy_modulo_stack: float | None = None
     stack_permutation: list[dict[str, object]] | None = None
+    accuracy_modulo_inline: float | None = None
+    inline_expansions: list[dict[str, object]] | None = None
     equivalence_level: str | None = None
 
 
@@ -472,6 +478,25 @@ def _serialize_version_1(
                     if entity.stack_permutation
                     else None
                 ),
+                accuracy_modulo_inline=entity.accuracy_modulo_inline,
+                inline_expansions=(
+                    [
+                        {
+                            "helper": entry.helper_name,
+                            "helper_orig": format_address(entry.helper_orig_addr),
+                            "helper_recomp": format_address(entry.helper_recomp_addr),
+                            "side": entry.side,
+                            "offset": entry.match_offset,
+                            "length": entry.match_length,
+                            "counterpart": entry.counterpart,
+                            "counterpart_offset": entry.counterpart_offset,
+                            "confidence": entry.confidence,
+                        }
+                        for entry in entity.inline_expansions
+                    ]
+                    if entity.inline_expansions
+                    else None
+                ),
                 equivalence_level=entity.equivalence_level.value,
             )
         )
@@ -532,8 +557,13 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             recomp_addr_varies=various,
             accuracy_modulo_stack=e.accuracy_modulo_stack,
             stack_permutation=_parse_stack_permutation(e.stack_permutation),
+            accuracy_modulo_inline=e.accuracy_modulo_inline,
+            inline_expansions=_parse_inline_expansions(e.inline_expansions),
             equivalence_level=_parse_equivalence_level(
-                e.equivalence_level, analysis, e.accuracy_modulo_stack
+                e.equivalence_level,
+                analysis,
+                e.accuracy_modulo_stack,
+                e.accuracy_modulo_inline,
             ),
         )
 
@@ -561,10 +591,59 @@ def _parse_stack_permutation(
     return tuple(entries)
 
 
+def _parse_inline_expansions(
+    value: list[dict[str, object]] | None,
+) -> tuple[InlineExpansionEvidence, ...]:
+    if not value:
+        return ()
+    entries: list[InlineExpansionEvidence] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ReccmpReportDeserializeError
+        helper = item.get("helper")
+        helper_orig = item.get("helper_orig")
+        helper_recomp = item.get("helper_recomp")
+        side = item.get("side")
+        offset = item.get("offset")
+        length = item.get("length")
+        counterpart = item.get("counterpart")
+        counterpart_offset = item.get("counterpart_offset")
+        confidence = item.get("confidence", 0.0)
+        if not isinstance(helper, str) or not isinstance(helper_orig, str):
+            raise ReccmpReportDeserializeError
+        if not isinstance(helper_recomp, str):
+            raise ReccmpReportDeserializeError
+        if side not in ("orig", "recomp", "both"):
+            raise ReccmpReportDeserializeError
+        if counterpart not in ("call", "inline", "absent"):
+            raise ReccmpReportDeserializeError
+        if not isinstance(offset, int) or not isinstance(length, int):
+            raise ReccmpReportDeserializeError
+        if counterpart_offset is not None and not isinstance(counterpart_offset, int):
+            raise ReccmpReportDeserializeError
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ReccmpReportDeserializeError
+        entries.append(
+            InlineExpansionEvidence(
+                helper_name=helper,
+                helper_orig_addr=int(helper_orig, 16),
+                helper_recomp_addr=int(helper_recomp, 16),
+                side=side,
+                match_offset=offset,
+                match_length=length,
+                counterpart=counterpart,
+                counterpart_offset=counterpart_offset,
+                confidence=float(confidence),
+            )
+        )
+    return tuple(entries)
+
+
 def _parse_equivalence_level(
     value: str | None,
     analysis: ComparisonAnalysis,
     accuracy_modulo_stack: float | None,
+    accuracy_modulo_inline: float | None = None,
 ) -> EquivalenceLevel:
     if value is not None:
         try:
@@ -572,7 +651,9 @@ def _parse_equivalence_level(
         except ValueError as ex:
             raise ReccmpReportDeserializeError from ex
     return derive_equivalence_level(
-        analysis, accuracy_modulo_stack=accuracy_modulo_stack
+        analysis,
+        accuracy_modulo_stack=accuracy_modulo_stack,
+        accuracy_modulo_inline=accuracy_modulo_inline,
     )
 
 

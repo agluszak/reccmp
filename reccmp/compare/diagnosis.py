@@ -43,8 +43,9 @@ def derive_equivalence_level(
     analysis: "ComparisonAnalysis",
     *,
     accuracy_modulo_stack: float | None = None,
+    accuracy_modulo_inline: float | None = None,
 ) -> EquivalenceLevel:
-    """Map a structured analysis (plus optional stack score) onto the lattice."""
+    """Map a structured analysis (plus optional modulo scores) onto the lattice."""
     if analysis.status == ComparisonStatus.EXACT:
         return EquivalenceLevel.EXACT_INSTRUCTIONS
 
@@ -66,6 +67,10 @@ def derive_equivalence_level(
             return EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
         return EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
 
+    # Non-proof lattice claims: inline explains CALL↔body asymmetries more
+    # specifically than stack layout when both collapse to 100%.
+    if accuracy_modulo_inline is not None and accuracy_modulo_inline >= 1.0:
+        return EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
     if accuracy_modulo_stack is not None and accuracy_modulo_stack >= 1.0:
         return EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
 

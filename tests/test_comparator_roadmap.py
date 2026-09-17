@@ -120,18 +120,45 @@ def test_derive_equivalence_level_lattice():
         == EquivalenceLevel.STACK_LAYOUT_EQUIVALENT
     )
     assert (
+        derive_equivalence_level(
+            ComparisonAnalysis.inconclusive("analysis_limit"),
+            accuracy_modulo_inline=1.0,
+        )
+        == EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
+    )
+    assert (
+        derive_equivalence_level(
+            ComparisonAnalysis.inconclusive("analysis_limit"),
+            accuracy_modulo_stack=1.0,
+            accuracy_modulo_inline=1.0,
+        )
+        == EquivalenceLevel.KNOWN_INLINE_EQUIVALENT
+    )
+    assert (
         derive_equivalence_level(ComparisonAnalysis.inconclusive("analysis_limit"))
         == EquivalenceLevel.UNKNOWN_DIFFERENCE
     )
 
 
+def test_strip_helper_epilog_drops_trailing_ret():
+    from reccmp.compare.inlines import strip_helper_epilog
+
+    body = (("mov", "eax, ecx"), ("add", "eax, 1"), ("imul", "eax, 2"), ("ret", ""))
+    assert strip_helper_epilog(body) == body[:-1]
+
+
 def test_find_inline_expansions_detects_subsequence():
-    helper = (("mov", "eax, ecx"), ("add", "eax, 1"), ("ret", ""))
+    helper = (
+        ("mov", "eax, ecx"),
+        ("add", "eax, 1"),
+        ("imul", "eax, 2"),
+        ("ret", ""),
+    )
     host = (
         ("push", "ebp"),
         ("mov", "eax, ecx"),
         ("add", "eax, 1"),
-        ("ret", ""),
+        ("imul", "eax, 2"),
         ("pop", "ebp"),
     )
 
@@ -149,6 +176,70 @@ def test_find_inline_expansions_detects_subsequence():
     assert hits[0].host_addr == 0x200
     assert hits[0].match_offset == 1
     assert hits[0].match_length == 3
+
+
+def test_accuracy_after_inline_elision_call_vs_body():
+    from reccmp.compare.inlines import accuracy_after_inline_elision
+
+    helper_body = [
+        ("mov", "eax, ecx"),
+        ("add", "eax, 1"),
+        ("imul", "eax, 2"),
+    ]
+    orig = [("push", "ebx"), *helper_body, ("pop", "ebx")]
+    recomp = [("push", "ebx"), ("call", "Foo::setX"), ("pop", "ebx")]
+    placeholder = ("inline", 0x100)
+    assert (
+        accuracy_after_inline_elision(
+            orig,
+            recomp,
+            orig_elide=[(1, 3, placeholder)],
+            recomp_collapse=[(1, placeholder)],
+        )
+        == 1.0
+    )
+
+
+def test_analyze_inline_layout_call_vs_inline():
+    from reccmp.compare.inlines import HelperCatalogEntry, analyze_inline_layout
+
+    helper_lines = [
+        "mov eax, ecx",
+        "add eax, 1",
+        "imul eax, 2",
+        "ret",
+    ]
+    orig = [
+        "push ebx",
+        "mov eax, ecx",
+        "add eax, 1",
+        "imul eax, 2",
+        "pop ebx",
+    ]
+    recomp = [
+        "push ebx",
+        "call Foo::setX",
+        "pop ebx",
+    ]
+    helpers = [
+        HelperCatalogEntry(
+            orig_addr=0x100,
+            recomp_addr=0x200,
+            name="Foo::setX",
+            fingerprint=(
+                ("mov", "eax, ecx"),
+                ("add", "eax, 1"),
+                ("imul", "eax, 2"),
+            ),
+            byte_size=16,
+        )
+    ]
+    result = analyze_inline_layout(orig, recomp, helpers)
+    assert result.accuracy_modulo_inline == 1.0
+    assert len(result.expansions) == 1
+    assert result.expansions[0].helper_name == "Foo::setX"
+    assert result.expansions[0].side == "orig"
+    assert result.expansions[0].counterpart == "call"
 
 
 def test_enrich_mismatch_side_preserves_kind():

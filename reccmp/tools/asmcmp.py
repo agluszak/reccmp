@@ -139,6 +139,32 @@ def stack_layout_text(match: ReccmpComparedEntity) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+def inline_layout_text(match: ReccmpComparedEntity) -> str | None:
+    """Human-readable known-inline expansions / modulo-inline score."""
+    if not match.inline_expansions and match.accuracy_modulo_inline is None:
+        return None
+    lines: list[str] = []
+    if match.accuracy_modulo_inline is not None:
+        raw = percent_string(match.accuracy)
+        modulo = percent_string(match.accuracy_modulo_inline)
+        lines.append(f"{raw} raw / {modulo} modulo known inline expansion")
+    if match.inline_expansions:
+        lines.append("known inline expansions:")
+        for entry in match.inline_expansions:
+            where = entry.side
+            counterpart = entry.counterpart
+            detail = f"insn@{entry.match_offset}+{entry.match_length}"
+            if entry.counterpart_offset is not None:
+                detail += f" ↔ {counterpart}@{entry.counterpart_offset}"
+            else:
+                detail += f" ({counterpart})"
+            lines.append(
+                f"    {format_address(entry.helper_orig_addr)}  {entry.helper_name}  "
+                f"on {where}: {detail}"
+            )
+    return "\n".join(lines) if lines else None
+
+
 def equivalence_level_text(match: ReccmpComparedEntity) -> str | None:
     level = match.equivalence_level
     if level in (
@@ -179,6 +205,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             stack = stack_layout_text(match)
             if stack is not None:
                 print(stack)
+            inline = inline_layout_text(match)
+            if inline is not None:
+                print(inline)
             level = equivalence_level_text(match)
             if level is not None:
                 print(level)
@@ -195,6 +224,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         stack = stack_layout_text(match)
         if stack is not None:
             print(stack)
+        inline = inline_layout_text(match)
+        if inline is not None:
+            print(inline)
         level = equivalence_level_text(match)
         if level is not None:
             print(level)
@@ -224,6 +256,15 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         semantic = semantic_similarity_text(match)
         if semantic is not None:
             print(f"  {match.name} ({addrs}) has {semantic}")
+        elif (
+            match.accuracy_modulo_inline is not None
+            and match.accuracy_modulo_inline > match.accuracy
+        ):
+            raw = percent_string(match.accuracy)
+            modulo = percent_string(match.accuracy_modulo_inline)
+            print(
+                f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo known inline"
+            )
         elif (
             match.accuracy_modulo_stack is not None
             and match.accuracy_modulo_stack > match.accuracy

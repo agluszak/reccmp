@@ -28,7 +28,15 @@ from reccmp.compare.diagnosis import (
 )
 from reccmp.compare.asm.ir import instruction_match_key
 from reccmp.compare.stack_layout import analyze_stack_layout
-from reccmp.compare.inlines import InlineHit, find_inline_expansions
+from reccmp.compare.inlines import (
+    HelperCatalogEntry,
+    InlineHit,
+    InlineLayoutResult,
+    analyze_inline_layout,
+    asm_fingerprint_from_lines,
+    find_inline_expansions,
+    strip_helper_epilog,
+)
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.cvdump.analysis import CvdumpNode
@@ -150,6 +158,10 @@ class FunctionComparator:
 
     def __post_init__(self):
         self._call_abi_cache: dict[str, CallAbi | None] | None = None
+        self._fp_cache: dict[tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None] = (
+            {}
+        )
+        self._helper_catalog: list[HelperCatalogEntry] | None = None
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -338,14 +350,23 @@ class FunctionComparator:
         before the more expensive proof.  Relocation position and instruction
         shape remain part of the key.
         """
+        cache_key = (image_id, addr, size)
+        cache = getattr(self, "_fp_cache", None)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
         image = self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin
         valid_addr = create_valid_addr_lookup(self.db, image_id, image)
         try:
             raw = image.read(addr, size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
+            if cache is not None:
+                cache[cache_key] = None
             return None
         instructions = _code_instructions(raw, addr, self.is_32bit)
         if instructions is None:
+            if cache is not None:
+                cache[cache_key] = None
             return None
 
         def normalize_operand(operand: str) -> str:
@@ -355,10 +376,74 @@ class FunctionComparator:
 
             return re.sub(r"0x[0-9a-fA-F]+", replace, operand)
 
-        return tuple(
+        fingerprint = tuple(
             (mnemonic, normalize_operand(operand))
             for _, _, mnemonic, operand in instructions
         )
+        if cache is not None:
+            cache[cache_key] = fingerprint
+        return fingerprint
+
+    def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
+        """Build (once) the set of paired helpers usable as inline needles."""
+        if self._helper_catalog is not None:
+            return self._helper_catalog
+
+        catalog: list[HelperCatalogEntry] = []
+        for entity in self.db.get_functions():
+            recomp_size = entity.size(ImageId.RECOMP)
+            if recomp_size is None or recomp_size <= 0:
+                continue
+            try:
+                raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
+            except (InvalidVirtualAddressError, InvalidVirtualReadError):
+                continue
+            # Same sanitization as host compare streams so symbol names align.
+            excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
+            fingerprint = asm_fingerprint_from_lines([line for _, line in excerpt])
+            needle = strip_helper_epilog(fingerprint)
+            if len(needle) < 3:
+                continue
+            name = entity.best_name() or f"sub_{entity.orig_addr:x}"
+            catalog.append(
+                HelperCatalogEntry(
+                    orig_addr=entity.orig_addr,
+                    recomp_addr=entity.recomp_addr,
+                    name=name,
+                    fingerprint=needle,
+                    byte_size=recomp_size,
+                )
+            )
+        catalog.sort(key=lambda entry: len(entry.fingerprint), reverse=True)
+        self._helper_catalog = catalog
+        return catalog
+
+    def _analyze_inline_expansions(
+        self,
+        match: ReccmpMatch,
+        orig_asm: list[str],
+        recomp_asm: list[str],
+    ) -> InlineLayoutResult | None:
+        catalog = self._ensure_helper_catalog()
+        if not catalog:
+            return None
+        host_len = max(len(orig_asm), len(recomp_asm))
+        helpers = [
+            entry
+            for entry in catalog
+            if entry.orig_addr != match.orig_addr and len(entry.fingerprint) < host_len
+        ]
+        if not helpers:
+            return None
+        result = analyze_inline_layout(
+            orig_asm,
+            recomp_asm,
+            helpers,
+            exclude_orig_addrs=(match.orig_addr,),
+        )
+        if not result.expansions:
+            return None
+        return result
 
     def _unpaired_function_candidates(
         self, image_id: ImageId
@@ -861,8 +946,29 @@ class FunctionComparator:
 
         analysis = self._enrich_analysis_with_source(analysis)
 
+        inline_layout = None
+        if (
+            ratio < 1.0
+            and match is not None
+            and not analysis.is_effective
+        ):
+            inline_layout = self._analyze_inline_expansions(
+                match, orig_asm, recomp_asm
+            )
+
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
-            result = EntityCompareResult(match_ratio=ratio, analysis=analysis)
+            result = EntityCompareResult(
+                match_ratio=ratio,
+                analysis=analysis,
+                inline_expansions=(
+                    inline_layout.expansions if inline_layout is not None else ()
+                ),
+                accuracy_modulo_inline=(
+                    inline_layout.accuracy_modulo_inline
+                    if inline_layout is not None
+                    else None
+                ),
+            )
             result.refresh_equivalence_level()
             return result
 
@@ -909,6 +1015,14 @@ class FunctionComparator:
             ),
             accuracy_modulo_stack=(
                 stack_layout.accuracy_modulo_stack if stack_layout is not None else None
+            ),
+            inline_expansions=(
+                inline_layout.expansions if inline_layout is not None else ()
+            ),
+            accuracy_modulo_inline=(
+                inline_layout.accuracy_modulo_inline
+                if inline_layout is not None
+                else None
             ),
         )
         result.refresh_equivalence_level()

@@ -9,6 +9,7 @@ from reccmp.compare.diagnosis import (
     StackPermutationEntry,
     derive_equivalence_level,
 )
+from reccmp.compare.inlines import InlineExpansionEvidence
 
 CombinedDiffInput = list[tuple[str, str]]
 
@@ -22,6 +23,7 @@ class RawDiffOutput:
 
 @dataclasses.dataclass
 class EntityCompareResult:
+    # pylint: disable=too-many-instance-attributes
     diff: RawDiffOutput = dataclasses.field(default_factory=RawDiffOutput)
     match_ratio: float = 0.0
     analysis: ComparisonAnalysis = dataclasses.field(
@@ -29,6 +31,8 @@ class EntityCompareResult:
     )
     stack_permutation: tuple[StackPermutationEntry, ...] = ()
     accuracy_modulo_stack: float | None = None
+    inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
+    accuracy_modulo_inline: float | None = None
     equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     @property
@@ -39,6 +43,7 @@ class EntityCompareResult:
         self.equivalence_level = derive_equivalence_level(
             self.analysis,
             accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
         )
 
 class MatchingOrMismatchingBlock(TypedDict):
