@@ -10,17 +10,13 @@ from enum import Enum, auto
 from typing import Iterable, Literal, NamedTuple
 from capstone import (  # type: ignore
     CS_ARCH_X86,
-    CS_GRP_BRANCH_RELATIVE,
-    CS_GRP_CALL,
-    CS_GRP_JUMP,
-    CS_GRP_RET,
     CS_MODE_16,
     CS_MODE_32,
     Cs,
-    CsError,
 )
-from capstone import x86_const  # type: ignore
 from .const import JUMP_MNEMONICS
+from .decode import as_lite_tuple, disasm_detail
+from .ir import DecodedInstruction
 
 
 @cache
@@ -84,6 +80,8 @@ class InstructGen:
         self.end = len(blob) + start
         self.section_end: int = self.end
         self.code_tracks: list[list[DisasmLiteTuple]] = []
+        # Canonical IR from the same Capstone detail pass as code_tracks.
+        self.decoded_by_addr: dict[int, DecodedInstruction] = {}
 
         # Todo: Could be refactored later
         self.cur_addr: int = 0
@@ -159,26 +157,20 @@ class InstructGen:
         return new_type
 
     def _get_code_for(self, addr: int) -> list[DisasmLiteTuple]:
-        """Start disassembling at the given address."""
+        """Start disassembling at the given address (single Capstone detail pass)."""
         # If we are reading a code block beyond the first, see if we already
         # have disassembled instructions beginning at the specified address.
-        # For a CODE/ADDR/CODE function, we might get lucky and produce the
-        # correct instruction after the jump table's junk instructions.
         for track in self.code_tracks:
             for i, inst in enumerate(track):
                 if inst[0] == addr:
                     return track[i:]
 
-        # If we are here, we don't have the instructions.
-        # Todo: Could try to be clever here and disassemble only
-        # as much as we probably need (i.e. if a jump table is between CODE
-        # blocks, there are probably only a few bad instructions after the
-        # jump table is finished. We could disassemble up to the next verified
-        # code address and stitch it together)
-
-        disassembler = get_disassembler(self.is_32bit)
         blob_cropped = self.blob[addr - self.start :]
-        instructions = list(stop_at_int3(disassembler.disasm_lite(blob_cropped, addr)))
+        decoded = disasm_detail(blob_cropped, addr, self.is_32bit)
+        for insn in decoded:
+            assert insn.address is not None
+            self.decoded_by_addr[insn.address] = insn
+        instructions = [as_lite_tuple(insn) for insn in decoded]
         self.code_tracks.append(instructions)
         return instructions
 
@@ -286,9 +278,10 @@ class InstructGen:
 
 @cache
 def get_detail_disassembler(is_32: bool = True) -> Cs:
-    disassembler = Cs(CS_ARCH_X86, CS_MODE_32 if is_32 else CS_MODE_16)
-    disassembler.detail = True
-    return disassembler
+    """Backward-compatible alias; prefer ``decode.get_detail_disassembler``."""
+    from .decode import get_detail_disassembler as _impl
+
+    return _impl(is_32)
 
 
 @dataclass(frozen=True)
@@ -296,7 +289,12 @@ class InstructionMeta:
     """Structured facts about one instruction, captured from capstone's
     detail mode at disassembly time: register accesses including implicit
     ones, flags effects, memory access, control-flow class and the branch
-    target. Consumed privately by the effective-match verifier."""
+    target. Consumed privately by the effective-match verifier.
+
+    Prefer reading these fields from ``DecodedInstruction`` directly; this
+    dataclass remains as a projection for callers that still pass parallel
+    meta lists into the verifier.
+    """
 
     # pylint: disable=too-many-instance-attributes
 
@@ -314,60 +312,38 @@ class InstructionMeta:
     branch_target: int | None
 
 
-# EFLAGS "test" bits mean the instruction reads that flag; everything else
-# in the mask (modify/set/reset/undefined) is a write.
-_EFLAGS_READ_MASK = 0
-for _name in dir(x86_const):
-    if _name.startswith("X86_EFLAGS_TEST_"):
-        _EFLAGS_READ_MASK |= getattr(x86_const, _name)
+def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
+    assert insn.address is not None
+    return InstructionMeta(
+        address=insn.address,
+        size=insn.size,
+        mnemonic=insn.mnemonic,
+        regs_read=insn.regs_read,
+        regs_written=insn.regs_written,
+        reads_flags=insn.reads_flags,
+        writes_flags=insn.writes_flags,
+        accesses_memory=insn.accesses_memory,
+        is_jump=insn.is_jump,
+        is_call=insn.is_call,
+        is_ret=insn.is_ret,
+        branch_target=insn.branch_target,
+    )
 
 
 def collect_instruction_meta(
     blob: bytes, start: int, sections: list[FuncSection], is_32bit: bool = True
 ) -> dict[int, InstructionMeta]:
-    """Disassemble the code sections again in detail mode and return a
-    per-address map of structured instruction facts."""
+    """Project canonical IR for code sections into the legacy meta map.
+
+    When ``InstructGen`` has already decoded the blob, prefer
+    ``InstructGen.decoded_by_addr`` instead of calling this.  This helper
+    reuses the single detail pass via ``disasm_detail`` rather than a second
+    Capstone walk over each section.
+    """
+    del sections  # IR is produced from the full blob; section bounds already applied.
     result: dict[int, InstructionMeta] = {}
-    disassembler = get_detail_disassembler(is_32bit)
-
-    for section in sections:
-        if section.type != SectionType.CODE or not section.contents:
+    for insn in disasm_detail(blob, start, is_32bit):
+        if insn.address is None:
             continue
-        first = section.contents[0][0]
-        last = section.contents[-1]
-        code = blob[first - start : last[0] + last[1] - start]
-
-        for insn in disassembler.disasm(code, first):
-            try:
-                read_ids, write_ids = insn.regs_access()
-            except CsError:
-                continue
-
-            is_jump = insn.group(CS_GRP_JUMP)
-            is_call = insn.group(CS_GRP_CALL)
-            branch_target = None
-            operands = insn.operands
-            if (
-                (is_jump or is_call)
-                and insn.group(CS_GRP_BRANCH_RELATIVE)
-                and len(operands) == 1
-                and operands[0].type == x86_const.X86_OP_IMM
-            ):
-                branch_target = operands[0].imm
-
-            result[insn.address] = InstructionMeta(
-                address=insn.address,
-                size=insn.size,
-                mnemonic=insn.mnemonic,
-                regs_read=tuple(sorted(insn.reg_name(r) for r in read_ids)),
-                regs_written=tuple(sorted(insn.reg_name(r) for r in write_ids)),
-                reads_flags=bool(insn.eflags & _EFLAGS_READ_MASK),
-                writes_flags=bool(insn.eflags & ~_EFLAGS_READ_MASK),
-                accesses_memory=any(op.type == x86_const.X86_OP_MEM for op in operands),
-                is_jump=is_jump,
-                is_call=is_call,
-                is_ret=insn.group(CS_GRP_RET),
-                branch_target=branch_target,
-            )
-
+        result[insn.address] = meta_from_decoded(insn)
     return result

@@ -1,32 +1,163 @@
-"""Structured instruction keys used for alignment and normalized ratios.
+"""Canonical instruction IR for the compare pipeline.
 
-Display strings remain the user-facing representation. Matching and
-stack-normalized scoring operate on Instruction IR (or opaque line keys when
-a line is not an instruction, e.g. jump/data tables).
+``DecodedInstruction`` is the single representation produced by Capstone
+detail-mode decode + sanitization. Display strings exist only for humans and
+JSON diffs. Matching, stack scoring, inline fingerprints, and (eventually) the
+effective verifier consume structured fields.
 """
 
 from __future__ import annotations
 
-from typing import Hashable
-
-from .effective import Instruction, Reject, parse_instruction
+from dataclasses import dataclass, replace
+from enum import Enum, auto
+from typing import Hashable, Iterator
 
 _MEM = "mem"
-
-# Sentinel displacing frame/stack offsets for modulo-stack comparison keys.
 _STACK_SLOT = ("stack_slot",)
 
 
-def try_parse_instruction(line: str) -> Instruction | None:
-    """Parse a sanitized asm line into IR, or None for non-instruction lines."""
-    try:
-        return parse_instruction(line)
-    except Reject:
-        return None
+class AsmRole(Enum):
+    """What kind of row this is in a function excerpt."""
+
+    CODE = auto()
+    JUMP_TABLE_HEADER = auto()
+    JUMP_TABLE_ENTRY = auto()
+    DATA_TABLE_HEADER = auto()
+    DATA_TABLE_ENTRY = auto()
+
+
+@dataclass(frozen=True)
+class DecodedInstruction:
+    """One canonical instruction (or table marker) in a function excerpt."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    address: int | None
+    size: int
+    mnemonic: str
+    prefix: str
+    operands: tuple
+    raw_operands: tuple[str, ...]
+    display: str
+    role: AsmRole = AsmRole.CODE
+    # Capstone detail facts (empty for table markers).
+    regs_read: tuple[str, ...] = ()
+    regs_written: tuple[str, ...] = ()
+    reads_flags: bool = False
+    writes_flags: bool = False
+    accesses_memory: bool = False
+    is_jump: bool = False
+    is_call: bool = False
+    is_ret: bool = False
+    branch_target: int | None = None
+    # Unsanitized Capstone op_str (useful for debug / jump-table discovery).
+    raw_op_str: str = ""
+
+    @property
+    def is_code(self) -> bool:
+        return self.role == AsmRole.CODE
+
+    def as_effective(self):
+        """View used by the effective-match verifier."""
+        from .effective import Instruction
+
+        return Instruction(
+            self.mnemonic, self.prefix, self.operands, self.raw_operands
+        )
+
+    def with_display(self, display: str) -> "DecodedInstruction":
+        """Replace the display string and refresh structured operands from it."""
+        from .effective import Reject, parse_instruction
+
+        if self.role != AsmRole.CODE:
+            return replace(
+                self, display=display, mnemonic="", prefix="", operands=(), raw_operands=()
+            )
+        try:
+            parsed = parse_instruction(display)
+        except Reject:
+            return replace(self, display=display)
+        return replace(
+            self,
+            display=display,
+            mnemonic=parsed.mnemonic,
+            prefix=parsed.prefix,
+            operands=parsed.operands,
+            raw_operands=parsed.raw_operands,
+        )
+
+    # Tuple-like access so existing ``(addr, line)`` unpacking keeps working.
+    def __getitem__(self, index: int) -> int | None | str:
+        if index == 0:
+            return self.address
+        if index == 1:
+            return self.display
+        raise IndexError(index)
+
+    def __iter__(self) -> Iterator[int | None | str]:
+        yield self.address
+        yield self.display
+
+    def __len__(self) -> int:
+        return 2
+
+
+def marker(
+    display: str,
+    *,
+    address: int | None = None,
+    role: AsmRole,
+) -> DecodedInstruction:
+    """Build a non-code excerpt row (jump/data table header or entry)."""
+    return DecodedInstruction(
+        address=address,
+        size=0,
+        mnemonic="",
+        prefix="",
+        operands=(),
+        raw_operands=(),
+        display=display,
+        role=role,
+    )
+
+
+def from_effective(
+    address: int | None,
+    size: int,
+    instruction,
+    display: str,
+    *,
+    raw_op_str: str = "",
+    meta: object | None = None,
+) -> DecodedInstruction:
+    """Assemble a code row from a parsed Instruction plus optional Capstone meta."""
+    kwargs: dict = {
+        "address": address,
+        "size": size,
+        "mnemonic": instruction.mnemonic,
+        "prefix": instruction.prefix,
+        "operands": instruction.operands,
+        "raw_operands": instruction.raw_operands,
+        "display": display,
+        "role": AsmRole.CODE,
+        "raw_op_str": raw_op_str,
+    }
+    if meta is not None:
+        kwargs.update(
+            regs_read=getattr(meta, "regs_read", ()),
+            regs_written=getattr(meta, "regs_written", ()),
+            reads_flags=getattr(meta, "reads_flags", False),
+            writes_flags=getattr(meta, "writes_flags", False),
+            accesses_memory=getattr(meta, "accesses_memory", False),
+            is_jump=getattr(meta, "is_jump", False),
+            is_call=getattr(meta, "is_call", False),
+            is_ret=getattr(meta, "is_ret", False),
+            branch_target=getattr(meta, "branch_target", None),
+        )
+    return DecodedInstruction(**kwargs)
 
 
 def _freeze(value) -> Hashable:
-    """Make parse_operand structures hashable (reg_terms are lists today)."""
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, tuple):
@@ -34,56 +165,59 @@ def _freeze(value) -> Hashable:
     return value
 
 
-def instruction_match_key(line: str) -> Hashable:
-    """Hashable key for SequenceMatcher alignment.
+def instruction_match_key(row: DecodedInstruction | str) -> Hashable:
+    """Hashable SequenceMatcher key from IR (or legacy display string)."""
+    from .effective import Reject, parse_instruction
 
-    Prefer structured Instruction equality so operand structure drives matching.
-    Fall back to the raw display string for jump/data table lines.
-    """
-    ins = try_parse_instruction(line)
-    if ins is None:
-        return ("raw", line)
-    return ("ins", ins.mnemonic, ins.prefix, _freeze(ins.operands))
+    if isinstance(row, str):
+        try:
+            ins = parse_instruction(row)
+        except Reject:
+            return ("raw", row)
+        return ("ins", ins.mnemonic, ins.prefix, _freeze(ins.operands))
+    if row.role != AsmRole.CODE:
+        return ("raw", row.display)
+    return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
 
 
 def _normalize_operand_stack(operand) -> object:
-    """Erase ebp/esp displacements so stack-layout entropy collapses."""
     if not isinstance(operand, tuple) or not operand:
         return operand
-    tag = operand[0]
-    if tag == _MEM:
-        # ("mem", size, seg, reg_terms, disp, syms)
-        size, seg, reg_terms, _disp, syms = (
-            operand[1],
-            operand[2],
-            operand[3],
-            operand[4],
-            operand[5],
-        )
-        regs = {name for name, _scale in reg_terms}
-        if regs & {"ebp", "esp"} and not syms:
-            return (_MEM, size, seg, _freeze(reg_terms), _STACK_SLOT, ())
+    if operand[0] != _MEM:
         return _freeze(operand)
+    size, seg, reg_terms, _disp, syms = (
+        operand[1],
+        operand[2],
+        operand[3],
+        operand[4],
+        operand[5],
+    )
+    regs = {name for name, _scale in reg_terms}
+    if regs & {"ebp", "esp"} and not syms:
+        return (_MEM, size, seg, _freeze(reg_terms), _STACK_SLOT, ())
     return _freeze(operand)
 
 
-def stack_normalized_key(line: str) -> Hashable:
-    """Match key with frame/stack displacements abstracted away."""
-    ins = try_parse_instruction(line)
-    if ins is None:
-        return ("raw", line)
-    operands = tuple(_normalize_operand_stack(op) for op in ins.operands)
-    return ("ins", ins.mnemonic, ins.prefix, operands)
+def stack_normalized_key(row: DecodedInstruction | str) -> Hashable:
+    from .effective import Reject, parse_instruction
+
+    if isinstance(row, str):
+        try:
+            ins = parse_instruction(row)
+        except Reject:
+            return ("raw", row)
+        operands = tuple(_normalize_operand_stack(op) for op in ins.operands)
+        return ("ins", ins.mnemonic, ins.prefix, operands)
+    if row.role != AsmRole.CODE:
+        return ("raw", row.display)
+    operands = tuple(_normalize_operand_stack(op) for op in row.operands)
+    return ("ins", row.mnemonic, row.prefix, operands)
 
 
 def rewrite_stack_displacements(
     line: str, mapping: dict[tuple[str, int], tuple[str, int]]
 ) -> str:
-    """Rewrite ebp/esp ± offset tokens in a display line through a slot map.
-
-    ``mapping`` keys and values are ``(register, signed_offset)``.
-    Unmapped offsets are left unchanged.
-    """
+    """Rewrite ebp/esp ± offset tokens in a display line through a slot map."""
     from reccmp.compare.stack_layout import STACK_ENTRY_REGEX
 
     def repl(match) -> str:
@@ -98,3 +232,11 @@ def rewrite_stack_displacements(
         return f"{tgt_reg} - {-tgt_off:#x}"
 
     return STACK_ENTRY_REGEX.sub(repl, line)
+
+
+def excerpt_displays(excerpt: list[DecodedInstruction]) -> list[str]:
+    return [row.display for row in excerpt]
+
+
+def excerpt_addrs(excerpt: list[DecodedInstruction]) -> list[int | None]:
+    return [row.address for row in excerpt]

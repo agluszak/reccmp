@@ -471,13 +471,15 @@ def test_16bit_mode():
 
     # Interpreted as CALL to 32-bit pointer
     p = ParseAsm(is_32bit=True)
-    assert p.parse_asm(code, 0x1000) == [
+    rows = p.parse_asm(code, 0x1000)
+    assert [(row.address, row.display) for row in rows] == [
         (0x1000, "call <OFFSET1>"),
     ]
 
     # Interpreted as CALL to cs:offset
     p = ParseAsm(is_32bit=False)
-    assert p.parse_asm(code, 0x1000) == [
+    rows = p.parse_asm(code, 0x1000)
+    assert [(row.address, row.display) for row in rows] == [
         (0x1000, "call <OFFSET1>"),
         (0x1003, "shl bx, 1"),
     ]

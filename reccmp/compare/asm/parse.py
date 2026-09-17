@@ -1,10 +1,9 @@
-"""Converts x86 machine code into text (i.e. assembly). The end goal is to
-compare the code in the original and recomp binaries, using longest common
-subsequence (LCS), i.e. difflib.SequenceMatcher.
-The capstone library takes the raw bytes and gives us the mnemonic
-and operand(s) for each instruction. We need to "sanitize" the text further
-so that virtual addresses are replaced by symbol name or a generic
-placeholder string."""
+"""Converts x86 machine code into canonical ``DecodedInstruction`` rows.
+
+Capstone detail-mode decode happens once in ``InstructGen``.  This module
+sanitizes addresses into symbols/placeholders and materializes structured
+operands on each ``DecodedInstruction``.  Display strings remain for UI only.
+"""
 
 import re
 from functools import cache
@@ -16,11 +15,13 @@ from .instgen import (
     InstructGen,
     InstructionMeta,
     SectionType,
-    collect_instruction_meta,
+    meta_from_decoded,
 )
+from .ir import AsmRole, DecodedInstruction, marker
+from .effective import Reject, parse_instruction
 from .replacement import AddrTestProtocol, NameReplacementProtocol
 
-AsmExcerpt = list[tuple[int | None, str]]
+AsmExcerpt = list[DecodedInstruction]
 
 ptr_replace_regex = re.compile(r"(?<=\[)(0x[0-9a-f]+)(?=\])")
 
@@ -57,10 +58,11 @@ class ParseAsm:
         self.replacements: dict[int, str] = {}
         self.indirect_replacements: dict[int, str] = {}
         self.number_placeholders = True
-        # Structured capstone facts for the most recent parse_asm() call,
-        # keyed by instruction address. Populated when collect_meta is set.
+        # Structured facts for the most recent parse_asm() call,
+        # keyed by instruction address. Populated from the single decode pass.
         self.meta: dict[int, InstructionMeta] = {}
         self._sections: list[FuncSection] = []
+        self._decoded_by_addr: dict[int, DecodedInstruction] = {}
 
     def reset(self):
         self.replacements = {}
@@ -207,31 +209,69 @@ class ParseAsm:
 
         return (inst_mnemonic, op_str)
 
+    def _finalize_code_row(
+        self, lite: DisasmLiteTuple, display: str
+    ) -> DecodedInstruction:
+        """Attach sanitized display + structured operands onto the decoded row."""
+        addr, size, _mnemonic, raw_op = lite
+        base = self._decoded_by_addr.get(addr)
+        try:
+            parsed = parse_instruction(display)
+        except Reject:
+            if base is not None:
+                return base.with_display(display)
+            return DecodedInstruction(
+                address=addr,
+                size=size,
+                mnemonic=display.split()[0] if display else "",
+                prefix="",
+                operands=(),
+                raw_operands=(),
+                display=display,
+                role=AsmRole.CODE,
+                raw_op_str=raw_op,
+            )
+        if base is not None:
+            from dataclasses import replace
+
+            return replace(
+                base,
+                display=display,
+                mnemonic=parsed.mnemonic,
+                prefix=parsed.prefix,
+                operands=parsed.operands,
+                raw_operands=parsed.raw_operands,
+            )
+        return DecodedInstruction(
+            address=addr,
+            size=size,
+            mnemonic=parsed.mnemonic,
+            prefix=parsed.prefix,
+            operands=parsed.operands,
+            raw_operands=parsed.raw_operands,
+            display=display,
+            role=AsmRole.CODE,
+            raw_op_str=raw_op,
+        )
+
     def parse_asm(self, data: Buffer, start_addr: int) -> AsmExcerpt:
         self.reset()
         asm: AsmExcerpt = []
 
         ig = InstructGen(bytes(data), start_addr, self.is_32bit)
         self._sections = ig.sections
+        self._decoded_by_addr = dict(ig.decoded_by_addr)
 
-        if self.collect_meta:
-            self.collect_instruction_meta(data, start_addr)
-        else:
-            self.meta = {}
+        # Project meta from the single decode pass (no second Capstone walk).
+        self.meta = {
+            addr: meta_from_decoded(insn)
+            for addr, insn in self._decoded_by_addr.items()
+        }
 
         for section in ig.sections:
             if section.type == SectionType.CODE:
                 for inst in section.contents:
                     inst_address, inst_size, inst_mnemonic, inst_op_str = inst
-                    # If there is no pointer or immediate value in the op_str,
-                    # there is nothing to sanitize.
-                    # This leaves us with cases where a small immediate value or
-                    # small displacement (this.member or vtable calls) appears.
-                    # If we assume that instructions we want to sanitize need to be 5
-                    # bytes -- 1 for the opcode and 4 for the address -- exclude cases
-                    # where the hex value could not be an address.
-                    # The exception is jumps which are as small as 2 bytes
-                    # but are still useful to sanitize.
                     if "0x" in inst_op_str and (
                         inst_mnemonic in JUMP_MNEMONICS
                         or inst_size > 4
@@ -241,36 +281,47 @@ class ParseAsm:
                     else:
                         result = (inst_mnemonic, inst_op_str)
 
-                    # mnemonic + " " + op_str
-                    asm.append((inst_address, " ".join(result)))
+                    display = " ".join(result)
+                    asm.append(self._finalize_code_row(inst, display))
             elif section.type == SectionType.ADDR_TAB:
-                asm.append((None, "Jump table:"))
+                asm.append(
+                    marker("Jump table:", role=AsmRole.JUMP_TABLE_HEADER)
+                )
                 for ofs, target in section.contents:
-                    # Jumps in jump tables are absolute, which can lead to false positives
-                    # when the function does not have the same address in orig and recomp.
-                    # Therefore, we compute where the jump will go relative to the start of the function.
                     target_relative_to_function_start = target - start_addr
                     asm.append(
-                        (ofs, f"start + 0x{(target_relative_to_function_start):x}")
+                        marker(
+                            f"start + 0x{(target_relative_to_function_start):x}",
+                            address=ofs,
+                            role=AsmRole.JUMP_TABLE_ENTRY,
+                        )
                     )
 
             elif section.type == SectionType.DATA_TAB:
-                asm.append((None, "Data table:"))
+                asm.append(marker("Data table:", role=AsmRole.DATA_TABLE_HEADER))
                 for ofs, b in section.contents:
-                    asm.append((ofs, hex(b)))
+                    asm.append(
+                        marker(hex(b), address=ofs, role=AsmRole.DATA_TABLE_ENTRY)
+                    )
 
         return asm
 
     def collect_instruction_meta(
         self, data: Buffer, start_addr: int
     ) -> dict[int, InstructionMeta]:
-        """Collect detailed facts for the most recently parsed instruction stream.
+        """Return meta from the most recent ``parse_asm`` decode, or decode now.
 
-        Text sanitization only needs Capstone's lightweight mode.  Callers that
-        discover a non-exact stream can opt into detail mode afterward without
-        making exact functions pay for a second disassembly.
+        The hot path already populated ``self.meta`` during ``parse_asm``.
+        This method remains for callers that only need meta without a full
+        sanitize pass.
         """
-        self.meta = collect_instruction_meta(
-            bytes(data), start_addr, self._sections, self.is_32bit
-        )
+        if self.meta and self._decoded_by_addr:
+            return self.meta
+        ig = InstructGen(bytes(data), start_addr, self.is_32bit)
+        self._sections = ig.sections
+        self._decoded_by_addr = dict(ig.decoded_by_addr)
+        self.meta = {
+            addr: meta_from_decoded(insn)
+            for addr, insn in self._decoded_by_addr.items()
+        }
         return self.meta

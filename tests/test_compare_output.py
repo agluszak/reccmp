@@ -114,7 +114,8 @@ def test_exact_comparison_skips_detailed_instruction_metadata():
     recomp_meta.assert_not_called()
 
 
-def test_nonexact_comparison_collects_detailed_instruction_metadata():
+def test_nonexact_comparison_uses_detail_metadata_from_single_decode():
+    """Non-exact compares use Capstone detail facts without a second meta pass."""
     orig_bin = RawImage.from_memory(b"\x90")
     recomp_bin = RawImage.from_memory(b"\xc3")
     pdb = Mock(spec=CvdumpAnalysis)
@@ -143,8 +144,10 @@ def test_nonexact_comparison_collects_detailed_instruction_metadata():
         match = compare.compare_address(0, include_diff=False)
 
     assert match is not None
-    orig_meta.assert_called_once()
-    recomp_meta.assert_called_once()
+    # Meta is projected from the single InstructGen detail decode during
+    # parse_asm; collect_instruction_meta is no longer required on the hot path.
+    orig_meta.assert_not_called()
+    recomp_meta.assert_not_called()
 
 
 def test_not_matched():

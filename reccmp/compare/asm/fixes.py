@@ -419,10 +419,17 @@ def _forward_jcc_within(
 def assert_fixup(asm: AsmExcerpt):
     """Detect assert calls and replace the code filename and line number
     values with macros (from assert.h)."""
-    for i, (_, line) in enumerate(asm):
+    for i, row in enumerate(asm):
+        line = row.display if hasattr(row, "display") else row[1]
         if "_assert" in line and line.startswith("call"):
             try:
-                asm[i - 3] = (asm[i - 3][0], "push __LINE__")
-                asm[i - 2] = (asm[i - 2][0], "push __FILE__")
+                prev3 = asm[i - 3]
+                prev2 = asm[i - 2]
+                if hasattr(prev3, "with_display"):
+                    asm[i - 3] = prev3.with_display("push __LINE__")
+                    asm[i - 2] = prev2.with_display("push __FILE__")
+                else:
+                    asm[i - 3] = (prev3[0], "push __LINE__")
+                    asm[i - 2] = (prev2[0], "push __FILE__")
             except IndexError:
                 continue

@@ -11,7 +11,13 @@ from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.asm.effective import CallAbi, FunctionMetadata
 from reccmp.compare.asm.fixes import analyze_effective_match, assert_fixup
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
+from reccmp.compare.asm.instgen import (
+    InstructGen,
+    InstructionMeta,
+    SectionType,
+    meta_from_decoded,
+)
+from reccmp.compare.asm.ir import instruction_match_key
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
 from reccmp.compare.asm.replacement import (
     canonical_callee_name,
@@ -962,13 +968,13 @@ class FunctionComparator:
         recomp_meta: list[InstructionMeta | None] | None = None,
     ) -> EntityCompareResult:
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-        # Detach addresses from asm lines for the text diff.
-        orig_asm = [x[1] for x in orig]
-        recomp_asm = [x[1] for x in recomp]
-
         # Align on structured IR keys; display strings stay for printing/scoring UI.
-        orig_keys = [instruction_match_key(line) for line in orig_asm]
-        recomp_keys = [instruction_match_key(line) for line in recomp_asm]
+        orig_asm = [x.display if hasattr(x, "display") else x[1] for x in orig]
+        recomp_asm = [x.display if hasattr(x, "display") else x[1] for x in recomp]
+
+        # Prefer canonical IR keys when rows are DecodedInstruction.
+        orig_keys = [instruction_match_key(row) for row in orig]
+        recomp_keys = [instruction_match_key(row) for row in recomp]
         diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
 
         ratio = diff.ratio()
@@ -978,34 +984,47 @@ class FunctionComparator:
         else:
             if metadata is None and match is not None:
                 metadata = self._function_metadata(match)
-            if orig_meta is None and orig_raw is not None:
-                orig_meta_by_addr = self.orig_sanitize.collect_instruction_meta(
-                    orig_raw,
-                    (
-                        match.orig_addr
-                        if match is not None
-                        else (orig[0][0] if orig and orig[0][0] is not None else 0)
-                    ),
-                )
-                orig_meta = [
-                    orig_meta_by_addr.get(addr) if addr is not None else None
-                    for addr, _ in orig
-                ]
-            if recomp_meta is None and recomp_raw is not None:
-                recomp_meta_by_addr = self.recomp_sanitize.collect_instruction_meta(
-                    recomp_raw,
-                    (
-                        match.recomp_addr
-                        if match is not None
-                        else (
-                            recomp[0][0] if recomp and recomp[0][0] is not None else 0
-                        )
-                    ),
-                )
-                recomp_meta = [
-                    recomp_meta_by_addr.get(addr) if addr is not None else None
-                    for addr, _ in recomp
-                ]
+            if orig_meta is None:
+                if orig and hasattr(orig[0], "is_code"):
+                    orig_meta = [
+                        meta_from_decoded(row) if row.is_code else None for row in orig
+                    ]
+                elif orig_raw is not None:
+                    orig_meta_by_addr = self.orig_sanitize.collect_instruction_meta(
+                        orig_raw,
+                        (
+                            match.orig_addr
+                            if match is not None
+                            else (orig[0][0] if orig and orig[0][0] is not None else 0)
+                        ),
+                    )
+                    orig_meta = [
+                        orig_meta_by_addr.get(addr) if addr is not None else None
+                        for addr, _ in orig
+                    ]
+            if recomp_meta is None:
+                if recomp and hasattr(recomp[0], "is_code"):
+                    recomp_meta = [
+                        meta_from_decoded(row) if row.is_code else None
+                        for row in recomp
+                    ]
+                elif recomp_raw is not None:
+                    recomp_meta_by_addr = self.recomp_sanitize.collect_instruction_meta(
+                        recomp_raw,
+                        (
+                            match.recomp_addr
+                            if match is not None
+                            else (
+                                recomp[0][0]
+                                if recomp and recomp[0][0] is not None
+                                else 0
+                            )
+                        ),
+                    )
+                    recomp_meta = [
+                        recomp_meta_by_addr.get(addr) if addr is not None else None
+                        for addr, _ in recomp
+                    ]
             analysis = analyze_effective_match(
                 opcodes,
                 orig_asm,
