@@ -857,3 +857,110 @@ def test_one_sided_push_live_at_call_rejected():
     t_o: list[int | None] = [None] * 2
     t_r: list[int | None] = [None] * 4
     assert verify_isomorphic_cfg_effective_match(orig, recomp, t_o, t_r) is False
+
+
+# --- Recognized switch jump tables -----------------------------------------
+
+
+def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
+    """Minimal cmp/ja + jmp-[idx*4+table] switch with two cases and a default."""
+    asm = [
+        # Shared stack argument so index-reg renames stay equivalent.
+        f"mov {index_reg}, dword ptr [ebp + 8]",
+        f"cmp {index_reg}, 1",
+        "ja 0x24",
+        f"jmp dword ptr [{index_reg}*4 + <OFFSET1>]",
+        "Jump table:",
+        "start + 0x14",
+        "start + 0x18",
+        f"mov {scratch}, 1",
+        "ret",
+        f"mov {scratch}, 2",
+        "ret",
+        f"xor {scratch}, {scratch}",
+        "ret",
+    ]
+    # Function start 0x1000; case0 at +0x14, case1 at +0x18, default at +0x24.
+    addrs: list[int | None] = [
+        0x1000,
+        0x1003,
+        0x1006,
+        0x1008,
+        None,
+        0x100C,  # table slot 0
+        0x1010,  # table slot 1
+        0x1014,  # case 0
+        0x1016,
+        0x1018,  # case 1
+        0x101A,
+        0x1024,  # default
+        0x1026,
+    ]
+    # ja -> default at index 11; table fills the rest.
+    targets: list[int | None] = [
+        None, None, 11, None, None, None, None, None, None, None, None, None, None
+    ]
+    return asm, addrs, targets
+
+
+def test_recognized_switch_table_iso_cfg_match_under_register_rename():
+    orig, orig_addrs, targets = _switch_fixture("eax", "edx")
+    recomp, recomp_addrs, _ = _switch_fixture("ecx", "edx")
+    # Shift recomp into a different VA range; relative start+ offsets unchanged.
+    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    metadata = FunctionMetadata(return_kind="void")
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig,
+            recomp,
+            targets,
+            list(targets),
+            metadata=metadata,
+            orig_addrs=orig_addrs,
+            recomp_addrs=recomp_addrs,
+        )
+        is True
+    )
+
+
+def test_recognized_switch_wrong_case_order_is_non_isomorphic():
+    orig, orig_addrs, targets = _switch_fixture()
+    recomp, recomp_addrs, _ = _switch_fixture()
+    # Swap case destinations in the recomp table.
+    recomp = list(recomp)
+    recomp[5], recomp[6] = recomp[6], recomp[5]
+    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    recorder = AnalysisRecorder(orig_addrs=orig_addrs, recomp_addrs=recomp_addrs)
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        targets,
+        list(targets),
+        metadata=FunctionMetadata(return_kind="void"),
+        recorder=recorder,
+        orig_addrs=orig_addrs,
+        recomp_addrs=recomp_addrs,
+    )
+    analysis = recorder.failure_analysis()
+    assert analysis.status != ComparisonStatus.EFFECTIVE
+    assert (
+        analysis.inconclusive_reason == "non_isomorphic_cfg"
+        or analysis.difference is not None
+    )
+
+
+def test_unresolved_switch_without_addrs_stays_jump_table_data():
+    orig, _addrs, targets = _switch_fixture()
+    recorder = AnalysisRecorder(
+        orig_addrs=[0x1000] * len(orig),
+        recomp_addrs=[0x2000] * len(orig),
+    )
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        list(orig),
+        targets,
+        list(targets),
+        recorder=recorder,
+        # No addrs → cannot resolve start+ entries.
+    )
+    assert recorder.failure_analysis().inconclusive_reason == "jump_table_data"

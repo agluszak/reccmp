@@ -1471,6 +1471,19 @@ def execute_x87(state: SideState, ctx: Context, ins: Instruction, obs: list) -> 
 
 # Non-executable lines emitted by the sanitizer (jump/data tables).
 DATA_LINE_RE = re.compile(r"^(Jump table:|Data table:|start \+ |0x[0-9a-f]+$)")
+# Jump-table entries produced by ParseAsm for ADDR_TAB destinations.
+JUMP_TABLE_ENTRY_RE = re.compile(r"^start \+ (0x[0-9a-f]+)$")
+
+
+def _switch_index_observation(state: SideState, ins: Instruction) -> tuple:
+    """Index register values that select a recognized switch-table case."""
+    op = ins.operands[0]
+    assert isinstance(op, tuple) and op[0] == "mem"
+    reg_terms = op[3]
+    return tuple(
+        (scale, state.read_reg(reg))
+        for reg, scale in sorted(reg_terms, key=lambda t: (-t[1], t[0]))
+    )
 
 
 def fully_synced(orig: SideState, recomp: SideState) -> bool:
@@ -3300,14 +3313,90 @@ def _control_kind(line: str) -> str:
     return "code"
 
 
+def _is_recognized_switch_jmp(line: str) -> bool:
+    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
+    try:
+        ins = parse_instruction(line)
+    except (Reject, IndexError, KeyError, ValueError, TypeError):
+        return False
+    if ins.mnemonic != "jmp" or len(ins.operands) != 1:
+        return False
+    op = ins.operands[0]
+    if not isinstance(op, tuple) or op[0] != "mem":
+        return False
+    _size, _seg, reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
+    if not any(scale == 4 for _reg, scale in reg_terms):
+        return False
+    # Require an identifiable table base (sanitized symbol and/or displacement).
+    return bool(syms) or disp != 0
+
+
+def _extract_switch_tables(
+    asm: list[str],
+    kinds: list[str],
+    addrs: list[int | None] | None,
+) -> tuple[dict[int, list[int]], set[int]] | None:
+    """Map recognized switch jmps to case destination indices.
+
+    Returns ``(jmp_index -> dest line indices, owned data line indices)``.
+    ``None`` means a candidate table could not be resolved conservatively.
+    """
+    # pylint: disable=too-many-locals
+    total = len(asm)
+    table_dests: dict[int, list[int]] = {}
+    owned: set[int] = set()
+    addr_index: dict[int, int] = {}
+    func_start: int | None = None
+    if addrs is not None and len(addrs) == total:
+        for i, addr in enumerate(addrs):
+            if addr is None or kinds[i] == "data":
+                continue
+            if func_start is None:
+                func_start = addr
+            addr_index.setdefault(addr, i)
+
+    i = 0
+    while i < total:
+        if kinds[i] == "jmp" and _is_recognized_switch_jmp(asm[i]):
+            if i + 1 < total and asm[i + 1] == "Jump table:":
+                entries: list[int] = []
+                j = i + 2
+                while j < total and JUMP_TABLE_ENTRY_RE.match(asm[j]):
+                    entries.append(j)
+                    j += 1
+                if entries:
+                    if func_start is None:
+                        return None
+                    dests: list[int] = []
+                    for entry_i in entries:
+                        match = JUMP_TABLE_ENTRY_RE.match(asm[entry_i])
+                        assert match is not None
+                        dest_va = func_start + int(match.group(1), 16)
+                        dest_i = addr_index.get(dest_va)
+                        if dest_i is None:
+                            return None
+                        dests.append(dest_i)
+                    table_dests[i] = dests
+                    owned.update(range(i + 1, j))
+                    i = j
+                    continue
+        i += 1
+    return table_dests, owned
+
+
 @dataclass
 class _SideCfg:
     starts: list[int]
     ends: list[int]
-    # Per block: role ("taken"/"fall"/"jmp"/"fallout") -> successor block
-    # index, or "external" for a target outside the excerpt.
+    # Per block: role ("taken"/"fall"/"jmp"/"fallout"/"caseN") -> successor
+    # block index, or "external" for a target outside the excerpt.
     succ: list[dict[str, int | str]]
     kinds: list[str]
+    # Jump-table header/entry lines attached to recognized switches; excluded
+    # from block bodies during alignment / symbolic execution.
+    owned_data: frozenset[int] = frozenset()
+    # jmp line index -> case destination line indices (recognized switches).
+    table_dests: dict[int, list[int]] = field(default_factory=dict)
 
 
 def _mark_side_inconclusive(
@@ -3325,15 +3414,36 @@ def _mark_side_inconclusive(
         recorder.mark_inconclusive(reason, recomp_index=index, facts=facts)
 
 
+def _block_terminator(
+    start: int, end: int, kinds: list[str], owned_data: set[int] | frozenset[int]
+) -> int:
+    """Last non-owned instruction in ``[start, end)``, preferring a control op."""
+    last_code = start
+    for i in range(end - 1, start - 1, -1):
+        if i in owned_data:
+            continue
+        if kinds[i] in ("jcc", "jmp", "ret"):
+            return i
+        last_code = i
+        break
+    return last_code
+
+
 def _build_side_cfg(
     asm: list[str],
     targets: list[int | None],
     *,
     recorder: AnalysisRecorder | None = None,
     side: str = "orig",
+    addrs: list[int | None] | None = None,
 ) -> _SideCfg | None:
     """One side's basic-block structure, or None when the shape is outside
-    this verifier's model (jump/data tables, invalid targets)."""
+    this verifier's model (unrecognized jump/data tables, invalid targets).
+
+    Recognized ``jmp [idx*4 + table]`` + ``Jump table:`` / ``start + …``
+    sequences become ``caseN`` CFG edges; other table/data lines still bail.
+    """
+    # pylint: disable=too-many-branches,too-many-locals,too-many-return-statements
     total = len(asm)
     if total == 0:
         _mark_side_inconclusive(
@@ -3358,8 +3468,9 @@ def _build_side_cfg(
         )
         return None
     kinds = [_control_kind(line) for line in asm]
-    if "data" in kinds:
-        first_data = kinds.index("data")
+    extracted = _extract_switch_tables(asm, kinds, addrs)
+    if extracted is None:
+        first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
         _mark_side_inconclusive(
             recorder,
             side,
@@ -3368,12 +3479,33 @@ def _build_side_cfg(
             {
                 "side": side,
                 "data_line_count": kinds.count("data"),
+                "data_line": asm[first_data] if asm else "",
+                "failure": "unresolved_switch_table",
+            },
+        )
+        return None
+    table_dests, owned_data = extracted
+    unowned_data = [
+        i for i, kind in enumerate(kinds) if kind == "data" and i not in owned_data
+    ]
+    if unowned_data:
+        first_data = unowned_data[0]
+        _mark_side_inconclusive(
+            recorder,
+            side,
+            "jump_table_data",
+            first_data,
+            {
+                "side": side,
+                "data_line_count": len(unowned_data),
                 "data_line": asm[first_data],
             },
         )
         return None
     leaders = {0}
     for i in range(total):
+        if i in owned_data:
+            continue
         target = targets[i]
         if target is not None:
             if not 0 <= target < total:
@@ -3386,14 +3518,22 @@ def _build_side_cfg(
                 )
                 return None
             leaders.add(target)
+        if i in table_dests:
+            for dest in table_dests[i]:
+                leaders.add(dest)
+            continue
         if kinds[i] in ("jcc", "jmp", "ret") and i + 1 < total:
-            leaders.add(i + 1)
+            nxt = i + 1
+            while nxt < total and nxt in owned_data:
+                nxt += 1
+            if nxt < total:
+                leaders.add(nxt)
     order = sorted(leaders)
     index = {start: n for n, start in enumerate(order)}
     ends = [order[n + 1] if n + 1 < len(order) else total for n in range(len(order))]
     succ: list[dict[str, int | str]] = []
     for n in range(len(order)):
-        last = ends[n] - 1
+        last = _block_terminator(order[n], ends[n], kinds, owned_data)
         kind = kinds[last]
         edges: dict[str, int | str] = {}
         if kind == "jcc":
@@ -3404,8 +3544,12 @@ def _build_side_cfg(
             else:
                 edges["fallout"] = "external"
         elif kind == "jmp":
-            target = targets[last]
-            edges["jmp"] = index[target] if target is not None else "external"
+            if last in table_dests:
+                for case_i, dest in enumerate(table_dests[last]):
+                    edges[f"case{case_i}"] = index[dest]
+            else:
+                target = targets[last]
+                edges["jmp"] = index[target] if target is not None else "external"
         elif kind == "ret":
             pass
         else:
@@ -3414,7 +3558,14 @@ def _build_side_cfg(
             else:
                 edges["fallout"] = "external"
         succ.append(edges)
-    return _SideCfg(starts=list(order), ends=ends, succ=succ, kinds=kinds)
+    return _SideCfg(
+        starts=list(order),
+        ends=ends,
+        succ=succ,
+        kinds=kinds,
+        owned_data=frozenset(owned_data),
+        table_dests=table_dests,
+    )
 
 
 def _pair_cfg_blocks(
@@ -3788,18 +3939,30 @@ def verify_isomorphic_cfg_effective_match(
     recomp_meta: list[InstructionMeta | None] | None = None,
     recorder: AnalysisRecorder | None = None,
     similarity: _SemanticSimilarityRecorder | None = None,
+    orig_addrs: list[int | None] | None = None,
+    recomp_addrs: list[int | None] | None = None,
 ) -> bool:
     """CFG verification that tolerates different instruction counts:
     per-side block graphs matched structurally, block contents aligned
     locally, one-sided unobservable instructions allowed. This proves
     register-allocation wobble in its full generality — renames composed
-    with folded loads, elided copies and shifted branch displacements."""
+    with folded loads, elided copies and shifted branch displacements.
+
+    Recognized switch jump tables become ``caseN`` edges so isomorphic
+    pairing compares entry count and case→block topology.
+    """
     # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
-    cfg_o = _build_side_cfg(orig_asm, orig_targets, recorder=recorder, side="orig")
+    cfg_o = _build_side_cfg(
+        orig_asm, orig_targets, recorder=recorder, side="orig", addrs=orig_addrs
+    )
     cfg_r = _build_side_cfg(
-        recomp_asm, recomp_targets, recorder=recorder, side="recomp"
+        recomp_asm,
+        recomp_targets,
+        recorder=recorder,
+        side="recomp",
+        addrs=recomp_addrs,
     )
     if cfg_o is None or cfg_r is None:
         return False
@@ -3814,7 +3977,16 @@ def verify_isomorphic_cfg_effective_match(
     for block_o, block_r in pairs:
         start_o, end_o = cfg_o.starts[block_o], cfg_o.ends[block_o]
         start_r, end_r = cfg_r.starts[block_r], cfg_r.ends[block_r]
-        aligned = _align_block_lines(orig_asm[start_o:end_o], recomp_asm[start_r:end_r])
+        indices_o = [
+            i for i in range(start_o, end_o) if i not in cfg_o.owned_data
+        ]
+        indices_r = [
+            i for i in range(start_r, end_r) if i not in cfg_r.owned_data
+        ]
+        aligned = _align_block_lines(
+            [orig_asm[i] for i in indices_o],
+            [recomp_asm[i] for i in indices_r],
+        )
         if aligned is None:
             if recorder is not None:
                 recorder.mark_inconclusive(
@@ -3823,8 +3995,8 @@ def verify_isomorphic_cfg_effective_match(
                     start_r,
                     {
                         "stage": "block_alignment",
-                        "orig_block_length": end_o - start_o,
-                        "recomp_block_length": end_r - start_r,
+                        "orig_block_length": len(indices_o),
+                        "recomp_block_length": len(indices_r),
                         "orig_block_count": len(cfg_o.starts),
                         "recomp_block_count": len(cfg_r.starts),
                     },
@@ -3833,14 +4005,18 @@ def verify_isomorphic_cfg_effective_match(
         # The block terminators (control lines) must pair with each other:
         # a one-sided branch or return breaks the matched structure.
         for local_o, local_r in aligned:
-            kind_o = cfg_o.kinds[start_o + local_o] if local_o is not None else "code"
-            kind_r = cfg_r.kinds[start_r + local_r] if local_r is not None else "code"
+            kind_o = (
+                cfg_o.kinds[indices_o[local_o]] if local_o is not None else "code"
+            )
+            kind_r = (
+                cfg_r.kinds[indices_r[local_r]] if local_r is not None else "code"
+            )
             if kind_o != kind_r or (local_o is None and kind_r != "code"):
                 if recorder is not None:
                     recorder.mark_inconclusive(
                         "alignment_failure",
-                        start_o + local_o if local_o is not None else None,
-                        start_r + local_r if local_r is not None else None,
+                        indices_o[local_o] if local_o is not None else None,
+                        indices_r[local_r] if local_r is not None else None,
                         {
                             "stage": "block_terminator_alignment",
                             "orig_kind": kind_o,
@@ -3852,8 +4028,8 @@ def verify_isomorphic_cfg_effective_match(
             any_shifted = True
         alignments[(block_o, block_r)] = [
             (
-                start_o + local_o if local_o is not None else None,
-                start_r + local_r if local_r is not None else None,
+                indices_o[local_o] if local_o is not None else None,
+                indices_r[local_r] if local_r is not None else None,
             )
             for local_o, local_r in aligned
         ]
@@ -3962,6 +4138,8 @@ def verify_isomorphic_cfg_effective_match(
             # already proved that both sides' edges lead to the same matched
             # blocks, so the displacement text is irrelevant. External
             # targets keep their raw text — those must match exactly.
+            # Recognized switch tables: caseN edges encode destinations; keep
+            # only the index-register values so table-base placeholders may differ.
             kind = cfg_o.kinds[index_o]
             if (
                 kind in ("jcc", "jmp")
@@ -3971,6 +4149,13 @@ def verify_isomorphic_cfg_effective_match(
                     for k, obs_entry in enumerate(entries):
                         if obs_entry[0] in CONTROL_TAGS - {"jmpind"}:
                             entries[k] = (*obs_entry[:-1], ("L", kind))
+            if any(role.startswith("case") for role in edges_o):
+                idx_o = _switch_index_observation(state_before_o, ins_o)
+                idx_r = _switch_index_observation(state_before_r, ins_r)
+                for entries, idx in ((obs_o, idx_o), (obs_r, idx_r)):
+                    for k, obs_entry in enumerate(entries):
+                        if obs_entry[0] == "jmpind":
+                            entries[k] = ("jmpind", ("L", "switch"), idx)
 
             if obs_o != obs_r:
                 meta_o = orig_meta[index_o] if orig_meta is not None else None
@@ -4047,9 +4232,13 @@ def verify_isomorphic_cfg_effective_match(
             ):
                 ctx.categories.add("condition_inversion")
             if any(obs_entry[0] == "jmpind" for obs_entry in obs_o):
-                if recorder is not None:
-                    recorder.mark_inconclusive("indirect_jump", index_o, index_r)
-                return False
+                # Recognized switch tables already expanded to caseN edges.
+                if not any(role.startswith("case") for role in edges_o):
+                    if recorder is not None:
+                        recorder.mark_inconclusive(
+                            "indirect_jump", index_o, index_r
+                        )
+                    return False
 
             # A direct edge outside the excerpt exposes the complete machine
             # state to code this proof does not inspect.
@@ -4072,7 +4261,19 @@ def verify_isomorphic_cfg_effective_match(
                 recorder.mark_inconclusive("analysis_limit")
             return False
 
-        last_kind = cfg_o.kinds[cfg_o.ends[block_o] - 1]
+        last_o = _block_terminator(
+            cfg_o.starts[block_o],
+            cfg_o.ends[block_o],
+            cfg_o.kinds,
+            cfg_o.owned_data,
+        )
+        last_r = _block_terminator(
+            cfg_r.starts[block_r],
+            cfg_r.ends[block_r],
+            cfg_r.kinds,
+            cfg_r.owned_data,
+        )
+        last_kind = cfg_o.kinds[last_o]
         if (
             last_kind == "ret"
             and orig_state.x87.state_key() != recomp_state.x87.state_key()
@@ -4083,8 +4284,8 @@ def verify_isomorphic_cfg_effective_match(
             if recorder is not None:
                 recorder.mark_inconclusive(
                     "function_fallthrough",
-                    cfg_o.ends[block_o] - 1,
-                    cfg_r.ends[block_r] - 1,
+                    last_o,
+                    last_r,
                 )
             return False
 

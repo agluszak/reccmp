@@ -181,6 +181,8 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
             orig_meta=orig_meta,
             recomp_meta=recomp_meta,
             recorder=iso,
+            orig_addrs=orig_addr_list,
+            recomp_addrs=recomp_addr_list,
         )
     else:
         iso_effective = False
