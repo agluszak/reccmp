@@ -120,6 +120,11 @@ def test_fix_mov_cmp_jmp_mem_with_non_matching_jmp_2():
 
 
 def test_fix_mov_cmp_jmp_mem_valid():
+    """Swapped cmp memories with a live EAX at the jcc.
+
+    Linear verification does not treat predicate membership as live-out
+    justification. Without CFG addresses this pair stays unproven.
+    """
 
     orig_asm = [
         "mov eax, dword ptr [ebp-4]",
@@ -135,10 +140,11 @@ def test_fix_mov_cmp_jmp_mem_valid():
     diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
     is_effective = is_effective_match(diff.get_opcodes(), orig_asm, recomp_asm)
 
-    assert is_effective is True
+    assert is_effective is False
 
 
 def test_fix_mov_test_jmp_mem_valid():
+    """Same as ``test_fix_mov_cmp_jmp_mem_valid`` for TEST."""
 
     orig_asm = [
         "mov eax, dword ptr [ebp-4]",
@@ -154,7 +160,7 @@ def test_fix_mov_test_jmp_mem_valid():
     diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
     is_effective = is_effective_match(diff.get_opcodes(), orig_asm, recomp_asm)
 
-    assert is_effective is True
+    assert is_effective is False
 
 
 def test_fix_fld_fmul_valid():

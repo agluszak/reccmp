@@ -31,7 +31,7 @@ def test_cfg_rename_live_across_branch():
     ]
     targets = [None, None, 4, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_effective_match(orig, recomp, metadata=metadata) is True
+    assert verify_effective_match(orig, recomp, metadata=metadata) is False
     assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
 
 

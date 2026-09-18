@@ -14,6 +14,7 @@ from reccmp.compare.asm.effective import (
     verify_isomorphic_cfg_effective_match,
 )
 from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.ir import (
     AsmStream,
     ResolvedAsm,
@@ -87,7 +88,19 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     the verifier can prove."""
     orig = resolve_asm_stream(orig_asm)
     recomp = resolve_asm_stream(recomp_asm)
-    exact = admit_exact_analysis(displays_equal=orig.displays == recomp.displays)
+    orig_addr_list = list(orig_addrs) if orig_addrs is not None else None
+    recomp_addr_list = list(recomp_addrs) if recomp_addrs is not None else None
+    exact = admit_exact_analysis(
+        displays_equal=orig.displays == recomp.displays,
+        topology_equal=_display_topology_equal(
+            orig,
+            recomp,
+            orig_addr_list,
+            orig_meta,
+            recomp_addr_list,
+            recomp_meta,
+        ),
+    )
     if exact is not None:
         return exact
 
@@ -101,9 +114,6 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         ):
             return ComparisonAnalysis.effective(("instruction_reorder",))
         return analysis
-
-    orig_addr_list = list(orig_addrs) if orig_addrs is not None else None
-    recomp_addr_list = list(recomp_addrs) if recomp_addrs is not None else None
 
     def new_recorder() -> AnalysisRecorder:
         return AnalysisRecorder(orig_addr_list, recomp_addr_list)
@@ -252,6 +262,32 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     analysis = inconclusive.failure_analysis()
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
     return analysis
+
+
+def _stream_has_local_jumps(stream: ResolvedAsm) -> bool:
+    return any(
+        display.partition(" ")[0] in JUMP_MNEMONICS for display in stream.displays
+    )
+
+
+def _display_topology_equal(
+    orig: ResolvedAsm,
+    recomp: ResolvedAsm,
+    orig_addrs: Sequence[int | None] | None,
+    orig_meta: Sequence[InstructionMeta | None] | None,
+    recomp_addrs: Sequence[int | None] | None,
+    recomp_meta: Sequence[InstructionMeta | None] | None,
+) -> bool:
+    """True when local branch destinations (instruction ids) are known and agree.
+
+    Jump-free streams are vacuously equal. Jump-bearing streams without
+    address/metadata cannot prove topology from displacement text alone.
+    """
+    if not _stream_has_local_jumps(orig) and not _stream_has_local_jumps(recomp):
+        return True
+    orig_targets = _branch_targets(orig, orig_addrs, orig_meta)
+    recomp_targets = _branch_targets(recomp, recomp_addrs, recomp_meta)
+    return orig_targets is not None and orig_targets == recomp_targets
 
 
 def _branch_targets(

@@ -5,14 +5,21 @@ from __future__ import annotations
 from reccmp.compare.diagnosis import ComparisonStatus, admit_exact_analysis
 
 
-def test_admit_exact_requires_coverage_and_models_or_displays():
-    assert admit_exact_analysis(displays_equal=True) is not None
+def test_admit_exact_requires_coverage_topology_and_models_or_displays():
+    assert admit_exact_analysis(displays_equal=True, topology_equal=True) is not None
     assert (
-        admit_exact_analysis(displays_equal=True, coverage_incomplete=True) is None
+        admit_exact_analysis(displays_equal=True, topology_equal=False) is None
+    )
+    assert (
+        admit_exact_analysis(
+            displays_equal=True, topology_equal=True, coverage_incomplete=True
+        )
+        is None
     )
     assert (
         admit_exact_analysis(
             displays_equal=False,
+            topology_equal=True,
             keys_equal=True,
             operands_complete=False,
             control_flow_complete=True,
@@ -21,6 +28,7 @@ def test_admit_exact_requires_coverage_and_models_or_displays():
     )
     admitted = admit_exact_analysis(
         displays_equal=False,
+        topology_equal=True,
         keys_equal=True,
         operands_complete=True,
         control_flow_complete=True,

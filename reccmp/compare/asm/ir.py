@@ -220,6 +220,100 @@ def instruction_match_key(row: DecodedInstruction | str) -> Hashable:
     return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
 
 
+def _operand_identity(row: DecodedInstruction) -> Hashable:
+    if row.operands:
+        return _freeze(row.operands[0])
+    if row.raw_operands:
+        return row.raw_operands[0]
+    return None
+
+
+def _local_destination_id(
+    target: int | None, addr_to_id: dict[int, int]
+) -> Hashable | None:
+    if target is None:
+        return None
+    return addr_to_id.get(target)
+
+
+def _switch_destination_key(
+    row: DecodedInstruction,
+    addr_to_id: dict[int, int],
+    jump_tables: Sequence[JumpTable],
+) -> Hashable | None:
+    for table in jump_tables:
+        if table.dispatch_address != row.address:
+            continue
+        cases = tuple(
+            (
+                ("L", addr_to_id[target])
+                if target in addr_to_id
+                else ("ext", target)
+            )
+            for _entry, target in table.entries
+        )
+        if cases:
+            return ("switch", cases)
+    return None
+
+
+def control_flow_topology_keys(
+    excerpt: Sequence[DecodedInstruction],
+    jump_tables: Sequence[JumpTable] = (),
+) -> tuple[Hashable, ...] | None:
+    """Per-row exact control-flow identities, or None if a transfer is unmodeled.
+
+    Ordinary instructions contribute ``()``. Local branches contribute the
+    destination instruction index in this excerpt. External branches keep the
+    sanitized operand identity (symbol or displacement), never raw encoding
+    size. Switch tables contribute the tuple of case destination ids.
+    """
+    addr_to_id = {
+        row.address: index
+        for index, row in enumerate(excerpt)
+        if row.address is not None
+    }
+    keys: list[Hashable] = []
+    for row in excerpt:
+        if row.role == AsmRole.JUMP_TABLE_ENTRY:
+            target_id = None
+            for table in jump_tables:
+                for entry_addr, target in table.entries:
+                    if entry_addr == row.address:
+                        target_id = _local_destination_id(target, addr_to_id)
+                        keys.append(
+                            ("case", target_id)
+                            if target_id is not None
+                            else ("case_ext", target)
+                        )
+                        break
+                else:
+                    continue
+                break
+            else:
+                keys.append(("table_entry", row.display))
+            continue
+        if not row.is_code or row.is_call or not (row.is_jump or row.is_ret):
+            keys.append(())
+            continue
+        if row.is_ret:
+            keys.append(("ret",))
+            continue
+        local_id = _local_destination_id(row.branch_target, addr_to_id)
+        if local_id is not None:
+            keys.append(("local", local_id))
+            continue
+        if row.branch_target is not None:
+            keys.append(("ext", _operand_identity(row)))
+            continue
+        switch_key = _switch_destination_key(row, addr_to_id, jump_tables)
+        if switch_key is not None:
+            keys.append(switch_key)
+            continue
+        return None
+    return tuple(keys)
+
+
 def _normalize_operand_stack(operand) -> object:
     if not isinstance(operand, tuple) or not operand:
         return operand

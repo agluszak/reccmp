@@ -1505,33 +1505,16 @@ CONTROL_TAGS = frozenset(
 )
 
 
-def _collect_expr_values(value: Value, acc: set) -> None:
-    """Collect expression nodes that may justify a live register at a branch."""
-    if value in acc:
-        return
-    acc.add(value)
-    if isinstance(value, tuple):
-        for item in value[1:]:
-            if isinstance(item, (tuple, str, int)):
-                _collect_expr_values(item, acc)  # type: ignore[arg-type]
-
-
 def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> bool:
     """At a control transfer, refuse unjustified live divergent register state.
 
-    ``matched_nodes`` membership alone is not a liveness proof (the same
-    immediate can be matched in one register and later live in another).
-    Values that participate in the branch predicate's flag/carry producer on
-    both sides may still differ when a commutative compare swapped operands.
-    Scratch pairs remain allowed.
+    Linear verification cannot prove live-out on both successors of a
+    conditional. Divergent values that merely appear in the branch predicate
+    are not a liveness proof: the taken path may still observe them. Scratch
+    pairs remain allowed; anything else must match or the CFG verifier owns
+    the pair.
     """
     del ctx
-    predicate_vals: set = set()
-    _collect_expr_values(orig.flags, predicate_vals)
-    _collect_expr_values(recomp.flags, predicate_vals)
-    _collect_expr_values(orig.carry, predicate_vals)
-    _collect_expr_values(recomp.carry, predicate_vals)
-
     for family in FAMILIES:
         value_o, value_r = orig.regs[family], recomp.regs[family]
         if value_o == value_r:
@@ -1554,9 +1537,6 @@ def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> 
             _is_scratch(value_o) or _is_scratch(value_r)
         ):
             continue
-        # Both values feed the branch predicate (e.g. swapped cmp operands).
-        if value_o in predicate_vals and value_r in predicate_vals:
-            continue
         return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
@@ -1566,6 +1546,43 @@ def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> 
         ):
             return False
     return True
+
+
+def _addrs_from_meta(
+    metas: list[InstructionMeta | None] | None,
+) -> list[int | None] | None:
+    if metas is None:
+        return None
+    return [meta.address if meta is not None else None for meta in metas]
+
+
+def _control_destination(
+    raw_operand: object,
+    meta: InstructionMeta | None,
+    addrs: list[int | None] | None,
+) -> object:
+    """Prefer local instruction-id over encoding displacement when known."""
+    if meta is None or meta.branch_target is None or addrs is None:
+        return raw_operand
+    try:
+        return ("L", addrs.index(meta.branch_target))
+    except ValueError:
+        return raw_operand
+
+
+def _rewrite_control_observables(
+    obs: list,
+    meta: InstructionMeta | None,
+    addrs: list[int | None] | None,
+) -> None:
+    if meta is None or addrs is None:
+        return
+    for index, entry in enumerate(obs):
+        if entry and entry[0] in CONTROL_TAGS - {"jmpind"}:
+            obs[index] = (
+                *entry[:-1],
+                _control_destination(entry[-1], meta, addrs),
+            )
 
 
 def _is_scratch(value: Value) -> bool:
@@ -2170,6 +2187,16 @@ def verify_effective_match(
     ctx = Context(metadata=metadata, recorder=recorder)
     last_index_o: int | None = None
     last_index_r: int | None = None
+    orig_cf_addrs = (
+        recorder.orig_addrs
+        if recorder is not None and recorder.orig_addrs is not None
+        else _addrs_from_meta(orig_meta)
+    )
+    recomp_cf_addrs = (
+        recorder.recomp_addrs
+        if recorder is not None and recorder.recomp_addrs is not None
+        else _addrs_from_meta(recomp_meta)
+    )
 
     try:
         for idx, (index_o, index_r) in enumerate(aligned):
@@ -2261,6 +2288,11 @@ def verify_effective_match(
             guard_state_size(orig, ctx)
             guard_state_size(recomp, ctx)
 
+            meta_o = orig_meta[index_o] if orig_meta is not None else None
+            meta_r = recomp_meta[index_r] if recomp_meta is not None else None
+            _rewrite_control_observables(obs_o, meta_o, orig_cf_addrs)
+            _rewrite_control_observables(obs_r, meta_r, recomp_cf_addrs)
+
             if _callee_save_swap(ctx, ins_o, ins_r, obs_o, obs_r, orig, recomp):
                 # The pushed values differ (that is the point of the swap),
                 # but the slot and width agree: commit from the orig side.
@@ -2333,12 +2365,18 @@ def verify_effective_match(
             ):
                 ctx.categories.add("condition_inversion")
 
-            # Linear execution is only valid while control stays linear:
-            # whenever control may transfer (a branch), any divergence in
-            # the current state escapes to the target, so it must already
-            # be justified here — not by a later overwrite on the
-            # fallthrough path.
+            # Linear execution cannot prove both successors of a conditional.
+            # Divergent registers at a jcc are a CFG problem even when both
+            # values appear in the predicate (xchg + inverted compare) or are
+            # "scratch" initials of different families.
             if any(entry[0] in CONTROL_TAGS for entry in obs_o):
+                conditional = any(
+                    entry[0]
+                    in {"branch", "loop", "loope", "loopne", "jcxz", "jecxz"}
+                    for entry in obs_o
+                )
+                if conditional and orig.regs != recomp.regs:
+                    return False
                 if not _divergences_justified(ctx, orig, recomp):
                     return False
 

@@ -19,6 +19,7 @@ from reccmp.compare.asm.instgen import (
 )
 from reccmp.compare.asm.ir import (
     FunctionImage,
+    control_flow_topology_keys,
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
@@ -496,6 +497,8 @@ class FunctionComparator:
             include_diff=include_diff,
             include_exact_diff=include_exact_diff,
             coverage_incomplete=coverage_incomplete,
+            orig_jump_tables=orig_image.jump_tables,
+            recomp_jump_tables=recomp_image.jump_tables,
         )
 
         # Folded-symbol island: the original address is a group member whose
@@ -1183,6 +1186,8 @@ class FunctionComparator:
         orig_meta: list[InstructionMeta | None] | None = None,
         recomp_meta: list[InstructionMeta | None] | None = None,
         coverage_incomplete: bool = False,
+        orig_jump_tables=(),
+        recomp_jump_tables=(),
     ) -> EntityCompareResult:
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         # Align on structured IR keys; display strings stay for printing/scoring UI.
@@ -1200,8 +1205,13 @@ class FunctionComparator:
             (not row.is_code) or row.control_flow_known for row in (*orig, *recomp)
         )
         displays_match = orig_asm == recomp_asm
+        orig_topology = control_flow_topology_keys(orig, orig_jump_tables)
+        recomp_topology = control_flow_topology_keys(recomp, recomp_jump_tables)
         exact = admit_exact_analysis(
             displays_equal=displays_match,
+            topology_equal=(
+                orig_topology is not None and orig_topology == recomp_topology
+            ),
             keys_equal=ratio == 1.0,
             operands_complete=operands_complete,
             control_flow_complete=control_flow_complete,

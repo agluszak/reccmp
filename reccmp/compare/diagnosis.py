@@ -333,6 +333,7 @@ class ComparisonAnalysis:
 def admit_exact_analysis(
     *,
     displays_equal: bool,
+    topology_equal: bool,
     keys_equal: bool = False,
     operands_complete: bool = True,
     control_flow_complete: bool = True,
@@ -342,11 +343,15 @@ def admit_exact_analysis(
 
     Strategies may propose identical displays or IR keys; this is the only
     gate that mints ``ComparisonStatus.EXACT``. Incomplete reachable coverage
-    never admits EXACT. Incomplete operand/control-flow models may still
-    admit EXACT when the displayed excerpt is identical end-to-end, but not
-    from key equality alone.
+    never admits EXACT. Identical display text is not enough: local branch
+    destinations (instruction ids, not encodings) must also agree, because
+    different instruction lengths can keep ``je +N`` text while changing
+    the taken-path target. Incomplete operand models may still admit EXACT
+    when displays *and* topology match, but not from key equality alone.
     """
     if coverage_incomplete:
+        return None
+    if not topology_equal:
         return None
     if displays_equal:
         return ComparisonAnalysis.exact()

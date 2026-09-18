@@ -18,6 +18,7 @@ import pytest
 from reccmp.compare.asm.effective import (
     FunctionMetadata,
     estimate_isomorphic_cfg_semantic_similarity,
+    verify_cfg_effective_match,
     verify_effective_match,
     verify_isomorphic_cfg_effective_match,
 )
@@ -638,7 +639,12 @@ def test_test_self_equals_cmp_zero():
         "ret",
     ]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_effective_match(orig, recomp, metadata=metadata) is True
+    assert verify_effective_match(orig, recomp, metadata=metadata) is False
+    targets = [None, None, 4, None, None]
+    assert (
+        verify_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_test_self_equals_cmp_zeroed_register():
