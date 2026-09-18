@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from reccmp.compare.diagnosis import ComparisonStatus, admit_exact_analysis
+from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.verification import admit_exact_analysis
 
 
 def test_admit_exact_requires_coverage_topology_and_models_or_displays():

@@ -95,6 +95,7 @@ def test_exact_comparison_skips_detailed_instruction_metadata():
     compare = Compare(orig_bin, recomp_bin, pdb, "HELLO")
 
     with get_db(compare).batch() as batch:
+        batch.set(ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.match(0, 0)
 
@@ -331,6 +332,7 @@ def test_compare_function_effective_match():
     compare = Compare(orig_bin, recomp_bin, pdb, "HELLO")
 
     with get_db(compare).batch() as batch:
+        batch.set(ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=5)
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=5)
         batch.match(0, 0)
 
@@ -381,6 +383,9 @@ def test_compare_function_diff_context():
 
     with get_db(compare).batch() as batch:
         # NAME, SIZE, and TYPE required for successful comparison.
+        batch.set(
+            ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=len(orig_mem)
+        )
         batch.set(
             ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=len(orig_mem)
         )

@@ -27,8 +27,8 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
-    admit_exact_analysis,
 )
+from reccmp.compare.verification import admit_exact_analysis, admit_proof
 from reccmp.compare.pinned_sequences import DiffOpcode
 
 logger = logging.getLogger(__name__)
@@ -112,8 +112,8 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
             analysis.status == ComparisonStatus.EFFECTIVE
             and not analysis.effective_reasons
         ):
-            return ComparisonAnalysis.effective(("instruction_reorder",))
-        return analysis
+            analysis = ComparisonAnalysis.effective(("instruction_reorder",))
+        return admit_proof(analysis)
 
     def new_recorder() -> AnalysisRecorder:
         return AnalysisRecorder(orig_addr_list, recomp_addr_list)

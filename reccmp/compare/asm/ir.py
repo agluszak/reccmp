@@ -70,6 +70,7 @@ class FunctionImage:
     excerpt: tuple[DecodedInstruction, ...]
     jump_tables: tuple[JumpTable, ...] = ()
     coverage_incomplete: bool = False
+    extent_closed: bool = True
     raw: bytes | None = None
 
     @property
@@ -332,6 +333,79 @@ def control_flow_topology_keys(
     return tuple(keys)
 
 
+_NO_FALLTHROUGH = frozenset({"ret", "jmp", "int3"})
+
+
+def compute_extent_closed(
+    excerpt: Sequence[DecodedInstruction],
+    *,
+    start_addr: int,
+    extent: int,
+    coverage_incomplete: bool = False,
+    jump_tables: Sequence[JumpTable] = (),
+    extent_kind: ExtentKind = ExtentKind.KNOWN,
+) -> bool:
+    """True when every reachable path ends inside a modeled terminal.
+
+    A coverage walk can only prove the supplied byte window. Estimated
+    extents that cut off a fallthrough or a local branch are not closed.
+    Known extents may transfer to a proven external tail (``jmp`` /
+    taken ``jcc`` leaving the window); fallthrough past the window is not
+    a modeled terminal on either kind.
+    """
+    if coverage_incomplete:
+        return False
+    if extent <= 0:
+        return True
+    code = [row for row in excerpt if row.is_code and row.address is not None]
+    if not code:
+        return False
+    addr_to_row = {row.address: row for row in code}
+    table_targets: set[int] = set()
+    for table in jump_tables:
+        for _entry, target in table.entries:
+            table_targets.add(target)
+    window = range(start_addr, start_addr + extent)
+    pending = [code[0].address]
+    seen: set[int] = set()
+    while pending:
+        addr = pending.pop()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        row = addr_to_row.get(addr)
+        if row is None:
+            if addr in window:
+                return False
+            # Successor outside the window: a known annotated extent is still
+            # the complete supplied body. An estimated extent may treat an
+            # explicit tail transfer as closed, but not a fallthrough cut.
+            continue
+        nxt = addr + row.size
+        mnemonic = row.mnemonic
+        if mnemonic in _NO_FALLTHROUGH:
+            if mnemonic == "jmp" and row.branch_target is not None:
+                pending.append(row.branch_target)
+            elif mnemonic == "jmp" and not row.control_flow_known:
+                return False
+            continue
+        if row.is_jump and row.branch_target is not None:
+            pending.append(row.branch_target)
+        elif row.is_jump and row.branch_target is None:
+            if not row.control_flow_known:
+                return False
+            for target in table_targets:
+                pending.append(target)
+            if mnemonic == "jmp":
+                continue
+        if nxt not in window:
+            if extent_kind is ExtentKind.ESTIMATED:
+                return False
+            continue
+        pending.append(nxt)
+    return True
+
+
 def _normalize_operand_stack(operand) -> object:
     if not isinstance(operand, tuple) or not operand:
         return operand
@@ -412,6 +486,7 @@ class ResolvedAsm:
     roles: list[AsmRole]
     from_ir: bool = False
     jump_tables: tuple[JumpTable, ...] = ()
+    instruction_ids: tuple[int, ...] = ()
 
     def __len__(self) -> int:
         return len(self.displays)
@@ -426,15 +501,18 @@ class ResolvedAsm:
             self.roles[:end],
             from_ir=self.from_ir,
             jump_tables=self.jump_tables,
+            instruction_ids=self.instruction_ids[:end],
         )
 
     def reorder(self, order: list[int]) -> "ResolvedAsm":
+        ids = self.instruction_ids
         return ResolvedAsm(
             [self.displays[i] for i in order],
             [self.instructions[i] for i in order],
             [self.roles[i] for i in order],
             from_ir=self.from_ir,
             jump_tables=self.jump_tables,
+            instruction_ids=tuple(ids[i] for i in order) if ids else (),
         )
 
 
@@ -453,6 +531,7 @@ def resolve_asm_stream(
                 asm.roles,
                 from_ir=asm.from_ir,
                 jump_tables=tuple(jump_tables),
+                instruction_ids=asm.instruction_ids,
             )
         return asm
     tables = tuple(jump_tables)
@@ -467,6 +546,10 @@ def resolve_asm_stream(
             roles=[row.role for row in rows],
             from_ir=True,
             jump_tables=tables,
+            instruction_ids=tuple(
+                row.instruction_id if row.instruction_id is not None else index
+                for index, row in enumerate(rows)
+            ),
         )
     lines: Sequence[str] = asm  # type: ignore[assignment]
     return ResolvedAsm(
@@ -475,6 +558,7 @@ def resolve_asm_stream(
         roles=[AsmRole.CODE] * len(lines),
         from_ir=False,
         jump_tables=tables,
+        instruction_ids=tuple(range(len(lines))),
     )
 
 

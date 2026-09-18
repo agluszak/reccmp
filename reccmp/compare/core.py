@@ -204,6 +204,9 @@ class Compare:
             source_index=self.source_index,
         )
         self._configure_function_nodes()
+        if not self._db.frozen:
+            self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     def run(self):
         if not isinstance(self.orig_bin, PEImage) or not isinstance(
@@ -299,6 +302,8 @@ class Compare:
 
         match_strings(self._db, self.report)
         classify_exact_string_aliases(self._db)
+        self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     @classmethod
     def from_target(
@@ -586,7 +591,7 @@ class Compare:
     ) -> ReccmpComparedEntity | None:
         """Router for comparison type"""
 
-        if match.size is None or match.any_size() == 0:
+        if match.any_size() == 0:
             return None
 
         if match.get("skip", False):

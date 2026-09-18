@@ -105,6 +105,7 @@ class SourceDeclaration:
 
 
 @dataclass(frozen=True)
+# pylint: disable=too-many-instance-attributes
 class SourceField:
     """One direct non-static source field emitted by Clang."""
 
@@ -119,6 +120,11 @@ class SourceField:
     bitfield_offset: int | None = None
     # ``record:Qualified::Name`` when the field type is (or points to) a record.
     record_semantic_id: str | None = None
+    # Physical storage: scalar, pointer, reference, embedded_record, array.
+    storage_kind: str | None = None
+    array_element_type: str | None = None
+    array_stride: int | None = None
+    array_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -661,6 +667,10 @@ def type_spelling_is_indirection(type_name: str) -> bool:
 
 def field_is_indirection(field: SourceField) -> bool:
     """Pointer/reference storage is a layout leaf; do not descend physically."""
+    if field.storage_kind in ("pointer", "reference"):
+        return True
+    if field.storage_kind == "array":
+        return False
     if (field.pointer_depth or 0) > 0:
         return True
     return type_spelling_is_indirection(field.type)
@@ -680,6 +690,10 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         "bitfield_offset",
         "pointer_depth",
         "record_semantic_id",
+        "storage_kind",
+        "array_element_type",
+        "array_stride",
+        "array_count",
     ):
         if key in data and data[key] is None:
             continue
@@ -696,6 +710,10 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         bitfield_width=data.get("bitfield_width"),
         bitfield_offset=data.get("bitfield_offset"),
         record_semantic_id=data.get("record_semantic_id"),
+        storage_kind=data.get("storage_kind"),
+        array_element_type=data.get("array_element_type"),
+        array_stride=data.get("array_stride"),
+        array_count=data.get("array_count"),
     )
 
 
@@ -928,7 +946,12 @@ class SourceIndex:
             # Single-ABI indexes (and legacy JSON) may only carry ``abi``.
             targets_present = {
                 item.target
-                for item in (*self.classes, *self.markers, *self.variables)
+                for item in (
+                    *self.classes,
+                    *self.markers,
+                    *self.variables,
+                    *self.declarations,
+                )
                 if item.target is not None
             }
             if not targets_present or targets_present == {target}:
@@ -1060,9 +1083,22 @@ class SourceIndex:
             if not covers:
                 continue
             remaining = offset - item.offset
-            nested = self._lookup_nested_class(item, item.type)
+            nested_type = item.array_element_type or item.type
+            nested = self._lookup_nested_class(item, nested_type)
             absolute = abs_base + item.offset
-            path = path_prefix + (item.name,)
+            if (
+                item.storage_kind == "array"
+                and item.array_stride
+                and item.array_stride > 0
+            ):
+                element_index = remaining // item.array_stride
+                if item.array_count is not None and element_index >= item.array_count:
+                    continue
+                remaining = remaining % item.array_stride
+                path = path_prefix + (f"{item.name}[{element_index}]",)
+                absolute = abs_base + item.offset + element_index * item.array_stride
+            else:
+                path = path_prefix + (item.name,)
             if nested is not None:
                 nested_resolved = self._resolve_field(
                     nested,

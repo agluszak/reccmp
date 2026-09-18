@@ -20,6 +20,7 @@ from reccmp.compare.asm.instgen import (
 from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
+    compute_extent_closed,
     control_flow_topology_keys,
     excerpt_addrs,
     excerpt_displays,
@@ -39,7 +40,11 @@ from reccmp.compare.diagnosis import (
     ComparisonStatus,
     DifferenceSide,
     FactValue,
+)
+from reccmp.compare.verification import (
+    admit_effective_analysis,
     admit_exact_analysis,
+    admit_proof,
 )
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
@@ -194,6 +199,17 @@ def create_bin_lookup(bin_file: Image) -> Callable[[int], int | None]:
     return lookup
 
 
+def _stamp_instruction_ids(excerpt: AsmExcerpt) -> tuple:
+    """Assign stable program-point ids when a test excerpt has none."""
+    rows = []
+    for index, row in enumerate(excerpt):
+        if row.instruction_id is None:
+            rows.append(dataclasses.replace(row, instruction_id=index))
+        else:
+            rows.append(row)
+    return tuple(rows)
+
+
 @dataclass
 class FunctionComparator:
     # pylint: disable=too-many-instance-attributes
@@ -252,6 +268,10 @@ class FunctionComparator:
             is_32bit=self.is_32bit,
             collect_meta=False,
         )
+
+    def rebuild_lookups(self) -> None:
+        """Rebuild name-lookup closures after the entity catalog is frozen."""
+        self.__post_init__()
 
     def _source_ref_of_recomp_addr(self, recomp_addr: int | None) -> str | None:
         if recomp_addr is None:
@@ -399,13 +419,22 @@ class FunctionComparator:
             dataclasses.replace(row, instruction_id=index)
             for index, row in enumerate(excerpt)
         )
+        tables = tuple(sanitizer.jump_tables)
         return FunctionImage(
             start_addr=start_addr,
             extent=extent,
             extent_kind=extent_kind,
             excerpt=stamped,
-            jump_tables=tuple(sanitizer.jump_tables),
+            jump_tables=tables,
             coverage_incomplete=sanitizer.coverage_incomplete,
+            extent_closed=compute_extent_closed(
+                stamped,
+                start_addr=start_addr,
+                extent=extent,
+                coverage_incomplete=sanitizer.coverage_incomplete,
+                jump_tables=tables,
+                extent_kind=extent_kind,
+            ),
             raw=raw,
         )
 
@@ -514,23 +543,25 @@ class FunctionComparator:
             and match.orig_addr in self.equivalence_groups
             and _is_bare_jmp_island(orig_raw)
         ):
-            result = dataclasses.replace(
-                result,
-                analysis=ComparisonAnalysis.effective(("folded_symbol_alias",)),
+            alias = admit_effective_analysis(
+                ("folded_symbol_alias",),
+                coverage_incomplete=(
+                    orig_image.coverage_incomplete or recomp_image.coverage_incomplete
+                ),
+                extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
             )
-            result.refresh_equivalence_level()
+            if alias is not None:
+                result = dataclasses.replace(result, analysis=alias)
 
-        # Incomplete reachable coverage is not a successful proof: refuse
-        # EXACT/EFFECTIVE even when the extracted excerpt happens to match.
-        if (
-            orig_image.coverage_incomplete or recomp_image.coverage_incomplete
-        ) and result.analysis.is_effective:
-            result = dataclasses.replace(
-                result,
-                analysis=ComparisonAnalysis.inconclusive("incomplete_coverage"),
-            )
-            result.refresh_equivalence_level()
-
+        analysis = admit_proof(
+            result.analysis,
+            coverage_incomplete=(
+                orig_image.coverage_incomplete or recomp_image.coverage_incomplete
+            ),
+            extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
+        )
+        if analysis is not result.analysis:
+            result = dataclasses.replace(result, analysis=analysis)
         return result
 
     def _alias_fingerprint(
@@ -1196,6 +1227,7 @@ class FunctionComparator:
         orig_rows = list(orig.excerpt)
         recomp_rows = list(recomp.excerpt)
         coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
+        extent_closed = orig.extent_closed and recomp.extent_closed
         orig_asm = excerpt_displays(orig_rows)
         recomp_asm = excerpt_displays(recomp_rows)
 
@@ -1224,6 +1256,7 @@ class FunctionComparator:
             operands_complete=operands_complete,
             control_flow_complete=control_flow_complete,
             coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
         )
         if exact is not None:
             analysis = exact
@@ -1250,8 +1283,11 @@ class FunctionComparator:
                 recomp_addrs=excerpt_addrs(recomp_rows),
                 recomp_meta=recomp_meta,
             )
-            if coverage_incomplete and analysis.is_effective:
-                analysis = ComparisonAnalysis.inconclusive("incomplete_coverage")
+        analysis = admit_proof(
+            analysis,
+            coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
+        )
 
         analysis = self._enrich_analysis_with_source(analysis, match=match)
 
@@ -1274,7 +1310,6 @@ class FunctionComparator:
                     else None
                 ),
             )
-            result.refresh_equivalence_level()
             return result
 
         # Convert the addresses to hex string for the diff output
@@ -1332,7 +1367,6 @@ class FunctionComparator:
                 else None
             ),
         )
-        result.refresh_equivalence_level()
         return result
 
     def _compare_function_assembly(
@@ -1354,14 +1388,14 @@ class FunctionComparator:
             start_addr=0,
             extent=0,
             extent_kind=ExtentKind.KNOWN,
-            excerpt=tuple(orig),
+            excerpt=_stamp_instruction_ids(orig),
             coverage_incomplete=coverage_incomplete,
         )
         recomp_image = FunctionImage(
             start_addr=0,
             extent=0,
             extent_kind=ExtentKind.KNOWN,
-            excerpt=tuple(recomp),
+            excerpt=_stamp_instruction_ids(recomp),
             coverage_incomplete=coverage_incomplete,
         )
         return self.compare_function_images(

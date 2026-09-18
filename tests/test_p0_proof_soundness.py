@@ -7,7 +7,8 @@ from unittest.mock import Mock
 from reccmp.compare.asm.effective import verify_effective_match
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb, ReccmpMatch
-from reccmp.compare.diagnosis import ComparisonStatus, admit_exact_analysis
+from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.verification import admit_exact_analysis
 from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb

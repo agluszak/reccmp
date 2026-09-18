@@ -206,6 +206,7 @@ INCONCLUSIVE_REASONS = frozenset(
         "missing_metadata",
         "analysis_limit",
         "incomplete_coverage",
+        "open_extent",
     }
 )
 
@@ -330,36 +331,6 @@ class ComparisonAnalysis:
         )
 
 
-def admit_exact_analysis(
-    *,
-    displays_equal: bool,
-    topology_equal: bool,
-    keys_equal: bool = False,
-    operands_complete: bool = True,
-    control_flow_complete: bool = True,
-    coverage_incomplete: bool = False,
-) -> ComparisonAnalysis | None:
-    """Shared EXACT admission policy for function comparison.
-
-    Strategies may propose identical displays or IR keys; this is the only
-    gate that mints ``ComparisonStatus.EXACT``. Incomplete reachable coverage
-    never admits EXACT. Identical display text is not enough: local branch
-    destinations (instruction ids, not encodings) must also agree, because
-    different instruction lengths can keep ``je +N`` text while changing
-    the taken-path target. Incomplete operand models may still admit EXACT
-    when displays *and* topology match, but not from key equality alone.
-    """
-    if coverage_incomplete:
-        return None
-    if not topology_equal:
-        return None
-    if displays_equal:
-        return ComparisonAnalysis.exact()
-    if keys_equal and operands_complete and control_flow_complete:
-        return ComparisonAnalysis.exact()
-    return None
-
-
 @dataclass
 class AnalysisRecorder:
     """Mutable evidence sink used by one speculative verifier strategy."""
@@ -447,7 +418,15 @@ class AnalysisRecorder:
         return self.difference
 
     def effective_analysis(self, extra_reasons=()) -> ComparisonAnalysis:
-        return ComparisonAnalysis.effective(self.reasons | set(extra_reasons))
+        from reccmp.compare.verification import admit_effective_analysis
+
+        admitted = admit_effective_analysis(self.reasons | set(extra_reasons))
+        if admitted is None:
+            return ComparisonAnalysis.inconclusive(
+                self.inconclusive_reason or "analysis_limit",
+                self.inconclusive_location,
+            )
+        return admitted
 
     def failure_analysis(self) -> ComparisonAnalysis:
         if self.best_difference is not None:

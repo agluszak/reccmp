@@ -38,6 +38,9 @@ class EntityCompareResult:
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
     equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
+    def __post_init__(self) -> None:
+        self.refresh_equivalence_level()
+
     @property
     def is_effective_match(self) -> bool:
         return self.analysis.status == ComparisonStatus.EFFECTIVE

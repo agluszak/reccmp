@@ -25,6 +25,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -183,6 +184,33 @@ class Indexer {
       current = pointer->getPointeeType();
     }
     return depth;
+  }
+
+  void describeStorage(llvm::json::Object& entry, QualType type) const {
+    QualType current = type.getCanonicalType();
+    if (current->getAs<ReferenceType>()) {
+      entry["storage_kind"] = "reference";
+      return;
+    }
+    if (current->getAs<PointerType>() || pointerDepth(type) > 0) {
+      entry["storage_kind"] = "pointer";
+      return;
+    }
+    if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+      QualType element = array->getElementType();
+      entry["storage_kind"] = "array";
+      entry["array_element_type"] = typeName(element);
+      entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
+        entry["array_count"] = static_cast<int64_t>(constant->getSize().getZExtValue());
+      }
+      return;
+    }
+    if (current->getAsCXXRecordDecl()) {
+      entry["storage_kind"] = "embedded_record";
+      return;
+    }
+    entry["storage_kind"] = "scalar";
   }
 
   // Semantic id of the CXX record a type ultimately refers to (after peeling
@@ -563,6 +591,7 @@ class Indexer {
           entry["bitfield_offset"] = static_cast<int64_t>(bitOffset % 8);
         }
       }
+      describeStorage(entry, field->getType());
       std::string recordId = recordSemanticId(field->getType());
       if (!recordId.empty()) entry["record_semantic_id"] = recordId;
       fields.push_back(std::move(entry));

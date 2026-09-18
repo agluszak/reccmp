@@ -1868,10 +1868,9 @@ def _discharge_run_obligations(
     load-folding obligations and frame-slot layouts must hold; x87 depth and
     live slots must agree.
 
-    ``require_dead_registers`` is False for CFG/iso block terminals: those
-    strategies keep a fresh ``Context`` per block, so ``matched_nodes`` cannot
-    yet discharge values proven equal in predecessor blocks. Linear
-    verification (one Context for the whole stream) keeps the full check.
+    ``require_dead_registers`` is True for every strategy: CFG/iso now
+    propagate matched nodes and other relational obligations across
+    blocks, so callee-saved and dead-register discharge can run at ``ret``.
     """
     # pylint: disable=too-many-return-statements,too-many-branches,too-many-arguments
     # pylint: disable=too-many-positional-arguments
@@ -2829,6 +2828,7 @@ def _clone_state(state: SideState) -> SideState:
 
 
 @dataclass
+# pylint: disable=too-many-instance-attributes
 class _CfgState:
     """Paired machine state at a basic-block boundary.
 
@@ -2837,6 +2837,10 @@ class _CfgState:
     memories remain equal.  Carrying the value through the CFG is important;
     a process-global generation would let visiting one path change loads on
     another path and is neither a concrete execution nor a sound join.
+
+    Relational proof obligations that genuinely cross block boundaries
+    (matched nodes, callee-save stacks, one-sided spills, trap-parity)
+    live here so CFG/iso discharge can use the same checklist as linear.
     """
 
     orig: SideState
@@ -2848,15 +2852,132 @@ class _CfgState:
     # Whether a pointer into the function's own frame may have escaped on
     # some path reaching this point (see Context.stack_escaped).
     escaped: bool = False
+    matched_nodes: set[Value] = field(default_factory=set)
+    matched_ids: set[int] = field(default_factory=set)
+    keepalive: list = field(default_factory=list)
+    save_stack: list[list] = field(default_factory=list)
+    scratch_pushes: list[list] = field(default_factory=list)
+    load_obligations: list[tuple] = field(default_factory=list)
+
+
+def _remap_scratch(
+    records: list[list],
+    old_orig: SideState,
+    old_recomp: SideState,
+    new_orig: SideState,
+    new_recomp: SideState,
+) -> list[list]:
+    remapped = []
+    for record in records:
+        cloned = list(record)
+        if cloned and cloned[0] is old_orig:
+            cloned[0] = new_orig
+        elif cloned and cloned[0] is old_recomp:
+            cloned[0] = new_recomp
+        remapped.append(cloned)
+    return remapped
+
+
+def _scratch_keys(state: _CfgState) -> tuple:
+    keys = []
+    for record in state.scratch_pushes:
+        side = "orig" if record[0] is state.orig else "recomp"
+        keys.append((side, record[1], record[2], record[3]))
+    return tuple(keys)
+
+
+def _remap_obligations(
+    records: list[tuple],
+    old_orig: SideState,
+    old_recomp: SideState,
+    new_orig: SideState,
+    new_recomp: SideState,
+) -> list[tuple]:
+    remapped = []
+    for other, *rest in records:
+        if other is old_orig:
+            other = new_orig
+        elif other is old_recomp:
+            other = new_recomp
+        remapped.append((other, *rest))
+    return remapped
+
+
+def _obligation_keys(state: _CfgState) -> tuple:
+    keys = []
+    for record in state.load_obligations:
+        other = record[0]
+        side = "orig" if other is state.orig else "recomp"
+        keys.append((side, *record[1:]))
+    return tuple(keys)
+
+
+def _unique_obligations(
+    records: list[tuple], orig: SideState, recomp: SideState
+) -> list[tuple]:
+    seen: set[tuple] = set()
+    unique: list[tuple] = []
+    for record in records:
+        other = record[0]
+        side = "orig" if other is orig else "recomp"
+        key = (side, *record[1:])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
+
+
+def _save_keys(state: _CfgState) -> tuple:
+    return tuple(tuple(record) for record in state.save_stack)
 
 
 def _clone_cfg_state(state: _CfgState) -> _CfgState:
+    orig = _clone_state(state.orig)
+    recomp = _clone_state(state.recomp)
     return _CfgState(
-        _clone_state(state.orig),
-        _clone_state(state.recomp),
+        orig,
+        recomp,
         state.memory,
         dict(state.receiver_values),
         state.escaped,
+        matched_nodes=set(state.matched_nodes),
+        matched_ids={id(node) for node in state.matched_nodes},
+        keepalive=list(state.matched_nodes),
+        save_stack=[list(record) for record in state.save_stack],
+        scratch_pushes=_remap_scratch(
+            state.scratch_pushes, state.orig, state.recomp, orig, recomp
+        ),
+        load_obligations=_remap_obligations(
+            state.load_obligations, state.orig, state.recomp, orig, recomp
+        ),
+    )
+
+
+def _seed_context_from_cfg(ctx: Context, flow: _CfgState) -> None:
+    ctx.receiver_values = dict(flow.receiver_values)
+    ctx.stack_escaped = flow.escaped
+    ctx.matched_nodes = set(flow.matched_nodes)
+    ctx.matched_ids = {id(node) for node in flow.matched_nodes}
+    ctx.keepalive = list(flow.matched_nodes)
+    ctx.save_stack = [list(record) for record in flow.save_stack]
+    ctx.scratch_pushes = [list(record) for record in flow.scratch_pushes]
+    ctx.load_obligations = list(flow.load_obligations)
+
+
+def _capture_cfg_state(orig: SideState, recomp: SideState, ctx: Context) -> _CfgState:
+    return _CfgState(
+        orig,
+        recomp,
+        ctx.gen,
+        dict(ctx.receiver_values),
+        ctx.stack_escaped,
+        matched_nodes=set(ctx.matched_nodes),
+        matched_ids={id(node) for node in ctx.matched_nodes},
+        keepalive=list(ctx.matched_nodes),
+        save_stack=[list(record) for record in ctx.save_stack],
+        scratch_pushes=[list(record) for record in ctx.scratch_pushes],
+        load_obligations=list(ctx.load_obligations),
     )
 
 
@@ -2971,12 +3092,39 @@ def _join_states(
         for key, value in entry.receiver_values.items()
         if incoming.receiver_values.get(key) == value
     }
+    if _save_keys(entry) != _save_keys(incoming):
+        return None
+    if _scratch_keys(entry) != _scratch_keys(incoming):
+        return None
+    out_o.load_log = entry_o.load_log | in_o.load_log
+    out_r.load_log = entry_r.load_log | in_r.load_log
     return _CfgState(
         out_o,
         out_r,
         memory,
         receiver_values,
         entry.escaped or incoming.escaped,
+        matched_nodes=set(entry.matched_nodes) | set(incoming.matched_nodes),
+        matched_ids={id(node) for node in (entry.matched_nodes | incoming.matched_nodes)},
+        keepalive=list(entry.matched_nodes | incoming.matched_nodes),
+        save_stack=[list(record) for record in entry.save_stack],
+        scratch_pushes=_remap_scratch(
+            entry.scratch_pushes, entry.orig, entry.recomp, out_o, out_r
+        ),
+        load_obligations=_unique_obligations(
+            _remap_obligations(
+                entry.load_obligations, entry.orig, entry.recomp, out_o, out_r
+            )
+            + _remap_obligations(
+                incoming.load_obligations,
+                incoming.orig,
+                incoming.recomp,
+                out_o,
+                out_r,
+            ),
+            out_o,
+            out_r,
+        ),
     )
 
 
@@ -3005,12 +3153,17 @@ def _states_equal(a: _CfgState, b: _CfgState) -> bool:
         a.memory == b.memory
         and a.receiver_values == b.receiver_values
         and a.escaped == b.escaped
+        and a.matched_nodes == b.matched_nodes
+        and _save_keys(a) == _save_keys(b)
+        and _scratch_keys(a) == _scratch_keys(b)
+        and _obligation_keys(a) == _obligation_keys(b)
         and all(
             x.regs == y.regs
             and x.flags == y.flags
             and x.carry == y.carry
             and x.fpu_flags == y.fpu_flags
             and x.x87.state_key() == y.x87.state_key()
+            and x.load_log == y.load_log
             for x, y in ((a.orig, b.orig), (a.recomp, b.recomp))
         )
     )
@@ -3242,8 +3395,7 @@ def verify_cfg_effective_match(
         flow = _clone_cfg_state(entry[block])
         orig_state, recomp_state = flow.orig, flow.recomp
         ctx = Context(gen=flow.memory, metadata=metadata, recorder=recorder)
-        ctx.receiver_values = dict(flow.receiver_values)
-        ctx.stack_escaped = flow.escaped
+        _seed_context_from_cfg(ctx, flow)
         for i in range(order[block], ends[block]):
             line_o, line_r = orig_asm[i], recomp_asm[i]
             if kinds[i] == "data":
@@ -3368,20 +3520,14 @@ def verify_cfg_effective_match(
                 recorder,
                 ends[block] - 1,
                 ends[block] - 1,
-                require_dead_registers=False,
+                require_dead_registers=True,
             ):
                 return False
         if last_kind == "code" and ends[block] == total:
             # Falling out of the disassembled function is not a modeled exit.
             return False
 
-        outgoing = _CfgState(
-            orig_state,
-            recomp_state,
-            ctx.gen,
-            dict(ctx.receiver_values),
-            ctx.stack_escaped,
-        )
+        outgoing = _capture_cfg_state(orig_state, recomp_state, ctx)
         if recorder is not None:
             recorder.reasons.update(ctx.categories)
         # Propagate to successors.
@@ -3672,6 +3818,7 @@ def _build_side_cfg(
             list(roles),
             from_ir=True,
             jump_tables=stream.jump_tables,
+            instruction_ids=stream.instruction_ids,
         )
     displays = stream.displays
     total = len(displays)
@@ -4422,6 +4569,7 @@ def verify_isomorphic_cfg_effective_match(
             list(orig_roles),
             from_ir=True,
             jump_tables=orig_stream.jump_tables,
+            instruction_ids=orig_stream.instruction_ids,
         )
     if recomp_roles is not None and len(recomp_roles) == len(recomp_stream):
         recomp_stream = ResolvedAsm(
@@ -4430,6 +4578,7 @@ def verify_isomorphic_cfg_effective_match(
             list(recomp_roles),
             from_ir=True,
             jump_tables=recomp_stream.jump_tables,
+            instruction_ids=recomp_stream.instruction_ids,
         )
     orig_asm = orig_stream.displays
     recomp_asm = recomp_stream.displays
@@ -4527,12 +4676,8 @@ def verify_isomorphic_cfg_effective_match(
         block_o, block_r = pair
         flow = _clone_cfg_state(entry[pair])
         orig_state, recomp_state = flow.orig, flow.recomp
-        # Trap-parity scope for one-sided loads is the block run.
-        orig_state.load_log = set()
-        recomp_state.load_log = set()
         ctx = Context(gen=flow.memory, metadata=metadata, recorder=recorder)
-        ctx.receiver_values = dict(flow.receiver_values)
-        ctx.stack_escaped = flow.escaped
+        _seed_context_from_cfg(ctx, flow)
         edges_o = cfg_o.succ[block_o]
         edges_r = cfg_r.succ[block_r]
         for index_o, index_r in alignments[pair]:
@@ -4744,11 +4889,6 @@ def verify_isomorphic_cfg_effective_match(
                     return False
             _commit_memory(ctx, obs_o, index_o)
 
-        if not _load_obligations_met(ctx):
-            if recorder is not None:
-                recorder.mark_inconclusive("analysis_limit")
-            return False
-
         last_o = _block_terminator(
             cfg_o.starts[block_o],
             cfg_o.ends[block_o],
@@ -4770,7 +4910,7 @@ def verify_isomorphic_cfg_effective_match(
                 recorder,
                 last_o,
                 last_r,
-                require_dead_registers=False,
+                require_dead_registers=similarity is None,
             ):
                 return False
         if "fallout" in edges_o:
@@ -4783,13 +4923,7 @@ def verify_isomorphic_cfg_effective_match(
                 )
             return False
 
-        outgoing = _CfgState(
-            orig_state,
-            recomp_state,
-            ctx.gen,
-            dict(ctx.receiver_values),
-            ctx.stack_escaped,
-        )
+        outgoing = _capture_cfg_state(orig_state, recomp_state, ctx)
         if recorder is not None:
             recorder.reasons.update(ctx.categories)
         for role, to_o in edges_o.items():
