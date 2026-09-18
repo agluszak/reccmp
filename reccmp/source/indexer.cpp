@@ -538,6 +538,9 @@ class Indexer {
       for (const CXXBaseSpecifier& base : record->bases()) {
         const CXXRecordDecl* baseRecord = base.getType()->getAsCXXRecordDecl();
         if (!baseRecord) continue;
+        // Virtual bases use a different layout API; skip until consumers
+        // understand vbtable-relative offsets (getVBaseClassOffset).
+        if (base.isVirtual()) continue;
         baseOffsets.push_back(llvm::json::Object{
             {"name", typeName(base.getType())},
             {"offset", layout->getBaseClassOffset(baseRecord).getQuantity()},

@@ -707,42 +707,76 @@ class SourceIndex:
         return self._classes_by_name.get(qualified_name)
 
     def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
-        """Largest field whose byte offset is <= ``offset`` (layout must be known)."""
+        """Field covering ``offset`` bytes within the class (layout must be known).
+
+        A field matches when ``offset <= target < offset + size``. Unknown-size
+        fields match only at their exact offset. Base subobjects are searched
+        recursively. Padding / out-of-range offsets return ``None``.
+        """
         source_class = self._classes_by_name.get(qualified_name)
         if source_class is None:
             return None
+
         best: SourceField | None = None
         for item in source_class.fields:
             if item.offset is None:
                 continue
-            if item.offset <= offset and (
-                best is None or item.offset > (best.offset or -1)
-            ):
+            if item.size is None:
+                covers = item.offset == offset
+            else:
+                covers = item.offset <= offset < item.offset + item.size
+            if covers and (best is None or (item.offset or 0) > (best.offset or -1)):
                 best = item
-        return best
+        if best is not None:
+            return best
+
+        for base in source_class.base_offsets:
+            if offset < base.offset:
+                continue
+            nested_name = strip_type_qualifiers(base.name)
+            found = self.field_at(nested_name, offset - base.offset)
+            if found is not None:
+                return found
+        return None
 
     def field_path_at(self, qualified_name: str, offset: int) -> str | None:
-        """Dotted field path for a byte offset, descending into nested records."""
-        parts: list[str] = []
-        current = qualified_name
-        remaining = offset
-        for _ in range(8):
-            field = self.field_at(current, remaining)
-            if field is None or field.offset is None:
-                break
-            parts.append(field.name)
-            remaining -= field.offset
-            nested = strip_type_qualifiers(field.type)
-            if remaining == 0:
-                break
-            if nested not in self._classes_by_name:
-                if remaining:
-                    parts.append(f"+{remaining:#x}")
-                break
-            current = nested
-        if not parts:
+        """Dotted field path for a byte offset, including base subobjects."""
+        source_class = self._classes_by_name.get(qualified_name)
+        if source_class is None:
             return None
-        return ".".join(parts)
+
+        # Prefer a direct field covering this offset.
+        for item in source_class.fields:
+            if item.offset is None:
+                continue
+            if item.size is None:
+                covers = item.offset == offset
+            else:
+                covers = item.offset <= offset < item.offset + item.size
+            if not covers:
+                continue
+            remaining = offset - item.offset
+            nested = strip_type_qualifiers(item.type)
+            if remaining == 0 or nested not in self._classes_by_name:
+                if remaining:
+                    return f"{item.name}+{remaining:#x}"
+                return item.name
+            nested_path = self.field_path_at(nested, remaining)
+            if nested_path is None:
+                return f"{item.name}+{remaining:#x}"
+            return f"{item.name}.{nested_path}"
+
+        # Otherwise descend into a base subobject.
+        for base in source_class.base_offsets:
+            if offset < base.offset:
+                continue
+            nested_name = strip_type_qualifiers(base.name)
+            nested_path = self.field_path_at(nested_name, offset - base.offset)
+            if nested_path is None:
+                continue
+            base_label = nested_name.rsplit("::", 1)[-1]
+            return f"{base_label}.{nested_path}"
+        return None
 
     def has_layout(self, qualified_name: str) -> bool:
         """True when the class carries Clang ASTRecordLayout field offsets."""

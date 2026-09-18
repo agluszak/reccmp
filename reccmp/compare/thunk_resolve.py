@@ -59,7 +59,7 @@ def _in_executable_section(binfile: Image, addr: int) -> bool:
 
 
 def _decodes_as_instruction(binfile: Image, addr: int) -> bool:
-    """True when Capstone can decode at least one instruction at *addr*."""
+    """True when Capstone decodes a non-padding instruction at *addr*."""
     try:
         view, remaining = binfile.seek(addr)
     except InvalidVirtualAddressError:
@@ -71,8 +71,15 @@ def _decodes_as_instruction(binfile: Image, addr: int) -> bool:
     data = bytes(view[:size]) if size <= len(view) else binfile.read(addr, size)
     if not data:
         return False
+    # int3 / alignment padding is common in .text and is not a vtable target.
+    if data[0] == 0xCC:
+        return False
     disassembler = get_detail_disassembler(is_32=True)
-    return any(True for _ in disassembler.disasm(data, addr, count=1))
+    for insn in disassembler.disasm(data, addr, count=1):
+        if insn.mnemonic == "int3":
+            return False
+        return True
+    return False
 
 
 def is_plausible_vtable_target(

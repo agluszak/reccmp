@@ -14,6 +14,8 @@ def test_canonical_stack_ref_heuristics():
     assert canonical_stack_ref("ebp", 0xC).label() == "arg[1]"
     assert canonical_stack_ref("ebp", -0x18).label() == "local[-24]"
     assert canonical_stack_ref("ebp", 0).kind == "saved"
+    # Unaligned / packed positive ebp offsets are not dword args.
+    assert canonical_stack_ref("ebp", 0xA).kind == "unknown"
     assert canonical_stack_ref("esp", 4).kind == "unknown"
     assert canonical_stack_ref("esp", 4, known_spills={4}).kind == "spill"
 
@@ -33,7 +35,7 @@ def test_summarize_helper_effects_detects_this_stores():
     )
 
 
-def test_semantic_inline_raises_confidence_when_summaries_match():
+def test_semantic_inline_marks_call_backed_helpers_with_summaries():
     body = (
         "mov eax, dword ptr [ecx]",
         "mov dword ptr [ecx + 0x4], eax",

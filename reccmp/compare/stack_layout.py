@@ -67,8 +67,11 @@ def canonical_stack_ref(
         if offset == 4:
             return CanonicalStackRef("saved", "return", physical)
         if offset > 0:
-            arg_index = (offset - 8) // 4 if offset >= 8 else offset
-            return CanonicalStackRef("argument", arg_index, physical)
+            # Only dword-aligned ebp+8+4k slots get argument indices.
+            if offset >= 8 and offset % 4 == 0:
+                arg_index = (offset - 8) // 4
+                return CanonicalStackRef("argument", arg_index, physical)
+            return CanonicalStackRef("unknown", offset, physical)
         return CanonicalStackRef("local", offset, physical)
     if reg == "esp":
         if known_spills is not None and offset in known_spills:

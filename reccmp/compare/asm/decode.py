@@ -42,7 +42,7 @@ _SIZE_NAMES = {
     2: "word",
     4: "dword",
     8: "qword",
-    10: "xword",
+    10: "tbyte",
     16: "xmmword",
     32: "ymmword",
     64: "zmmword",

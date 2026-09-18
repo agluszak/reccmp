@@ -305,17 +305,18 @@ class ParseAsm:
                     operands[i] = self._sanitize_imm_operand(mnemonic, op)
 
         ops_tuple = tuple(operands)
+        raw_operands: tuple[str, ...]
         if jump_disp_hex and ops_tuple and ops_tuple[0][0] == "imm":
-            raw = (hex(ops_tuple[0][1]),)
+            raw_operands = (hex(ops_tuple[0][1]),)
             head = f"{insn.prefix} {mnemonic}".strip() if insn.prefix else mnemonic
-            display = f"{head} {raw[0]}"
+            display = f"{head} {raw_operands[0]}"
         else:
-            raw = tuple(format_operand(op) for op in ops_tuple)
+            raw_operands = tuple(format_operand(op) for op in ops_tuple)
             display = format_instruction(mnemonic, insn.prefix, ops_tuple)
         return replace(
             insn,
             operands=ops_tuple,
-            raw_operands=raw,
+            raw_operands=raw_operands,
             display=display,
         )
 

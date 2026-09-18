@@ -1026,3 +1026,33 @@ def test_empty_jump_only_block_both_sides_still_match():
         verify_isomorphic_cfg_effective_match(side, list(side), targets, list(targets))
         is True
     )
+
+
+def test_ret_and_ret_imm_are_not_collapsed_together():
+    """stdcall ``ret 4`` must not be equated with bare ``ret`` by CFG canon."""
+    # Two exit paths: bare ret vs ret 4 — different stack cleanup.
+    orig = [
+        "test eax, eax",
+        "je 0x4",
+        "ret",
+        "ret 4",
+    ]
+    orig_targets: list[int | None] = [None, 3, None, None]
+    recomp = [
+        "test eax, eax",
+        "je 0x4",
+        "ret 4",
+        "ret",
+    ]
+    recomp_targets: list[int | None] = [None, 3, None, None]
+    # If canon collapsed all rets into one, both sides would look isomorphic
+    # with swapped exits and could wrongly prove. Require divergence or at
+    # least no false EFFECTIVE via identical structure after bad collapse.
+    # With text-aware collapse, each side keeps two distinct ret blocks →
+    # edge roles still match (both have two ret exits), but bodies differ.
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig, recomp, orig_targets, recomp_targets
+        )
+        is False
+    )

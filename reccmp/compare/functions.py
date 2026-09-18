@@ -312,7 +312,8 @@ class FunctionComparator:
             or not isinstance(facts.get("displacement"), int)
         ):
             return {}
-        displacement = int(facts["displacement"])
+        displacement = facts["displacement"]
+        assert isinstance(displacement, int)
         field = self.source_index.field_at(class_name, displacement)
         if field is None or field.offset is None:
             return {}

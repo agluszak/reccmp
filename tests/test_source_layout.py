@@ -10,7 +10,7 @@ from reccmp.compare.diagnosis import (
     DifferenceSide,
 )
 from reccmp.compare.functions import FunctionComparator
-from reccmp.source import SourceClass, SourceField, SourceIndex
+from reccmp.source import SourceBaseOffset, SourceClass, SourceField, SourceIndex
 
 
 def _index_with_layout() -> SourceIndex:
@@ -89,13 +89,19 @@ def _index_with_layout() -> SourceIndex:
     )
 
 
-def test_field_at_picks_largest_offset_not_exceeding_request():
+def test_field_at_requires_covering_size_and_searches_bases():
     index = _index_with_layout()
-    assert index.field_at("Foo", 0).name == "bar"
-    assert index.field_at("Foo", 7).name == "bar"
-    assert index.field_at("Foo", 8).name == "flag"
-    assert index.field_at("Foo", 12).name == "tail"
-    assert index.field_at("Foo", 100).name == "tail"
+    at0 = index.field_at("Foo", 0)
+    assert at0 is not None and at0.name == "bar"
+    at7 = index.field_at("Foo", 7)
+    assert at7 is not None and at7.name == "bar"
+    at8 = index.field_at("Foo", 8)
+    assert at8 is not None and at8.name == "flag"
+    at12 = index.field_at("Foo", 12)
+    assert at12 is not None and at12.name == "tail"
+    # Past the end / padding: do not clamp to the last field.
+    assert index.field_at("Foo", 100) is None
+    assert index.field_at("Foo", 13) is None
     assert index.field_at("Missing", 0) is None
 
 
@@ -103,6 +109,64 @@ def test_field_path_at_descends_into_nested_layout():
     index = _index_with_layout()
     assert index.field_path_at("Foo", 4) == "bar.qux"
     assert index.field_path_at("Foo", 8) == "flag"
+
+
+def test_field_at_searches_base_subobjects():
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Base",
+                qualified_name="Base",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="base_x",
+                        type="int",
+                        source_file="a.h",
+                        line=1,
+                        offset=0,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=1,
+                end_line=2,
+                size=4,
+                alignment=4,
+            ),
+            SourceClass(
+                semantic_id="record:Derived",
+                qualified_name="Derived",
+                bases=("Base",),
+                fields=(
+                    SourceField(
+                        name="derived_y",
+                        type="int",
+                        source_file="a.h",
+                        line=5,
+                        offset=4,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=3,
+                end_line=6,
+                size=8,
+                alignment=4,
+                base_offsets=(SourceBaseOffset(name="Base", offset=0),),
+            ),
+        ),
+    )
+    field = index.field_at("Derived", 0)
+    assert field is not None
+    assert field.name == "base_x"
+    assert index.field_path_at("Derived", 0) == "Base.base_x"
+    derived = index.field_at("Derived", 4)
+    assert derived is not None and derived.name == "derived_y"
 
 
 def test_v3_schema_loads_without_layout_fields():

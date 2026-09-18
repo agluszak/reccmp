@@ -451,14 +451,6 @@ def _inline_confidence(
     return round(score, 4)
 
 
-def _semantic_match(helper: HelperCatalogEntry, span_fingerprint: Fingerprint) -> bool:
-    """True when helper and inlined span share the same effect summary."""
-    if helper.effect_summary is None:
-        return False
-    span_summary = summarize_helper_effects(span_fingerprint)
-    return span_summary is not None and span_summary == helper.effect_summary
-
-
 def _evidence_confidence(
     helper: HelperCatalogEntry,
     host_fp: Fingerprint,
@@ -466,14 +458,14 @@ def _evidence_confidence(
     *,
     call_backed: bool,
 ) -> tuple[float, bool]:
+    """Confidence from uniqueness/size; semantic only when CALL-backed + summary.
+
+    Do not boost confidence merely because a fingerprint-matched span
+    re-summarizes to the same effects as the helper needle — that is vacuous.
+    """
+    del span  # fingerprint identity already established by the caller
     confidence = _inline_confidence(helper, len(host_fp), call_backed=call_backed)
-    semantic = False
-    if span is not None:
-        start, length = span
-        span_fp = host_fp[start : start + length]
-        if _semantic_match(helper, span_fp):
-            semantic = True
-            confidence = min(1.0, round(confidence + 0.2, 4))
+    semantic = call_backed and helper.effect_summary is not None
     return confidence, semantic
 
 

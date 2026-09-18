@@ -3649,29 +3649,47 @@ def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
     )
 
 
-def _collapse_duplicate_ret_blocks(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
-    """Point every empty ``ret`` block at a single canonical ret block."""
-    ret_blocks = [b for b in range(len(cfg.starts)) if _is_empty_ret_block(cfg, b)]
-    if len(ret_blocks) < 2:
+def _collapse_duplicate_ret_blocks(
+    cfg: _SideCfg, asm: list[str]
+) -> tuple[_SideCfg, bool]:
+    """Collapse empty ``ret`` blocks that share identical terminator text.
+
+    ``ret`` and ``ret 4`` must not be treated as the same exit — collapsing
+    them would let stdcall/cdecl differences prove EFFECTIVE.
+    """
+    groups: dict[str, list[int]] = {}
+    for block in range(len(cfg.starts)):
+        if not _is_empty_ret_block(cfg, block):
+            continue
+        indices = _block_code_indices(cfg, block)
+        text = asm[indices[0]] if indices[0] < len(asm) else ""
+        groups.setdefault(text, []).append(block)
+
+    redirect: dict[int, int] = {}
+    for blocks in groups.values():
+        if len(blocks) < 2:
+            continue
+        canonical = blocks[0]
+        for block in blocks[1:]:
+            redirect[block] = canonical
+    if not redirect:
         return cfg, False
-    canonical = ret_blocks[0]
-    redirect = {b: canonical for b in ret_blocks[1:]}
     keep = [b for b in range(len(cfg.starts)) if b not in redirect]
     return _rebuild_cfg_keeping(cfg, keep, redirect=redirect), True
 
 
-def _canonicalize_side_cfg(cfg: _SideCfg) -> _SideCfg:
+def _canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
     """Conservative CFG cleanup before isomorphic block pairing.
 
     Removes empty jump-only trampolines, merges trivial fallthrough splits,
-    and collapses duplicated empty ``ret`` blocks. Transforms that are not
-    clearly safe are skipped.
+    and collapses duplicated empty ``ret`` blocks that share the same text.
+    Transforms that are not clearly safe are skipped.
     """
     current = cfg
     for _ in range(len(cfg.starts) + 2):
         current, jumped = _remove_empty_jump_blocks(current)
         current, fell = _merge_trivial_fallthrough_splits(current)
-        current, rets = _collapse_duplicate_ret_blocks(current)
+        current, rets = _collapse_duplicate_ret_blocks(current, asm)
         if not (jumped or fell or rets):
             break
     return current
@@ -4075,8 +4093,8 @@ def verify_isomorphic_cfg_effective_match(
     )
     if cfg_o is None or cfg_r is None:
         return False
-    cfg_o = _canonicalize_side_cfg(cfg_o)
-    cfg_r = _canonicalize_side_cfg(cfg_r)
+    cfg_o = _canonicalize_side_cfg(cfg_o, orig_asm)
+    cfg_r = _canonicalize_side_cfg(cfg_r, recomp_asm)
     pairs = _pair_cfg_blocks(cfg_o, cfg_r, recorder)
     if pairs is None:
         return False
