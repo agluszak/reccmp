@@ -18,11 +18,13 @@ from reccmp.compare.asm.instgen import (
     meta_from_decoded,
 )
 from reccmp.compare.asm.ir import (
+    ExtentKind,
     FunctionImage,
     control_flow_topology_keys,
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
+    resolve_asm_stream,
 )
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
 from reccmp.compare.asm.replacement import (
@@ -389,15 +391,19 @@ class FunctionComparator:
         raw: bytes,
         start_addr: int,
         extent: int,
-        extent_kind: str,
+        extent_kind: ExtentKind,
     ) -> FunctionImage:
         """Decode one side into an owned function image (excerpt + tables)."""
         excerpt = sanitizer.parse_asm(raw, start_addr)
+        stamped = tuple(
+            dataclasses.replace(row, instruction_id=index)
+            for index, row in enumerate(excerpt)
+        )
         return FunctionImage(
             start_addr=start_addr,
             extent=extent,
             extent_kind=extent_kind,
-            excerpt=tuple(excerpt),
+            excerpt=stamped,
             jump_tables=tuple(sanitizer.jump_tables),
             coverage_incomplete=sanitizer.coverage_incomplete,
             raw=raw,
@@ -424,9 +430,9 @@ class FunctionComparator:
         annotated_orig_size = match.size(ImageId.ORIG)
         recomp_size = match.size(ImageId.RECOMP)
 
-        orig_extent_kind = "known"
+        orig_extent_kind = ExtentKind.KNOWN
         if annotated_orig_size is None:
-            orig_extent_kind = "estimated"
+            orig_extent_kind = ExtentKind.ESTIMATED
             assert recomp_size is not None
             orig_max = match.max_size(ImageId.ORIG)
             if orig_max is not None:
@@ -468,37 +474,33 @@ class FunctionComparator:
             recomp_raw,
             match.recomp_addr,
             recomp_size,
-            "known",
+            ExtentKind.KNOWN,
         )
-        orig_combined = list(orig_image.excerpt)
-        recomp_combined = list(recomp_image.excerpt)
-        coverage_incomplete = (
-            orig_image.coverage_incomplete or recomp_image.coverage_incomplete
-        )
+        orig_rows = list(orig_image.excerpt)
+        recomp_rows = list(recomp_image.excerpt)
 
         # Check for assert calls only if we expect to find them
         if has_asserts(self.orig_bin):
-            assert_fixup(orig_combined)
+            assert_fixup(orig_rows)
+            orig_image = orig_image.with_excerpt(orig_rows)
 
         if has_asserts(self.recomp_bin):
-            assert_fixup(recomp_combined)
+            assert_fixup(recomp_rows)
+            recomp_image = recomp_image.with_excerpt(recomp_rows)
 
-        line_annotations = self._collect_line_annotations(recomp_combined)
+        line_annotations = self._collect_line_annotations(list(recomp_image.excerpt))
 
         split_points = self._compute_split_points(
-            orig_combined, recomp_combined, line_annotations
+            list(orig_image.excerpt), list(recomp_image.excerpt), line_annotations
         )
 
-        result = self._compare_function_assembly(
-            orig_combined,
-            recomp_combined,
+        result = self.compare_function_images(
+            orig_image,
+            recomp_image,
             split_points,
             match=match,
             include_diff=include_diff,
             include_exact_diff=include_exact_diff,
-            coverage_incomplete=coverage_incomplete,
-            orig_jump_tables=orig_image.jump_tables,
-            recomp_jump_tables=recomp_image.jump_tables,
         )
 
         # Folded-symbol island: the original address is a group member whose
@@ -520,7 +522,9 @@ class FunctionComparator:
 
         # Incomplete reachable coverage is not a successful proof: refuse
         # EXACT/EFFECTIVE even when the extracted excerpt happens to match.
-        if coverage_incomplete and result.analysis.is_effective:
+        if (
+            orig_image.coverage_incomplete or recomp_image.coverage_incomplete
+        ) and result.analysis.is_effective:
             result = dataclasses.replace(
                 result,
                 analysis=ComparisonAnalysis.inconclusive("incomplete_coverage"),
@@ -1173,10 +1177,10 @@ class FunctionComparator:
                 # Unreachable, but mypy doesn't understand
                 assert False
 
-    def _compare_function_assembly(
+    def compare_function_images(
         self,
-        orig: AsmExcerpt,
-        recomp: AsmExcerpt,
+        orig: FunctionImage,
+        recomp: FunctionImage,
         split_points: list[tuple[int, int]],
         *,
         match: ReccmpMatch | None = None,
@@ -1185,28 +1189,32 @@ class FunctionComparator:
         metadata: FunctionMetadata | None = None,
         orig_meta: list[InstructionMeta | None] | None = None,
         recomp_meta: list[InstructionMeta | None] | None = None,
-        coverage_incomplete: bool = False,
-        orig_jump_tables=(),
-        recomp_jump_tables=(),
     ) -> EntityCompareResult:
+        """Compare two owned function images; they are the source of excerpt,
+        tables, addresses, and coverage."""
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-        # Align on structured IR keys; display strings stay for printing/scoring UI.
-        orig_asm = excerpt_displays(orig)
-        recomp_asm = excerpt_displays(recomp)
+        orig_rows = list(orig.excerpt)
+        recomp_rows = list(recomp.excerpt)
+        coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
+        orig_asm = excerpt_displays(orig_rows)
+        recomp_asm = excerpt_displays(recomp_rows)
 
-        orig_keys = [instruction_match_key(row) for row in orig]
-        recomp_keys = [instruction_match_key(row) for row in recomp]
+        orig_keys = [instruction_match_key(row) for row in orig_rows]
+        recomp_keys = [instruction_match_key(row) for row in recomp_rows]
         diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
 
         ratio = diff.ratio()
         opcodes = diff.get_opcodes()
-        operands_complete = all(row.operand_model_complete for row in (*orig, *recomp))
+        operands_complete = all(
+            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
+        )
         control_flow_complete = all(
-            (not row.is_code) or row.control_flow_known for row in (*orig, *recomp)
+            (not row.is_code) or row.control_flow_known
+            for row in (*orig_rows, *recomp_rows)
         )
         displays_match = orig_asm == recomp_asm
-        orig_topology = control_flow_topology_keys(orig, orig_jump_tables)
-        recomp_topology = control_flow_topology_keys(recomp, recomp_jump_tables)
+        orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
+        recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
         exact = admit_exact_analysis(
             displays_equal=displays_match,
             topology_equal=(
@@ -1224,28 +1232,22 @@ class FunctionComparator:
                 metadata = self._function_metadata(match)
             if orig_meta is None:
                 orig_meta = [
-                    meta_from_decoded(row) if row.is_code else None for row in orig
+                    meta_from_decoded(row) if row.is_code else None
+                    for row in orig_rows
                 ]
             if recomp_meta is None:
                 recomp_meta = [
-                    meta_from_decoded(row) if row.is_code else None for row in recomp
+                    meta_from_decoded(row) if row.is_code else None
+                    for row in recomp_rows
                 ]
-            # Pass DecodedInstruction rows so the verifier uses Capstone
-            # operands instead of reparsing display strings.
-            from reccmp.compare.asm.ir import resolve_asm_stream
-
             analysis = analyze_effective_match(
                 opcodes,
-                resolve_asm_stream(
-                    orig, jump_tables=self.orig_sanitize.jump_tables
-                ),
-                resolve_asm_stream(
-                    recomp, jump_tables=self.recomp_sanitize.jump_tables
-                ),
-                orig_addrs=excerpt_addrs(orig),
+                resolve_asm_stream(orig_rows, jump_tables=orig.jump_tables),
+                resolve_asm_stream(recomp_rows, jump_tables=recomp.jump_tables),
+                orig_addrs=excerpt_addrs(orig_rows),
                 metadata=metadata,
                 orig_meta=orig_meta,
-                recomp_addrs=excerpt_addrs(recomp),
+                recomp_addrs=excerpt_addrs(recomp_rows),
                 recomp_meta=recomp_meta,
             )
             if coverage_incomplete and analysis.is_effective:
@@ -1255,7 +1257,9 @@ class FunctionComparator:
 
         inline_layout = None
         if ratio < 1.0 and match is not None and not analysis.is_effective:
-            inline_layout = self._analyze_inline_expansions(match, orig, recomp)
+            inline_layout = self._analyze_inline_expansions(
+                match, orig_rows, recomp_rows
+            )
 
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
             result = EntityCompareResult(
@@ -1276,7 +1280,7 @@ class FunctionComparator:
         # Convert the addresses to hex string for the diff output
         orig_for_printing = [
             (hex(row.address) if row.address is not None else "", row.display)
-            for row in orig
+            for row in orig_rows
         ]
 
         recomp_for_printing = [
@@ -1290,7 +1294,7 @@ class FunctionComparator:
                     ),
                 ),
             )
-            for line_index, row in enumerate(recomp)
+            for line_index, row in enumerate(recomp_rows)
         ]
 
         rdiff = RawDiffOutput(
@@ -1330,6 +1334,47 @@ class FunctionComparator:
         )
         result.refresh_equivalence_level()
         return result
+
+    def _compare_function_assembly(
+        self,
+        orig: AsmExcerpt,
+        recomp: AsmExcerpt,
+        split_points: list[tuple[int, int]],
+        *,
+        match: ReccmpMatch | None = None,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+        metadata: FunctionMetadata | None = None,
+        orig_meta: list[InstructionMeta | None] | None = None,
+        recomp_meta: list[InstructionMeta | None] | None = None,
+        coverage_incomplete: bool = False,
+    ) -> EntityCompareResult:
+        """Test/legacy wrapper that lifts excerpts into ephemeral function images."""
+        orig_image = FunctionImage(
+            start_addr=0,
+            extent=0,
+            extent_kind=ExtentKind.KNOWN,
+            excerpt=tuple(orig),
+            coverage_incomplete=coverage_incomplete,
+        )
+        recomp_image = FunctionImage(
+            start_addr=0,
+            extent=0,
+            extent_kind=ExtentKind.KNOWN,
+            excerpt=tuple(recomp),
+            coverage_incomplete=coverage_incomplete,
+        )
+        return self.compare_function_images(
+            orig_image,
+            recomp_image,
+            split_points,
+            match=match,
+            include_diff=include_diff,
+            include_exact_diff=include_exact_diff,
+            metadata=metadata,
+            orig_meta=orig_meta,
+            recomp_meta=recomp_meta,
+        )
 
     def find_inlines(self, helper: ReccmpMatch) -> list[InlineHit]:
         """Search original functions for probable expansions of ``helper``'s body."""

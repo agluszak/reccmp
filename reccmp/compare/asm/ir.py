@@ -35,6 +35,13 @@ class AsmRole(Enum):
     DATA_TABLE_ENTRY = auto()
 
 
+class ExtentKind(Enum):
+    """How the compared byte window was chosen."""
+
+    KNOWN = "known"
+    ESTIMATED = "estimated"
+
+
 @dataclass(frozen=True)
 class JumpTable:
     """One switch address table discovered by ``InstructGen``.
@@ -59,9 +66,7 @@ class FunctionImage:
 
     start_addr: int
     extent: int
-    # ``known`` when PDB/entity size is authoritative; ``estimated`` when the
-    # original extent was guessed from the recompilation length.
-    extent_kind: str
+    extent_kind: ExtentKind
     excerpt: tuple[DecodedInstruction, ...]
     jump_tables: tuple[JumpTable, ...] = ()
     coverage_incomplete: bool = False
@@ -69,8 +74,17 @@ class FunctionImage:
 
     @property
     def instruction_ids(self) -> tuple[int, ...]:
-        """Stable indices into ``excerpt`` for program-point identity."""
-        return tuple(range(len(self.excerpt)))
+        """Stable program-point ids owned by this image."""
+        return tuple(
+            row.instruction_id if row.instruction_id is not None else index
+            for index, row in enumerate(self.excerpt)
+        )
+
+    def with_excerpt(
+        self, excerpt: Sequence[DecodedInstruction]
+    ) -> "FunctionImage":
+        """Return a copy whose excerpt (and ids) come from ``excerpt``."""
+        return replace(self, excerpt=tuple(excerpt))
 
 
 @dataclass(frozen=True)
@@ -107,6 +121,8 @@ class DecodedInstruction:
     control_flow_known: bool = True
     # Unsanitized Capstone op_str (useful for debug / jump-table discovery).
     raw_op_str: str = ""
+    # Immutable program-point identity assigned by ``FunctionImage``.
+    instruction_id: int | None = None
 
     @property
     def is_code(self) -> bool:
@@ -269,7 +285,9 @@ def control_flow_topology_keys(
     size. Switch tables contribute the tuple of case destination ids.
     """
     addr_to_id = {
-        row.address: index
+        row.address: (
+            row.instruction_id if row.instruction_id is not None else index
+        )
         for index, row in enumerate(excerpt)
         if row.address is not None
     }

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from reccmp.compare.asm.ir import FunctionImage
+from reccmp.compare.asm.ir import ExtentKind, FunctionImage
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb
 from reccmp.compare.source_capability import (
@@ -35,16 +36,22 @@ def test_function_image_captures_excerpt_tables_and_coverage():
     image = FunctionImage(
         start_addr=0x1000,
         extent=len(blob),
-        extent_kind="known",
+        extent_kind=ExtentKind.KNOWN,
         excerpt=tuple(sanitizer.parse_asm(blob, 0x1000)),
         jump_tables=tuple(sanitizer.jump_tables),
         coverage_incomplete=sanitizer.coverage_incomplete,
         raw=blob,
     )
-    assert image.extent_kind == "known"
+    assert image.extent_kind is ExtentKind.KNOWN
     assert image.coverage_incomplete is False
     assert any(row.mnemonic == "mov" for row in image.excerpt if row.is_code)
-    assert image.instruction_ids == tuple(range(len(image.excerpt)))
+    stamped = image.with_excerpt(
+        tuple(replace(row, instruction_id=i) for i, row in enumerate(image.excerpt))
+    )
+    assert stamped.instruction_ids == tuple(range(len(stamped.excerpt)))
+    assert all(
+        row.instruction_id == i for i, row in enumerate(stamped.excerpt)
+    )
 
 
 def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
