@@ -1834,6 +1834,120 @@ def _load_obligations_met(ctx: Context) -> bool:
     )
 
 
+def _discharge_run_obligations(
+    ctx: Context,
+    orig: SideState,
+    recomp: SideState,
+    recorder: AnalysisRecorder | None,
+    last_index_o: int | None = None,
+    last_index_r: int | None = None,
+    *,
+    require_dead_registers: bool = True,
+) -> bool:
+    """Shared end-of-run admission checklist for every verifier strategy.
+
+    Divergent caller-saved registers must be dead (matched/consumed or
+    scratch); callee-saved and SP must match; callee-save swaps must balance;
+    load-folding obligations and frame-slot layouts must hold; x87 depth and
+    live slots must agree.
+
+    ``require_dead_registers`` is False for CFG/iso block terminals: those
+    strategies keep a fresh ``Context`` per block, so ``matched_nodes`` cannot
+    yet discharge values proven equal in predecessor blocks. Linear
+    verification (one Context for the whole stream) keeps the full check.
+    """
+    # pylint: disable=too-many-return-statements,too-many-branches,too-many-arguments
+    # pylint: disable=too-many-positional-arguments
+    if require_dead_registers:
+        for family in FAMILIES:
+            if orig.regs[family] == recomp.regs[family]:
+                ctx.add_matched(orig.regs[family])
+        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
+            if slot_o == slot_r:
+                ctx.add_matched(slot_o)
+
+        dead_register_difference = False
+        for family in FAMILIES:
+            value_o, value_r = orig.regs[family], recomp.regs[family]
+            if value_o == value_r:
+                continue
+            if family not in CALLER_SAVED:
+                if recorder is not None:
+                    summary_o, summary_r = _diagnostic_summaries(value_o, value_r)
+                    recorder.record_difference(
+                        "preserved_state",
+                        last_index_o,
+                        last_index_r,
+                        {"register": family, "value": summary_o},
+                        {"register": family, "value": summary_r},
+                    )
+                return False
+            if _ins_split_ok(value_o, value_r, ctx):
+                dead_register_difference = True
+                continue
+            for value in (value_o, value_r):
+                if _is_scratch(value):
+                    dead_register_difference = True
+                    continue
+                if not _contained(value, ctx):
+                    if recorder is not None:
+                        recorder.mark_inconclusive("analysis_limit")
+                    return False
+                dead_register_difference = True
+        if dead_register_difference and "register_allocation" not in ctx.categories:
+            ctx.categories.add("dead_operation")
+
+    if ctx.save_stack:
+        if recorder is not None:
+            recorder.mark_inconclusive("analysis_limit")
+        return False
+    if not _load_obligations_met(ctx):
+        if recorder is not None:
+            recorder.mark_inconclusive("analysis_limit")
+        return False
+    if not _slots_consistent(orig, recomp):
+        if recorder is not None:
+            recorder.mark_inconclusive("analysis_limit")
+        return False
+    if _uses_frame_slot_layout(orig, recomp):
+        ctx.categories.add("frame_slot_layout")
+
+    if orig.x87.state_key()[1:] != recomp.x87.state_key()[1:]:
+        return False
+    if len(orig.x87.known) != len(recomp.x87.known):
+        return False
+    if require_dead_registers:
+        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
+            if slot_o != slot_r:
+                if not (_contained(slot_o, ctx) and _contained(slot_r, ctx)):
+                    return False
+    elif orig.x87.known != recomp.x87.known:
+        return False
+    return True
+
+
+def admit_unsupported_identical(
+    orig: SideState,
+    recomp: SideState,
+    ctx: Context,
+    idx: int,
+    meta_o: InstructionMeta | None,
+    meta_r: InstructionMeta | None,
+) -> bool:
+    """Shared policy for identical unsupported instructions on both sides."""
+    if (
+        meta_o is not None
+        and meta_r is not None
+        and _same_meta_effects(meta_o, meta_r)
+        and _meta_step(orig, recomp, meta_o, idx)
+    ):
+        return True
+    if not fully_synced(orig, recomp):
+        return False
+    resync((orig, recomp), idx, ctx)
+    return True
+
+
 def _callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> bool:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-boolean-expressions
@@ -2134,21 +2248,15 @@ def verify_effective_match(
                     if recomp_meta is not None and index_r is not None
                     else None
                 )
-                if (
-                    meta_o is not None
-                    and meta_r is not None
-                    and _same_meta_effects(meta_o, meta_r)
-                    and _meta_step(orig, recomp, meta_o, idx)
+                if admit_unsupported_identical(
+                    orig, recomp, ctx, idx, meta_o, meta_r
                 ):
                     continue
-                if not fully_synced(orig, recomp):
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "unsupported_instruction", index_o, index_r
-                        )
-                    return False
-                resync((orig, recomp), idx, ctx)
-                continue
+                if recorder is not None:
+                    recorder.mark_inconclusive(
+                        "unsupported_instruction", index_o, index_r
+                    )
+                return False
 
             guard_state_size(orig, ctx)
             guard_state_size(recomp, ctx)
@@ -2236,74 +2344,10 @@ def verify_effective_match(
 
             _commit_memory(ctx, obs_o, idx)
 
-        # Values still diverged at the end must be dead. Callee-saved
-        # registers and the stack pointer are externally observable machine
-        # state and must match exactly; a divergent caller-saved register
-        # is accepted only if both of its values were consumed by something
-        # that was proven equal across the two sides.
-        for family in FAMILIES:
-            if orig.regs[family] == recomp.regs[family]:
-                ctx.add_matched(orig.regs[family])
-        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-            if slot_o == slot_r:
-                ctx.add_matched(slot_o)
-
-        dead_register_difference = False
-        for family in FAMILIES:
-            value_o, value_r = orig.regs[family], recomp.regs[family]
-            if value_o == value_r:
-                continue
-            if family not in CALLER_SAVED:
-                if recorder is not None:
-                    summary_o, summary_r = _diagnostic_summaries(value_o, value_r)
-                    recorder.record_difference(
-                        "preserved_state",
-                        last_index_o,
-                        last_index_r,
-                        {"register": family, "value": summary_o},
-                        {"register": family, "value": summary_r},
-                    )
-                return False
-            if _ins_split_ok(value_o, value_r, ctx):
-                dead_register_difference = True
-                continue
-            for value in (value_o, value_r):
-                if _is_scratch(value):
-                    dead_register_difference = True
-                    continue
-                if not _contained(value, ctx):
-                    if recorder is not None:
-                        recorder.mark_inconclusive("analysis_limit")
-                    return False
-                dead_register_difference = True
-        if dead_register_difference and "register_allocation" not in ctx.categories:
-            ctx.categories.add("dead_operation")
-
-        # Every callee-save substitution must have been balanced by its pop,
-        # and any frame-slot renaming must describe a consistent layout.
-        if ctx.save_stack:
-            if recorder is not None:
-                recorder.mark_inconclusive("analysis_limit")
+        if not _discharge_run_obligations(
+            ctx, orig, recomp, recorder, last_index_o, last_index_r
+        ):
             return False
-        if not _load_obligations_met(ctx):
-            if recorder is not None:
-                recorder.mark_inconclusive("analysis_limit")
-            return False
-        if not _slots_consistent(orig, recomp):
-            if recorder is not None:
-                recorder.mark_inconclusive("analysis_limit")
-            return False
-        if _uses_frame_slot_layout(orig, recomp):
-            ctx.categories.add("frame_slot_layout")
-
-        if orig.x87.state_key()[1:] != recomp.x87.state_key()[1:]:
-            return False
-        if len(orig.x87.known) != len(recomp.x87.known):
-            return False
-        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-            if slot_o != slot_r:
-                if not (_contained(slot_o, ctx) and _contained(slot_r, ctx)):
-                    return False
     except (Reject, RecursionError):
         if recorder is not None:
             recorder.mark_inconclusive("analysis_limit")
@@ -3187,16 +3231,13 @@ def verify_cfg_effective_match(
                     return False
                 meta_o = orig_meta[i] if orig_meta is not None else None
                 meta_r = recomp_meta[i] if recomp_meta is not None else None
-                if _same_meta_effects(meta_o, meta_r) and _meta_step(
-                    orig_state, recomp_state, meta_o, i
+                if admit_unsupported_identical(
+                    orig_state, recomp_state, ctx, i, meta_o, meta_r
                 ):
                     continue
-                if not fully_synced(orig_state, recomp_state):
-                    if recorder is not None:
-                        recorder.mark_inconclusive("unsupported_instruction", i, i)
-                    return False
-                resync((orig_state, recomp_state), i, ctx)
-                continue
+                if recorder is not None:
+                    recorder.mark_inconclusive("unsupported_instruction", i, i)
+                return False
 
             guard_state_size(orig_state, ctx)
             guard_state_size(recomp_state, ctx)
@@ -3210,6 +3251,12 @@ def verify_cfg_effective_match(
                     for k, obs_entry in enumerate(entries):
                         if obs_entry[0] in CONTROL_TAGS - {"jmpind"}:
                             entries[k] = (*obs_entry[:-1], ("L", starts[target]))
+
+            if _callee_save_swap(
+                ctx, ins_o, ins_r, obs_o, obs_r, orig_state, recomp_state
+            ):
+                _commit_memory(ctx, obs_o, i)
+                continue
 
             if obs_o != obs_r:
                 meta_o = orig_meta[i] if orig_meta is not None else None
@@ -3275,11 +3322,17 @@ def verify_cfg_effective_match(
             _commit_memory(ctx, obs_o, i)
 
         last_kind = kinds[ends[block] - 1]
-        if (
-            last_kind == "ret"
-            and orig_state.x87.state_key() != recomp_state.x87.state_key()
-        ):
-            return False
+        if last_kind == "ret":
+            if not _discharge_run_obligations(
+                ctx,
+                orig_state,
+                recomp_state,
+                recorder,
+                ends[block] - 1,
+                ends[block] - 1,
+                require_dead_registers=False,
+            ):
+                return False
         if last_kind == "code" and ends[block] == total:
             # Falling out of the disassembled function is not a modeled exit.
             return False
@@ -4504,27 +4557,22 @@ def verify_isomorphic_cfg_effective_match(
                     return False
                 meta_o = orig_meta[index_o] if orig_meta is not None else None
                 meta_r = recomp_meta[index_r] if recomp_meta is not None else None
-                if _same_meta_effects(meta_o, meta_r) and _meta_step(
-                    orig_state, recomp_state, meta_o, index_o
+                if admit_unsupported_identical(
+                    orig_state, recomp_state, ctx, index_o, meta_o, meta_r
                 ):
                     if similarity is not None:
                         similarity.match(index_o, index_r)
                     continue
-                if not fully_synced(orig_state, recomp_state):
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "unsupported_instruction", index_o, index_r
-                        )
-                    return False
-                resync((orig_state, recomp_state), index_o, ctx)
-                if similarity is not None:
-                    similarity.match(index_o, index_r)
-                continue
+                if recorder is not None:
+                    recorder.mark_inconclusive(
+                        "unsupported_instruction", index_o, index_r
+                    )
+                return False
 
             guard_state_size(orig_state, ctx)
             guard_state_size(recomp_state, ctx)
 
-            if similarity is not None and _callee_save_swap(
+            if _callee_save_swap(
                 ctx,
                 ins_o,
                 ins_r,
@@ -4533,7 +4581,8 @@ def verify_isomorphic_cfg_effective_match(
                 orig_state,
                 recomp_state,
             ):
-                similarity.match(index_o, index_r)
+                if similarity is not None:
+                    similarity.match(index_o, index_r)
                 _commit_memory(ctx, obs_o, index_o)
                 continue
 
@@ -4675,11 +4724,17 @@ def verify_isomorphic_cfg_effective_match(
             cfg_r.owned_data,
         )
         last_kind = cfg_o.kinds[last_o]
-        if (
-            last_kind == "ret"
-            and orig_state.x87.state_key() != recomp_state.x87.state_key()
-        ):
-            return False
+        if last_kind == "ret":
+            if not _discharge_run_obligations(
+                ctx,
+                orig_state,
+                recomp_state,
+                recorder,
+                last_o,
+                last_r,
+                require_dead_registers=False,
+            ):
+                return False
         if "fallout" in edges_o:
             # Falling out of the disassembled function is not a modeled exit.
             if recorder is not None:

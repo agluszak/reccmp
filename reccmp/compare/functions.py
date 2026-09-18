@@ -36,6 +36,7 @@ from reccmp.compare.diagnosis import (
     ComparisonStatus,
     DifferenceSide,
     FactValue,
+    admit_exact_analysis,
 )
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
@@ -494,6 +495,7 @@ class FunctionComparator:
             match=match,
             include_diff=include_diff,
             include_exact_diff=include_exact_diff,
+            coverage_incomplete=coverage_incomplete,
         )
 
         # Folded-symbol island: the original address is a group member whose
@@ -1180,6 +1182,7 @@ class FunctionComparator:
         metadata: FunctionMetadata | None = None,
         orig_meta: list[InstructionMeta | None] | None = None,
         recomp_meta: list[InstructionMeta | None] | None = None,
+        coverage_incomplete: bool = False,
     ) -> EntityCompareResult:
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         # Align on structured IR keys; display strings stay for printing/scoring UI.
@@ -1192,18 +1195,20 @@ class FunctionComparator:
 
         ratio = diff.ratio()
         opcodes = diff.get_opcodes()
-        # IR-key equality alone is not EXACT when either side used opaque or
-        # unknown-size operands, or when control-flow targets are incomplete —
-        # unless display strings match end-to-end.
         operands_complete = all(row.operand_model_complete for row in (*orig, *recomp))
         control_flow_complete = all(
             (not row.is_code) or row.control_flow_known for row in (*orig, *recomp)
         )
         displays_match = orig_asm == recomp_asm
-        if ratio == 1.0 and (
-            displays_match or (operands_complete and control_flow_complete)
-        ):
-            analysis = ComparisonAnalysis.exact()
+        exact = admit_exact_analysis(
+            displays_equal=displays_match,
+            keys_equal=ratio == 1.0,
+            operands_complete=operands_complete,
+            control_flow_complete=control_flow_complete,
+            coverage_incomplete=coverage_incomplete,
+        )
+        if exact is not None:
+            analysis = exact
         else:
             if metadata is None and match is not None:
                 metadata = self._function_metadata(match)
@@ -1233,6 +1238,8 @@ class FunctionComparator:
                 recomp_addrs=excerpt_addrs(recomp),
                 recomp_meta=recomp_meta,
             )
+            if coverage_incomplete and analysis.is_effective:
+                analysis = ComparisonAnalysis.inconclusive("incomplete_coverage")
 
         analysis = self._enrich_analysis_with_source(analysis, match=match)
 

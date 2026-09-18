@@ -26,6 +26,7 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
+    admit_exact_analysis,
 )
 from reccmp.compare.pinned_sequences import DiffOpcode
 
@@ -86,8 +87,9 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     the verifier can prove."""
     orig = resolve_asm_stream(orig_asm)
     recomp = resolve_asm_stream(recomp_asm)
-    if orig.displays == recomp.displays:
-        return ComparisonAnalysis.exact()
+    exact = admit_exact_analysis(displays_equal=orig.displays == recomp.displays)
+    if exact is not None:
+        return exact
 
     def finish(analysis: ComparisonAnalysis) -> ComparisonAnalysis:
         # A proof over textually-different streams with no specific reason

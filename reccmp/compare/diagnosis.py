@@ -330,6 +330,31 @@ class ComparisonAnalysis:
         )
 
 
+def admit_exact_analysis(
+    *,
+    displays_equal: bool,
+    keys_equal: bool = False,
+    operands_complete: bool = True,
+    control_flow_complete: bool = True,
+    coverage_incomplete: bool = False,
+) -> ComparisonAnalysis | None:
+    """Shared EXACT admission policy for function comparison.
+
+    Strategies may propose identical displays or IR keys; this is the only
+    gate that mints ``ComparisonStatus.EXACT``. Incomplete reachable coverage
+    never admits EXACT. Incomplete operand/control-flow models may still
+    admit EXACT when the displayed excerpt is identical end-to-end, but not
+    from key equality alone.
+    """
+    if coverage_incomplete:
+        return None
+    if displays_equal:
+        return ComparisonAnalysis.exact()
+    if keys_equal and operands_complete and control_flow_complete:
+        return ComparisonAnalysis.exact()
+    return None
+
+
 @dataclass
 class AnalysisRecorder:
     """Mutable evidence sink used by one speculative verifier strategy."""
