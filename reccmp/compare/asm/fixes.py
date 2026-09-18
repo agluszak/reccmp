@@ -14,6 +14,13 @@ from reccmp.compare.asm.effective import (
     verify_isomorphic_cfg_effective_match,
 )
 from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.ir import (
+    AsmStream,
+    ResolvedAsm,
+    instruction_at,
+    resolve_asm_stream,
+)
+from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.parse import AsmExcerpt
 from reccmp.compare.diagnosis import (
     AnalysisRecorder,
@@ -30,15 +37,21 @@ logger = logging.getLogger(__name__)
 _PADDING = ("nop", "int3")
 
 
-def _trim_padding(asm: list[str]) -> list[str]:
+def _trim_padding(stream: ResolvedAsm) -> ResolvedAsm:
     """Strip trailing nop/int3 alignment padding, but only behind an
     instruction that does not fall through into it."""
-    end = len(asm)
-    while end > 0 and asm[end - 1] in _PADDING:
+    displays = stream.displays
+    end = len(displays)
+    while end > 0 and displays[end - 1] in _PADDING:
         end -= 1
-    if 0 < end < len(asm) and asm[end - 1].partition(" ")[0] in ("ret", "jmp"):
-        return asm[:end]
-    return asm
+    if 0 < end < len(displays):
+        try:
+            mnemonic = instruction_at(stream, end - 1).mnemonic
+        except (Reject, IndexError, KeyError, ValueError, TypeError):
+            mnemonic = displays[end - 1].partition(" ")[0]
+        if mnemonic in ("ret", "jmp"):
+            return stream.slice(end)
+    return stream
 
 
 def analyze_effective_match(  # pylint: disable=too-many-arguments
@@ -46,8 +59,8 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     # pylint: disable=too-many-return-statements
     # pylint: disable=too-many-locals
     codes: Sequence[DiffOpcode],
-    orig_asm: list[str],
-    recomp_asm: list[str],
+    orig_asm: AsmStream,
+    recomp_asm: AsmStream,
     orig_addrs: Sequence[int | None] | None = None,
     metadata: FunctionMetadata | None = None,
     orig_meta: list[InstructionMeta | None] | None = None,
@@ -55,6 +68,9 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     recomp_meta: list[InstructionMeta | None] | None = None,
 ) -> ComparisonAnalysis:
     """Canonical semantic analysis of two sanitized instruction streams.
+
+    Prefer ``DecodedInstruction`` excerpts so the verifier uses Capstone
+    operands directly. Legacy ``list[str]`` still works via text parse.
 
     The relational verifier (see effective.py) proves equivalence modulo
     register allocation, commutative-operand order and inverted compare/jump
@@ -68,7 +84,9 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     lies within the crossed region. `metadata` (optional) provides
     PDB-derived return-type and callee-convention facts that widen what
     the verifier can prove."""
-    if orig_asm == recomp_asm:
+    orig = resolve_asm_stream(orig_asm)
+    recomp = resolve_asm_stream(recomp_asm)
+    if orig.displays == recomp.displays:
         return ComparisonAnalysis.exact()
 
     def finish(analysis: ComparisonAnalysis) -> ComparisonAnalysis:
@@ -91,16 +109,14 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     # Plain lockstep pairing first (with trailing alignment padding
     # trimmed): for equal-length sequences the diff's insert/delete blocks
     # can misalign lines that pair up fine positionally.
-    trimmed_orig = _trim_padding(orig_asm)
-    trimmed_recomp = _trim_padding(recomp_asm)
-    padding = len(trimmed_orig) != len(orig_asm) or len(trimmed_recomp) != len(
-        recomp_asm
-    )
+    trimmed_orig = _trim_padding(orig)
+    trimmed_recomp = _trim_padding(recomp)
+    padding = len(trimmed_orig) != len(orig) or len(trimmed_recomp) != len(recomp)
     trimmed_meta = orig_meta[: len(trimmed_orig)] if orig_meta is not None else None
     trimmed_recomp_meta = (
         recomp_meta[: len(trimmed_recomp)] if recomp_meta is not None else None
     )
-    relocation_normalized = undo_relocations(codes, orig_asm, recomp_asm, orig_addrs)
+    relocation_normalized = undo_relocations(codes, orig, recomp, orig_addrs)
     lockstep = new_recorder()
     if verify_effective_match(
         trimmed_orig,
@@ -124,8 +140,8 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     # register copy) and transposed independent lines.
     diff_aligned = new_recorder()
     if verify_effective_match(
-        orig_asm,
-        recomp_asm,
+        orig,
+        recomp,
         codes,
         metadata=metadata,
         orig_meta=orig_meta,
@@ -137,7 +153,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
 
     relocation = new_recorder()
     if relocation_normalized is not None and verify_effective_match(
-        orig_asm, relocation_normalized, metadata=metadata, recorder=relocation
+        orig, relocation_normalized, metadata=metadata, recorder=relocation
     ):
         logger.debug("effective match: instruction relocation")
         return finish(relocation.effective_analysis({"instruction_reorder"}))
@@ -167,14 +183,14 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     # Isomorphic-CFG verification: per-side block graphs matched by
     # structure. Tolerates different instruction counts (folded loads,
     # elided copies) and the shifted branch displacements they cause.
-    full_orig_targets = _branch_targets(orig_asm, orig_addr_list, orig_meta)
-    full_recomp_targets = _branch_targets(recomp_asm, recomp_addr_list, recomp_meta)
+    full_orig_targets = _branch_targets(orig, orig_addr_list, orig_meta)
+    full_recomp_targets = _branch_targets(recomp, recomp_addr_list, recomp_meta)
     iso = new_recorder()
     iso_attempted = full_orig_targets is not None and full_recomp_targets is not None
     if full_orig_targets is not None and full_recomp_targets is not None:
         iso_effective = verify_isomorphic_cfg_effective_match(
-            orig_asm,
-            recomp_asm,
+            orig,
+            recomp,
             full_orig_targets,
             full_recomp_targets,
             metadata=metadata,
@@ -199,8 +215,8 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
             and full_recomp_targets is not None
         ):
             similarity = estimate_isomorphic_cfg_semantic_similarity(
-                orig_asm,
-                recomp_asm,
+                orig.displays,
+                recomp.displays,
                 full_orig_targets,
                 full_recomp_targets,
                 metadata=metadata,
@@ -237,7 +253,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
 
 
 def _branch_targets(
-    asm: list[str],
+    asm: ResolvedAsm | Sequence[str],
     addrs: Sequence[int | None] | None,
     metas: Sequence[InstructionMeta | None] | None,
 ) -> list[int | None] | None:
@@ -245,9 +261,10 @@ def _branch_targets(
     Targets outside the excerpt resolve to None (external)."""
     if addrs is None or metas is None:
         return None
+    length = len(asm)
     index_of = {addr: i for i, addr in enumerate(addrs) if addr is not None}
     result: list[int | None] = []
-    for i in range(len(asm)):
+    for i in range(length):
         meta = metas[i] if i < len(metas) else None
         target = meta.branch_target if meta is not None else None
         # Calls are not local control flow.
@@ -259,16 +276,18 @@ def _branch_targets(
 
 def undo_relocations(
     codes: Sequence[DiffOpcode],
-    orig_asm: list[str],
-    recomp_asm: list[str],
+    orig_asm: AsmStream,
+    recomp_asm: AsmStream,
     orig_addrs: Sequence[int | None] | None = None,
-) -> list[str] | None:
+) -> ResolvedAsm | None:
     """If every diff insertion can be paired with an equal-text deletion
     whose move is proven independent of all crossed instructions, return
     recomp_asm reordered into orig's instruction order. Returns None when
     the diffs are not (only) relocations."""
     # pylint: disable=too-many-return-statements
-    if len(orig_asm) != len(recomp_asm):
+    orig = resolve_asm_stream(orig_asm)
+    recomp = resolve_asm_stream(recomp_asm)
+    if len(orig) != len(recomp):
         return None
 
     # Sorted for deterministic matching when several identical lines
@@ -289,7 +308,7 @@ def undo_relocations(
     if not inserts or len(inserts) != len(deletes):
         return None
 
-    effects = sequence_effects(orig_asm)
+    effects = sequence_effects(orig.displays)
     if effects is None:
         return None
 
@@ -300,12 +319,14 @@ def undo_relocations(
     pairs: dict[int, int] = {}
     remaining = list(deletes)
     for orig_dest, j in inserts:
-        line = recomp_asm[j]
+        line = recomp.displays[j]
         matched = None
         for i in remaining:
-            if orig_asm[i] != line:
+            if orig.displays[i] != line:
                 continue
-            if _can_relocate(effects, orig_asm, i, orig_dest, orig_addrs, addr_index):
+            if _can_relocate(
+                effects, orig.displays, i, orig_dest, orig_addrs, addr_index
+            ):
                 matched = i
                 break
         if matched is None:
@@ -327,12 +348,12 @@ def undo_relocations(
             for j in range(j1, j2):
                 key[j] = pairs[j]
 
-    if len(key) != len(recomp_asm):
+    if len(key) != len(recomp):
         return None
 
-    order = sorted(range(len(recomp_asm)), key=key.__getitem__)
-    reordered = [recomp_asm[j] for j in order]
-    return None if reordered == recomp_asm else reordered
+    order = sorted(range(len(recomp)), key=key.__getitem__)
+    reordered = recomp.reorder(order)
+    return None if reordered.displays == recomp.displays else reordered
 
 
 def _can_relocate(  # pylint: disable=too-many-positional-arguments

@@ -1,6 +1,7 @@
 """Compiler-backed source ownership model."""
 
 from .index import (
+    SourceAbi,
     SourceBaseOffset,
     SourceBaseVtable,
     SourceClass,
@@ -17,6 +18,7 @@ from .index import (
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [
+    "SourceAbi",
     "SourceBaseOffset",
     "SourceBaseVtable",
     "SourceClass",

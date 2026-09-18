@@ -16,7 +16,7 @@ from capstone import (  # type: ignore
 )
 from .const import JUMP_MNEMONICS
 from .decode import as_lite_tuple, disasm_detail
-from .ir import DecodedInstruction
+from .ir import DecodedInstruction, JumpTable
 
 
 @cache
@@ -91,6 +91,7 @@ class InstructGen:
         self.sections: list[FuncSection] = []
 
         self.confirmed_addrs: dict[int, SectionType] = {}
+        self.jump_tables: list[JumpTable] = []
         self.analysis()
 
     def _finish_code_section(self, contents: list[DisasmLiteTuple]):
@@ -98,6 +99,31 @@ class InstructGen:
 
     def _finish_tab_section(self, type_: TabSectionType, stuff: list[tuple[int, int]]):
         self.sections.append(TabSection(type_, stuff))
+        if type_ == SectionType.ADDR_TAB and stuff:
+            table_addr = stuff[0][0]
+            dispatch = self._dispatch_for_table(table_addr)
+            self.jump_tables.append(
+                JumpTable(
+                    address=table_addr,
+                    entries=tuple(stuff),
+                    dispatch_address=dispatch,
+                )
+            )
+
+    def _dispatch_for_table(self, table_addr: int) -> int | None:
+        """Find a ``jmp`` whose memory displacement points at ``table_addr``."""
+        for addr, insn in self.decoded_by_addr.items():
+            if not insn.is_jump or insn.mnemonic != "jmp":
+                continue
+            for op in insn.operands:
+                if not isinstance(op, tuple) or op[0] != "mem":
+                    continue
+                # Capstone absolute displacement before sanitization.
+                if op[4] == table_addr:
+                    return addr
+                if any(scale == 4 for _reg, scale in op[3]) and op[4] == table_addr:
+                    return addr
+        return None
 
     def _insert_confirmed_addr(self, addr: int, type_: SectionType):
         # Ignore address outside the bounds of the function

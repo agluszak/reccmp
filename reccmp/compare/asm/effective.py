@@ -38,7 +38,14 @@ from typing import Callable
 
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 from reccmp.compare.asm.instgen import InstructionMeta
-from reccmp.compare.asm.ir import AsmRole
+from reccmp.compare.asm.ir import (
+    AsmRole,
+    AsmStream,
+    ResolvedAsm,
+    instruction_at,
+    is_data_row,
+    resolve_asm_stream,
+)
 from reccmp.compare.asm.model import (  # noqa: F401 — re-export for callers
     Instruction,
     REGISTERS,
@@ -1671,7 +1678,14 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
 
 
 def _one_sided_ok(
-    state: SideState, other: SideState, ctx: Context, idx: int, line: str
+    state: SideState,
+    other: SideState,
+    ctx: Context,
+    idx: int,
+    line: str,
+    *,
+    ins: Instruction | None = None,
+    is_data: bool = False,
 ) -> bool:
     # pylint: disable=too-many-return-statements
     """Execute an instruction that exists on only one side. Any instruction
@@ -1682,12 +1696,13 @@ def _one_sided_ok(
     read the same address at the same memory generation somewhere in the
     same verification scope (the folded-load case). Control flow, stack
     adjustments, x87 and potentially-faulting arithmetic stay excluded."""
-    if DATA_LINE_RE.match(line):
+    if is_data or (ins is None and DATA_LINE_RE.match(line)):
         return False
-    try:
-        ins = parse_instruction(line)
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return False
+    if ins is None:
+        try:
+            ins = parse_instruction(line)
+        except (Reject, IndexError, KeyError, ValueError, TypeError):
+            return False
     if ins.prefix or ins.mnemonic in _ONE_SIDED_BLACKLIST:
         return False
     if ins.mnemonic == "nop":
@@ -1911,8 +1926,8 @@ def _commutative_order_used(
 
 
 def verify_effective_match(
-    orig_asm: list[str],
-    recomp_asm: list[str],
+    orig_asm: AsmStream,
+    recomp_asm: AsmStream,
     codes=None,
     metadata: FunctionMetadata | None = None,
     orig_meta: list[InstructionMeta | None] | None = None,
@@ -1923,21 +1938,26 @@ def verify_effective_match(
     modulo register allocation, frame-slot layout, commutative-operand
     order and inverted compare/jump conditions.
 
+    Prefer ``DecodedInstruction`` / ``ResolvedAsm`` streams so structured
+    operands are used directly. Legacy ``list[str]`` still reparses.
+
     `orig_meta` (optional, aligned with orig_asm) provides structured
     capstone facts; with them, an unmodeled register-only instruction can
     be stepped over precisely instead of requiring full synchronization."""
     # pylint: disable=too-many-branches,too-many-return-statements,too-many-statements
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
-    aligned = _aligned_indices(codes, len(orig_asm), len(recomp_asm))
+    orig_stream = resolve_asm_stream(orig_asm)
+    recomp_stream = resolve_asm_stream(recomp_asm)
+    aligned = _aligned_indices(codes, len(orig_stream), len(recomp_stream))
     if aligned is None:
         if recorder is not None:
             recorder.mark_inconclusive(
                 "alignment_failure",
                 facts={
                     "stage": "stream_alignment",
-                    "orig_instruction_count": len(orig_asm),
-                    "recomp_instruction_count": len(recomp_asm),
+                    "orig_instruction_count": len(orig_stream),
+                    "recomp_instruction_count": len(recomp_stream),
                 },
             )
         return False
@@ -1951,14 +1971,31 @@ def verify_effective_match(
     try:
         for idx, (index_o, index_r) in enumerate(aligned):
             last_index_o, last_index_r = index_o, index_r
-            line_o = orig_asm[index_o] if index_o is not None else None
-            line_r = recomp_asm[index_r] if index_r is not None else None
+            line_o = orig_stream.displays[index_o] if index_o is not None else None
+            line_r = recomp_stream.displays[index_r] if index_r is not None else None
             if line_o is None or line_r is None:
                 side = recomp if line_o is None else orig
                 other_side = orig if line_o is None else recomp
                 line = line_r if line_o is None else line_o
-                assert line is not None
-                if not _one_sided_ok(side, other_side, ctx, idx, line):
+                side_stream = recomp_stream if line_o is None else orig_stream
+                side_index = index_r if line_o is None else index_o
+                assert line is not None and side_index is not None
+                side_ins = None
+                side_data = is_data_row(side_stream, side_index)
+                if not side_data:
+                    try:
+                        side_ins = instruction_at(side_stream, side_index)
+                    except (Reject, IndexError, KeyError, ValueError, TypeError):
+                        side_ins = None
+                if not _one_sided_ok(
+                    side,
+                    other_side,
+                    ctx,
+                    idx,
+                    line,
+                    ins=side_ins,
+                    is_data=side_data,
+                ):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "alignment_failure",
@@ -1969,15 +2006,15 @@ def verify_effective_match(
                     return False
                 continue
 
-            if DATA_LINE_RE.match(line_o) or DATA_LINE_RE.match(line_r):
+            assert index_o is not None and index_r is not None
+            if is_data_row(orig_stream, index_o) or is_data_row(recomp_stream, index_r):
                 if line_o != line_r:
                     return False
                 continue
 
-            assert index_o is not None and index_r is not None
             try:
-                ins_o = parse_instruction(line_o)
-                ins_r = parse_instruction(line_r)
+                ins_o = instruction_at(orig_stream, index_o)
+                ins_r = instruction_at(recomp_stream, index_r)
                 _record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
                 obs_o: list = []
                 obs_r: list = []
@@ -2843,8 +2880,8 @@ def _same_meta_effects(
 
 
 def verify_cfg_effective_match(
-    orig_asm: list[str],
-    recomp_asm: list[str],
+    orig_asm: AsmStream,
+    recomp_asm: AsmStream,
     orig_targets: list[int | None],
     recomp_targets: list[int | None],
     metadata: FunctionMetadata | None = None,
@@ -2862,6 +2899,10 @@ def verify_cfg_effective_match(
     # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
+    orig_stream = resolve_asm_stream(orig_asm)
+    recomp_stream = resolve_asm_stream(recomp_asm)
+    orig_asm = orig_stream.displays
+    recomp_asm = recomp_stream.displays
     total = len(orig_asm)
     if (
         len(recomp_asm) != total
@@ -2894,41 +2935,50 @@ def verify_cfg_effective_match(
             if differing is not None:
                 meta_o = orig_meta[differing] if orig_meta is not None else None
                 meta_r = recomp_meta[differing] if recomp_meta is not None else None
+                try:
+                    facts_o = _target_facts(
+                        instruction_at(orig_stream, differing),
+                        meta_o,
+                        orig_targets[differing],
+                    )
+                    facts_r = _target_facts(
+                        instruction_at(recomp_stream, differing),
+                        meta_r,
+                        recomp_targets[differing],
+                    )
+                except (Reject, IndexError, KeyError, ValueError, TypeError):
+                    facts_o = facts_r = {}
                 recorder.record_difference(
                     "branch_target",
                     differing,
                     differing,
-                    _target_facts(
-                        parse_instruction(orig_asm[differing]),
-                        meta_o,
-                        orig_targets[differing],
-                    ),
-                    _target_facts(
-                        parse_instruction(recomp_asm[differing]),
-                        meta_r,
-                        recomp_targets[differing],
-                    ),
+                    facts_o,
+                    facts_r,
                 )
         return False
 
-    def classify(asm: list[str]) -> list[str]:
+    def classify(stream: ResolvedAsm) -> list[str]:
         kinds = []
-        for line in asm:
-            mnemonic = line.partition(" ")[0]
+        for index in range(len(stream)):
+            if is_data_row(stream, index):
+                kinds.append("data")
+                continue
+            try:
+                mnemonic = instruction_at(stream, index).mnemonic
+            except (Reject, IndexError, KeyError, ValueError, TypeError):
+                mnemonic = stream.displays[index].partition(" ")[0]
             if mnemonic in JCC_MNEMONICS:
                 kinds.append("jcc")
             elif mnemonic in ("jmp", "ret"):
                 kinds.append(mnemonic)
             elif mnemonic in ("loop", "loope", "loopne", "jcxz", "jecxz"):
                 kinds.append("jcc")
-            elif DATA_LINE_RE.match(line):
-                kinds.append("data")
             else:
                 kinds.append("code")
         return kinds
 
-    kinds = classify(orig_asm)
-    recomp_kinds = classify(recomp_asm)
+    kinds = classify(orig_stream)
+    recomp_kinds = classify(recomp_stream)
     if kinds != recomp_kinds:
         if recorder is not None:
             differing = next(
@@ -3022,8 +3072,8 @@ def verify_cfg_effective_match(
                     return False
                 continue
             try:
-                ins_o = parse_instruction(line_o)
-                ins_r = parse_instruction(line_r)
+                ins_o = instruction_at(orig_stream, i)
+                ins_r = instruction_at(recomp_stream, i)
                 _record_operand_candidate(ctx, i, i, ins_o, ins_r)
                 obs_o: list = []
                 obs_r: list = []
@@ -3214,12 +3264,33 @@ def _control_kind(line: str) -> str:
     return "code"
 
 
-def _is_recognized_switch_jmp(line: str) -> bool:
-    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
+def _control_kind_at(stream: ResolvedAsm, index: int) -> str:
+    if is_data_row(stream, index):
+        return "data"
     try:
-        ins = parse_instruction(line)
+        mnemonic = instruction_at(stream, index).mnemonic
     except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return False
+        return _control_kind(stream.displays[index])
+    if mnemonic in JCC_MNEMONICS or mnemonic in (
+        "loop",
+        "loope",
+        "loopne",
+        "jcxz",
+        "jecxz",
+    ):
+        return "jcc"
+    if mnemonic in ("jmp", "ret"):
+        return mnemonic
+    return "code"
+
+
+def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> bool:
+    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
+    if ins is None:
+        try:
+            ins = parse_instruction(line)
+        except (Reject, IndexError, KeyError, ValueError, TypeError):
+            return False
     if ins.mnemonic != "jmp" or len(ins.operands) != 1:
         return False
     op = ins.operands[0]
@@ -3233,10 +3304,9 @@ def _is_recognized_switch_jmp(line: str) -> bool:
 
 
 def _extract_switch_tables(
-    asm: list[str],
+    stream: ResolvedAsm,
     kinds: list[str],
     addrs: list[int | None] | None,
-    roles: list[AsmRole] | None = None,
 ) -> tuple[dict[int, list[int]], set[int]] | None:
     """Map recognized switch jmps to case destination indices.
 
@@ -3248,6 +3318,8 @@ def _extract_switch_tables(
     contiguous ``start + …`` entry lines (and/or ``AsmRole.JUMP_TABLE_ENTRY``).
     """
     # pylint: disable=too-many-locals
+    asm = stream.displays
+    roles = stream.roles
     total = len(asm)
     table_dests: dict[int, list[int]] = {}
     owned: set[int] = set()
@@ -3262,20 +3334,57 @@ def _extract_switch_tables(
             addr_index.setdefault(addr, i)
 
     def _is_table_header(index: int) -> bool:
-        if roles is not None and len(roles) == total:
-            if roles[index] == AsmRole.JUMP_TABLE_HEADER:
-                return True
+        if stream.from_ir and roles[index] == AsmRole.JUMP_TABLE_HEADER:
+            return True
         return asm[index] == "Jump table:"
 
     def _is_table_entry(index: int) -> bool:
-        if roles is not None and len(roles) == total:
-            if roles[index] == AsmRole.JUMP_TABLE_ENTRY:
-                return True
+        if stream.from_ir and roles[index] == AsmRole.JUMP_TABLE_ENTRY:
+            return True
         return JUMP_TABLE_ENTRY_RE.match(asm[index]) is not None
+
+    # Prefer first-class JumpTable objects from InstructGen when addresses align.
+    if stream.jump_tables and addrs is not None:
+        addr_to_index = {
+            addr: i for i, addr in enumerate(addrs) if addr is not None
+        }
+        for table in stream.jump_tables:
+            if table.dispatch_address is None:
+                continue
+            dispatch_i = addr_to_index.get(table.dispatch_address)
+            if dispatch_i is None or kinds[dispatch_i] != "jmp":
+                continue
+            dests: list[int] = []
+            entry_indices: list[int] = []
+            for entry_addr, target_va in table.entries:
+                entry_i = addr_to_index.get(entry_addr)
+                dest_i = addr_to_index.get(target_va)
+                if entry_i is None or dest_i is None:
+                    dests = []
+                    break
+                entry_indices.append(entry_i)
+                dests.append(dest_i)
+            if not dests:
+                continue
+            table_dests[dispatch_i] = dests
+            owned.update(entry_indices)
+            if entry_indices:
+                header_i = min(entry_indices) - 1
+                if header_i >= 0 and _is_table_header(header_i):
+                    owned.add(header_i)
 
     i = 0
     while i < total:
-        if kinds[i] == "jmp" and _is_recognized_switch_jmp(asm[i]):
+        if i in table_dests:
+            i += 1
+            continue
+        switch_ins = None
+        if kinds[i] == "jmp":
+            try:
+                switch_ins = instruction_at(stream, i)
+            except (Reject, IndexError, KeyError, ValueError, TypeError):
+                switch_ins = None
+        if kinds[i] == "jmp" and _is_recognized_switch_jmp(asm[i], ins=switch_ins):
             if i + 1 < total and _is_table_header(i + 1):
                 entries: list[int] = []
                 j = i + 2
@@ -3285,7 +3394,7 @@ def _extract_switch_tables(
                 if entries:
                     if func_start is None:
                         return None
-                    dests: list[int] = []
+                    dests = []
                     for entry_i in entries:
                         match = JUMP_TABLE_ENTRY_RE.match(asm[entry_i])
                         if match is None:
@@ -3349,7 +3458,7 @@ def _block_terminator(
 
 
 def _build_side_cfg(
-    asm: list[str],
+    asm: AsmStream,
     targets: list[int | None],
     *,
     recorder: AnalysisRecorder | None = None,
@@ -3363,10 +3472,21 @@ def _build_side_cfg(
     Recognized ``jmp [idx*4 + table]`` + ``Jump table:`` / ``start + …``
     sequences become ``caseN`` CFG edges; other table/data lines still bail.
     Optional ``roles`` (``AsmRole``) strengthens header/entry detection when
-    display text alone is ambiguous.
+    display text alone is ambiguous; prefer passing a ``DecodedInstruction``
+    stream so roles come from IR.
     """
     # pylint: disable=too-many-branches,too-many-locals,too-many-return-statements
-    total = len(asm)
+    stream = resolve_asm_stream(asm)
+    if roles is not None and len(roles) == len(stream) and not stream.from_ir:
+        stream = ResolvedAsm(
+            stream.displays,
+            stream.instructions,
+            list(roles),
+            from_ir=True,
+            jump_tables=stream.jump_tables,
+        )
+    displays = stream.displays
+    total = len(displays)
     if total == 0:
         _mark_side_inconclusive(
             recorder,
@@ -3389,8 +3509,8 @@ def _build_side_cfg(
             },
         )
         return None
-    kinds = [_control_kind(line) for line in asm]
-    extracted = _extract_switch_tables(asm, kinds, addrs, roles=roles)
+    kinds = [_control_kind_at(stream, i) for i in range(total)]
+    extracted = _extract_switch_tables(stream, kinds, addrs)
     if extracted is None:
         first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
         _mark_side_inconclusive(
@@ -3401,7 +3521,7 @@ def _build_side_cfg(
             {
                 "side": side,
                 "data_line_count": kinds.count("data"),
-                "data_line": asm[first_data] if asm else "",
+                "data_line": displays[first_data] if displays else "",
                 "failure": "unresolved_switch_table",
             },
         )
@@ -3420,7 +3540,7 @@ def _build_side_cfg(
             {
                 "side": side,
                 "data_line_count": len(unowned_data),
-                "data_line": asm[first_data],
+                "data_line": displays[first_data],
             },
         )
         return None
@@ -4079,8 +4199,8 @@ def _observations_touch_memory(observations: list) -> bool:
 
 
 def verify_isomorphic_cfg_effective_match(
-    orig_asm: list[str],
-    recomp_asm: list[str],
+    orig_asm: AsmStream,
+    recomp_asm: AsmStream,
     orig_targets: list[int | None],
     recomp_targets: list[int | None],
     metadata: FunctionMetadata | None = None,
@@ -4105,21 +4225,39 @@ def verify_isomorphic_cfg_effective_match(
     # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
+    orig_stream = resolve_asm_stream(orig_asm)
+    recomp_stream = resolve_asm_stream(recomp_asm)
+    if orig_roles is not None and len(orig_roles) == len(orig_stream):
+        orig_stream = ResolvedAsm(
+            orig_stream.displays,
+            orig_stream.instructions,
+            list(orig_roles),
+            from_ir=True,
+            jump_tables=orig_stream.jump_tables,
+        )
+    if recomp_roles is not None and len(recomp_roles) == len(recomp_stream):
+        recomp_stream = ResolvedAsm(
+            recomp_stream.displays,
+            recomp_stream.instructions,
+            list(recomp_roles),
+            from_ir=True,
+            jump_tables=recomp_stream.jump_tables,
+        )
+    orig_asm = orig_stream.displays
+    recomp_asm = recomp_stream.displays
     cfg_o = _build_side_cfg(
-        orig_asm,
+        orig_stream,
         orig_targets,
         recorder=recorder,
         side="orig",
         addrs=orig_addrs,
-        roles=orig_roles,
     )
     cfg_r = _build_side_cfg(
-        recomp_asm,
+        recomp_stream,
         recomp_targets,
         recorder=recorder,
         side="recomp",
         addrs=recomp_addrs,
-        roles=recomp_roles,
     )
     if cfg_o is None or cfg_r is None:
         return False
@@ -4215,12 +4353,29 @@ def verify_isomorphic_cfg_effective_match(
                     assert index_r is not None
                     side, other_side = recomp_state, orig_state
                     line, position = recomp_asm[index_r], index_r
+                    side_stream = recomp_stream
                 else:
                     side, other_side = orig_state, recomp_state
                     line, position = orig_asm[index_o], index_o
+                    side_stream = orig_stream
                 # A one-sided instruction can never store (any observable
                 # rejects it), so the memory generation is unaffected.
-                if not _one_sided_ok(side, other_side, ctx, position, line):
+                side_ins = None
+                side_data = is_data_row(side_stream, position)
+                if not side_data:
+                    try:
+                        side_ins = instruction_at(side_stream, position)
+                    except (Reject, IndexError, KeyError, ValueError, TypeError):
+                        side_ins = None
+                if not _one_sided_ok(
+                    side,
+                    other_side,
+                    ctx,
+                    position,
+                    line,
+                    ins=side_ins,
+                    is_data=side_data,
+                ):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "alignment_failure",
@@ -4232,8 +4387,8 @@ def verify_isomorphic_cfg_effective_match(
                 continue
             line_o, line_r = orig_asm[index_o], recomp_asm[index_r]
             try:
-                ins_o = parse_instruction(line_o)
-                ins_r = parse_instruction(line_r)
+                ins_o = instruction_at(orig_stream, index_o)
+                ins_r = instruction_at(recomp_stream, index_r)
                 _record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
                 obs_o: list = []
                 obs_r: list = []

@@ -7,7 +7,8 @@
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
 // `{"record":"variable",...}`, `{"record":"class",...}`,
-// `{"record":"size-assertion",...}` or `{"record":"dependency",...}`.
+// `{"record":"size-assertion",...}`, `{"record":"unit-abi",...}` or
+// `{"record":"dependency",...}`.
 
 #include <cstdlib>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -181,6 +183,34 @@ class Indexer {
       current = pointer->getPointeeType();
     }
     return depth;
+  }
+
+  // Semantic id of the CXX record a type ultimately refers to (after peeling
+  // pointers, references and arrays). Empty when the type is not a record.
+  // Layout lookup uses this instead of stripping qualifiers from spellings.
+  std::string recordSemanticId(QualType type) const {
+    QualType current = type.getCanonicalType();
+    while (!current.isNull()) {
+      if (const auto* reference = current->getAs<ReferenceType>()) {
+        current = reference->getPointeeType().getCanonicalType();
+        continue;
+      }
+      if (const auto* pointer = current->getAs<PointerType>()) {
+        current = pointer->getPointeeType().getCanonicalType();
+        continue;
+      }
+      if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+        current = array->getElementType().getCanonicalType();
+        continue;
+      }
+      break;
+    }
+    const CXXRecordDecl* record = current->getAsCXXRecordDecl();
+    if (!record || !record->getIdentifier()) return "";
+    std::string qualified;
+    llvm::raw_string_ostream stream(qualified);
+    record->printQualifiedName(stream, policy_);
+    return ("record:" + stream.str()).str();
   }
 
   std::string templateArguments(const ClassTemplateSpecializationDecl* specialization) const {
@@ -482,7 +512,7 @@ class Indexer {
     if (!context->isDependentContext()) mangled = names_.getName(variable);
     std::string semanticId = mangled;
     if (semanticId.empty()) semanticId = "VarDecl:" + qualifiedName + "(" + type + ")";
-    emit(llvm::json::Object{
+    llvm::json::Object payload{
         {"record", "variable"},
         {"semantic_id", semanticId},
         {"qualified_name", qualifiedName},
@@ -494,7 +524,10 @@ class Indexer {
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-    });
+    };
+    std::string recordId = recordSemanticId(variable->getType());
+    if (!recordId.empty()) payload["record_semantic_id"] = recordId;
+    emit(std::move(payload));
   }
 
   static bool isVirtual(const FunctionDecl* function) {
@@ -530,6 +563,8 @@ class Indexer {
           entry["bitfield_offset"] = static_cast<int64_t>(bitOffset % 8);
         }
       }
+      std::string recordId = recordSemanticId(field->getType());
+      if (!recordId.empty()) entry["record_semantic_id"] = recordId;
       fields.push_back(std::move(entry));
     }
 
@@ -703,6 +738,14 @@ class IndexConsumer : public ASTConsumer {
       : instance_(instance), out_(out) {}
 
   void HandleTranslationUnit(ASTContext& context) override {
+    const TargetInfo& target = context.getTargetInfo();
+    out_ << llvm::json::Value(llvm::json::Object{
+                {"record", "unit-abi"},
+                {"target_triple", target.getTriple().str()},
+                {"pointer_width", static_cast<int64_t>(target.getPointerWidth(0) / 8)},
+                {"ms_abi", target.getCXXABI().isMicrosoft()},
+            })
+         << "\n";
     Indexer(context, out_).run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any

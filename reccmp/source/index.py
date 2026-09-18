@@ -27,10 +27,11 @@ from reccmp.parser.marker import MarkerType, ProjectAliases
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v5"
+_SCHEMA = "reccmp-source-index-v6"
 _SUPPORTED_SCHEMAS = frozenset(
     {
         _SCHEMA,
+        "reccmp-source-index-v5",
         "reccmp-source-index-v4",
         "reccmp-source-index-v3",
         "reccmp-source-index-v2",
@@ -116,6 +117,17 @@ class SourceField:
     size: int | None = None
     bitfield_width: int | None = None
     bitfield_offset: int | None = None
+    # ``record:Qualified::Name`` when the field type is (or points to) a record.
+    record_semantic_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceAbi:
+    """Compilation ABI facts shared by translation units in this index."""
+
+    target_triple: str
+    pointer_width: int
+    ms_abi: bool
 
 
 @dataclass(frozen=True)
@@ -211,6 +223,7 @@ class _NamespaceRecords:
     classes: tuple[SourceClass, ...]
     conflicts: tuple[SourceConflict, ...]
     size_assertions: dict[str, int]
+    abi: SourceAbi | None = None
 
 
 @dataclass
@@ -227,6 +240,7 @@ class TranslationUnitRecords:
     classes: list[SourceClass] = field(default_factory=list)
     size_assertions: list[_SizeAssertion] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
+    abi: SourceAbi | None = None
 
     def add(self, record: Mapping[str, Any]) -> None:
         """Store one compiler observation from this unit."""
@@ -234,6 +248,13 @@ class TranslationUnitRecords:
         kind = values.pop("record")
         if kind == "dependency":
             self.dependencies = [str(path) for path in values.get("files") or ()]
+            return
+        if kind == "unit-abi":
+            self.abi = SourceAbi(
+                target_triple=str(values["target_triple"]),
+                pointer_width=int(values["pointer_width"]),
+                ms_abi=bool(values["ms_abi"]),
+            )
             return
         if kind == "declaration":
             self.declarations.append(
@@ -321,6 +342,7 @@ def derive_namespace(
     )
     derived_classes, class_conflicts = _derive_classes(classes, target=target)
     size_assertions = _derive_size_assertions(assertions)
+    abi = _derive_abi(selected)
     return _NamespaceRecords(
         declarations=derived_declarations,
         variables=derived_variables,
@@ -330,6 +352,7 @@ def derive_namespace(
         ),
         conflicts=declaration_conflicts + variable_conflicts + class_conflicts,
         size_assertions=size_assertions,
+        abi=abi,
     )
 
 
@@ -532,6 +555,19 @@ def _derive_size_assertions(assertions: Sequence[_SizeAssertion]) -> dict[str, i
     return sizes
 
 
+def _derive_abi(units: Sequence[TranslationUnitRecords]) -> SourceAbi | None:
+    """Pick a representative ABI; disagreeing units yield no trusted ABI."""
+    seen: dict[tuple[str, int, bool], SourceAbi] = {}
+    for unit in units:
+        if unit.abi is None:
+            continue
+        key = (unit.abi.target_triple, unit.abi.pointer_width, unit.abi.ms_abi)
+        seen[key] = unit.abi
+    if len(seen) == 1:
+        return next(iter(seen.values()))
+    return None
+
+
 def _command_arguments(entry: dict[str, Any]) -> list[str]:
     arguments = entry.get("arguments")
     if arguments:
@@ -613,7 +649,14 @@ def strip_type_qualifiers(type_name: str) -> str:
 
 def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
     data = dict(values)
-    for key in ("offset", "size", "bitfield_width", "bitfield_offset", "pointer_depth"):
+    for key in (
+        "offset",
+        "size",
+        "bitfield_width",
+        "bitfield_offset",
+        "pointer_depth",
+        "record_semantic_id",
+    ):
         if key in data and data[key] is None:
             continue
         if key not in data:
@@ -628,6 +671,7 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         size=data.get("size"),
         bitfield_width=data.get("bitfield_width"),
         bitfield_offset=data.get("bitfield_offset"),
+        record_semantic_id=data.get("record_semantic_id"),
     )
 
 
@@ -802,6 +846,7 @@ class SourceIndex:
         markers: Iterable[SourceMarker],
         variables: Iterable[SourceVariable] = (),
         conflicts: Iterable[SourceConflict] = (),
+        abi: SourceAbi | None = None,
     ) -> None:
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
@@ -812,11 +857,30 @@ class SourceIndex:
         )
         self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
+        self.abi = abi
         self._classes_by_name = {item.qualified_name: item for item in self.classes}
+        self._classes_by_semantic_id = {
+            item.semantic_id: item for item in self.classes
+        }
 
     def class_named(self, qualified_name: str) -> SourceClass | None:
         """Return the indexed class with this qualified name, if present."""
         return self._classes_by_name.get(qualified_name)
+
+    def class_for_semantic_id(self, semantic_id: str) -> SourceClass | None:
+        """Return the indexed class for a ``record:…`` semantic id."""
+        return self._classes_by_semantic_id.get(semantic_id)
+
+    def _lookup_nested_class(self, field: SourceField, type_spelling: str) -> str | None:
+        """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping."""
+        if field.record_semantic_id:
+            nested = self._classes_by_semantic_id.get(field.record_semantic_id)
+            if nested is not None:
+                return nested.qualified_name
+        stripped = strip_type_qualifiers(type_spelling)
+        if stripped in self._classes_by_name:
+            return stripped
+        return None
 
     def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
         """Leaf field covering ``offset`` bytes within the class layout."""
@@ -888,10 +952,10 @@ class SourceIndex:
             if not covers:
                 continue
             remaining = offset - item.offset
-            nested = strip_type_qualifiers(item.type)
+            nested = self._lookup_nested_class(item, item.type)
             absolute = abs_base + item.offset
             path = path_prefix + (item.name,)
-            if nested in self._classes_by_name:
+            if nested is not None:
                 nested_resolved = self._resolve_field(
                     nested,
                     remaining,
@@ -965,6 +1029,7 @@ class SourceIndex:
             markers=markers,
             variables=namespace.variables,
             conflicts=namespace.conflicts,
+            abi=namespace.abi,
         )
 
     @classmethod
@@ -1020,6 +1085,11 @@ class SourceIndex:
             ),
             conflicts=(
                 _conflict_from_dict(item) for item in document.get("conflicts", ())
+            ),
+            abi=(
+                SourceAbi(**document["abi"])
+                if isinstance(document.get("abi"), Mapping)
+                else None
             ),
         )
 
@@ -1081,7 +1151,7 @@ class SourceIndex:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "schema": _SCHEMA,
             "markers": [_marker_projection(item) for item in self.markers],
             "declarations": [asdict(item) for item in self.declarations],
@@ -1089,6 +1159,9 @@ class SourceIndex:
             "variables": [asdict(item) for item in self.variables],
             "conflicts": [asdict(item) for item in self.conflicts],
         }
+        if self.abi is not None:
+            document["abi"] = asdict(self.abi)
+        return document
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

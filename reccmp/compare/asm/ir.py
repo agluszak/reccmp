@@ -3,15 +3,16 @@
 ``DecodedInstruction`` is the single representation produced by Capstone
 detail-mode decode (typed operands from detail) + sanitization. Display
 strings exist only for humans and JSON diffs. Matching, stack scoring,
-inline fingerprints, and (eventually) the effective verifier consume
-structured fields.
+inline fingerprints, and the effective verifier consume structured fields
+via ``ResolvedAsm`` / ``instruction_at``; ``parse_instruction`` remains a
+legacy fallback for string-only callers and incomplete rows.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Hashable
+from typing import Hashable, Sequence, Union
 
 from .model import (
     STACK_ENTRY_REGEX,
@@ -32,6 +33,19 @@ class AsmRole(Enum):
     JUMP_TABLE_ENTRY = auto()
     DATA_TABLE_HEADER = auto()
     DATA_TABLE_ENTRY = auto()
+
+
+@dataclass(frozen=True)
+class JumpTable:
+    """One switch address table discovered by ``InstructGen``.
+
+    ``entries`` are ``(entry_address, target_address)`` pairs. Optional
+    ``dispatch_address`` is the ``jmp`` that indexes the table when known.
+    """
+
+    address: int
+    entries: tuple[tuple[int, int], ...]
+    dispatch_address: int | None = None
 
 
 @dataclass(frozen=True)
@@ -245,3 +259,103 @@ def as_addr_display_pairs(
 ) -> list[tuple[int | None, str]]:
     """Tuple form for APIs that still consume ``(addr, display)`` pairs."""
     return [(row.address, row.display) for row in excerpt]
+
+
+@dataclass(frozen=True)
+class ResolvedAsm:
+    """Parallel display / Instruction / role views of one function excerpt.
+
+    When ``from_ir`` is True, ``instructions[i]`` is already decoded for every
+    CODE row and must not be rebuilt via ``parse_instruction``.  Legacy
+    ``list[str]`` callers get ``from_ir=False`` and fall back to text parse.
+    """
+
+    displays: list[str]
+    instructions: list[Instruction | None]
+    roles: list[AsmRole]
+    from_ir: bool = False
+    jump_tables: tuple[JumpTable, ...] = ()
+
+    def __len__(self) -> int:
+        return len(self.displays)
+
+    def __getitem__(self, index: int) -> str:
+        return self.displays[index]
+
+    def slice(self, end: int) -> "ResolvedAsm":
+        return ResolvedAsm(
+            self.displays[:end],
+            self.instructions[:end],
+            self.roles[:end],
+            from_ir=self.from_ir,
+            jump_tables=self.jump_tables,
+        )
+
+    def reorder(self, order: list[int]) -> "ResolvedAsm":
+        return ResolvedAsm(
+            [self.displays[i] for i in order],
+            [self.instructions[i] for i in order],
+            [self.roles[i] for i in order],
+            from_ir=self.from_ir,
+            jump_tables=self.jump_tables,
+        )
+
+
+AsmStream = Union[Sequence[str], Sequence[DecodedInstruction], ResolvedAsm]
+
+
+def resolve_asm_stream(
+    asm: AsmStream, *, jump_tables: Sequence[JumpTable] = ()
+) -> ResolvedAsm:
+    """Normalize display lines or ``DecodedInstruction`` rows to ``ResolvedAsm``."""
+    if isinstance(asm, ResolvedAsm):
+        if jump_tables and not asm.jump_tables:
+            return ResolvedAsm(
+                asm.displays,
+                asm.instructions,
+                asm.roles,
+                from_ir=asm.from_ir,
+                jump_tables=tuple(jump_tables),
+            )
+        return asm
+    tables = tuple(jump_tables)
+    if not asm:
+        return ResolvedAsm([], [], [], from_ir=False, jump_tables=tables)
+    first = asm[0]
+    if isinstance(first, DecodedInstruction):
+        rows: Sequence[DecodedInstruction] = asm  # type: ignore[assignment]
+        return ResolvedAsm(
+            displays=[row.display for row in rows],
+            instructions=[row.as_effective() if row.is_code else None for row in rows],
+            roles=[row.role for row in rows],
+            from_ir=True,
+            jump_tables=tables,
+        )
+    lines: Sequence[str] = asm  # type: ignore[assignment]
+    return ResolvedAsm(
+        displays=list(lines),
+        instructions=[None] * len(lines),
+        roles=[AsmRole.CODE] * len(lines),
+        from_ir=False,
+        jump_tables=tables,
+    )
+
+
+def instruction_at(stream: ResolvedAsm, index: int) -> Instruction:
+    """Return the structured instruction at ``index``, parsing only as fallback."""
+    cached = stream.instructions[index]
+    if cached is not None:
+        return cached
+    return parse_instruction(stream.displays[index])
+
+
+def is_data_row(stream: ResolvedAsm, index: int) -> bool:
+    if stream.from_ir:
+        return stream.roles[index] != AsmRole.CODE
+    display = stream.displays[index]
+    return (
+        display.startswith("Jump table:")
+        or display.startswith("Data table:")
+        or display.startswith("start + ")
+        or (display.startswith("0x") and " " not in display)
+    )

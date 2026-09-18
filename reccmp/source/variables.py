@@ -27,6 +27,8 @@ class SourceVariable:
     unit_id: str = ""
     # Link namespace (reccmp target) assigned when observations are partitioned.
     target: str | None = None
+    # ``record:Qualified::Name`` when the variable type is (or points to) a record.
+    record_semantic_id: str | None = None
 
     @property
     def signature(self) -> tuple[str, ...]:

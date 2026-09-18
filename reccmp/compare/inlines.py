@@ -468,7 +468,7 @@ def register_normalized_fingerprint(fingerprint: Fingerprint) -> Fingerprint:
     mapping: dict[str, str] = {}
     result: list[tuple[str, str]] = []
     for mnemonic, operand in fingerprint:
-        line = f"{mnemonic} {operand}".rstrip() if operand else f"{mnemonic} "
+        line = f"{mnemonic} {operand}".rstrip() if operand else mnemonic
         try:
             ins = parse_instruction(line)
         except (Reject, IndexError, KeyError, ValueError, TypeError):
@@ -480,6 +480,25 @@ def register_normalized_fingerprint(fingerprint: Fingerprint) -> Fingerprint:
             op_text = ", ".join(format_operand(op) for op in new_ops) if new_ops else ""
         except Reject:
             op_text = operand
+        result.append((head, op_text))
+    return tuple(result)
+
+
+def register_normalized_from_ir(rows: Sequence[DecodedInstruction]) -> Fingerprint:
+    """Register-normalize directly from IR operands (no display reparse)."""
+    mapping: dict[str, str] = {}
+    result: list[tuple[str, str]] = []
+    for row in rows:
+        if row.role != AsmRole.CODE:
+            continue
+        head = f"{row.prefix} {row.mnemonic}".strip() if row.prefix else row.mnemonic
+        if not head:
+            continue
+        new_ops = tuple(_rename_structured_operand(op, mapping) for op in row.operands)
+        try:
+            op_text = ", ".join(format_operand(op) for op in new_ops) if new_ops else ""
+        except Reject:
+            op_text = ", ".join(row.raw_operands) if row.raw_operands else ""
         result.append((head, op_text))
     return tuple(result)
 

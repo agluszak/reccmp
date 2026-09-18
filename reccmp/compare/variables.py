@@ -247,6 +247,12 @@ class VariableComparator:
                 f"::{var.name}"
             ):
                 continue
+            if item.record_semantic_id:
+                nested = self.source_index.class_for_semantic_id(item.record_semantic_id)
+                if nested is not None and self.source_index.has_layout(
+                    nested.qualified_name
+                ):
+                    return nested.qualified_name
             from reccmp.source.index import strip_type_qualifiers
 
             name = strip_type_qualifiers(item.type)

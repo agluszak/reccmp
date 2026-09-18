@@ -32,12 +32,17 @@ class CanonicalStackRef:
     kind: StackRefKind
     key: str | int
     physical: tuple[str, int] | None = None
+    # Byte offset within a multi-slot argument/local (e.g. double / struct).
+    within: int = 0
 
     def label(self) -> str:
+        suffix = f"+{self.within:#x}" if self.within else ""
         if self.kind == "argument":
-            return f"arg[{self.key}]"
+            return f"arg[{self.key}]{suffix}"
         if self.kind == "local":
-            return f"local[{self.key}]"
+            if isinstance(self.key, str):
+                return f"local[{self.key}]{suffix}"
+            return f"local[{self.key}]{suffix}"
         if self.kind == "spill":
             return f"spill[{self.key}]"
         if self.kind == "saved":
@@ -50,8 +55,13 @@ def canonical_stack_ref(
     offset: int,
     *,
     known_spills: set[int] | frozenset[int] | None = None,
+    pdb_slots: Sequence[tuple[int, int, str, StackRefKind]] | None = None,
 ) -> CanonicalStackRef:
     """Map a physical (reg, offset) pair to a canonical stack reference.
+
+    When ``pdb_slots`` is provided (``(start, size, name, kind)`` covering
+    ranges from S_BPREL32 + type size), prefer named multi-slot coverage over
+    the dword-index heuristic.
 
     Heuristics (MSVC thiscall/cdecl frame):
     - ``ebp`` with positive offset → argument (``ebp+8`` is arg 0)
@@ -61,6 +71,10 @@ def canonical_stack_ref(
     """
     reg = register.lower()
     physical = (reg, offset)
+    if pdb_slots is not None and reg == "ebp":
+        for start, size, name, kind in pdb_slots:
+            if start <= offset < start + max(size, 1):
+                return CanonicalStackRef(kind, name, physical, within=offset - start)
     if reg == "ebp":
         if offset == 0:
             return CanonicalStackRef("saved", "ebp", physical)
@@ -131,10 +145,16 @@ class StackRegisterOffset:
         return f"{self.register}-{ -self.offset:#x}"
 
     def attach_canonical(
-        self, *, known_spills: set[int] | frozenset[int] | None = None
+        self,
+        *,
+        known_spills: set[int] | frozenset[int] | None = None,
+        pdb_slots: Sequence[tuple[int, int, str, StackRefKind]] | None = None,
     ) -> "StackRegisterOffset":
         self.canonical = canonical_stack_ref(
-            self.register, self.offset, known_spills=known_spills
+            self.register,
+            self.offset,
+            known_spills=known_spills,
+            pdb_slots=pdb_slots,
         )
         return self
 
@@ -176,15 +196,68 @@ def extract_stack_offset_from_instruction(
     return slot
 
 
+def extract_stack_offset_from_operands(
+    operands: Sequence,
+) -> StackRegisterOffset | None:
+    """Pull the first ebp/esp-relative displacement from structured operands."""
+    for op in operands:
+        if not isinstance(op, tuple) or not op or op[0] != "mem":
+            continue
+        _size, _seg, reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
+        if syms:
+            continue
+        regs = [name for name, _scale in reg_terms]
+        if len(regs) != 1 or regs[0] not in ("ebp", "esp"):
+            continue
+        slot = StackRegisterOffset(regs[0], int(disp))
+        slot.attach_canonical()
+        return slot
+    return None
+
+
 def annotate_canonical_refs(
     stack_pairs: StackPairs,
     *,
     known_spills: set[int] | frozenset[int] | None = None,
+    pdb_slots: Sequence[tuple[int, int, str, StackRefKind]] | None = None,
 ) -> None:
     """Attach or refresh CanonicalStackRef labels on every observed slot."""
     for orig, recomp in stack_pairs:
-        orig.attach_canonical(known_spills=known_spills)
-        recomp.attach_canonical(known_spills=known_spills)
+        orig.attach_canonical(known_spills=known_spills, pdb_slots=pdb_slots)
+        recomp.attach_canonical(known_spills=known_spills, pdb_slots=pdb_slots)
+
+
+def pdb_stack_slots(
+    fn_symbol: SymbolsEntry | None,
+    types: object | None = None,
+) -> list[tuple[int, int, str, StackRefKind]]:
+    """Build ``(start, size, name, kind)`` coverage from S_BPREL32 + type sizes.
+
+    ``types`` is an optional ``CvdumpTypesParser``; without it every symbol is
+    treated as a 4-byte slot.
+    """
+    slots: list[tuple[int, int, str, StackRefKind]] = []
+    if fn_symbol is None:
+        return slots
+    for symbol in fn_symbol.symbols:
+        if symbol.symbol_type != "S_BPREL32":
+            continue
+        hex_bytes = bytes.fromhex(symbol.location[1:-1])
+        stack_offset = struct.unpack(">l", hex_bytes)[0]
+        size = 4
+        if types is not None:
+            try:
+                info = types.get(symbol.data_type)  # type: ignore[attr-defined]
+                if info is not None and getattr(info, "size", None):
+                    size = int(info.size)
+            except Exception:  # pylint: disable=broad-exception-caught
+                size = 4
+        kind: StackRefKind = "argument" if stack_offset >= 8 else "local"
+        if stack_offset in (0, 4):
+            kind = "saved"
+        slots.append((stack_offset, size, symbol.name, kind))
+    slots.sort(key=lambda item: (item[0], -item[1]))
+    return slots
 
 
 def analyze_diff_block(
@@ -327,6 +400,7 @@ def analyze_stack_layout(
     orig_asm: Sequence[str],
     recomp_asm: Sequence[str],
     fn_symbol: SymbolsEntry | None = None,
+    types: object | None = None,
 ) -> StackLayoutResult | None:
     """Infer stack permutation and modulo-stack accuracy from a raw diff.
 
@@ -341,7 +415,8 @@ def analyze_stack_layout(
         return None
 
     annotate_recomp_symbols(stack_pairs, fn_symbol)
-    annotate_canonical_refs(stack_pairs)
+    slots = pdb_stack_slots(fn_symbol, types)
+    annotate_canonical_refs(stack_pairs, pdb_slots=slots or None)
     mapping, bijective = build_slot_bijection(stack_pairs)
     # Identity pairs do not need rewriting; only non-identity matter for score.
     non_identity = {k: v for k, v in mapping.items() if k != v}

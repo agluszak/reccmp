@@ -22,7 +22,7 @@ from .instgen import (
     SectionType,
     meta_from_decoded,
 )
-from .ir import AsmRole, DecodedInstruction, marker
+from .ir import AsmRole, DecodedInstruction, JumpTable, marker
 from .model import Reject, format_instruction, format_operand, parse_instruction
 from .replacement import AddrTestProtocol, NameReplacementProtocol
 
@@ -73,6 +73,7 @@ class ParseAsm:
         self.meta: dict[int, InstructionMeta] = {}
         self._sections: list[FuncSection] = []
         self._decoded_by_addr: dict[int, DecodedInstruction] = {}
+        self.jump_tables: tuple[JumpTable, ...] = ()
 
     def reset(self):
         self.replacements = {}
@@ -375,6 +376,7 @@ class ParseAsm:
         ig = InstructGen(bytes(data), start_addr, self.is_32bit)
         self._sections = ig.sections
         self._decoded_by_addr = dict(ig.decoded_by_addr)
+        self.jump_tables = tuple(ig.jump_tables)
 
         # Project meta from the single decode pass (no second Capstone walk).
         self.meta = {
@@ -444,6 +446,7 @@ class ParseAsm:
         ig = InstructGen(bytes(data), start_addr, self.is_32bit)
         self._sections = ig.sections
         self._decoded_by_addr = dict(ig.decoded_by_addr)
+        self.jump_tables = tuple(ig.jump_tables)
         self.meta = {
             addr: meta_from_decoded(insn)
             for addr, insn in self._decoded_by_addr.items()

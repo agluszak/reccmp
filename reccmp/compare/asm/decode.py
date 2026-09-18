@@ -157,10 +157,24 @@ def from_capstone(insn) -> DecodedInstruction:
     operands = tuple(operand for operand, _complete in decoded_ops)
     operand_model_complete = all(complete for _operand, complete in decoded_ops)
     # Opaque operands mean jump/call targets are not fully modeled.
-    control_flow_known = all(
+    control_flow_known = operand_model_complete and all(
         not (isinstance(operand, tuple) and operand and operand[0] == "opaque")
         for operand in operands
     )
+    # Indirect control transfers have no absolute branch_target at decode time.
+    # CFG may still recover switch tables via JumpTable metadata later.
+    if control_flow_known and (is_jump or is_call) and branch_target is None:
+        if is_jump:
+            control_flow_known = False
+        elif not any(
+            isinstance(op, tuple) and op and op[0] in ("imm", "sym", "reg")
+            for op in operands
+        ):
+            control_flow_known = False
+        elif any(
+            isinstance(op, tuple) and op and op[0] == "mem" for op in operands
+        ):
+            control_flow_known = False
     raw_operands = tuple(format_operand(op) for op in operands)
 
     # Preserve Capstone's own display text (including combined rep mnemonic).

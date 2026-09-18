@@ -436,7 +436,85 @@ def test_v3_schema_loads_without_layout_fields():
     assert index.classes[0].size is None
     assert index.classes[0].fields[0].offset is None
     assert index.classes[0].layout_trusted is None
-    assert index.to_dict()["schema"] == "reccmp-source-index-v5"
+    assert index.to_dict()["schema"] == "reccmp-source-index-v6"
+
+
+def test_unit_abi_round_trips_in_index_projection():
+    from reccmp.source import SourceAbi
+
+    index = SourceIndex(
+        declarations=(),
+        classes=(),
+        markers=(),
+        abi=SourceAbi(
+            target_triple="i386-pc-windows-msvc",
+            pointer_width=4,
+            ms_abi=True,
+        ),
+    )
+    revived = SourceIndex.from_dict(index.to_dict())
+    assert revived.abi is not None
+    assert revived.abi.target_triple == "i386-pc-windows-msvc"
+    assert revived.abi.pointer_width == 4
+    assert revived.abi.ms_abi is True
+
+
+def test_record_semantic_id_preferred_for_nested_lookup():
+    from reccmp.source import SourceClass, SourceField
+
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Bar",
+                qualified_name="Bar",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="x",
+                        type="int",
+                        source_file="b.h",
+                        line=1,
+                        offset=0,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="b.h",
+                line=1,
+                end_line=2,
+                size=4,
+                layout_trusted=True,
+            ),
+            SourceClass(
+                semantic_id="record:Foo",
+                qualified_name="Foo",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="inner",
+                        type="volatile const struct Bar &",
+                        source_file="f.h",
+                        line=1,
+                        offset=0,
+                        size=4,
+                        record_semantic_id="record:Bar",
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="f.h",
+                line=1,
+                end_line=2,
+                size=4,
+                layout_trusted=True,
+            ),
+        ),
+    )
+    resolved = index.resolve_field("Foo", 0)
+    assert resolved is not None
+    assert resolved.path == ("inner", "x")
+    assert resolved.leaf.name == "x"
 
 
 def test_enrich_memory_address_with_layout_facts():

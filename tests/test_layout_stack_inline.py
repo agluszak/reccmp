@@ -24,6 +24,17 @@ def test_canonical_stack_ref_heuristics():
     assert canonical_stack_ref("esp", 4, known_spills={4}).kind == "spill"
 
 
+def test_canonical_stack_ref_pdb_multi_slot():
+    """A double/struct spanning two dwords is one named argument."""
+    slots = [(8, 8, "x", "argument")]
+    low = canonical_stack_ref("ebp", 8, pdb_slots=slots)
+    high = canonical_stack_ref("ebp", 0xC, pdb_slots=slots)
+    assert low.label() == "arg[x]"
+    assert high.label() == "arg[x]+0x4"
+    assert high.within == 4
+    assert low.kind == "argument" and high.kind == "argument"
+
+
 def test_summarize_helper_effects_detects_this_stores():
     fingerprint = (
         ("mov", "dword ptr [ecx + 0x4], eax"),

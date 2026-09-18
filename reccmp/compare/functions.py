@@ -1139,10 +1139,16 @@ class FunctionComparator:
         ratio = diff.ratio()
         opcodes = diff.get_opcodes()
         # IR-key equality alone is not EXACT when either side used opaque or
-        # unknown-size operands — unless display strings match end-to-end.
+        # unknown-size operands, or when control-flow targets are incomplete —
+        # unless display strings match end-to-end.
         operands_complete = all(row.operand_model_complete for row in (*orig, *recomp))
+        control_flow_complete = all(
+            (not row.is_code) or row.control_flow_known for row in (*orig, *recomp)
+        )
         displays_match = orig_asm == recomp_asm
-        if ratio == 1.0 and (operands_complete or displays_match):
+        if ratio == 1.0 and (
+            displays_match or (operands_complete and control_flow_complete)
+        ):
             analysis = ComparisonAnalysis.exact()
         else:
             if metadata is None and match is not None:
@@ -1155,10 +1161,18 @@ class FunctionComparator:
                 recomp_meta = [
                     meta_from_decoded(row) if row.is_code else None for row in recomp
                 ]
+            # Pass DecodedInstruction rows so the verifier uses Capstone
+            # operands instead of reparsing display strings.
+            from reccmp.compare.asm.ir import resolve_asm_stream
+
             analysis = analyze_effective_match(
                 opcodes,
-                orig_asm,
-                recomp_asm,
+                resolve_asm_stream(
+                    orig, jump_tables=self.orig_sanitize.jump_tables
+                ),
+                resolve_asm_stream(
+                    recomp, jump_tables=self.recomp_sanitize.jump_tables
+                ),
                 orig_addrs=excerpt_addrs(orig),
                 metadata=metadata,
                 orig_meta=orig_meta,
@@ -1221,6 +1235,7 @@ class FunctionComparator:
                 orig_asm,
                 recomp_asm,
                 fn_symbol=self._fn_symbol_entry(match),
+                types=self.types,
             )
 
         result = EntityCompareResult(
