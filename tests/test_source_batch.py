@@ -10,9 +10,10 @@ from reccmp.source import SourceIndex, SourceIndexError
 
 
 def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
-    if not os.environ.get("RECCMP_SOURCE_INDEXER") and not Path(
-        "/usr/lib/llvm-19/include/clang/AST/ASTConsumer.h"
-    ).is_file():
+    if (
+        not os.environ.get("RECCMP_SOURCE_INDEXER")
+        and not Path("/usr/lib/llvm-19/include/clang/AST/ASTConsumer.h").is_file()
+    ):
         pytest.skip(
             "run inside the pinned analysis image (LLVM 19 + reccmp-source-indexer)"
         )

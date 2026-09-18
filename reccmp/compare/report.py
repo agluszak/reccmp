@@ -108,6 +108,7 @@ class ReccmpComparedEntity:
             accuracy_modulo_inline=self.accuracy_modulo_inline,
         )
 
+
 class ReccmpStatusReport:
     filename: str
     """The filename of the original binary.
@@ -552,7 +553,8 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
         if e.comparison is not None:
             analysis = _parse_analysis(e.comparison)
         elif e.effective:
-            raise ReccmpReportDeserializeError
+            # Legacy reports only recorded a boolean; reason codes are unknown.
+            analysis = ComparisonAnalysis.effective(())
         elif e.matching == 1.0:
             analysis = ComparisonAnalysis.exact()
         else:

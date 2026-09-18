@@ -187,6 +187,7 @@ def diagnostic_normalizations_text(match: ReccmpComparedEntity) -> str | None:
     joined = ", ".join(tag.value.replace("_", " ") for tag in tags)
     return f"diagnostic normalizations: {joined}"
 
+
 def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = False):
     percenttext = percent_string(match.effective_accuracy, match.is_effective_match)
 
@@ -283,9 +284,7 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         ):
             raw = percent_string(match.accuracy)
             modulo = percent_string(match.accuracy_modulo_stack)
-            print(
-                f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack"
-            )
+            print(f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack")
         else:
             print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
         level = equivalence_level_text(match)

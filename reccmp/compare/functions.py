@@ -17,7 +17,11 @@ from reccmp.compare.asm.instgen import (
     SectionType,
     meta_from_decoded,
 )
-from reccmp.compare.asm.ir import instruction_match_key
+from reccmp.compare.asm.ir import (
+    excerpt_addrs,
+    excerpt_displays,
+    instruction_match_key,
+)
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
 from reccmp.compare.asm.replacement import (
     canonical_callee_name,
@@ -32,7 +36,6 @@ from reccmp.compare.diagnosis import (
     DifferenceSide,
     FactValue,
 )
-from reccmp.compare.asm.ir import instruction_match_key
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
     Fingerprint,
@@ -60,6 +63,43 @@ from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
 
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
+
+
+def _longest_increasing_by_recomp(
+    annotations: list[ReccmpMatch],
+) -> list[ReccmpMatch]:
+    """Keep the longest subsequence with strictly increasing recomp addresses."""
+    n = len(annotations)
+    if n == 0:
+        return []
+
+    # tails[k] = index of the smallest-recomp-addr end of an IS of length k+1
+    tails: list[int] = []
+    predecessor: list[int | None] = [None] * n
+
+    for i, ann in enumerate(annotations):
+        addr = ann.recomp_addr
+        lo, hi = 0, len(tails)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if annotations[tails[mid]].recomp_addr < addr:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo > 0:
+            predecessor[i] = tails[lo - 1]
+        if lo == len(tails):
+            tails.append(i)
+        else:
+            tails[lo] = i
+
+    result: list[ReccmpMatch] = []
+    idx: int | None = tails[-1]
+    while idx is not None:
+        result.append(annotations[idx])
+        idx = predecessor[idx]
+    result.reverse()
+    return result
 
 
 def _code_instructions(
@@ -165,11 +205,14 @@ class FunctionComparator:
 
     def __post_init__(self):
         self._call_abi_cache: dict[str, CallAbi | None] | None = None
-        self._fp_cache: dict[tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None] = (
-            {}
-        )
+        self._fp_cache: dict[
+            tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
+        ] = {}
         self._helper_catalog: list[HelperCatalogEntry] | None = None
         self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
+        # Exact call-identity → unique orig_addr (ambiguous keys omitted).
+        self._helper_identity_index: dict[str, int] | None = None
+        self._helper_identity_ambiguous: set[str] | None = None
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -232,7 +275,10 @@ class FunctionComparator:
         self, analysis: ComparisonAnalysis
     ) -> ComparisonAnalysis:
         """Pin mismatch / inconclusive locations to recomp source lines."""
-        if analysis.status == ComparisonStatus.MISMATCH and analysis.difference is not None:
+        if (
+            analysis.status == ComparisonStatus.MISMATCH
+            and analysis.difference is not None
+        ):
             diff = analysis.difference
             enriched = ComparisonDifference(
                 diff.kind,
@@ -322,8 +368,6 @@ class FunctionComparator:
             recomp_combined,
             split_points,
             match=match,
-            orig_raw=orig_raw,
-            recomp_raw=recomp_raw,
             include_diff=include_diff,
             include_exact_diff=include_exact_diff,
         )
@@ -392,9 +436,7 @@ class FunctionComparator:
             cache[cache_key] = fingerprint
         return fingerprint
 
-    def _helper_entry_for_match(
-        self, entity: ReccmpMatch
-    ) -> HelperCatalogEntry | None:
+    def _helper_entry_for_match(self, entity: ReccmpMatch) -> HelperCatalogEntry | None:
         """Lazily fingerprint one paired helper (memoized in the catalog map)."""
         cache = getattr(self, "_helper_by_orig", None)
         if cache is None:
@@ -413,7 +455,7 @@ class FunctionComparator:
             cache[entity.orig_addr] = None
             return None
         excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-        fingerprint = asm_fingerprint_from_lines([line for _, line in excerpt])
+        fingerprint = asm_fingerprint_from_lines(excerpt_displays(excerpt))
         needle = strip_helper_epilog(fingerprint)
         if len(needle) < 3:
             cache[entity.orig_addr] = None
@@ -429,25 +471,60 @@ class FunctionComparator:
         cache[entity.orig_addr] = entry
         return entry
 
+    def _ensure_helper_identity_index(self) -> None:
+        """Build exact-identity maps for call-driven helper resolution.
+
+        Ambiguous names (overloads / collisions) are recorded but never chosen.
+        Substring matching is not used for modulo-inline accounting.
+        """
+        if self._helper_identity_index is not None:
+            return
+        index: dict[str, int] = {}
+        ambiguous: set[str] = set()
+
+        def add_key(key: str, orig_addr: int) -> None:
+            if not key or key in ambiguous:
+                return
+            existing = index.get(key)
+            if existing is None:
+                index[key] = orig_addr
+            elif existing != orig_addr:
+                del index[key]
+                ambiguous.add(key)
+
+        for entity in self.db.get_functions():
+            add_key(f"{entity.orig_addr:#x}", entity.orig_addr)
+            add_key(f"{entity.recomp_addr:#x}", entity.orig_addr)
+            add_key(f"{entity.orig_addr:x}", entity.orig_addr)
+            add_key(f"{entity.recomp_addr:x}", entity.orig_addr)
+            name = entity.best_name() or ""
+            if name:
+                add_key(name, entity.orig_addr)
+
+        self._helper_identity_index = index
+        self._helper_identity_ambiguous = ambiguous
+
     def _resolve_helper_from_call_identities(
         self, identities: set[str]
     ) -> HelperCatalogEntry | None:
         """Map sanitized call-operand identities to a paired helper."""
-        for entity in self.db.get_functions():
-            name = entity.best_name() or ""
-            candidates = {
-                name,
-                f"{entity.orig_addr:#x}",
-                f"{entity.recomp_addr:#x}",
-                f"{entity.orig_addr:x}",
-                f"{entity.recomp_addr:x}",
-            }
-            if not (identities & candidates) and not any(
-                name and name in identity for identity in identities
-            ):
+        self._ensure_helper_identity_index()
+        assert self._helper_identity_index is not None
+        assert self._helper_identity_ambiguous is not None
+
+        matched_orig: set[int] = set()
+        for identity in identities:
+            if identity in self._helper_identity_ambiguous:
                 continue
-            return self._helper_entry_for_match(entity)
-        return None
+            orig_addr = self._helper_identity_index.get(identity)
+            if orig_addr is not None:
+                matched_orig.add(orig_addr)
+        if len(matched_orig) != 1:
+            return None
+        entity = self.db.get_one_match(next(iter(matched_orig)))
+        if entity is None:
+            return None
+        return self._helper_entry_for_match(entity)
 
     def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
         """Full catalog for ``find-inlines`` only — not used on the hot compare path."""
@@ -790,9 +867,9 @@ class FunctionComparator:
             or len(recomp_insts) != len(orig_asm)
         ):
             return False
-        for index, ((_, orig_line), (_, recomp_line)) in enumerate(
-            zip(orig_asm, recomp_asm)
-        ):
+        for index, (orig_row, recomp_row) in enumerate(zip(orig_asm, recomp_asm)):
+            orig_line = orig_row.display
+            recomp_line = recomp_row.display
             if orig_line == recomp_line and "<OFFSET" not in orig_line:
                 continue
             if not self._transfer_targets_alias_equivalent(
@@ -959,8 +1036,6 @@ class FunctionComparator:
         split_points: list[tuple[int, int]],
         *,
         match: ReccmpMatch | None = None,
-        orig_raw: bytes | None = None,
-        recomp_raw: bytes | None = None,
         include_diff: bool = True,
         include_exact_diff: bool = True,
         metadata: FunctionMetadata | None = None,
@@ -969,10 +1044,9 @@ class FunctionComparator:
     ) -> EntityCompareResult:
         # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         # Align on structured IR keys; display strings stay for printing/scoring UI.
-        orig_asm = [x.display if hasattr(x, "display") else x[1] for x in orig]
-        recomp_asm = [x.display if hasattr(x, "display") else x[1] for x in recomp]
+        orig_asm = excerpt_displays(orig)
+        recomp_asm = excerpt_displays(recomp)
 
-        # Prefer canonical IR keys when rows are DecodedInstruction.
         orig_keys = [instruction_match_key(row) for row in orig]
         recomp_keys = [instruction_match_key(row) for row in recomp]
         diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
@@ -985,68 +1059,29 @@ class FunctionComparator:
             if metadata is None and match is not None:
                 metadata = self._function_metadata(match)
             if orig_meta is None:
-                if orig and hasattr(orig[0], "is_code"):
-                    orig_meta = [
-                        meta_from_decoded(row) if row.is_code else None for row in orig
-                    ]
-                elif orig_raw is not None:
-                    orig_meta_by_addr = self.orig_sanitize.collect_instruction_meta(
-                        orig_raw,
-                        (
-                            match.orig_addr
-                            if match is not None
-                            else (orig[0][0] if orig and orig[0][0] is not None else 0)
-                        ),
-                    )
-                    orig_meta = [
-                        orig_meta_by_addr.get(addr) if addr is not None else None
-                        for addr, _ in orig
-                    ]
+                orig_meta = [
+                    meta_from_decoded(row) if row.is_code else None for row in orig
+                ]
             if recomp_meta is None:
-                if recomp and hasattr(recomp[0], "is_code"):
-                    recomp_meta = [
-                        meta_from_decoded(row) if row.is_code else None
-                        for row in recomp
-                    ]
-                elif recomp_raw is not None:
-                    recomp_meta_by_addr = self.recomp_sanitize.collect_instruction_meta(
-                        recomp_raw,
-                        (
-                            match.recomp_addr
-                            if match is not None
-                            else (
-                                recomp[0][0]
-                                if recomp and recomp[0][0] is not None
-                                else 0
-                            )
-                        ),
-                    )
-                    recomp_meta = [
-                        recomp_meta_by_addr.get(addr) if addr is not None else None
-                        for addr, _ in recomp
-                    ]
+                recomp_meta = [
+                    meta_from_decoded(row) if row.is_code else None for row in recomp
+                ]
             analysis = analyze_effective_match(
                 opcodes,
                 orig_asm,
                 recomp_asm,
-                orig_addrs=[x[0] for x in orig],
+                orig_addrs=excerpt_addrs(orig),
                 metadata=metadata,
                 orig_meta=orig_meta,
-                recomp_addrs=[x[0] for x in recomp],
+                recomp_addrs=excerpt_addrs(recomp),
                 recomp_meta=recomp_meta,
             )
 
         analysis = self._enrich_analysis_with_source(analysis)
 
         inline_layout = None
-        if (
-            ratio < 1.0
-            and match is not None
-            and not analysis.is_effective
-        ):
-            inline_layout = self._analyze_inline_expansions(
-                match, orig_asm, recomp_asm
-            )
+        if ratio < 1.0 and match is not None and not analysis.is_effective:
+            inline_layout = self._analyze_inline_expansions(match, orig_asm, recomp_asm)
 
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
             result = EntityCompareResult(
@@ -1066,21 +1101,22 @@ class FunctionComparator:
 
         # Convert the addresses to hex string for the diff output
         orig_for_printing = [
-            (hex(addr) if addr is not None else "", instr) for addr, instr in orig
+            (hex(row.address) if row.address is not None else "", row.display)
+            for row in orig
         ]
 
         recomp_for_printing = [
             (
-                hex(addr) if addr is not None else "",
+                hex(row.address) if row.address is not None else "",
                 self._print_recomp_instruction(
-                    instruction,
-                    source_ref=self._source_ref_of_recomp_addr(addr),
+                    row.display,
+                    source_ref=self._source_ref_of_recomp_addr(row.address),
                     is_pinned=any(
                         recomp_addr == line_index for _, recomp_addr in split_points
                     ),
                 ),
             )
-            for line_index, (addr, instruction) in enumerate(recomp)
+            for line_index, row in enumerate(recomp)
         ]
 
         rdiff = RawDiffOutput(
@@ -1155,23 +1191,22 @@ class FunctionComparator:
         if len(recomp) == 0:
             return []
 
-        recomp_start_addr = recomp[0][0]
-        recomp_end_addr = recomp[-1][0]
+        recomp_start_addr = recomp[0].address
+        recomp_end_addr = recomp[-1].address
         assert recomp_start_addr is not None and recomp_end_addr is not None
-        line_annotations = self.db.get_lines_in_recomp_range(
-            recomp_start_addr, recomp_end_addr
+        line_annotations = list(
+            self.db.get_lines_in_recomp_range(recomp_start_addr, recomp_end_addr)
         )
 
-        # This is a naive/greedy algorithm to remove the non-monotonous entries.
-        # There likely is a "better" way to do this, in the sense that the smallest number
-        # of entries is removed.
-        line_annotations_monotonous: list[ReccmpMatch] = []
-        last_address = 0
-        for sync_point in line_annotations:
-            if sync_point.recomp_addr > last_address:
-                line_annotations_monotonous.append(sync_point)
-                last_address = sync_point.recomp_addr
-            else:
+        # Longest increasing subsequence of recomp addresses keeps the maximum
+        # set of monotonic source pins (O(n log n)).
+        line_annotations_monotonous = _longest_increasing_by_recomp(line_annotations)
+        dropped = len(line_annotations) - len(line_annotations_monotonous)
+        if dropped:
+            kept = {id(ann) for ann in line_annotations_monotonous}
+            for sync_point in line_annotations:
+                if id(sync_point) in kept:
+                    continue
                 self.report(
                     ReccmpEvent.WRONG_ORDER,
                     sync_point.orig_addr,
@@ -1216,7 +1251,7 @@ class FunctionComparator:
                 (
                     i
                     for i, entry in enumerate(orig)
-                    if entry[0] == line_annotation.orig_addr
+                    if entry.address == line_annotation.orig_addr
                 ),
                 None,
             )
@@ -1232,7 +1267,7 @@ class FunctionComparator:
                 (
                     i
                     for i, entry in enumerate(recomp)
-                    if entry[0] == line_annotation.recomp_addr
+                    if entry.address == line_annotation.recomp_addr
                 ),
                 None,
             )

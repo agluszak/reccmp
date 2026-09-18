@@ -18,7 +18,7 @@ from .instgen import (
     meta_from_decoded,
 )
 from .ir import AsmRole, DecodedInstruction, marker
-from .effective import Reject, parse_instruction
+from .model import Reject, parse_instruction
 from .replacement import AddrTestProtocol, NameReplacementProtocol
 
 AsmExcerpt = list[DecodedInstruction]
@@ -284,9 +284,7 @@ class ParseAsm:
                     display = " ".join(result)
                     asm.append(self._finalize_code_row(inst, display))
             elif section.type == SectionType.ADDR_TAB:
-                asm.append(
-                    marker("Jump table:", role=AsmRole.JUMP_TABLE_HEADER)
-                )
+                asm.append(marker("Jump table:", role=AsmRole.JUMP_TABLE_HEADER))
                 for ofs, target in section.contents:
                     target_relative_to_function_start = target - start_addr
                     asm.append(

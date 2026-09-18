@@ -54,6 +54,7 @@ class EntityCompareResult:
             accuracy_modulo_inline=self.accuracy_modulo_inline,
         )
 
+
 class MatchingOrMismatchingBlock(TypedDict):
     # I tried a union and narrowing, but this does not work in mypy - see https://github.com/python/mypy/issues/11080
     both: NotRequired[list[tuple[str, str, str]]]

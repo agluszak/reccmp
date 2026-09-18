@@ -88,9 +88,7 @@ def test_accuracy_after_stack_map_reaches_one():
 
 def test_rewrite_stack_displacements():
     line = "mov eax, dword ptr [ebp - 0x24]"
-    rewritten = rewrite_stack_displacements(
-        line, {("ebp", -0x24): ("ebp", -0x18)}
-    )
+    rewritten = rewrite_stack_displacements(line, {("ebp", -0x24): ("ebp", -0x18)})
     assert "ebp - 0x18" in rewritten
     assert extract_stack_offset_from_instruction(rewritten) == StackRegisterOffset(
         "ebp", -0x18
@@ -113,9 +111,7 @@ def test_derive_equivalence_level_lattice():
     ) == (DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,)
     # folded_symbol must never be reported as known_inline
     assert (
-        derive_equivalence_level(
-            ComparisonAnalysis.effective({"folded_symbol_alias"})
-        )
+        derive_equivalence_level(ComparisonAnalysis.effective({"folded_symbol_alias"}))
         == EquivalenceLevel.FOLDED_SYMBOL_ALIAS
     )
     assert derive_diagnostic_normalizations(
@@ -305,3 +301,19 @@ def test_enrich_mismatch_side_preserves_kind():
     assert enriched.difference.recomp.facts["source_path"] == "foo.cpp"
     assert enriched.difference.recomp.facts["source_line"] == 183
     assert enriched.difference.recomp.facts["target"] == "bar"
+
+
+def test_longest_increasing_source_pins_beats_greedy():
+    """Crossing early pin should not discard a longer later chain."""
+    from types import SimpleNamespace
+    from reccmp.compare.functions import _longest_increasing_by_recomp
+
+    # Greedy keeps only the first (recomp=100). LIS keeps the length-3 chain.
+    annotations = [
+        SimpleNamespace(recomp_addr=100, orig_addr=1, name="a"),
+        SimpleNamespace(recomp_addr=10, orig_addr=2, name="b"),
+        SimpleNamespace(recomp_addr=20, orig_addr=3, name="c"),
+        SimpleNamespace(recomp_addr=30, orig_addr=4, name="d"),
+    ]
+    kept = _longest_increasing_by_recomp(annotations)  # type: ignore[arg-type]
+    assert [a.name for a in kept] == ["b", "c", "d"]

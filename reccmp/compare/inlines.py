@@ -310,7 +310,6 @@ def find_call_indices(lines: Sequence[str], helper_names: Sequence[str]) -> list
     )
 
 
-
 def _inline_confidence(
     helper: HelperCatalogEntry, host_len: int, *, call_backed: bool
 ) -> float:
@@ -487,7 +486,9 @@ def analyze_inline_layout(
         if p.recomp_span is not None
     ]
     kept_orig = {(s.helper_orig, s.offset) for s in select_nonoverlapping(orig_spans)}
-    kept_recomp = {(s.helper_orig, s.offset) for s in select_nonoverlapping(recomp_spans)}
+    kept_recomp = {
+        (s.helper_orig, s.offset) for s in select_nonoverlapping(recomp_spans)
+    }
 
     expansions: list[InlineExpansionEvidence] = []
     orig_elide: list[tuple[int, int, Hashable]] = []

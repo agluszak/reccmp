@@ -212,7 +212,9 @@ def test_conflicting_global_spellings_are_retained() -> None:
 
     namespace = collector.derive()
     # The definition still wins the merged index, but the disagreement survives.
-    assert {item.semantic_id: item for item in namespace.variables}["_gThing"].type == "int"
+    assert {item.semantic_id: item for item in namespace.variables}[
+        "_gThing"
+    ].type == "int"
     (conflict,) = namespace.conflicts
     assert conflict.semantic_id == "_gThing"
     assert conflict.record_kind == "variable"

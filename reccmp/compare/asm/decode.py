@@ -48,11 +48,14 @@ def stop_at_int3_detail(instructions) -> Iterable:
 
 def from_capstone(insn) -> DecodedInstruction:
     """Convert one Capstone detail instruction into canonical IR (unsanitized)."""
+    register_access_known = True
     try:
         read_ids, write_ids = insn.regs_access()
         regs_read = tuple(sorted(insn.reg_name(r) for r in read_ids))
         regs_written = tuple(sorted(insn.reg_name(r) for r in write_ids))
     except CsError:
+        # Unknown access must not be treated as "touches no registers".
+        register_access_known = False
         regs_read = ()
         regs_written = ()
 
@@ -89,6 +92,7 @@ def from_capstone(insn) -> DecodedInstruction:
         is_call=is_call,
         is_ret=insn.group(CS_GRP_RET),
         branch_target=branch_target,
+        register_access_known=register_access_known,
         raw_op_str=insn.op_str,
     )
 

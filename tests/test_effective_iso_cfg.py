@@ -52,20 +52,22 @@ def fixture_wobble_analysis():
     orig_meta_by_addr = orig_parser.collect_instruction_meta(orig_raw, base)
     recomp_meta_by_addr = recomp_parser.collect_instruction_meta(recomp_raw, base)
 
-    orig_asm = [x[1] for x in orig]
-    recomp_asm = [x[1] for x in recomp]
+    orig_asm = [x.display for x in orig]
+    recomp_asm = [x.display for x in recomp]
     codes = SequenceMatcherWithPins(orig_asm, recomp_asm, []).get_opcodes()
     return analyze_effective_match(
         codes,
         orig_asm,
         recomp_asm,
-        orig_addrs=[x[0] for x in orig],
+        orig_addrs=[x.address for x in orig],
         orig_meta=[
-            orig_meta_by_addr.get(a) if a is not None else None for a, _ in orig
+            orig_meta_by_addr.get(row.address) if row.address is not None else None
+            for row in orig
         ],
-        recomp_addrs=[x[0] for x in recomp],
+        recomp_addrs=[x.address for x in recomp],
         recomp_meta=[
-            recomp_meta_by_addr.get(a) if a is not None else None for a, _ in recomp
+            recomp_meta_by_addr.get(row.address) if row.address is not None else None
+            for row in recomp
         ],
     )
 
@@ -898,7 +900,19 @@ def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
     ]
     # ja -> default at index 11; table fills the rest.
     targets: list[int | None] = [
-        None, None, 11, None, None, None, None, None, None, None, None, None, None
+        None,
+        None,
+        11,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     ]
     return asm, addrs, targets
 

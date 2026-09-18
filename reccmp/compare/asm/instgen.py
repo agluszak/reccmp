@@ -310,6 +310,7 @@ class InstructionMeta:
     is_call: bool
     is_ret: bool
     branch_target: int | None
+    register_access_known: bool = True
 
 
 def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
@@ -327,23 +328,21 @@ def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
         is_call=insn.is_call,
         is_ret=insn.is_ret,
         branch_target=insn.branch_target,
+        register_access_known=insn.register_access_known,
     )
 
 
 def collect_instruction_meta(
     blob: bytes, start: int, sections: list[FuncSection], is_32bit: bool = True
 ) -> dict[int, InstructionMeta]:
-    """Project canonical IR for code sections into the legacy meta map.
+    """Project CODE-section IR into the legacy meta map via ``InstructGen``.
 
-    When ``InstructGen`` has already decoded the blob, prefer
-    ``InstructGen.decoded_by_addr`` instead of calling this.  This helper
-    reuses the single detail pass via ``disasm_detail`` rather than a second
-    Capstone walk over each section.
+    Honours embedded jump/data tables the same way as ``parse_asm``.
     """
-    del sections  # IR is produced from the full blob; section bounds already applied.
-    result: dict[int, InstructionMeta] = {}
-    for insn in disasm_detail(blob, start, is_32bit):
-        if insn.address is None:
-            continue
-        result[insn.address] = meta_from_decoded(insn)
-    return result
+    del sections  # InstructGen rediscovers section bounds from the blob.
+    ig = InstructGen(blob, start, is_32bit)
+    return {
+        addr: meta_from_decoded(insn)
+        for addr, insn in ig.decoded_by_addr.items()
+        if insn.address is not None
+    }

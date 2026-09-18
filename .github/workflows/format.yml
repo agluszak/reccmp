@@ -41,7 +41,7 @@ jobs:
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
       run: |
-        codespell \
+        uv run codespell \
           --ignore-multiline-regex \
             '# codespell:ignore-begin.*?codespell:ignore-end *\n' \
           --ignore-regex remote-checkin-comment \

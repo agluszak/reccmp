@@ -1,6 +1,8 @@
 """Reccmp reports: files that contain the comparison result from asmcmp."""
 
 import json
+from pathlib import Path
+
 import pytest
 from reccmp.compare.report import (
     ReccmpStatusReport,
@@ -254,7 +256,8 @@ def test_structured_comparison_schema_round_trip():
     assert restored_analyses[2].semantic_similarity == 0.875
 
 
-def test_old_effective_boolean_schema_is_rejected():
+def test_old_effective_boolean_schema_is_accepted():
+    """Version-1 reports stored effective match as a bare boolean."""
     old_report = json.dumps(
         {
             "file": "test.exe",
@@ -270,8 +273,20 @@ def test_old_effective_boolean_schema_is_rejected():
             ],
         }
     )
-    with pytest.raises(ReccmpReportDeserializeError):
-        deserialize_reccmp_report(old_report)
+    report = deserialize_reccmp_report(old_report)
+    entity = report.entities[0x400000]
+    assert entity.is_effective_match is True
+    assert entity.accuracy == 0.5
+    assert entity.analysis.status == ComparisonStatus.EFFECTIVE
+    assert entity.analysis.effective_reasons == ()
+
+
+def test_webui_testdata_deserializes():
+    """The Playwright fixture must remain loadable by reccmp-aggregate."""
+    fixture = Path(__file__).resolve().parents[1] / "webui" / "testdata.json"
+    report = deserialize_reccmp_report(fixture.read_text(encoding="utf-8"))
+    assert report.entities
+    assert any(entity.is_effective_match for entity in report.entities.values())
 
 
 def test_aggregate_recomp_addr():

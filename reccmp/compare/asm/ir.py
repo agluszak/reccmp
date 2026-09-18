@@ -10,7 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Hashable, Iterator
+from typing import Hashable
+
+from .model import (
+    STACK_ENTRY_REGEX,
+    Instruction,
+    Reject,
+    parse_instruction,
+)
 
 _MEM = "mem"
 _STACK_SLOT = ("stack_slot",)
@@ -50,6 +57,9 @@ class DecodedInstruction:
     is_call: bool = False
     is_ret: bool = False
     branch_target: int | None = None
+    # False when Capstone could not report register access (CsError). Empty
+    # regs_read/regs_written then means "unknown", not "touches nothing".
+    register_access_known: bool = True
     # Unsanitized Capstone op_str (useful for debug / jump-table discovery).
     raw_op_str: str = ""
 
@@ -59,19 +69,18 @@ class DecodedInstruction:
 
     def as_effective(self):
         """View used by the effective-match verifier."""
-        from .effective import Instruction
-
-        return Instruction(
-            self.mnemonic, self.prefix, self.operands, self.raw_operands
-        )
+        return Instruction(self.mnemonic, self.prefix, self.operands, self.raw_operands)
 
     def with_display(self, display: str) -> "DecodedInstruction":
         """Replace the display string and refresh structured operands from it."""
-        from .effective import Reject, parse_instruction
-
         if self.role != AsmRole.CODE:
             return replace(
-                self, display=display, mnemonic="", prefix="", operands=(), raw_operands=()
+                self,
+                display=display,
+                mnemonic="",
+                prefix="",
+                operands=(),
+                raw_operands=(),
             )
         try:
             parsed = parse_instruction(display)
@@ -85,21 +94,6 @@ class DecodedInstruction:
             operands=parsed.operands,
             raw_operands=parsed.raw_operands,
         )
-
-    # Tuple-like access so existing ``(addr, line)`` unpacking keeps working.
-    def __getitem__(self, index: int) -> int | None | str:
-        if index == 0:
-            return self.address
-        if index == 1:
-            return self.display
-        raise IndexError(index)
-
-    def __iter__(self) -> Iterator[int | None | str]:
-        yield self.address
-        yield self.display
-
-    def __len__(self) -> int:
-        return 2
 
 
 def marker(
@@ -153,6 +147,7 @@ def from_effective(
             is_call=getattr(meta, "is_call", False),
             is_ret=getattr(meta, "is_ret", False),
             branch_target=getattr(meta, "branch_target", None),
+            register_access_known=getattr(meta, "register_access_known", True),
         )
     return DecodedInstruction(**kwargs)
 
@@ -167,8 +162,6 @@ def _freeze(value) -> Hashable:
 
 def instruction_match_key(row: DecodedInstruction | str) -> Hashable:
     """Hashable SequenceMatcher key from IR (or legacy display string)."""
-    from .effective import Reject, parse_instruction
-
     if isinstance(row, str):
         try:
             ins = parse_instruction(row)
@@ -199,8 +192,6 @@ def _normalize_operand_stack(operand) -> object:
 
 
 def stack_normalized_key(row: DecodedInstruction | str) -> Hashable:
-    from .effective import Reject, parse_instruction
-
     if isinstance(row, str):
         try:
             ins = parse_instruction(row)
@@ -218,7 +209,6 @@ def rewrite_stack_displacements(
     line: str, mapping: dict[tuple[str, int], tuple[str, int]]
 ) -> str:
     """Rewrite ebp/esp ± offset tokens in a display line through a slot map."""
-    from reccmp.compare.stack_layout import STACK_ENTRY_REGEX
 
     def repl(match) -> str:
         register = match.group("register")
@@ -240,3 +230,10 @@ def excerpt_displays(excerpt: list[DecodedInstruction]) -> list[str]:
 
 def excerpt_addrs(excerpt: list[DecodedInstruction]) -> list[int | None]:
     return [row.address for row in excerpt]
+
+
+def as_addr_display_pairs(
+    excerpt: list[DecodedInstruction],
+) -> list[tuple[int | None, str]]:
+    """Tuple form for APIs that still consume ``(addr, display)`` pairs."""
+    return [(row.address, row.display) for row in excerpt]

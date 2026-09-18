@@ -38,41 +38,19 @@ from typing import Callable
 
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.model import (  # noqa: F401 — re-export for callers
+    Instruction,
+    REGISTERS,
+    Reject,
+    parse_instruction,
+    parse_operand,
+    split_operands,
+)
 
 # A symbolic value. Nested tuples of str/int; compared structurally.
 Value = tuple
 
-
-class Reject(Exception):
-    """The two sequences could not be proven equivalent."""
-
-
-# Register families. Writing e.g. `al` produces a new value for the whole
-# `a` family so that partial-register writes are never lost.
-REGISTERS: dict[str, tuple[str, str]] = {
-    **{f"e{r}x": (r, "r32") for r in "abcd"},
-    **{f"{r}x": (r, "r16") for r in "abcd"},
-    **{f"{r}l": (r, "l8") for r in "abcd"},
-    **{f"{r}h": (r, "h8") for r in "abcd"},
-    "esi": ("si", "r32"),
-    "si": ("si", "r16"),
-    "edi": ("di", "r32"),
-    "di": ("di", "r16"),
-    "ebp": ("bp", "r32"),
-    "bp": ("bp", "r16"),
-    "esp": ("sp", "r32"),
-    "sp": ("sp", "r16"),
-}
-
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
-
-MEM_RE = re.compile(
-    r"^(?:(byte|word|dword|qword|tbyte|xword|xmmword) ptr )?"
-    r"(?:(cs|ds|es|fs|gs|ss):)?\[(.+)\]$"
-)
-SCALED_REG_RE = re.compile(r"^(e[a-d]x|e[sd]i|e[bs]p)\*([1248])$")
-NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
-ST_RE = re.compile(r"^st(?:\((\d)\))?$")
 
 COMMUTATIVE_BINOPS = {"add", "and", "or", "xor", "imul"}
 ASSOCIATIVE_COMMUTATIVE_BINOPS = {"add"}
@@ -472,90 +450,7 @@ def guard_state_size(state: SideState, ctx: Context) -> None:
             raise Reject
 
 
-# ---------------------------------------------------------------------------
-# Parsing of sanitized instruction text
-
-
-def split_operands(op_str: str) -> list[str]:
-    """Split on top-level ', ' only: brackets and parens may contain commas."""
-    operands = []
-    depth = 0
-    start = 0
-    i = 0
-    while i < len(op_str):
-        char = op_str[i]
-        if char in "[(":
-            depth += 1
-        elif char in "])":
-            depth -= 1
-        elif depth == 0 and op_str.startswith(", ", i):
-            operands.append(op_str[start:i])
-            start = i + 2
-            i += 2
-            continue
-        i += 1
-    operands.append(op_str[start:])
-    return [op for op in (o.strip() for o in operands) if op]
-
-
-def parse_operand(text: str):
-    if text in REGISTERS:
-        return ("reg", text)
-
-    st_match = ST_RE.match(text)
-    if st_match:
-        return ("st", int(st_match.group(1) or 0))
-
-    if NUM_RE.match(text):
-        return ("imm", int(text, 0))
-
-    mem_match = MEM_RE.match(text)
-    if mem_match:
-        size, seg, content = mem_match.groups()
-        reg_terms: list[tuple[str, int]] = []
-        disp = 0
-        syms: list[tuple[int, str]] = []
-        tokens = re.split(r" ([+-]) ", content)
-        sign = 1
-        for k, token in enumerate(tokens):
-            if k % 2 == 1:
-                sign = 1 if token == "+" else -1
-                continue
-            token = token.strip()
-            if token in REGISTERS:
-                if sign < 0:
-                    raise Reject
-                reg_terms.append((token, 1))
-            elif (scaled := SCALED_REG_RE.match(token)) is not None:
-                if sign < 0:
-                    raise Reject
-                reg_terms.append((scaled.group(1), int(scaled.group(2))))
-            elif NUM_RE.match(token):
-                disp += sign * int(token, 0)
-            else:
-                syms.append((sign, token))
-        return ("mem", size or "", seg or "", reg_terms, disp, tuple(sorted(syms)))
-
-    # Symbol, placeholder, or anything else we treat as an opaque token.
-    return ("sym", text)
-
-
-@dataclass(frozen=True)
-class Instruction:
-    mnemonic: str
-    prefix: str  # rep/repe/repne or ""
-    operands: tuple
-    raw_operands: tuple[str, ...]
-
-
-def parse_instruction(line: str) -> Instruction:
-    mnemonic, _, op_str = line.partition(" ")
-    prefix = ""
-    if mnemonic in ("rep", "repe", "repne"):
-        prefix = mnemonic
-        mnemonic, _, op_str = op_str.partition(" ")
-    raw = tuple(split_operands(op_str)) if op_str else ()
-    return Instruction(mnemonic, prefix, tuple(parse_operand(t) for t in raw), raw)
+# Parsing lives in ``.model``; re-exported above for backward compatibility.
 
 
 def _clean_symbol(text: str) -> str:
@@ -1664,6 +1559,8 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
     paired value. Anything with memory access, control flow, x87, or
     unmapped registers falls back to the full-synchronization rule."""
     # pylint: disable=too-many-return-statements,too-many-boolean-expressions
+    if not getattr(meta, "register_access_known", True):
+        return False
     if (
         meta.accesses_memory
         or meta.is_jump
@@ -2924,8 +2821,11 @@ def _same_meta_effects(
     The textual instruction is already identical when this is used.  Still,
     consume metadata only as a pair: trusting facts collected from one binary
     to model the other would defeat the purpose of structured input.
+    Incomplete Capstone register-access info must not be treated as empty.
     """
     if orig is None or recomp is None:
+        return False
+    if not orig.register_access_known or not recomp.register_access_known:
         return False
     fields = (
         "mnemonic",
@@ -3977,12 +3877,8 @@ def verify_isomorphic_cfg_effective_match(
     for block_o, block_r in pairs:
         start_o, end_o = cfg_o.starts[block_o], cfg_o.ends[block_o]
         start_r, end_r = cfg_r.starts[block_r], cfg_r.ends[block_r]
-        indices_o = [
-            i for i in range(start_o, end_o) if i not in cfg_o.owned_data
-        ]
-        indices_r = [
-            i for i in range(start_r, end_r) if i not in cfg_r.owned_data
-        ]
+        indices_o = [i for i in range(start_o, end_o) if i not in cfg_o.owned_data]
+        indices_r = [i for i in range(start_r, end_r) if i not in cfg_r.owned_data]
         aligned = _align_block_lines(
             [orig_asm[i] for i in indices_o],
             [recomp_asm[i] for i in indices_r],
@@ -4005,12 +3901,8 @@ def verify_isomorphic_cfg_effective_match(
         # The block terminators (control lines) must pair with each other:
         # a one-sided branch or return breaks the matched structure.
         for local_o, local_r in aligned:
-            kind_o = (
-                cfg_o.kinds[indices_o[local_o]] if local_o is not None else "code"
-            )
-            kind_r = (
-                cfg_r.kinds[indices_r[local_r]] if local_r is not None else "code"
-            )
+            kind_o = cfg_o.kinds[indices_o[local_o]] if local_o is not None else "code"
+            kind_r = cfg_r.kinds[indices_r[local_r]] if local_r is not None else "code"
             if kind_o != kind_r or (local_o is None and kind_r != "code"):
                 if recorder is not None:
                     recorder.mark_inconclusive(
@@ -4235,9 +4127,7 @@ def verify_isomorphic_cfg_effective_match(
                 # Recognized switch tables already expanded to caseN edges.
                 if not any(role.startswith("case") for role in edges_o):
                     if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "indirect_jump", index_o, index_r
-                        )
+                        recorder.mark_inconclusive("indirect_jump", index_o, index_r)
                     return False
 
             # A direct edge outside the excerpt exposes the complete machine

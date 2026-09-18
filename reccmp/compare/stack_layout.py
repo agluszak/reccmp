@@ -7,20 +7,20 @@ applied.
 
 from __future__ import annotations
 
-import re
 import struct
 from dataclasses import dataclass, field
 from typing import NamedTuple, Sequence
 
+from reccmp.compare.asm.model import STACK_ENTRY_REGEX
 from reccmp.compare.diagnosis import StackPermutationEntry
-from reccmp.compare.diff import CombinedDiffOutput, MatchingOrMismatchingBlock, RawDiffOutput
+from reccmp.compare.diff import (
+    CombinedDiffOutput,
+    MatchingOrMismatchingBlock,
+    RawDiffOutput,
+)
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpTypeKey
-
-STACK_ENTRY_REGEX = re.compile(
-    r"(?P<register>e[sb]p)\s(?P<sign>[+-])\s(?P<offset>(0x)?[0-9a-f]+)(?![0-9a-f])"
-)
 
 
 @dataclass
