@@ -2865,6 +2865,10 @@ def _same_meta_effects(
         return False
     if not orig.register_access_known or not recomp.register_access_known:
         return False
+    if not getattr(orig, "control_flow_known", True) or not getattr(
+        recomp, "control_flow_known", True
+    ):
+        return False
     fields = (
         "mnemonic",
         "regs_read",

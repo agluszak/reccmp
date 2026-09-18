@@ -337,6 +337,8 @@ class InstructionMeta:
     is_ret: bool
     branch_target: int | None
     register_access_known: bool = True
+    operand_model_complete: bool = True
+    control_flow_known: bool = True
 
 
 def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
@@ -355,6 +357,8 @@ def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
         is_ret=insn.is_ret,
         branch_target=insn.branch_target,
         register_access_known=insn.register_access_known,
+        operand_model_complete=insn.operand_model_complete,
+        control_flow_known=insn.control_flow_known,
     )
 
 
