@@ -122,11 +122,19 @@ def effective_orig_vtable_size(
     db: EntityDb | None = None,
     image_id: ImageId = ImageId.ORIG,
 ) -> int:
-    """Trim comparison past the last plausible orig vtable slot.
+    """Trim comparison to the longest contiguous plausible orig prefix.
 
-    Recompiled vtables are often longer than the original (extra inherited tail).
-    Reading ``recomp_size`` bytes from the orig address pulls in the next object in
-    ``.rdata`` and tanks the match ratio (TMapMaker is the canonical case).
+    Walk slots from the start of the table. Null slots are allowed (they do
+    not end the prefix). The first non-null implausible target stops the walk.
+    The returned size covers through the last plausible non-null slot in that
+    prefix — trailing nulls after the last method are dropped.
+
+    Recompiled vtables are often longer than the original (extra inherited
+    tail). Reading ``recomp_size`` bytes from the orig address pulls in the
+    next object in ``.rdata`` and tanks the match ratio (TMapMaker is the
+    canonical case). Using a contiguous prefix (not "last plausible anywhere")
+    also avoids extending past a mid-table hole of non-code data into a later
+    accidental code pointer.
     """
     if read_size <= 0 or read_size % 4 != 0:
         return read_size
@@ -138,10 +146,11 @@ def effective_orig_vtable_size(
 
     last_nonzero_code = -1
     for i, (slot,) in enumerate(struct.iter_unpack("<L", table)):
-        if slot != 0 and is_plausible_vtable_target(
-            binfile, slot, db=db, image_id=image_id
-        ):
-            last_nonzero_code = i
+        if slot == 0:
+            continue
+        if not is_plausible_vtable_target(binfile, slot, db=db, image_id=image_id):
+            break
+        last_nonzero_code = i
 
     if last_nonzero_code < 0:
         return read_size

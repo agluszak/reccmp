@@ -7,10 +7,21 @@ from reccmp.compare.diagnosis import (
     ComparisonDifference,
     DifferenceSide,
 )
-from reccmp.compare.mismatch_clusters import cluster_memory_address_mismatches
+from reccmp.compare.mismatch_clusters import (
+    cluster_layout_shifts,
+    cluster_memory_address_mismatches,
+)
 
 
-def _entity(addr: int, class_name: str, orig_disp: int, recomp_disp: int, field: str):
+def _entity(
+    addr: int,
+    class_name: str,
+    orig_disp: int,
+    recomp_disp: int,
+    field: str,
+    *,
+    recomp_field: str | None = None,
+):
     analysis = ComparisonAnalysis.mismatch(
         ComparisonDifference(
             "memory_address",
@@ -29,7 +40,7 @@ def _entity(addr: int, class_name: str, orig_disp: int, recomp_disp: int, field:
                 {
                     "displacement": recomp_disp,
                     "class_name": class_name,
-                    "field_name": field,
+                    "field_name": recomp_field or field,
                 },
             ),
         )
@@ -64,3 +75,27 @@ def test_cluster_memory_address_mismatches_groups_by_layout_key():
     assert top.count == 2
     assert top.field_name == "x"
     assert set(top.sample_addrs) == {0x100, 0x200}
+
+
+def test_cluster_layout_shifts_groups_by_class_and_delta():
+    """A shared +4 shift across fields of Foo collapses to one shift cluster."""
+    entities = [
+        _entity(0x100, "Foo", 0x10, 0x14, "a"),
+        _entity(0x200, "Foo", 0x20, 0x24, "b"),
+        _entity(0x300, "Foo", 0x30, 0x34, "c"),
+        # Different delta — separate cluster.
+        _entity(0x400, "Foo", 0x40, 0x48, "d"),
+        # Different class.
+        _entity(0x500, "Bar", 0x10, 0x14, "e"),
+    ]
+    shifts = cluster_layout_shifts(entities)
+    assert len(shifts) == 3
+    top = shifts[0]
+    assert top.class_name == "Foo"
+    assert top.delta == 4
+    assert top.count == 3
+    assert top.fields == ("a", "b", "c")
+    assert top.earliest_orig_disp == 0x10
+    # Exact clusters still available separately.
+    exact = cluster_memory_address_mismatches(entities)
+    assert len(exact) == 5

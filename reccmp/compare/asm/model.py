@@ -145,6 +145,11 @@ def format_operand(operand) -> str:
         return format_imm(operand[1])
     if kind == "sym":
         return operand[1]
+    if kind == "opaque":
+        # ("opaque", type, op_str, index) — prefer Capstone text when present.
+        if len(operand) >= 3 and operand[2]:
+            return str(operand[2])
+        return "?"
     if kind != "mem":
         raise Reject
 

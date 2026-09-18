@@ -10,6 +10,7 @@ from .index import (
     SourceIndex,
     SourceIndexError,
     SourceMarker,
+    ResolvedField,
     TranslationUnitRecords,
     record_command,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "SourceIndex",
     "SourceIndexError",
     "SourceMarker",
+    "ResolvedField",
     "SourceVariable",
     "TranslationUnitRecords",
     "record_command",

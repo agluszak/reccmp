@@ -96,3 +96,18 @@ def test_vtable_keeps_trailing_callee_cleanup_noops() -> None:
     assert is_plausible_vtable_target(image, base + 18)
     assert not is_plausible_vtable_target(image, base + 21)
     assert effective_orig_vtable_size(image, base, len(table)) == 12
+
+
+def test_vtable_stops_at_first_implausible_not_last_plausible() -> None:
+    """Contiguous prefix: an early non-code hole must not extend to a later method."""
+    base = 0x401000
+    # File layout: [12-byte table][2-byte non-exec pad][two push/ret methods].
+    # slot0 → first method, slot1 → pad (not executable), slot2 → second method.
+    table = struct.pack("<3I", base + 14, base + 12, base + 16)
+    image = RawImage.from_memory(table + b"\x00\x00\x55\xc3\x55\xc3", base_addr=base)
+    image = _with_executable_range(image, base + 14, base + 18)
+    assert is_plausible_vtable_target(image, base + 14)
+    assert not is_plausible_vtable_target(image, base + 12)
+    assert is_plausible_vtable_target(image, base + 16)
+    # Old "last plausible anywhere" would return 12; contiguous prefix stops at 4.
+    assert effective_orig_vtable_size(image, base, len(table)) == 4

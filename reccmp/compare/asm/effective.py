@@ -38,6 +38,7 @@ from typing import Callable
 
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.ir import AsmRole
 from reccmp.compare.asm.model import (  # noqa: F401 — re-export for callers
     Instruction,
     REGISTERS,
@@ -3235,11 +3236,16 @@ def _extract_switch_tables(
     asm: list[str],
     kinds: list[str],
     addrs: list[int | None] | None,
+    roles: list[AsmRole] | None = None,
 ) -> tuple[dict[int, list[int]], set[int]] | None:
     """Map recognized switch jmps to case destination indices.
 
     Returns ``(jmp_index -> dest line indices, owned data line indices)``.
     ``None`` means a candidate table could not be resolved conservatively.
+
+    A table is recognized when a switch jmp is followed by a jump-table header
+    (display ``Jump table:`` and/or ``AsmRole.JUMP_TABLE_HEADER``) and then
+    contiguous ``start + …`` entry lines (and/or ``AsmRole.JUMP_TABLE_ENTRY``).
     """
     # pylint: disable=too-many-locals
     total = len(asm)
@@ -3255,13 +3261,25 @@ def _extract_switch_tables(
                 func_start = addr
             addr_index.setdefault(addr, i)
 
+    def _is_table_header(index: int) -> bool:
+        if roles is not None and len(roles) == total:
+            if roles[index] == AsmRole.JUMP_TABLE_HEADER:
+                return True
+        return asm[index] == "Jump table:"
+
+    def _is_table_entry(index: int) -> bool:
+        if roles is not None and len(roles) == total:
+            if roles[index] == AsmRole.JUMP_TABLE_ENTRY:
+                return True
+        return JUMP_TABLE_ENTRY_RE.match(asm[index]) is not None
+
     i = 0
     while i < total:
         if kinds[i] == "jmp" and _is_recognized_switch_jmp(asm[i]):
-            if i + 1 < total and asm[i + 1] == "Jump table:":
+            if i + 1 < total and _is_table_header(i + 1):
                 entries: list[int] = []
                 j = i + 2
-                while j < total and JUMP_TABLE_ENTRY_RE.match(asm[j]):
+                while j < total and _is_table_entry(j):
                     entries.append(j)
                     j += 1
                 if entries:
@@ -3270,7 +3288,8 @@ def _extract_switch_tables(
                     dests: list[int] = []
                     for entry_i in entries:
                         match = JUMP_TABLE_ENTRY_RE.match(asm[entry_i])
-                        assert match is not None
+                        if match is None:
+                            return None
                         dest_va = func_start + int(match.group(1), 16)
                         dest_i = addr_index.get(dest_va)
                         if dest_i is None:
@@ -3336,12 +3355,15 @@ def _build_side_cfg(
     recorder: AnalysisRecorder | None = None,
     side: str = "orig",
     addrs: list[int | None] | None = None,
+    roles: list[AsmRole] | None = None,
 ) -> _SideCfg | None:
     """One side's basic-block structure, or None when the shape is outside
     this verifier's model (unrecognized jump/data tables, invalid targets).
 
     Recognized ``jmp [idx*4 + table]`` + ``Jump table:`` / ``start + …``
     sequences become ``caseN`` CFG edges; other table/data lines still bail.
+    Optional ``roles`` (``AsmRole``) strengthens header/entry detection when
+    display text alone is ambiguous.
     """
     # pylint: disable=too-many-branches,too-many-locals,too-many-return-statements
     total = len(asm)
@@ -3368,7 +3390,7 @@ def _build_side_cfg(
         )
         return None
     kinds = [_control_kind(line) for line in asm]
-    extracted = _extract_switch_tables(asm, kinds, addrs)
+    extracted = _extract_switch_tables(asm, kinds, addrs, roles=roles)
     if extracted is None:
         first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
         _mark_side_inconclusive(
@@ -4068,6 +4090,8 @@ def verify_isomorphic_cfg_effective_match(
     similarity: _SemanticSimilarityRecorder | None = None,
     orig_addrs: list[int | None] | None = None,
     recomp_addrs: list[int | None] | None = None,
+    orig_roles: list[AsmRole] | None = None,
+    recomp_roles: list[AsmRole] | None = None,
 ) -> bool:
     """CFG verification that tolerates different instruction counts:
     per-side block graphs matched structurally, block contents aligned
@@ -4082,7 +4106,12 @@ def verify_isomorphic_cfg_effective_match(
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     cfg_o = _build_side_cfg(
-        orig_asm, orig_targets, recorder=recorder, side="orig", addrs=orig_addrs
+        orig_asm,
+        orig_targets,
+        recorder=recorder,
+        side="orig",
+        addrs=orig_addrs,
+        roles=orig_roles,
     )
     cfg_r = _build_side_cfg(
         recomp_asm,
@@ -4090,6 +4119,7 @@ def verify_isomorphic_cfg_effective_match(
         recorder=recorder,
         side="recomp",
         addrs=recomp_addrs,
+        roles=recomp_roles,
     )
     if cfg_o is None or cfg_r is None:
         return False

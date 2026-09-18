@@ -43,7 +43,8 @@ from reccmp.compare.inlines import (
     InlineHit,
     InlineLayoutResult,
     analyze_inline_layout,
-    asm_fingerprint_from_lines,
+    asm_fingerprint_from_ir,
+    fingerprint_from_asm,
     find_inline_expansions,
     strip_helper_epilog,
     summarize_helper_effects,
@@ -312,18 +313,19 @@ class FunctionComparator:
             or not isinstance(facts.get("displacement"), int)
         ):
             return {}
+        if not self.source_index.has_layout(class_name):
+            return {}
         displacement = facts["displacement"]
         assert isinstance(displacement, int)
-        field = self.source_index.field_at(class_name, displacement)
-        if field is None or field.offset is None:
+        resolved = self.source_index.resolve_field(class_name, displacement)
+        if resolved is None:
             return {}
-        path = self.source_index.field_path_at(class_name, displacement)
         return {
-            "class_name": class_name,
-            "field_name": field.name,
-            "field_offset": field.offset,
-            "field_type": field.type,
-            "field_path": path or field.name,
+            "class_name": resolved.root_class,
+            "field_name": resolved.leaf.name,
+            "field_offset": resolved.absolute_offset,
+            "field_type": resolved.leaf.type,
+            "field_path": ".".join(resolved.path) or resolved.leaf.name,
         }
 
     def _enrich_analysis_with_source(
@@ -535,7 +537,7 @@ class FunctionComparator:
             cache[entity.orig_addr] = None
             return None
         excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-        fingerprint = asm_fingerprint_from_lines(excerpt_displays(excerpt))
+        fingerprint = asm_fingerprint_from_ir(excerpt)
         needle = strip_helper_epilog(fingerprint)
         if len(needle) < 3:
             cache[entity.orig_addr] = None
@@ -640,14 +642,14 @@ class FunctionComparator:
     def _analyze_inline_expansions(
         self,
         match: ReccmpMatch,
-        orig_asm: list[str],
-        recomp_asm: list[str],
+        orig_asm: AsmExcerpt,
+        recomp_asm: AsmExcerpt,
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
         from reccmp.compare.inlines import find_call_sites
 
-        orig_fp = asm_fingerprint_from_lines(orig_asm)
-        recomp_fp = asm_fingerprint_from_lines(recomp_asm)
+        orig_fp = fingerprint_from_asm(orig_asm)
+        recomp_fp = fingerprint_from_asm(recomp_asm)
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}
         for fingerprint in (orig_fp, recomp_fp):
             for _index, identities in find_call_sites(fingerprint):
@@ -1136,7 +1138,11 @@ class FunctionComparator:
 
         ratio = diff.ratio()
         opcodes = diff.get_opcodes()
-        if ratio == 1.0:
+        # IR-key equality alone is not EXACT when either side used opaque or
+        # unknown-size operands — unless display strings match end-to-end.
+        operands_complete = all(row.operand_model_complete for row in (*orig, *recomp))
+        displays_match = orig_asm == recomp_asm
+        if ratio == 1.0 and (operands_complete or displays_match):
             analysis = ComparisonAnalysis.exact()
         else:
             if metadata is None and match is not None:
@@ -1164,7 +1170,7 @@ class FunctionComparator:
 
         inline_layout = None
         if ratio < 1.0 and match is not None and not analysis.is_effective:
-            inline_layout = self._analyze_inline_expansions(match, orig_asm, recomp_asm)
+            inline_layout = self._analyze_inline_expansions(match, orig, recomp)
 
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
             result = EntityCompareResult(

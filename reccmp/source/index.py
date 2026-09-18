@@ -27,10 +27,11 @@ from reccmp.parser.marker import MarkerType, ProjectAliases
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v4"
+_SCHEMA = "reccmp-source-index-v5"
 _SUPPORTED_SCHEMAS = frozenset(
     {
         _SCHEMA,
+        "reccmp-source-index-v4",
         "reccmp-source-index-v3",
         "reccmp-source-index-v2",
     }
@@ -154,6 +155,21 @@ class SourceClass:
     size: int | None = None
     alignment: int | None = None
     base_offsets: tuple[SourceBaseOffset, ...] = ()
+    # True when Clang layout is present and consistent across observations;
+    # False on layout conflict or asserted_size mismatch; None when unknown.
+    layout_trusted: bool | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedField:
+    """A byte offset resolved to a leaf field within a class hierarchy."""
+
+    root_class: str
+    path: tuple[str, ...]
+    leaf: SourceField
+    absolute_offset: int
+    relative_offset: int  # within leaf storage
+    base_chain: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -303,16 +319,16 @@ def derive_namespace(
         record_kind="variable",
         target=target,
     )
-    derived_classes = _derive_classes(classes, target=target)
+    derived_classes, class_conflicts = _derive_classes(classes, target=target)
     size_assertions = _derive_size_assertions(assertions)
     return _NamespaceRecords(
         declarations=derived_declarations,
         variables=derived_variables,
         classes=tuple(
-            replace(item, asserted_size=size_assertions.get(item.qualified_name))
+            _apply_asserted_size(item, size_assertions.get(item.qualified_name))
             for item in derived_classes
         ),
-        conflicts=declaration_conflicts + variable_conflicts,
+        conflicts=declaration_conflicts + variable_conflicts + class_conflicts,
         size_assertions=size_assertions,
     )
 
@@ -395,17 +411,112 @@ def _derive_entities(
     return tuple(winners), tuple(conflicts)
 
 
+def _layout_identity(source_class: SourceClass) -> tuple:
+    """Fingerprint of Clang layout facts used for cross-TU consistency."""
+    return (
+        source_class.size,
+        source_class.alignment,
+        tuple(
+            (
+                field.name,
+                field.type,
+                field.offset,
+                field.size,
+                field.bitfield_width,
+                field.bitfield_offset,
+            )
+            for field in source_class.fields
+        ),
+        tuple((base.name, base.offset) for base in source_class.base_offsets),
+    )
+
+
+def _has_layout_evidence(source_class: SourceClass) -> bool:
+    return (
+        source_class.size is not None
+        or source_class.alignment is not None
+        or bool(source_class.base_offsets)
+        or any(field.offset is not None for field in source_class.fields)
+    )
+
+
+def _layout_identity_signature(identity: tuple) -> tuple[str, ...]:
+    """Flatten a layout identity into a conflict-variant signature."""
+    size, alignment, fields, base_offsets = identity
+    parts = [f"size={size}", f"align={alignment}"]
+    for name, type_name, offset, field_size, bit_width, bit_offset in fields:
+        parts.append(
+            f"field:{name}:{type_name}:{offset}:{field_size}:{bit_width}:{bit_offset}"
+        )
+    for name, offset in base_offsets:
+        parts.append(f"base:{name}:{offset}")
+    return tuple(parts)
+
+
+def _apply_asserted_size(
+    source_class: SourceClass, asserted_size: int | None
+) -> SourceClass:
+    updated = replace(source_class, asserted_size=asserted_size)
+    if (
+        updated.size is not None
+        and asserted_size is not None
+        and updated.size != asserted_size
+    ):
+        return replace(updated, layout_trusted=False)
+    return updated
+
+
 def _derive_classes(
     observations: Sequence[SourceClass], *, target: str | None
-) -> tuple[SourceClass, ...]:
-    best: dict[str, SourceClass] = {}
+) -> tuple[tuple[SourceClass, ...], tuple[SourceConflict, ...]]:
+    groups: dict[str, list[SourceClass]] = {}
     for item in observations:
-        previous = best.get(item.semantic_id)
-        if previous is None or (not previous.line and item.line):
-            best[item.semantic_id] = (
-                replace(item, target=target) if target is not None else item
+        groups.setdefault(item.semantic_id, []).append(item)
+
+    winners: list[SourceClass] = []
+    conflicts: list[SourceConflict] = []
+    for group in groups.values():
+        winner = group[0]
+        for item in group[1:]:
+            if not winner.line and item.line:
+                winner = item
+
+        variants: dict[tuple, list[str]] = {}
+        for item in group:
+            identity = _layout_identity(item)
+            location = f"{item.source_file}:{item.line}"
+            variants.setdefault(identity, [])
+            if location not in variants[identity]:
+                variants[identity].append(location)
+
+        layout_trusted: bool | None = None
+        if len(variants) > 1:
+            layout_trusted = False
+            sample = group[0]
+            conflicts.append(
+                SourceConflict(
+                    semantic_id=sample.semantic_id,
+                    qualified_name=sample.qualified_name,
+                    record_kind="class_layout",
+                    variants=tuple(
+                        SourceConflictVariant(
+                            signature=_layout_identity_signature(identity),
+                            locations=tuple(locations),
+                        )
+                        for identity, locations in variants.items()
+                    ),
+                    target=target,
+                )
             )
-    return tuple(best.values())
+        elif _has_layout_evidence(winner):
+            layout_trusted = True
+
+        if target is not None:
+            winner = replace(winner, target=target, layout_trusted=layout_trusted)
+        else:
+            winner = replace(winner, layout_trusted=layout_trusted)
+        winners.append(winner)
+    return tuple(winners), tuple(conflicts)
 
 
 def _derive_size_assertions(assertions: Sequence[_SizeAssertion]) -> dict[str, int]:
@@ -543,6 +654,7 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
             SourceBaseOffset(name=str(item["name"]), offset=int(item["offset"]))
             for item in values.get("base_offsets") or ()
         ),
+        layout_trusted=values.get("layout_trusted"),
     )
 
 
@@ -707,45 +819,65 @@ class SourceIndex:
         return self._classes_by_name.get(qualified_name)
 
     def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
-        """Field covering ``offset`` bytes within the class (layout must be known).
+        """Leaf field covering ``offset`` bytes within the class layout."""
+        resolved = self.resolve_field(qualified_name, offset)
+        return resolved.leaf if resolved is not None else None
 
-        A field matches when ``offset <= target < offset + size``. Unknown-size
-        fields match only at their exact offset. Base subobjects are searched
-        recursively. Padding / out-of-range offsets return ``None``.
-        """
-        source_class = self._classes_by_name.get(qualified_name)
-        if source_class is None:
+    def field_path_at(self, qualified_name: str, offset: int) -> str | None:
+        """Dotted field path for a byte offset, including base subobjects."""
+        resolved = self.resolve_field(qualified_name, offset)
+        if resolved is None:
             return None
+        return ".".join(resolved.path) if resolved.path else resolved.leaf.name
 
-        best: SourceField | None = None
+    def resolve_field(self, qualified_name: str, offset: int) -> ResolvedField | None:
+        """Resolve ``offset`` to a leaf field with absolute hierarchy offsets.
+
+        Overlapping bitfields at the same byte return ``None`` — byte-level
+        queries cannot pick a unique leaf without bit-position information.
+        """
+        return self._resolve_field(
+            qualified_name,
+            offset,
+            root_class=qualified_name,
+            base_chain=(),
+            path_prefix=(),
+            abs_base=0,
+        )
+
+    def _bitfields_covering(
+        self, source_class: SourceClass, offset: int
+    ) -> list[SourceField]:
+        covering: list[SourceField] = []
         for item in source_class.fields:
-            if item.offset is None:
+            if item.bitfield_width is None or item.offset is None:
                 continue
             if item.size is None:
                 covers = item.offset == offset
             else:
                 covers = item.offset <= offset < item.offset + item.size
-            if covers and (best is None or (item.offset or 0) > (best.offset or -1)):
-                best = item
-        if best is not None:
-            return best
+            if covers:
+                covering.append(item)
+        return covering
 
-        for base in source_class.base_offsets:
-            if offset < base.offset:
-                continue
-            nested_name = strip_type_qualifiers(base.name)
-            found = self.field_at(nested_name, offset - base.offset)
-            if found is not None:
-                return found
-        return None
-
-    def field_path_at(self, qualified_name: str, offset: int) -> str | None:
-        """Dotted field path for a byte offset, including base subobjects."""
+    def _resolve_field(
+        self,
+        qualified_name: str,
+        offset: int,
+        *,
+        root_class: str,
+        base_chain: tuple[str, ...],
+        path_prefix: tuple[str, ...],
+        abs_base: int,
+    ) -> ResolvedField | None:
         source_class = self._classes_by_name.get(qualified_name)
         if source_class is None:
             return None
 
-        # Prefer a direct field covering this offset.
+        # Ambiguous bitfield packing: refuse a byte-level answer.
+        if len(self._bitfields_covering(source_class, offset)) > 1:
+            return None
+
         for item in source_class.fields:
             if item.offset is None:
                 continue
@@ -757,33 +889,59 @@ class SourceIndex:
                 continue
             remaining = offset - item.offset
             nested = strip_type_qualifiers(item.type)
-            if remaining == 0 or nested not in self._classes_by_name:
-                if remaining:
-                    return f"{item.name}+{remaining:#x}"
-                return item.name
-            nested_path = self.field_path_at(nested, remaining)
-            if nested_path is None:
-                return f"{item.name}+{remaining:#x}"
-            return f"{item.name}.{nested_path}"
+            absolute = abs_base + item.offset
+            path = path_prefix + (item.name,)
+            if nested in self._classes_by_name:
+                nested_resolved = self._resolve_field(
+                    nested,
+                    remaining,
+                    root_class=root_class,
+                    base_chain=base_chain,
+                    path_prefix=path,
+                    abs_base=absolute,
+                )
+                if nested_resolved is not None:
+                    return nested_resolved
+            return ResolvedField(
+                root_class=root_class,
+                path=path,
+                leaf=item,
+                absolute_offset=absolute,
+                relative_offset=remaining,
+                base_chain=base_chain,
+            )
 
-        # Otherwise descend into a base subobject.
         for base in source_class.base_offsets:
             if offset < base.offset:
                 continue
             nested_name = strip_type_qualifiers(base.name)
-            nested_path = self.field_path_at(nested_name, offset - base.offset)
-            if nested_path is None:
-                continue
             base_label = nested_name.rsplit("::", 1)[-1]
-            return f"{base_label}.{nested_path}"
+            found = self._resolve_field(
+                nested_name,
+                offset - base.offset,
+                root_class=root_class,
+                base_chain=base_chain + (nested_name,),
+                path_prefix=path_prefix + (base_label,),
+                abs_base=abs_base + base.offset,
+            )
+            if found is not None:
+                return found
         return None
 
     def has_layout(self, qualified_name: str) -> bool:
-        """True when the class carries Clang ASTRecordLayout field offsets."""
+        """True when trusted Clang layout evidence is available for the class."""
         source_class = self._classes_by_name.get(qualified_name)
         if source_class is None:
             return False
-        return any(field.offset is not None for field in source_class.fields)
+        return (
+            source_class.layout_trusted is not False
+            and source_class.size is not None
+            and (
+                any(field.offset is not None for field in source_class.fields)
+                or bool(source_class.base_offsets)
+                or source_class.alignment is not None
+            )
+        )
 
     @classmethod
     def from_units(

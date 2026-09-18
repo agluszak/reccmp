@@ -73,19 +73,32 @@ def _reg_operand(name: str):
     return ("sym", name)
 
 
-def _mem_size_name(mnemonic: str, size: int) -> str:
-    # Capstone omits the size keyword for lea; match that in structured form.
+def _mem_size_name(mnemonic: str, size: int) -> tuple[str, bool]:
+    """Return ``(size_token, size_known)`` for a memory operand.
+
+    Capstone omits the size keyword for lea; match that in structured form.
+    Unknown sizes stay distinct (``size{N}``) so they cannot collapse together.
+    """
     if mnemonic == "lea":
-        return ""
-    return _SIZE_NAMES.get(size, "")
+        return "", True
+    known = _SIZE_NAMES.get(size)
+    if known is not None:
+        return known, True
+    return f"size{size}", False
 
 
-def capstone_operand(insn, op, mnemonic: str):
-    """Convert one Capstone operand to the ``parse_operand`` tuple shape."""
+def capstone_operand(
+    insn, op, mnemonic: str, operand_index: int
+) -> tuple[object, bool]:
+    """Convert one Capstone operand to the ``parse_operand`` tuple shape.
+
+    Returns ``(operand, model_complete)``. Unsupported kinds become unique
+    opaque tuples so distinct unknowns cannot share match keys.
+    """
     if op.type == x86_const.X86_OP_REG:
-        return _reg_operand(insn.reg_name(op.reg))
+        return _reg_operand(insn.reg_name(op.reg)), True
     if op.type == x86_const.X86_OP_IMM:
-        return ("imm", int(op.imm))
+        return ("imm", int(op.imm)), True
     if op.type == x86_const.X86_OP_MEM:
         mem = op.mem
         reg_terms: list[tuple[str, int]] = []
@@ -94,16 +107,20 @@ def capstone_operand(insn, op, mnemonic: str):
         if mem.index:
             reg_terms.append((insn.reg_name(mem.index), int(mem.scale)))
         seg = insn.reg_name(mem.segment) if mem.segment else ""
+        size_name, size_known = _mem_size_name(mnemonic, op.size)
         return (
-            "mem",
-            _mem_size_name(mnemonic, op.size),
-            seg or "",
-            reg_terms,
-            int(mem.disp),
-            (),
+            (
+                "mem",
+                size_name,
+                seg or "",
+                reg_terms,
+                int(mem.disp),
+                (),
+            ),
+            size_known,
         )
-    # Rare / unsupported (e.g. invalid): fall back to opaque symbol.
-    return ("sym", "?")
+    # Rare / unsupported (e.g. invalid): keep a unique opaque identity.
+    return ("opaque", op.type, str(insn.op_str), operand_index), False
 
 
 def from_capstone(insn) -> DecodedInstruction:
@@ -133,7 +150,17 @@ def from_capstone(insn) -> DecodedInstruction:
 
     prefix, mnemonic = split_mnemonic_prefix(insn.mnemonic)
     # Use the post-split mnemonic for lea size omission etc.
-    operands = tuple(capstone_operand(insn, op, mnemonic) for op in cs_operands)
+    decoded_ops = [
+        capstone_operand(insn, op, mnemonic, index)
+        for index, op in enumerate(cs_operands)
+    ]
+    operands = tuple(operand for operand, _complete in decoded_ops)
+    operand_model_complete = all(complete for _operand, complete in decoded_ops)
+    # Opaque operands mean jump/call targets are not fully modeled.
+    control_flow_known = all(
+        not (isinstance(operand, tuple) and operand and operand[0] == "opaque")
+        for operand in operands
+    )
     raw_operands = tuple(format_operand(op) for op in operands)
 
     # Preserve Capstone's own display text (including combined rep mnemonic).
@@ -163,6 +190,8 @@ def from_capstone(insn) -> DecodedInstruction:
         is_ret=insn.group(CS_GRP_RET),
         branch_target=branch_target,
         register_access_known=register_access_known,
+        operand_model_complete=operand_model_complete,
+        control_flow_known=control_flow_known,
         raw_op_str=insn.op_str,
     )
 

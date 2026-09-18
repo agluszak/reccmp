@@ -9,14 +9,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Hashable, Literal, Sequence
+from typing import Callable, Hashable, Literal, Sequence, Union
 
+from reccmp.compare.asm.ir import AsmRole, DecodedInstruction
+from reccmp.compare.asm.model import (
+    REGISTERS,
+    Reject,
+    format_operand,
+    parse_instruction,
+)
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 Fingerprint = tuple[tuple[str, str], ...]
 FingerprintFn = Callable[[int, int], Fingerprint | None]
 Counterpart = Literal["call", "inline", "absent"]
 InlineSide = Literal["orig", "recomp", "both"]
+MatchKind = Literal["literal", "register", "summary"]
+AsmInput = Union[Sequence[str], Sequence[DecodedInstruction]]
 
 # Trailing opcodes that belong to a standalone helper epilog, not an inline site.
 _EPILOG_MNEMONICS = frozenset({"ret", "retn", "retf"})
@@ -376,6 +385,153 @@ def asm_fingerprint_from_lines(lines: Sequence[str]) -> Fingerprint:
     return tuple(result)
 
 
+def asm_fingerprint_from_ir(rows: Sequence[DecodedInstruction]) -> Fingerprint:
+    """Build a fingerprint from structured IR operands (not display splits).
+
+    Table markers (``AsmRole`` non-CODE) are skipped. Operand text is rendered
+    from the typed Capstone/sanitizer tuples via ``format_operand``.
+    """
+    result: list[tuple[str, str]] = []
+    for row in rows:
+        if row.role != AsmRole.CODE:
+            continue
+        mnemonic = (
+            f"{row.prefix} {row.mnemonic}".strip() if row.prefix else row.mnemonic
+        )
+        if not mnemonic:
+            continue
+        if row.operands:
+            try:
+                operand = ", ".join(format_operand(op) for op in row.operands)
+            except Reject:
+                operand = ", ".join(row.raw_operands) if row.raw_operands else ""
+        else:
+            operand = ""
+        result.append((mnemonic, operand))
+    return tuple(result)
+
+
+def fingerprint_from_asm(asm: AsmInput) -> Fingerprint:
+    """Prefer IR fingerprints when ``DecodedInstruction`` rows are available."""
+    if asm and isinstance(asm[0], DecodedInstruction):
+        return asm_fingerprint_from_ir(asm)  # type: ignore[arg-type]
+    return asm_fingerprint_from_lines(asm)  # type: ignore[arg-type]
+
+
+def _canon_reg_family(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
+    """Map a GP register to a stable ``(placeholder, width)`` slot, or None."""
+    info = REGISTERS.get(name)
+    if info is None:
+        return None
+    family, width = info
+    if family not in mapping:
+        mapping[family] = f"R{len(mapping)}"
+    return mapping[family], width
+
+
+def _rename_structured_operand(operand, mapping: dict[str, str]):
+    if not isinstance(operand, tuple) or not operand:
+        return operand
+    kind = operand[0]
+    if kind == "reg":
+        renamed = _canon_reg_family(operand[1], mapping)
+        if renamed is None:
+            return operand
+        placeholder, width = renamed
+        return ("sym", f"{placeholder}.{width}")
+    if kind == "mem":
+        size, seg, reg_terms, disp, syms = (
+            operand[1],
+            operand[2],
+            operand[3],
+            operand[4],
+            operand[5],
+        )
+        new_terms = []
+        for reg, scale in reg_terms:
+            renamed = _canon_reg_family(reg, mapping)
+            if renamed is None:
+                new_terms.append((reg, scale))
+            else:
+                placeholder, width = renamed
+                new_terms.append((f"{placeholder}.{width}", scale))
+        return ("mem", size, seg, tuple(new_terms), disp, syms)
+    return operand
+
+
+def register_normalized_fingerprint(fingerprint: Fingerprint) -> Fingerprint:
+    """Rewrite GP registers to occurrence-ordered placeholders (R0.r32, …).
+
+    Used as a second-level span key when the literal IR fingerprint misses.
+    Relative register identity is preserved; absolute names are not.
+    """
+    mapping: dict[str, str] = {}
+    result: list[tuple[str, str]] = []
+    for mnemonic, operand in fingerprint:
+        line = f"{mnemonic} {operand}".rstrip() if operand else f"{mnemonic} "
+        try:
+            ins = parse_instruction(line)
+        except (Reject, IndexError, KeyError, ValueError, TypeError):
+            result.append((mnemonic, operand))
+            continue
+        new_ops = tuple(_rename_structured_operand(op, mapping) for op in ins.operands)
+        head = f"{ins.prefix} {ins.mnemonic}".strip() if ins.prefix else ins.mnemonic
+        try:
+            op_text = ", ".join(format_operand(op) for op in new_ops) if new_ops else ""
+        except Reject:
+            op_text = operand
+        result.append((head, op_text))
+    return tuple(result)
+
+
+def find_fingerprint_spans_tolerant(
+    haystack: Fingerprint, needle: Fingerprint
+) -> tuple[list[int], MatchKind]:
+    """Literal span search, then per-window register-normalized fallback.
+
+    Register slots are renumbered independently for each candidate window so
+    surrounding host instructions do not shift placeholder indices.
+    """
+    starts = find_fingerprint_spans(haystack, needle)
+    if starts:
+        return starts, "literal"
+    n = len(needle)
+    if n == 0 or n > len(haystack):
+        return [], "literal"
+    norm_needle = register_normalized_fingerprint(needle)
+    norm_starts: list[int] = []
+    for start in range(len(haystack) - n + 1):
+        window = haystack[start : start + n]
+        if register_normalized_fingerprint(window) == norm_needle:
+            norm_starts.append(start)
+    if norm_starts:
+        return norm_starts, "register"
+    return [], "literal"
+
+
+def _span_match_kind(
+    host_fp: Fingerprint,
+    needle: Fingerprint,
+    span: tuple[int, int],
+    *,
+    helper_summary: HelperEffectSummary | None,
+) -> MatchKind:
+    """Classify how ``needle`` relates to ``host_fp[span]``."""
+    offset, length = span
+    host_slice = host_fp[offset : offset + length]
+    if host_slice == needle:
+        return "literal"
+    if register_normalized_fingerprint(host_slice) == register_normalized_fingerprint(
+        needle
+    ):
+        return "register"
+    if helper_summary is not None:
+        host_summary = summarize_helper_effects(host_slice)
+        if host_summary is not None and host_summary == helper_summary:
+            return "summary"
+    return "literal"
+
+
 def find_call_sites(
     fingerprint: Fingerprint,
 ) -> list[tuple[int, set[str]]]:
@@ -457,15 +613,18 @@ def _evidence_confidence(
     span: tuple[int, int] | None,
     *,
     call_backed: bool,
+    match_kind: MatchKind = "literal",
 ) -> tuple[float, bool]:
-    """Confidence from uniqueness/size; semantic only when CALL-backed + summary.
+    """Confidence from uniqueness/size; semantic only for non-literal matches.
 
-    Do not boost confidence merely because a fingerprint-matched span
-    re-summarizes to the same effects as the helper needle — that is vacuous.
+    ``semantic=True`` means the sequences differ at the literal fingerprint
+    level but still match via register-normalized fingerprints or equal effect
+    summaries. Exact literal fingerprint hits are never marked semantic —
+    re-summarizing an identical needle is vacuous.
     """
     del span  # fingerprint identity already established by the caller
     confidence = _inline_confidence(helper, len(host_fp), call_backed=call_backed)
-    semantic = call_backed and helper.effect_summary is not None
+    semantic = match_kind in ("register", "summary")
     return confidence, semantic
 
 
@@ -513,6 +672,7 @@ class _Pairing:
     orig_call: int | None
     recomp_call: int | None
     confidence: float
+    match_kind: MatchKind = "literal"
 
     @property
     def kind(self) -> str:
@@ -526,16 +686,20 @@ class _Pairing:
 
 
 def analyze_inline_layout(
-    orig_asm: Sequence[str],
-    recomp_asm: Sequence[str],
+    orig_asm: AsmInput,
+    recomp_asm: AsmInput,
     helpers: Sequence[HelperCatalogEntry],
     *,
     min_helper_ops: int = 3,
     exclude_orig_addrs: Sequence[int] = (),
 ) -> InlineLayoutResult:
-    """Detect CALL↔inline asymmetries; handle every occurrence of each helper."""
-    orig_fp = asm_fingerprint_from_lines(orig_asm)
-    recomp_fp = asm_fingerprint_from_lines(recomp_asm)
+    """Detect CALL↔inline asymmetries; handle every occurrence of each helper.
+
+    Accepts sanitized display lines or ``DecodedInstruction`` excerpts; IR is
+    preferred when available.
+    """
+    orig_fp = fingerprint_from_asm(orig_asm)
+    recomp_fp = fingerprint_from_asm(recomp_asm)
     if not orig_fp or not recomp_fp:
         return InlineLayoutResult()
 
@@ -551,8 +715,14 @@ def analyze_inline_layout(
         if len(needle) >= max(len(orig_fp), len(recomp_fp)):
             continue
 
-        orig_starts = find_fingerprint_spans(orig_fp, needle)
-        recomp_starts = find_fingerprint_spans(recomp_fp, needle)
+        orig_starts, orig_kind = find_fingerprint_spans_tolerant(orig_fp, needle)
+        recomp_starts, recomp_kind = find_fingerprint_spans_tolerant(recomp_fp, needle)
+        # Worst (most semantic) kind across sides for the body hits.
+        body_kind: MatchKind = (
+            "register"
+            if "register" in (orig_kind, recomp_kind)
+            else ("summary" if "summary" in (orig_kind, recomp_kind) else "literal")
+        )
         orig_calls = find_call_indices_for_helper(orig_fp, helper)
         recomp_calls = find_call_indices_for_helper(recomp_fp, helper)
 
@@ -566,6 +736,7 @@ def analyze_inline_layout(
                     None,
                     None,
                     _inline_confidence(helper, len(orig_fp), call_backed=False),
+                    match_kind=body_kind,
                 )
             )
 
@@ -574,14 +745,19 @@ def analyze_inline_layout(
         for i, start in enumerate(remaining_orig):
             if i >= len(recomp_calls):
                 break
+            span = (start, len(needle))
+            kind = _span_match_kind(
+                orig_fp, needle, span, helper_summary=helper.effect_summary
+            )
             pairings.append(
                 _Pairing(
                     helper,
-                    (start, len(needle)),
+                    span,
                     None,
                     None,
                     recomp_calls[i],
                     _inline_confidence(helper, len(orig_fp), call_backed=True),
+                    match_kind=kind,
                 )
             )
 
@@ -590,14 +766,19 @@ def analyze_inline_layout(
         for i, start in enumerate(remaining_recomp):
             if i >= len(orig_calls):
                 break
+            span = (start, len(needle))
+            kind = _span_match_kind(
+                recomp_fp, needle, span, helper_summary=helper.effect_summary
+            )
             pairings.append(
                 _Pairing(
                     helper,
                     None,
-                    (start, len(needle)),
+                    span,
                     orig_calls[i],
                     None,
                     _inline_confidence(helper, len(recomp_fp), call_backed=True),
+                    match_kind=kind,
                 )
             )
 
@@ -672,6 +853,7 @@ def analyze_inline_layout(
                 orig_fp,
                 pairing.orig_span,
                 call_backed=False,
+                match_kind=pairing.match_kind,
             )
             expansions.append(
                 InlineExpansionEvidence(
@@ -702,6 +884,7 @@ def analyze_inline_layout(
                 orig_fp,
                 pairing.orig_span,
                 call_backed=True,
+                match_kind=pairing.match_kind,
             )
             expansions.append(
                 InlineExpansionEvidence(
@@ -732,6 +915,7 @@ def analyze_inline_layout(
                 recomp_fp,
                 pairing.recomp_span,
                 call_backed=True,
+                match_kind=pairing.match_kind,
             )
             expansions.append(
                 InlineExpansionEvidence(

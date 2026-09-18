@@ -61,6 +61,11 @@ class DecodedInstruction:
     # False when Capstone could not report register access (CsError). Empty
     # regs_read/regs_written then means "unknown", not "touches nothing".
     register_access_known: bool = True
+    # False when any operand is opaque or has an unknown memory size — match
+    # keys must not be treated as a complete semantic model of the instruction.
+    operand_model_complete: bool = True
+    # False when jump/call target modeling is incomplete (e.g. opaque operands).
+    control_flow_known: bool = True
     # Unsanitized Capstone op_str (useful for debug / jump-table discovery).
     raw_op_str: str = ""
 
@@ -149,6 +154,8 @@ def from_effective(
             is_ret=getattr(meta, "is_ret", False),
             branch_target=getattr(meta, "branch_target", None),
             register_access_known=getattr(meta, "register_access_known", True),
+            operand_model_complete=getattr(meta, "operand_model_complete", True),
+            control_flow_known=getattr(meta, "control_flow_known", True),
         )
     return DecodedInstruction(**kwargs)
 

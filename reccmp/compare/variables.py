@@ -257,6 +257,67 @@ class VariableComparator:
             return var.name
         return None
 
+    def _source_layout_members(
+        self, type_name: str, data_size: int
+    ) -> list[tuple[DataOffset, int]] | None:
+        """Build ``(DataOffset, size)`` rows from trusted Clang layout.
+
+        Used when PDB cannot provide a typed format string (``raw_only``).
+        Returns ``None`` when layout is missing or untrusted so callers fall
+        back to byte-wise raw comparison.
+        """
+        if self.source_index is None or not self.source_index.has_layout(type_name):
+            return None
+        members: list[tuple[DataOffset, int]] = []
+        offset = 0
+        while offset < data_size:
+            resolved = self.source_index.resolve_field(type_name, offset)
+            if resolved is None or resolved.relative_offset != 0:
+                members.append((DataOffset(offset=offset, name="", pointer=False), 1))
+                offset += 1
+                continue
+            leaf = resolved.leaf
+            size = leaf.size
+            if size is None or size <= 0:
+                members.append((DataOffset(offset=offset, name="", pointer=False), 1))
+                offset += 1
+                continue
+            is_pointer = (leaf.pointer_depth or 0) > 0
+            if is_pointer:
+                size = 4  # 32-bit targets
+            # Do not overrun the variable extent.
+            if resolved.absolute_offset + size > data_size:
+                size = data_size - resolved.absolute_offset
+            if size <= 0:
+                break
+            path = ".".join(resolved.path) if resolved.path else leaf.name
+            members.append(
+                (
+                    DataOffset(
+                        offset=resolved.absolute_offset,
+                        name=path,
+                        pointer=is_pointer,
+                    ),
+                    size,
+                )
+            )
+            offset = resolved.absolute_offset + size
+        return members or None
+
+    @staticmethod
+    def _unpack_layout_members(
+        data: bytes, members: list[tuple[DataOffset, int]]
+    ) -> tuple:
+        values: list[int] = []
+        for item, size in members:
+            chunk = data[item.offset : item.offset + size]
+            if len(chunk) < size:
+                raise StructError(
+                    f"short read at offset {item.offset:#x} need {size} got {len(chunk)}"
+                )
+            values.append(int.from_bytes(chunk, "little"))
+        return tuple(values)
+
     def _member_display_name(
         self, member: DataOffset, type_name: str | None
     ) -> str | None:
@@ -354,15 +415,39 @@ class VariableComparator:
         # Reading from recomp should never fail, so if it does, raising an exception is correct
         recomp_block = DataBlock.read(var.recomp_addr, data_size, self.recomp_bin)
 
+        used_source_layout = False
         if raw_only:
-            # If there is no specific type information available
-            # (i.e. if this is a static or non-public variable)
-            # then we can only compare the raw bytes.
-            compare_items = [
-                DataOffset(offset=i, name="", pointer=False) for i in range(data_size)
-            ]
-            orig_data = tuple(orig_block.data)
-            recomp_data = tuple(recomp_block.data)
+            source_members = (
+                self._source_layout_members(source_type_name, data_size)
+                if source_type_name
+                else None
+            )
+            if source_members is not None:
+                # Trusted Clang layout as an alternate type provider when PDB
+                # cannot materialize a format string.
+                used_source_layout = True
+                compare_items = [item for item, _size in source_members]
+                try:
+                    orig_data = self._unpack_layout_members(
+                        orig_block.data, source_members
+                    )
+                    recomp_data = self._unpack_layout_members(
+                        recomp_block.data, source_members
+                    )
+                except StructError as e:
+                    return create_comparison_item(
+                        var, error=f"Failed to unpack data: {e}"
+                    )
+            else:
+                # If there is no specific type information available
+                # (i.e. if this is a static or non-public variable)
+                # then we can only compare the raw bytes.
+                compare_items = [
+                    DataOffset(offset=i, name="", pointer=False)
+                    for i in range(data_size)
+                ]
+                orig_data = tuple(orig_block.data)
+                recomp_data = tuple(recomp_block.data)
         else:
             assert type_key is not None
             compare_items = [
@@ -410,7 +495,11 @@ class VariableComparator:
             compared.append(
                 ComparedOffset(
                     offset=member.offset,
-                    name=self._member_display_name(member, source_type_name),
+                    name=(
+                        member.name
+                        if used_source_layout and member.name
+                        else self._member_display_name(member, source_type_name)
+                    ),
                     match=match,
                     values=(value_a, value_b),
                 )
@@ -419,5 +508,6 @@ class VariableComparator:
         return create_comparison_item(
             var,
             compared=compared,
-            raw_only=raw_only,
+            # Source-layout typed compare is not "raw only" for reporting.
+            raw_only=raw_only and not used_source_layout,
         )
