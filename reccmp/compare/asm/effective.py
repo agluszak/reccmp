@@ -50,6 +50,8 @@ from reccmp.compare.asm.model import (  # noqa: F401 — re-export for callers
     Instruction,
     REGISTERS,
     Reject,
+    operand_display,
+    operand_identity,
     parse_instruction,
     parse_operand,
     split_operands,
@@ -590,7 +592,7 @@ def _checked_call_registers(ctx: Context, ins: Instruction) -> list[str]:
     abi = None
     if ctx.metadata is not None and ctx.metadata.call_abi is not None:
         if ins.operands and ins.operands[0][0] == "sym":
-            abi = ctx.metadata.call_abi(ins.operands[0][1])
+            abi = ctx.metadata.call_abi(operand_display(ins.operands[0][1]))
     registers = []
     if abi is None or abi.uses_ecx:
         registers.append("ecx")
@@ -832,7 +834,7 @@ def read_operand(state: SideState, ctx: Context, op) -> Value:
     if kind == "imm":
         return ("imm", op[1])
     if kind == "sym":
-        return ("sym", op[1])
+        return ("sym", operand_identity(op[1]))
     if kind == "st":
         return state.x87.read(op[1])
     if kind == "mem":
@@ -1227,7 +1229,7 @@ def execute(
         abi = None
         if ctx.metadata is not None and ctx.metadata.call_abi is not None:
             if ops[0][0] == "sym":
-                abi = ctx.metadata.call_abi(ops[0][1])
+                abi = ctx.metadata.call_abi(operand_display(ops[0][1]))
         target = read_operand(state, ctx, ops[0])
         virtual_target = _canonical_virtual_target(target, ctx)
         entry = ["call", virtual_target or target]
@@ -2909,7 +2911,7 @@ def _obligation_keys(state: _CfgState) -> tuple:
         other = record[0]
         side = "orig" if other is state.orig else "recomp"
         keys.append((side, *record[1:]))
-    return tuple(keys)
+    return tuple(sorted(keys, key=repr))
 
 
 def _unique_obligations(
@@ -3096,8 +3098,18 @@ def _join_states(
         return None
     if _scratch_keys(entry) != _scratch_keys(incoming):
         return None
-    out_o.load_log = entry_o.load_log | in_o.load_log
-    out_r.load_log = entry_r.load_log | in_r.load_log
+    entry_obl = frozenset(_obligation_keys(entry))
+    in_obl = frozenset(_obligation_keys(incoming))
+    # Opposite-arm trap histories are incomparable and must not join.
+    # A loop header's empty first visit is a subset of the body's
+    # obligations; keep the superset so folded loads can stabilize.
+    if entry_obl != in_obl and not entry_obl < in_obl and not in_obl < entry_obl:
+        return None
+    chosen_obl = incoming if in_obl > entry_obl else entry
+    # Never union trap histories. When obligations refine along a loop,
+    # take the more specific predecessor's logs rather than mixing paths.
+    out_o.load_log = set(chosen_obl.orig.load_log)
+    out_r.load_log = set(chosen_obl.recomp.load_log)
     return _CfgState(
         out_o,
         out_r,
@@ -3111,17 +3123,10 @@ def _join_states(
         scratch_pushes=_remap_scratch(
             entry.scratch_pushes, entry.orig, entry.recomp, out_o, out_r
         ),
-        load_obligations=_unique_obligations(
-            _remap_obligations(
-                entry.load_obligations, entry.orig, entry.recomp, out_o, out_r
-            )
-            + _remap_obligations(
-                incoming.load_obligations,
-                incoming.orig,
-                incoming.recomp,
-                out_o,
-                out_r,
-            ),
+        load_obligations=_remap_obligations(
+            chosen_obl.load_obligations,
+            chosen_obl.orig,
+            chosen_obl.recomp,
             out_o,
             out_r,
         ),

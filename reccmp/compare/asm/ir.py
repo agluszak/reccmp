@@ -17,7 +17,9 @@ from typing import Hashable, Sequence, Union
 from .model import (
     STACK_ENTRY_REGEX,
     Instruction,
+    Reference,
     Reject,
+    operand_identity,
     parse_instruction,
 )
 
@@ -216,16 +218,25 @@ def from_effective(
     return DecodedInstruction(**kwargs)
 
 
-def _freeze(value) -> Hashable:
+def _freeze(value, *, semantic: bool = False) -> Hashable:
     if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
+        return tuple(_freeze(item, semantic=semantic) for item in value)
     if isinstance(value, tuple):
-        return tuple(_freeze(item) for item in value)
+        return tuple(_freeze(item, semantic=semantic) for item in value)
+    if semantic:
+        return operand_identity(value)
+    if isinstance(value, Reference):
+        return value.display
     return value
 
 
 def instruction_match_key(row: DecodedInstruction | str) -> Hashable:
-    """Hashable SequenceMatcher key from IR (or legacy display string)."""
+    """Hashable SequenceMatcher key from IR (or legacy display string).
+
+    Reference operands contribute their display token so scoring can treat
+    ``<OFFSET1>`` as the same placeholder. Proofs use
+    ``instruction_semantic_key`` instead.
+    """
     if isinstance(row, str):
         try:
             ins = parse_instruction(row)
@@ -237,9 +248,42 @@ def instruction_match_key(row: DecodedInstruction | str) -> Hashable:
     return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
 
 
+def instruction_semantic_key(row: DecodedInstruction | str | Instruction) -> Hashable:
+    """Proof key: unresolved references compare by identity, not placeholder."""
+    if isinstance(row, str):
+        try:
+            ins = parse_instruction(row)
+        except Reject:
+            return ("raw", row)
+        return (
+            "ins",
+            ins.mnemonic,
+            ins.prefix,
+            _freeze(ins.operands, semantic=True),
+        )
+    if isinstance(row, Instruction):
+        return (
+            "ins",
+            row.mnemonic,
+            row.prefix,
+            _freeze(row.operands, semantic=True),
+        )
+    if row.role != AsmRole.CODE:
+        return ("raw", row.display)
+    return (
+        "ins",
+        row.mnemonic,
+        row.prefix,
+        _freeze(row.operands, semantic=True),
+    )
+
+
 def _operand_identity(row: DecodedInstruction) -> Hashable:
     if row.operands:
-        return _freeze(row.operands[0])
+        op = row.operands[0]
+        if isinstance(op, tuple) and op and op[0] == "sym" and len(op) > 1:
+            return operand_identity(op[1])
+        return _freeze(op, semantic=True)
     if row.raw_operands:
         return row.raw_operands[0]
     return None
@@ -312,7 +356,13 @@ def control_flow_topology_keys(
             else:
                 keys.append(("table_entry", row.display))
             continue
-        if not row.is_code or row.is_call or not (row.is_jump or row.is_ret):
+        if not row.is_code:
+            keys.append(())
+            continue
+        if row.is_call:
+            keys.append(("call", _operand_identity(row)))
+            continue
+        if not (row.is_jump or row.is_ret):
             keys.append(())
             continue
         if row.is_ret:
@@ -347,12 +397,13 @@ def compute_extent_closed(
 ) -> bool:
     """True when every reachable path ends inside a modeled terminal.
 
-    A coverage walk can only prove the supplied byte window. Estimated
-    extents that cut off a fallthrough or a local branch are not closed.
-    Known extents may transfer to a proven external tail (``jmp`` /
-    taken ``jcc`` leaving the window); fallthrough past the window is not
-    a modeled terminal on either kind.
+    A coverage walk can only prove the supplied byte window. Implicit
+    fallthrough past the window is never a modeled terminal, even for a
+    known annotated size. Explicit ``jmp`` to an external target, or to
+    the cases of that dispatch's ``JumpTable``, can close the extent.
     """
+    # Provenance does not turn implicit fallthrough into a return.
+    _ = extent_kind
     if coverage_incomplete:
         return False
     if extent <= 0:
@@ -361,10 +412,6 @@ def compute_extent_closed(
     if not code:
         return False
     addr_to_row = {row.address: row for row in code}
-    table_targets: set[int] = set()
-    for table in jump_tables:
-        for _entry, target in table.entries:
-            table_targets.add(target)
     window = range(start_addr, start_addr + extent)
     pending = [code[0].address]
     seen: set[int] = set()
@@ -377,33 +424,45 @@ def compute_extent_closed(
         if row is None:
             if addr in window:
                 return False
-            # Successor outside the window: a known annotated extent is still
-            # the complete supplied body. An estimated extent may treat an
-            # explicit tail transfer as closed, but not a fallthrough cut.
             continue
         nxt = addr + row.size
         mnemonic = row.mnemonic
         if mnemonic in _NO_FALLTHROUGH:
-            if mnemonic == "jmp" and row.branch_target is not None:
-                pending.append(row.branch_target)
-            elif mnemonic == "jmp" and not row.control_flow_known:
-                return False
+            if mnemonic == "jmp":
+                if row.branch_target is not None:
+                    pending.append(row.branch_target)
+                else:
+                    table = _table_for_dispatch(row.address, jump_tables)
+                    if table is None:
+                        return False
+                    for _entry, target in table.entries:
+                        pending.append(target)
             continue
         if row.is_jump and row.branch_target is not None:
             pending.append(row.branch_target)
         elif row.is_jump and row.branch_target is None:
-            if not row.control_flow_known:
+            table = _table_for_dispatch(row.address, jump_tables)
+            if table is None:
                 return False
-            for target in table_targets:
+            for _entry, target in table.entries:
                 pending.append(target)
             if mnemonic == "jmp":
                 continue
         if nxt not in window:
-            if extent_kind is ExtentKind.ESTIMATED:
-                return False
-            continue
+            return False
         pending.append(nxt)
     return True
+
+
+def _table_for_dispatch(
+    address: int | None, jump_tables: Sequence[JumpTable]
+) -> JumpTable | None:
+    if address is None:
+        return None
+    for table in jump_tables:
+        if table.dispatch_address == address:
+            return table
+    return None
 
 
 def _normalize_operand_stack(operand) -> object:

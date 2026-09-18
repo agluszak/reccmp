@@ -25,6 +25,7 @@ from reccmp.compare.asm.ir import (
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
+    instruction_semantic_key,
     resolve_asm_stream,
 )
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
@@ -252,6 +253,7 @@ class FunctionComparator:
             ),
             is_32bit=self.is_32bit,
             collect_meta=False,
+            image_id=ImageId.ORIG,
         )
         self.recomp_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(
@@ -267,6 +269,7 @@ class FunctionComparator:
             ),
             is_32bit=self.is_32bit,
             collect_meta=False,
+            image_id=ImageId.RECOMP,
         )
 
     def rebuild_lookups(self) -> None:
@@ -1233,6 +1236,8 @@ class FunctionComparator:
 
         orig_keys = [instruction_match_key(row) for row in orig_rows]
         recomp_keys = [instruction_match_key(row) for row in recomp_rows]
+        orig_sem = [instruction_semantic_key(row) for row in orig_rows]
+        recomp_sem = [instruction_semantic_key(row) for row in recomp_rows]
         diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
 
         ratio = diff.ratio()
@@ -1252,7 +1257,7 @@ class FunctionComparator:
             topology_equal=(
                 orig_topology is not None and orig_topology == recomp_topology
             ),
-            keys_equal=ratio == 1.0,
+            keys_equal=orig_sem == recomp_sem,
             operands_complete=operands_complete,
             control_flow_complete=control_flow_complete,
             coverage_incomplete=coverage_incomplete,

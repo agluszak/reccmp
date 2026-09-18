@@ -10,8 +10,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from reccmp.compare.asm.ir import (
+    AsmRole,
+    DecodedInstruction,
     ExtentKind,
     FunctionImage,
+    JumpTable,
     compute_extent_closed,
     resolve_asm_stream,
 )
@@ -62,6 +65,20 @@ def test_estimated_extent_without_terminal_is_open():
     )
 
 
+def test_known_extent_with_plain_fallthrough_is_open():
+    blob = bytes.fromhex("B801000000B901000000")  # mov eax,1; mov ecx,1
+    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    assert (
+        compute_extent_closed(
+            excerpt,
+            start_addr=0x1000,
+            extent=len(blob),
+            extent_kind=ExtentKind.KNOWN,
+        )
+        is False
+    )
+
+
 def test_known_extent_ending_in_ret_is_closed():
     blob = bytes.fromhex("B801000000C3")  # mov eax,1; ret
     sanitizer = ParseAsm()
@@ -83,6 +100,70 @@ def test_known_extent_ending_in_ret_is_closed():
         raw=blob,
     )
     assert image.extent_closed is True
+
+
+def _ret_at(addr: int, iid: int) -> DecodedInstruction:
+    row = ParseAsm().parse_asm(b"\xc3", addr)[0]
+    return replace(row, instruction_id=iid)
+
+
+def test_jump_table_dispatch_closes_indirect_switch_extent():
+    dispatch = DecodedInstruction(
+        address=0x1000,
+        size=2,
+        mnemonic="jmp",
+        prefix="",
+        operands=(("mem", "dword", "", (("eax", 4),), 0, ()),),
+        raw_operands=("dword ptr [eax*4]",),
+        display="jmp dword ptr [eax*4]",
+        role=AsmRole.CODE,
+        is_jump=True,
+        branch_target=None,
+        control_flow_known=False,
+        instruction_id=0,
+    )
+    case0 = _ret_at(0x1010, 1)
+    case1 = _ret_at(0x1020, 2)
+    table = JumpTable(
+        address=0x1004,
+        entries=((0x1004, 0x1010), (0x1008, 0x1020)),
+        dispatch_address=0x1000,
+    )
+    excerpt = (dispatch, case0, case1)
+    assert (
+        compute_extent_closed(
+            excerpt,
+            start_addr=0x1000,
+            extent=0x21,
+            jump_tables=(table,),
+            extent_kind=ExtentKind.KNOWN,
+        )
+        is True
+    )
+    other_table = JumpTable(
+        address=0x2000,
+        entries=((0x2000, 0x1010),),
+        dispatch_address=0x9999,
+    )
+    assert (
+        compute_extent_closed(
+            excerpt,
+            start_addr=0x1000,
+            extent=0x21,
+            jump_tables=(other_table,),
+            extent_kind=ExtentKind.KNOWN,
+        )
+        is False
+    )
+    assert (
+        compute_extent_closed(
+            excerpt,
+            start_addr=0x1000,
+            extent=0x21,
+            extent_kind=ExtentKind.KNOWN,
+        )
+        is False
+    )
 
 
 def test_admit_proof_refuses_open_extent_and_incomplete_coverage():

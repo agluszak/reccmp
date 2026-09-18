@@ -13,6 +13,9 @@ import re
 from dataclasses import replace
 from functools import cache
 from typing_extensions import Buffer
+
+from reccmp.types import ImageId
+
 from .const import JUMP_MNEMONICS, SINGLE_OPERAND_INSTS
 from .instgen import (
     DisasmLiteTuple,
@@ -23,10 +26,18 @@ from .instgen import (
     meta_from_decoded,
 )
 from .ir import AsmRole, DecodedInstruction, JumpTable, marker
-from .model import Reject, format_instruction, format_operand, parse_instruction
+from .model import (
+    Reject,
+    Reference,
+    format_instruction,
+    format_operand,
+    parse_instruction,
+)
 from .replacement import AddrTestProtocol, NameReplacementProtocol
 
 AsmExcerpt = list[DecodedInstruction]
+
+_OFFSET_PLACEHOLDER = re.compile(r"^<OFFSET\d*>$")
 
 ptr_replace_regex = re.compile(r"(?<=\[)(0x[0-9a-f]+)(?=\])")
 
@@ -59,11 +70,13 @@ class ParseAsm:
         name_lookup: NameReplacementProtocol | None = None,
         is_32bit: bool = True,
         collect_meta: bool = False,
+        image_id: ImageId | None = None,
     ) -> None:
         self.addr_test = addr_test
         self.name_lookup = name_lookup
         self.is_32bit = is_32bit
         self.collect_meta = collect_meta
+        self.image_id = image_id
 
         self.replacements: dict[int, str] = {}
         self.indirect_replacements: dict[int, str] = {}
@@ -75,6 +88,8 @@ class ParseAsm:
         self._decoded_by_addr: dict[int, DecodedInstruction] = {}
         self.jump_tables: tuple[JumpTable, ...] = ()
         self.coverage_incomplete: bool = False
+        self._body_start: int | None = None
+        self._body_end: int | None = None
 
     def reset(self):
         self.replacements = {}
@@ -115,6 +130,29 @@ class ParseAsm:
         placeholder = self._next_placeholder()
         self.replacements[addr] = placeholder
         return placeholder
+
+    def _side_name(self) -> str:
+        if self.image_id is None:
+            return "unknown"
+        return self.image_id.name.lower()
+
+    def reference(self, addr: int, exact: bool = False) -> Reference:
+        """Display token plus the identity proofs must compare."""
+        display = self.replace(addr, exact=exact)
+        return Reference(display, self._reference_identity(addr, display))
+
+    def indirect_reference(self, addr: int) -> Reference:
+        display = self.indirect_replace(addr)
+        return Reference(display, self._reference_identity(addr, display))
+
+    def _reference_identity(self, addr: int, display: str):
+        if not _OFFSET_PLACEHOLDER.match(display):
+            return ("named", display)
+        start = self._body_start
+        end = self._body_end
+        if start is not None and end is not None and start <= addr < end:
+            return ("local", addr - start)
+        return ("unresolved", self._side_name(), addr)
 
     def indirect_replace(self, addr: int) -> str:
         if addr in self.indirect_replacements:
@@ -236,7 +274,9 @@ class ParseAsm:
         # Absolute pointer: ``[0x1234]`` (hex-style only; ``[8]`` is left alone).
         if not reg_terms:
             if _hex_style_addr(disp):
-                name = self.indirect_replace(disp) if indirect else self.replace(disp)
+                name = (
+                    self.indirect_reference(disp) if indirect else self.reference(disp)
+                )
                 return ("mem", size, seg, [], 0, ((1, name),))
             return operand
 
@@ -244,7 +284,7 @@ class ParseAsm:
         if _hex_style_addr(disp) and self.is_addr(abs(disp)):
             value = abs(disp)
             sign = 1 if disp >= 0 else -1
-            name = self.replace(value)
+            name = self.reference(value)
             return ("mem", size, seg, list(reg_terms), 0, ((sign, name),))
 
         return operand
@@ -256,10 +296,10 @@ class ParseAsm:
         if mnemonic == "cmp":
             name = self.lookup(value)
             if name is not None:
-                return ("sym", name)
+                return ("sym", Reference(name, ("named", name)))
             return operand
         if self.is_addr(value):
-            return ("sym", self.replace(value))
+            return ("sym", self.reference(value))
         return operand
 
     def sanitize_row(self, insn: DecodedInstruction) -> DecodedInstruction:
@@ -276,14 +316,14 @@ class ParseAsm:
         ):
             addr_val = operands[0][1]
             if mnemonic == "call":
-                operands[0] = ("sym", self.replace(addr_val, exact=True))
+                operands[0] = ("sym", self.reference(addr_val, exact=True))
             elif mnemonic == "push":
                 if self.is_addr(addr_val):
-                    operands[0] = ("sym", self.replace(addr_val))
+                    operands[0] = ("sym", self.reference(addr_val))
             elif mnemonic == "jmp":
                 potential_name = self.lookup(addr_val, exact=True)
                 if potential_name is not None:
-                    operands[0] = ("sym", potential_name)
+                    operands[0] = ("sym", Reference(potential_name, ("named", potential_name)))
                 else:
                     operands[0] = (
                         "imm",
@@ -373,8 +413,11 @@ class ParseAsm:
     def parse_asm(self, data: Buffer, start_addr: int) -> AsmExcerpt:
         self.reset()
         asm: AsmExcerpt = []
+        blob = bytes(data)
+        self._body_start = start_addr
+        self._body_end = start_addr + len(blob)
 
-        ig = InstructGen(bytes(data), start_addr, self.is_32bit)
+        ig = InstructGen(blob, start_addr, self.is_32bit)
         self._sections = ig.sections
         self._decoded_by_addr = dict(ig.decoded_by_addr)
         self.jump_tables = tuple(ig.jump_tables)

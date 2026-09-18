@@ -1,5 +1,5 @@
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Literal, cast
 
 from pydantic import BaseModel, ValidationError
@@ -280,13 +280,15 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
         # Our aggregate accuracy score is the highest from any report.
         e_list.sort(key=_accuracy_sort_key, reverse=True)
 
-        output.entities[addr] = e_list[0]
+        chosen = replace(e_list[0])
+        output.entities[addr] = chosen
 
         # Keep the recomp_addr if it is the same across all samples.
         # i.e. to detect where function alignment ends
         if not all(e_list[0].recomp_addr == e.recomp_addr for e in e_list):
-            output.entities[addr].recomp_addr = None
-            output.entities[addr].recomp_addr_varies = True
+            output.entities[addr] = replace(
+                chosen, recomp_addr=None, recomp_addr_varies=True
+            )
 
     # Recalculate the count against the functions we actually have.
     # This may be higher than the count from any one sample.

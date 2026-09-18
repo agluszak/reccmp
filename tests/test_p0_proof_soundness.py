@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from unittest.mock import Mock
 
 from reccmp.compare.asm.effective import verify_effective_match
@@ -13,7 +14,7 @@ from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
-from reccmp.types import EntityType
+from reccmp.types import EntityType, ImageId
 
 # cmp ecx,0; je +5; push 0 (imm32); add eax,1; ret
 _TOPOLOGY_ORIG = bytes.fromhex("83F9007405680000000083C001C3")
@@ -81,6 +82,12 @@ def test_admit_exact_requires_topology_not_just_displays():
     )
     assert admitted is not None
     assert admitted.status == ComparisonStatus.EXACT
+    assert (
+        admit_exact_analysis(
+            displays_equal=True, topology_equal=True, keys_equal=False
+        )
+        is None
+    )
 
 
 def test_encoding_length_shift_is_not_exact_or_effective():
@@ -125,5 +132,44 @@ def test_linear_verifier_does_not_excuse_divergent_live_out_via_predicate():
     assert verify_effective_match(orig, recomp) is False
 
     result = _compare_bytes(_LIVEOUT_ORIG, _LIVEOUT_RECOMP)
+    assert result.analysis.status != ComparisonStatus.EXACT
+    assert result.analysis.is_effective is False
+
+
+def _call_ret(func_addr: int, target: int) -> bytes:
+    rel = (target - (func_addr + 5)) & 0xFFFFFFFF
+    return b"\xe8" + struct.pack("<I", rel) + b"\xc3"
+
+
+def _mov_abs_ret(target: int) -> bytes:
+    return b"\xa1" + struct.pack("<I", target) + b"\xc3"
+
+
+def test_unresolved_call_offsets_are_not_exact_or_effective():
+    """Same ``<OFFSET1>`` display is not semantic identity across images."""
+    orig = _call_ret(0x200, 0x401000)
+    recomp = _call_ret(0x400, 0x527000)
+    orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(orig, 0x200)
+    recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(recomp, 0x400)
+    assert orig_rows[0].display == recomp_rows[0].display
+    assert "<OFFSET" in orig_rows[0].display
+    orig_id = orig_rows[0].operands[0][1].identity
+    recomp_id = recomp_rows[0].operands[0][1].identity
+    assert orig_id != recomp_id
+
+    result = _compare_bytes(orig, recomp)
+    assert result.analysis.status != ComparisonStatus.EXACT
+    assert result.analysis.is_effective is False
+
+
+def test_unresolved_data_offsets_are_not_exact_or_effective():
+    orig = _mov_abs_ret(0x401000)
+    recomp = _mov_abs_ret(0x527000)
+    orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(orig, 0x200)
+    recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(recomp, 0x400)
+    assert orig_rows[0].display == recomp_rows[0].display
+    assert "<OFFSET" in orig_rows[0].display
+
+    result = _compare_bytes(orig, recomp)
     assert result.analysis.status != ComparisonStatus.EXACT
     assert result.analysis.is_effective is False

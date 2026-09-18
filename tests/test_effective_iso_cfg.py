@@ -17,6 +17,9 @@ import pytest
 
 from reccmp.compare.asm.effective import (
     FunctionMetadata,
+    SideState,
+    _CfgState,
+    _join_states,
     estimate_isomorphic_cfg_semantic_similarity,
     verify_cfg_effective_match,
     verify_effective_match,
@@ -1062,3 +1065,58 @@ def test_ret_and_ret_imm_are_not_collapsed_together():
         )
         is False
     )
+
+
+def test_branch_swapped_load_is_not_trap_equivalent():
+    """A load on opposite CFG arms is not the same trap-parity history.
+
+    Unioning load logs at the join would discharge both obligations even
+    though no single path performs both counterpart reads.
+    """
+    orig = [
+        "test eax, eax",
+        "je 0x4",
+        "mov ecx, dword ptr [esi]",
+        "mov edx, 1",
+        "jmp 0x2",
+        "mov edx, 1",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "je 0x4",
+        "mov edx, 1",
+        "jmp 0x2",
+        "mov ecx, dword ptr [esi]",
+        "mov edx, 1",
+        "ret",
+    ]
+    recorder = AnalysisRecorder(
+        orig_addrs=list(range(0x1000, 0x1007)),
+        recomp_addrs=list(range(0x2000, 0x2007)),
+    )
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig,
+            recomp,
+            [None, 5, None, None, 6, None, None],
+            [None, 4, None, 6, None, None, None],
+            recorder=recorder,
+        )
+        is False
+    )
+    analysis = recorder.failure_analysis()
+    assert analysis.status != ComparisonStatus.EFFECTIVE
+
+
+def test_cfg_join_rejects_uncorrelated_trap_parity():
+    """Opposite-arm loads must not join by unioning trap-parity histories."""
+    addr = (("reg", "si"), 4)
+    gen = ("cfg_mem_init",)
+    fall_o, fall_r = SideState(), SideState()
+    fall_o.load_log.add((addr, gen))
+    taken_o, taken_r = SideState(), SideState()
+    taken_r.load_log.add((addr, gen))
+    fall = _CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
+    taken = _CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
+    assert _join_states(fall, taken, 0) is None

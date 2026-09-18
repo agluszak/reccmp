@@ -8,10 +8,40 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Hashable
 
 
 class Reject(Exception):
     """The two sequences could not be proven equivalent."""
+
+
+@dataclass(frozen=True)
+class Reference:
+    """A relocated or absolute address after sanitization.
+
+    ``display`` is the human/placeholder token (``<OFFSET1>``, a symbol).
+    ``identity`` is what proofs compare: a named/paired entity, or a
+    side-local unresolved address that cannot equal a placeholder from
+    the other image merely by occupying the same replacement slot.
+    """
+
+    display: str
+    identity: Hashable
+
+    def __str__(self) -> str:
+        return self.display
+
+
+def operand_display(value) -> str:
+    if isinstance(value, Reference):
+        return value.display
+    return str(value)
+
+
+def operand_identity(value) -> Hashable:
+    if isinstance(value, Reference):
+        return value.identity
+    return value
 
 
 # Register families. Writing e.g. `al` produces a new value for the whole
@@ -144,7 +174,7 @@ def format_operand(operand) -> str:
     if kind == "imm":
         return format_imm(operand[1])
     if kind == "sym":
-        return operand[1]
+        return operand_display(operand[1])
     if kind == "opaque":
         # ("opaque", type, op_str, index) — prefer Capstone text when present.
         if len(operand) >= 3 and operand[2]:
@@ -169,9 +199,10 @@ def format_operand(operand) -> str:
             parts.append(f"+ {token}")
     for sign, name in syms:
         if not parts:
-            parts.append(name if sign > 0 else f"-{name}")
+            parts.append(operand_display(name) if sign > 0 else f"-{operand_display(name)}")
         else:
-            parts.append(f"+ {name}" if sign > 0 else f"- {name}")
+            shown = operand_display(name)
+            parts.append(f"+ {shown}" if sign > 0 else f"- {shown}")
     if disp or (not parts and not syms):
         if not parts:
             parts.append(format_imm(disp))

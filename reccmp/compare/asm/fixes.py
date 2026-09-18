@@ -19,6 +19,7 @@ from reccmp.compare.asm.ir import (
     AsmStream,
     ResolvedAsm,
     instruction_at,
+    instruction_semantic_key,
     resolve_asm_stream,
 )
 from reccmp.compare.asm.model import Reject
@@ -90,6 +91,14 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     recomp = resolve_asm_stream(recomp_asm)
     orig_addr_list = list(orig_addrs) if orig_addrs is not None else None
     recomp_addr_list = list(recomp_addrs) if recomp_addrs is not None else None
+    orig_sem = tuple(
+        instruction_semantic_key(ins) if ins is not None else ("raw", display)
+        for ins, display in zip(orig.instructions, orig.displays)
+    )
+    recomp_sem = tuple(
+        instruction_semantic_key(ins) if ins is not None else ("raw", display)
+        for ins, display in zip(recomp.instructions, recomp.displays)
+    )
     exact = admit_exact_analysis(
         displays_equal=orig.displays == recomp.displays,
         topology_equal=_display_topology_equal(
@@ -100,6 +109,9 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
             recomp_addr_list,
             recomp_meta,
         ),
+        keys_equal=orig_sem == recomp_sem,
+        operands_complete=False,
+        control_flow_complete=False,
     )
     if exact is not None:
         return exact

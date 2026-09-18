@@ -125,6 +125,16 @@ def test_aggregate_effective_over_any():
     assert combined.entities[100].accuracy == 0.5
 
 
+def test_combine_reports_does_not_mutate_input_entities():
+    x = create_report([(100, 0.9)])
+    y = create_report([(100, 0.8)])
+    x.entities[100].recomp_addr = 1
+    y.entities[100].recomp_addr = 2
+    combine_reports([x, y])
+    assert x.entities[100].recomp_addr == 1
+    assert y.entities[100].recomp_addr == 2
+
+
 def test_aggregate_different_files():
     """Should raise an exception if we try to aggregate reports
     where the orig filename does not match."""

@@ -56,7 +56,7 @@ def admit_exact_analysis(
     *,
     displays_equal: bool,
     topology_equal: bool,
-    keys_equal: bool = False,
+    keys_equal: bool | None = None,
     operands_complete: bool = True,
     control_flow_complete: bool = True,
     coverage_incomplete: bool = False,
@@ -68,13 +68,17 @@ def admit_exact_analysis(
     gate that mints ``ComparisonStatus.EXACT``. Incomplete reachable coverage
     or an unclosed estimated extent never admits EXACT. Identical display text
     is not enough: local branch destinations (instruction ids, not encodings)
-    must also agree.
+    must also agree, and match keys (which include reference identities) must
+    not disagree. Unresolved ``<OFFSET>`` placeholders from opposite images
+    therefore cannot become EXACT merely by sharing a replacement slot.
     """
     if coverage_incomplete or not extent_closed:
         return None
     if not topology_equal:
         return None
     if displays_equal:
+        if keys_equal is False:
+            return None
         return ComparisonAnalysis.exact()
     if keys_equal and operands_complete and control_flow_complete:
         return ComparisonAnalysis.exact()
