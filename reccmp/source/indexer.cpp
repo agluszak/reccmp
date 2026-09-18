@@ -26,6 +26,7 @@
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/AddressSpaces.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -250,7 +251,8 @@ class Indexer {
     std::string qualified;
     llvm::raw_string_ostream stream(qualified);
     record->printQualifiedName(stream, policy_);
-    return ("record:" + stream.str()).str();
+    stream.flush();
+    return "record:" + qualified;
   }
 
   std::string templateArguments(const ClassTemplateSpecializationDecl* specialization) const {
@@ -783,7 +785,8 @@ class IndexConsumer : public ASTConsumer {
     out_ << llvm::json::Value(llvm::json::Object{
                 {"record", "unit-abi"},
                 {"target_triple", target.getTriple().str()},
-                {"pointer_width", static_cast<int64_t>(target.getPointerWidth(0) / 8)},
+                {"pointer_width",
+                 static_cast<int64_t>(target.getPointerWidth(LangAS::Default) / 8)},
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";
