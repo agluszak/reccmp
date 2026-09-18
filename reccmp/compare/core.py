@@ -11,6 +11,7 @@ from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
 from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.functions import FunctionComparator
+from reccmp.compare.variables import VariableComparator
 from reccmp.formats import (
     Image,
     PEImage,
@@ -22,6 +23,7 @@ from reccmp.compare.event import (
     ReccmpReportProtocol,
     create_logging_wrapper,
 )
+from reccmp.source.index import SourceIndex
 from .match_msvc import (
     match_lines,
     match_symbols,
@@ -92,9 +94,11 @@ class Compare:
     bin_encoding: str
     types: CvdumpTypesParser
     function_comparator: FunctionComparator
+    variable_comparator: VariableComparator
     data_sources: list[TextFile]
     project_aliases: ProjectAliases
     codebase: DecompCodebase | None
+    source_index: SourceIndex | None
 
     # pylint: disable=too-many-arguments
     # pylint: disable=too-many-positional-arguments
@@ -110,6 +114,7 @@ class Compare:
         project_aliases: ProjectAliases | None = None,
         codebase: DecompCodebase | None = None,
         equivalence_sources: list[TextFile] | None = None,
+        source_index: SourceIndex | None = None,
     ):
         self.orig_bin = orig_bin
         self.recomp_bin = recomp_bin
@@ -143,6 +148,7 @@ class Compare:
 
         self.types = CvdumpTypesParser()
 
+        self.source_index = source_index
         self.function_comparator = FunctionComparator(
             self._db,
             self._lines_db,
@@ -151,6 +157,14 @@ class Compare:
             self.report,
             self.types,
             equivalence_groups=self.equivalence_groups,
+            source_index=source_index,
+        )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=source_index,
         )
 
     def _configure_function_nodes(self) -> None:
@@ -180,6 +194,14 @@ class Compare:
             self.report,
             self.types,
             equivalence_groups=self.equivalence_groups,
+            source_index=self.source_index,
+        )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=self.source_index,
         )
         self._configure_function_nodes()
 
@@ -286,13 +308,18 @@ class Compare:
         orig_addrs: Iterable[int] = (),
         recomp_addrs: Iterable[int] = (),
         use_cache: bool = True,
+        source_index: SourceIndex | None = None,
     ) -> Self:
+        from .source_capability import load_source_index_for_target
+
         loaded = load_target_analysis(
             target,
             orig_addrs=orig_addrs,
             recomp_addrs=recomp_addrs,
             use_cache=use_cache,
         )
+        if source_index is None:
+            source_index = load_source_index_for_target(target)
         compare = cls(
             loaded.orig_bin,
             loaded.recomp_bin,
@@ -304,6 +331,7 @@ class Compare:
             project_aliases=loaded.project_aliases,
             codebase=loaded.codebase,
             equivalence_sources=loaded.equivalence_sources,
+            source_index=source_index,
         )
         prepared = loaded.load_prepared()
         if prepared is not None:

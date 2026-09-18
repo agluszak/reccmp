@@ -18,6 +18,7 @@ from reccmp.compare.asm.instgen import (
     meta_from_decoded,
 )
 from reccmp.compare.asm.ir import (
+    FunctionImage,
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
@@ -380,6 +381,26 @@ class FunctionComparator:
             )
         return analysis
 
+    def _load_function_image(
+        self,
+        sanitizer: ParseAsm,
+        raw: bytes,
+        start_addr: int,
+        extent: int,
+        extent_kind: str,
+    ) -> FunctionImage:
+        """Decode one side into an owned function image (excerpt + tables)."""
+        excerpt = sanitizer.parse_asm(raw, start_addr)
+        return FunctionImage(
+            start_addr=start_addr,
+            extent=extent,
+            extent_kind=extent_kind,
+            excerpt=tuple(excerpt),
+            jump_tables=tuple(sanitizer.jump_tables),
+            coverage_incomplete=sanitizer.coverage_incomplete,
+            raw=raw,
+        )
+
     def _fn_symbol_entry(self, match: ReccmpMatch | None) -> SymbolsEntry | None:
         if match is None:
             return None
@@ -398,16 +419,20 @@ class FunctionComparator:
         # Detect when the recomp function size would cause us to read
         # enough bytes from the original function that we cross into
         # the next annotated function.
-        orig_size = match.size(ImageId.ORIG)
+        annotated_orig_size = match.size(ImageId.ORIG)
         recomp_size = match.size(ImageId.RECOMP)
 
-        if orig_size is None:
+        orig_extent_kind = "known"
+        if annotated_orig_size is None:
+            orig_extent_kind = "estimated"
             assert recomp_size is not None
             orig_max = match.max_size(ImageId.ORIG)
             if orig_max is not None:
                 orig_size = min(orig_max, recomp_size)
             else:
                 orig_size = recomp_size
+        else:
+            orig_size = annotated_orig_size
 
         assert orig_size is not None and recomp_size is not None
 
@@ -429,11 +454,24 @@ class FunctionComparator:
         except IndexError:
             pass
 
-        orig_combined = self.orig_sanitize.parse_asm(orig_raw, match.orig_addr)
-        recomp_combined = self.recomp_sanitize.parse_asm(recomp_raw, match.recomp_addr)
+        orig_image = self._load_function_image(
+            self.orig_sanitize,
+            orig_raw,
+            match.orig_addr,
+            orig_size,
+            orig_extent_kind,
+        )
+        recomp_image = self._load_function_image(
+            self.recomp_sanitize,
+            recomp_raw,
+            match.recomp_addr,
+            recomp_size,
+            "known",
+        )
+        orig_combined = list(orig_image.excerpt)
+        recomp_combined = list(recomp_image.excerpt)
         coverage_incomplete = (
-            self.orig_sanitize.coverage_incomplete
-            or self.recomp_sanitize.coverage_incomplete
+            orig_image.coverage_incomplete or recomp_image.coverage_incomplete
         )
 
         # Check for assert calls only if we expect to find them

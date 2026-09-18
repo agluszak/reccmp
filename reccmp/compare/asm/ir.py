@@ -49,6 +49,31 @@ class JumpTable:
 
 
 @dataclass(frozen=True)
+class FunctionImage:
+    """Lossless view of one decoded function for comparison.
+
+    Owns the extent evidence, decoded excerpt, jump tables, and coverage
+    flag for a single side (original or recompiled). Callers should not
+    read long-lived state off a shared ``ParseAsm`` after construction.
+    """
+
+    start_addr: int
+    extent: int
+    # ``known`` when PDB/entity size is authoritative; ``estimated`` when the
+    # original extent was guessed from the recompilation length.
+    extent_kind: str
+    excerpt: tuple[DecodedInstruction, ...]
+    jump_tables: tuple[JumpTable, ...] = ()
+    coverage_incomplete: bool = False
+    raw: bytes | None = None
+
+    @property
+    def instruction_ids(self) -> tuple[int, ...]:
+        """Stable indices into ``excerpt`` for program-point identity."""
+        return tuple(range(len(self.excerpt)))
+
+
+@dataclass(frozen=True)
 class DecodedInstruction:
     """One canonical instruction (or table marker) in a function excerpt."""
 

@@ -647,6 +647,30 @@ def strip_type_qualifiers(type_name: str) -> str:
     return name
 
 
+def type_spelling_is_indirection(type_name: str) -> bool:
+    """True when the outermost type is a pointer or reference (not an array)."""
+    name = type_name.strip()
+    for prefix in ("const ", "volatile "):
+        if name.startswith(prefix):
+            name = name[len(prefix) :].strip()
+    # Array spellings look like ``T [N]`` or ``T[]``; those are containment.
+    if name.endswith("]") and "[" in name:
+        return False
+    return name.endswith("*") or name.endswith("&")
+
+
+def field_is_indirection(field: SourceField) -> bool:
+    """Pointer/reference storage is a layout leaf; do not descend physically."""
+    if (field.pointer_depth or 0) > 0:
+        return True
+    return type_spelling_is_indirection(field.type)
+
+
+def variable_type_is_indirection(type_name: str) -> bool:
+    """A ``T*`` / ``T&`` variable stores an address, not a ``T`` aggregate."""
+    return type_spelling_is_indirection(type_name)
+
+
 def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
     data = dict(values)
     for key in (
@@ -835,6 +859,28 @@ def _join_markers(
     return classes, markers
 
 
+def _unique_class_map(
+    classes: Sequence[SourceClass],
+    *,
+    key,
+) -> dict[str, SourceClass]:
+    """Build an unscoped lookup that drops names colliding across targets."""
+    by_key: dict[str, SourceClass] = {}
+    ambiguous: set[str] = set()
+    for item in classes:
+        map_key = key(item)
+        if map_key in ambiguous:
+            continue
+        previous = by_key.get(map_key)
+        if previous is None:
+            by_key[map_key] = item
+            continue
+        if previous.target != item.target:
+            del by_key[map_key]
+            ambiguous.add(map_key)
+    return by_key
+
+
 class SourceIndex:
     """Canonical marker plus Clang semantic source index."""
 
@@ -847,6 +893,7 @@ class SourceIndex:
         variables: Iterable[SourceVariable] = (),
         conflicts: Iterable[SourceConflict] = (),
         abi: SourceAbi | None = None,
+        target_abis: Mapping[str, SourceAbi] | None = None,
     ) -> None:
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
@@ -858,21 +905,70 @@ class SourceIndex:
         self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
         self.abi = abi
-        self._classes_by_name = {item.qualified_name: item for item in self.classes}
-        self._classes_by_semantic_id = {
-            item.semantic_id: item for item in self.classes
+        self.target_abis: dict[str, SourceAbi] = dict(target_abis or {})
+        # Unscoped name/id maps only retain unambiguous entries. Cross-target
+        # collisions must not silently pick a last-wins layout.
+        self._classes_by_name = _unique_class_map(
+            self.classes, key=lambda item: item.qualified_name
+        )
+        self._classes_by_semantic_id = _unique_class_map(
+            self.classes, key=lambda item: item.semantic_id
+        )
+        self._classes_by_target_name: dict[tuple[str | None, str], SourceClass] = {
+            (item.target, item.qualified_name): item for item in self.classes
         }
+        self._classes_by_target_semantic_id: dict[
+            tuple[str | None, str], SourceClass
+        ] = {(item.target, item.semantic_id): item for item in self.classes}
 
-    def class_named(self, qualified_name: str) -> SourceClass | None:
+    def for_target(self, target: str) -> "SourceIndex":
+        """Return a view restricted to one link-namespace / reccmp target."""
+        abi = self.target_abis.get(target)
+        if abi is None and self.abi is not None:
+            # Single-ABI indexes (and legacy JSON) may only carry ``abi``.
+            targets_present = {
+                item.target
+                for item in (*self.classes, *self.markers, *self.variables)
+                if item.target is not None
+            }
+            if not targets_present or targets_present == {target}:
+                abi = self.abi
+        return SourceIndex(
+            declarations=(
+                item for item in self.declarations if item.target == target
+            ),
+            classes=(item for item in self.classes if item.target == target),
+            markers=(item for item in self.markers if item.target == target),
+            variables=(item for item in self.variables if item.target == target),
+            conflicts=(item for item in self.conflicts if item.target == target),
+            abi=abi,
+            target_abis={target: abi} if abi is not None else {},
+        )
+
+    def class_named(
+        self, qualified_name: str, *, target: str | None = None
+    ) -> SourceClass | None:
         """Return the indexed class with this qualified name, if present."""
+        if target is not None:
+            return self._classes_by_target_name.get((target, qualified_name))
         return self._classes_by_name.get(qualified_name)
 
-    def class_for_semantic_id(self, semantic_id: str) -> SourceClass | None:
+    def class_for_semantic_id(
+        self, semantic_id: str, *, target: str | None = None
+    ) -> SourceClass | None:
         """Return the indexed class for a ``record:…`` semantic id."""
+        if target is not None:
+            return self._classes_by_target_semantic_id.get((target, semantic_id))
         return self._classes_by_semantic_id.get(semantic_id)
 
     def _lookup_nested_class(self, field: SourceField, type_spelling: str) -> str | None:
-        """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping."""
+        """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping.
+
+        Only for *embedded* record storage. Pointer/reference fields keep the
+        pointee id for metadata but are not physical containment.
+        """
+        if field_is_indirection(field):
+            return None
         if field.record_semantic_id:
             nested = self._classes_by_semantic_id.get(field.record_semantic_id)
             if nested is not None:
@@ -924,6 +1020,18 @@ class SourceIndex:
                 covering.append(item)
         return covering
 
+    def _layout_usable(self, source_class: SourceClass) -> bool:
+        """Trusted layout evidence for this class (checked on every visit)."""
+        return (
+            source_class.layout_trusted is not False
+            and source_class.size is not None
+            and (
+                any(field.offset is not None for field in source_class.fields)
+                or bool(source_class.base_offsets)
+                or source_class.alignment is not None
+            )
+        )
+
     def _resolve_field(
         self,
         qualified_name: str,
@@ -935,7 +1043,7 @@ class SourceIndex:
         abs_base: int,
     ) -> ResolvedField | None:
         source_class = self._classes_by_name.get(qualified_name)
-        if source_class is None:
+        if source_class is None or not self._layout_usable(source_class):
             return None
 
         # Ambiguous bitfield packing: refuse a byte-level answer.
@@ -966,6 +1074,9 @@ class SourceIndex:
                 )
                 if nested_resolved is not None:
                     return nested_resolved
+                # Nested layout unavailable/untrusted: treat this field as an
+                # opaque leaf rather than publishing an untrusted path.
+                return None
             return ResolvedField(
                 root_class=root_class,
                 path=path,
@@ -992,20 +1103,12 @@ class SourceIndex:
                 return found
         return None
 
-    def has_layout(self, qualified_name: str) -> bool:
+    def has_layout(self, qualified_name: str, *, target: str | None = None) -> bool:
         """True when trusted Clang layout evidence is available for the class."""
-        source_class = self._classes_by_name.get(qualified_name)
+        source_class = self.class_named(qualified_name, target=target)
         if source_class is None:
             return False
-        return (
-            source_class.layout_trusted is not False
-            and source_class.size is not None
-            and (
-                any(field.offset is not None for field in source_class.fields)
-                or bool(source_class.base_offsets)
-                or source_class.alignment is not None
-            )
-        )
+        return self._layout_usable(source_class)
 
     @classmethod
     def from_units(
@@ -1091,6 +1194,11 @@ class SourceIndex:
                 if isinstance(document.get("abi"), Mapping)
                 else None
             ),
+            target_abis={
+                str(target): SourceAbi(**values)
+                for target, values in (document.get("target_abis") or {}).items()
+                if isinstance(values, Mapping)
+            },
         )
 
     def functions_by_address(
@@ -1161,6 +1269,10 @@ class SourceIndex:
         }
         if self.abi is not None:
             document["abi"] = asdict(self.abi)
+        if self.target_abis:
+            document["target_abis"] = {
+                target: asdict(abi) for target, abi in sorted(self.target_abis.items())
+            }
         return document
 
     def write(self, path: Path) -> None:

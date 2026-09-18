@@ -239,22 +239,31 @@ class VariableComparator:
     source_index: "SourceIndex | None" = None
 
     def _source_type_name(self, var: ReccmpMatch) -> str | None:
-        """Resolve a Clang layout type name for this variable, when indexed."""
+        """Resolve a Clang layout type name for this variable, when indexed.
+
+        Pointer/reference variables store an address; do not treat their
+        pointee ``record_semantic_id`` as the variable's physical layout.
+        """
         if self.source_index is None or not var.name:
             return None
+        from reccmp.source.index import (
+            strip_type_qualifiers,
+            variable_type_is_indirection,
+        )
+
         for item in self.source_index.variables:
             if item.qualified_name != var.name and not item.qualified_name.endswith(
                 f"::{var.name}"
             ):
                 continue
+            if variable_type_is_indirection(item.type):
+                return None
             if item.record_semantic_id:
                 nested = self.source_index.class_for_semantic_id(item.record_semantic_id)
                 if nested is not None and self.source_index.has_layout(
                     nested.qualified_name
                 ):
                     return nested.qualified_name
-            from reccmp.source.index import strip_type_qualifiers
-
             name = strip_type_qualifiers(item.type)
             if self.source_index.has_layout(name):
                 return name
@@ -290,7 +299,10 @@ class VariableComparator:
                 continue
             is_pointer = (leaf.pointer_depth or 0) > 0
             if is_pointer:
-                size = 4  # 32-bit targets
+                pointer_width = 4
+                if self.source_index is not None and self.source_index.abi is not None:
+                    pointer_width = max(1, self.source_index.abi.pointer_width // 8)
+                size = pointer_width
             # Do not overrun the variable extent.
             if resolved.absolute_offset + size > data_size:
                 size = data_size - resolved.absolute_offset

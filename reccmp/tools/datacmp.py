@@ -12,7 +12,6 @@ from reccmp.compare.variables import (
     ComparedOffset,
     CompareResult,
     ComparisonItem,
-    VariableComparator,
 )
 from reccmp.formats.pe import PEImage
 from reccmp.project.logging import (
@@ -81,13 +80,7 @@ def do_the_comparison(target: RecCmpTarget) -> Iterator[ComparisonItem]:
     if not isinstance(origfile, PEImage) or not isinstance(recompfile, PEImage):
         raise ValueError("`datacmp` currently only supports 32-bit PE images")
 
-    variable_comparator = VariableComparator(
-        # pylint: disable=protected-access
-        db=compare._db,
-        types=compare.types,
-        orig_bin=origfile,
-        recomp_bin=recompfile,
-    )
+    variable_comparator = compare.variable_comparator
 
     for var in compare.get_variables():
         if var.name in target.report_config.ignore_variables:

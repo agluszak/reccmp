@@ -381,6 +381,23 @@ def collect_compile_database(
             markers=(item for part in indexes for item in part.markers),
             variables=variables.values(),
             conflicts=conflicts.values(),
+            abi=_merged_abi(indexes),
+            target_abis={
+                target: part.abi
+                for (target, _paths), part in zip(targets.items(), indexes)
+                if part.abi is not None
+            },
         )
         result.write(cache / "source-index.json")
         return result
+
+
+def _merged_abi(indexes: Sequence[SourceIndex]) -> SourceAbi | None:
+    """Shared ABI only when every target that recorded one agrees."""
+    abis = [part.abi for part in indexes if part.abi is not None]
+    if not abis:
+        return None
+    first = abis[0]
+    if all(abi == first for abi in abis[1:]):
+        return first
+    return None

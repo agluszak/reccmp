@@ -494,7 +494,9 @@ def test_record_semantic_id_preferred_for_nested_lookup():
                 fields=(
                     SourceField(
                         name="inner",
-                        type="volatile const struct Bar &",
+                        # Embedded record: peeling would leave ``Bar``; the
+                        # semantic id must still win over the spelling.
+                        type="volatile const struct WeirdSpelling",
                         source_file="f.h",
                         line=1,
                         offset=0,
@@ -515,6 +517,223 @@ def test_record_semantic_id_preferred_for_nested_lookup():
     assert resolved is not None
     assert resolved.path == ("inner", "x")
     assert resolved.leaf.name == "x"
+
+
+def test_pointer_and_reference_fields_are_layout_leaves():
+    """Pointer/reference storage must not descend into the pointee layout."""
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Node",
+                qualified_name="Node",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="next",
+                        type="Node *",
+                        source_file="n.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                        pointer_depth=1,
+                        record_semantic_id="record:Node",
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="n.h",
+                line=1,
+                end_line=3,
+                size=4,
+                layout_trusted=True,
+            ),
+            SourceClass(
+                semantic_id="record:Child",
+                qualified_name="Child",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="value",
+                        type="int",
+                        source_file="c.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="c.h",
+                line=1,
+                end_line=3,
+                size=4,
+                layout_trusted=True,
+            ),
+            SourceClass(
+                semantic_id="record:Holder",
+                qualified_name="Holder",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="ptr",
+                        type="Child *",
+                        source_file="h.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                        pointer_depth=1,
+                        record_semantic_id="record:Child",
+                    ),
+                    SourceField(
+                        name="ref",
+                        type="Child &",
+                        source_file="h.h",
+                        line=3,
+                        offset=4,
+                        size=4,
+                        record_semantic_id="record:Child",
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="h.h",
+                line=1,
+                end_line=4,
+                size=8,
+                layout_trusted=True,
+            ),
+        ),
+    )
+    # Recursive Node* must terminate at the pointer field.
+    node = index.resolve_field("Node", 0)
+    assert node is not None
+    assert node.path == ("next",)
+    assert node.leaf.name == "next"
+    assert (node.leaf.pointer_depth or 0) == 1
+
+    holder_ptr = index.resolve_field("Holder", 0)
+    assert holder_ptr is not None
+    assert holder_ptr.path == ("ptr",)
+    assert holder_ptr.leaf.name == "ptr"
+
+    holder_ref = index.resolve_field("Holder", 4)
+    assert holder_ref is not None
+    assert holder_ref.path == ("ref",)
+    assert holder_ref.leaf.name == "ref"
+
+
+def test_untrusted_nested_layout_is_not_published():
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Child",
+                qualified_name="Child",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="value",
+                        type="int",
+                        source_file="c.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="c.h",
+                line=1,
+                end_line=3,
+                size=4,
+                layout_trusted=False,
+            ),
+            SourceClass(
+                semantic_id="record:Parent",
+                qualified_name="Parent",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="child",
+                        type="Child",
+                        source_file="p.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                        record_semantic_id="record:Child",
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="p.h",
+                line=1,
+                end_line=3,
+                size=4,
+                layout_trusted=True,
+            ),
+        ),
+    )
+    assert index.has_layout("Parent") is True
+    assert index.has_layout("Child") is False
+    assert index.resolve_field("Parent", 0) is None
+
+
+def test_cross_target_class_name_is_not_last_wins():
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Foo",
+                qualified_name="Foo",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="a",
+                        type="char",
+                        source_file="a.h",
+                        line=1,
+                        offset=0,
+                        size=1,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=1,
+                end_line=2,
+                size=8,
+                layout_trusted=True,
+                target="EXE",
+            ),
+            SourceClass(
+                semantic_id="record:Foo",
+                qualified_name="Foo",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="a",
+                        type="char",
+                        source_file="a.h",
+                        line=1,
+                        offset=0,
+                        size=1,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=1,
+                end_line=2,
+                size=4,
+                layout_trusted=True,
+                target="DLL",
+            ),
+        ),
+    )
+    assert index.class_named("Foo") is None
+    exe = index.for_target("EXE")
+    dll = index.for_target("DLL")
+    assert exe.class_named("Foo") is not None
+    assert exe.class_named("Foo").size == 8
+    assert dll.class_named("Foo") is not None
+    assert dll.class_named("Foo").size == 4
 
 
 def test_enrich_memory_address_with_layout_facts():
