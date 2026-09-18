@@ -2,7 +2,7 @@ import re
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from struct import unpack, error as StructError
 from typing_extensions import Self
 from reccmp.formats import Image
@@ -15,6 +15,9 @@ from reccmp.cvdump.types import (
     CvdumpIntegrityError,
 )
 from reccmp.types import ImageId
+
+if TYPE_CHECKING:
+    from reccmp.source import SourceIndex
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +236,40 @@ class VariableComparator:
     types: CvdumpTypesParser
     orig_bin: Image
     recomp_bin: Image
+    source_index: "SourceIndex | None" = None
+
+    def _source_type_name(self, var: ReccmpMatch) -> str | None:
+        """Resolve a Clang layout type name for this variable, when indexed."""
+        if self.source_index is None or not var.name:
+            return None
+        for item in self.source_index.variables:
+            if item.qualified_name != var.name and not item.qualified_name.endswith(
+                f"::{var.name}"
+            ):
+                continue
+            from reccmp.source.index import strip_type_qualifiers
+
+            name = strip_type_qualifiers(item.type)
+            if self.source_index.has_layout(name):
+                return name
+        # Fall back: variable name may itself be a typed aggregate in the index.
+        if self.source_index.has_layout(var.name):
+            return var.name
+        return None
+
+    def _member_display_name(
+        self, member: DataOffset, type_name: str | None
+    ) -> str | None:
+        """Prefer SourceIndex field paths when layout is known; else PDB name."""
+        if type_name is not None and self.source_index is not None:
+            path = self.source_index.field_path_at(type_name, member.offset)
+            if path:
+                return path
+        if member.name:
+            return member.name
+        if type_name is None:
+            return None
+        return f"+{member.offset:#x}" if member.offset else None
 
     def is_pointer_match(self, orig_addr: int, recomp_addr: int) -> bool:
         """Check whether these pointers point at the same thing"""
@@ -306,6 +343,7 @@ class VariableComparator:
                 )
 
         assert data_size is not None
+        source_type_name = self._source_type_name(var)
 
         try:
             orig_block = DataBlock.read(var.orig_addr, data_size, self.orig_bin)
@@ -372,7 +410,7 @@ class VariableComparator:
             compared.append(
                 ComparedOffset(
                     offset=member.offset,
-                    name=member.name,
+                    name=self._member_display_name(member, source_type_name),
                     match=match,
                     values=(value_a, value_b),
                 )

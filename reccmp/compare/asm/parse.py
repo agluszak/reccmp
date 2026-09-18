@@ -1,11 +1,16 @@
 """Converts x86 machine code into canonical ``DecodedInstruction`` rows.
 
 Capstone detail-mode decode happens once in ``InstructGen``.  This module
-sanitizes addresses into symbols/placeholders and materializes structured
-operands on each ``DecodedInstruction``.  Display strings remain for UI only.
+sanitizes addresses into symbols/placeholders on structured operands and
+refreshes the display string from that form.  ``parse_instruction`` is only
+a fallback when Capstone IR is missing or a line cannot be handled
+structurally.
 """
 
+from __future__ import annotations
+
 import re
+from dataclasses import replace
 from functools import cache
 from typing_extensions import Buffer
 from .const import JUMP_MNEMONICS, SINGLE_OPERAND_INSTS
@@ -18,7 +23,7 @@ from .instgen import (
     meta_from_decoded,
 )
 from .ir import AsmRole, DecodedInstruction, marker
-from .model import Reject, parse_instruction
+from .model import Reject, format_instruction, format_operand, parse_instruction
 from .replacement import AddrTestProtocol, NameReplacementProtocol
 
 AsmExcerpt = list[DecodedInstruction]
@@ -39,6 +44,11 @@ def from_hex(string: str) -> int | None:
         pass
 
     return None
+
+
+def _hex_style_addr(value: int) -> bool:
+    """True when Capstone-style text would emit a ``0x...`` token for ``value``."""
+    return abs(value) >= 10
 
 
 class ParseAsm:
@@ -209,10 +219,115 @@ class ParseAsm:
 
         return (inst_mnemonic, op_str)
 
+    def _sanitize_mem_operand(self, operand, *, indirect: bool):
+        """Apply absolute/displacement address replacement to a mem operand."""
+        size, seg, reg_terms, disp, syms = (
+            operand[1],
+            operand[2],
+            operand[3],
+            operand[4],
+            operand[5],
+        )
+        if syms:
+            return operand
+
+        # Absolute pointer: ``[0x1234]`` (hex-style only; ``[8]`` is left alone).
+        if not reg_terms:
+            if _hex_style_addr(disp):
+                name = self.indirect_replace(disp) if indirect else self.replace(disp)
+                return ("mem", size, seg, [], 0, ((1, name),))
+            return operand
+
+        # Register + displacement: only replace relocated addresses.
+        if _hex_style_addr(disp) and self.is_addr(abs(disp)):
+            value = abs(disp)
+            sign = 1 if disp >= 0 else -1
+            name = self.replace(value)
+            return ("mem", size, seg, list(reg_terms), 0, ((sign, name),))
+
+        return operand
+
+    def _sanitize_imm_operand(self, mnemonic: str, operand):
+        value = operand[1]
+        if not _hex_style_addr(value):
+            return operand
+        if mnemonic == "cmp":
+            name = self.lookup(value)
+            if name is not None:
+                return ("sym", name)
+            return operand
+        if self.is_addr(value):
+            return ("sym", self.replace(value))
+        return operand
+
+    def sanitize_row(self, insn: DecodedInstruction) -> DecodedInstruction:
+        """Transform Capstone operands structurally; refresh display from them."""
+        assert insn.address is not None
+        mnemonic = insn.mnemonic
+        operands = list(insn.operands)
+        jump_disp_hex = False
+
+        if (
+            mnemonic in SINGLE_OPERAND_INSTS
+            and len(operands) == 1
+            and operands[0][0] == "imm"
+        ):
+            addr_val = operands[0][1]
+            if mnemonic == "call":
+                operands[0] = ("sym", self.replace(addr_val, exact=True))
+            elif mnemonic == "push":
+                if self.is_addr(addr_val):
+                    operands[0] = ("sym", self.replace(addr_val))
+            elif mnemonic == "jmp":
+                potential_name = self.lookup(addr_val, exact=True)
+                if potential_name is not None:
+                    operands[0] = ("sym", potential_name)
+                else:
+                    operands[0] = (
+                        "imm",
+                        addr_val - (insn.address + insn.size),
+                    )
+                    jump_disp_hex = True
+            else:
+                # Other jumps: show relative displacement via hex().
+                operands[0] = ("imm", addr_val - (insn.address + insn.size))
+                jump_disp_hex = True
+        else:
+            for i, op in enumerate(operands):
+                if op[0] == "mem":
+                    if mnemonic == "call":
+                        # Absolute indirect only; leave [reg+disp] alone.
+                        if not op[3]:
+                            operands[i] = self._sanitize_mem_operand(op, indirect=True)
+                    else:
+                        operands[i] = self._sanitize_mem_operand(op, indirect=False)
+                elif op[0] == "imm":
+                    operands[i] = self._sanitize_imm_operand(mnemonic, op)
+
+        ops_tuple = tuple(operands)
+        if jump_disp_hex and ops_tuple and ops_tuple[0][0] == "imm":
+            raw = (hex(ops_tuple[0][1]),)
+            head = f"{insn.prefix} {mnemonic}".strip() if insn.prefix else mnemonic
+            display = f"{head} {raw[0]}"
+        else:
+            raw = tuple(format_operand(op) for op in ops_tuple)
+            display = format_instruction(mnemonic, insn.prefix, ops_tuple)
+        return replace(
+            insn,
+            operands=ops_tuple,
+            raw_operands=raw,
+            display=display,
+        )
+
+    def _should_sanitize(self, mnemonic: str, op_str: str, size: int) -> bool:
+        return "0x" in op_str and (
+            mnemonic in JUMP_MNEMONICS or size > 4 or not self.is_32bit
+        )
+
     def _finalize_code_row(
         self, lite: DisasmLiteTuple, display: str
     ) -> DecodedInstruction:
-        """Attach sanitized display + structured operands onto the decoded row."""
+        """Fallback: attach sanitized display via parse_instruction."""
         addr, size, _mnemonic, raw_op = lite
         base = self._decoded_by_addr.get(addr)
         try:
@@ -232,8 +347,6 @@ class ParseAsm:
                 raw_op_str=raw_op,
             )
         if base is not None:
-            from dataclasses import replace
-
             return replace(
                 base,
                 display=display,
@@ -272,15 +385,27 @@ class ParseAsm:
             if section.type == SectionType.CODE:
                 for inst in section.contents:
                     inst_address, inst_size, inst_mnemonic, inst_op_str = inst
-                    if "0x" in inst_op_str and (
-                        inst_mnemonic in JUMP_MNEMONICS
-                        or inst_size > 4
-                        or not self.is_32bit
-                    ):
+                    # Strip combined rep prefix for JUMP_MNEMONICS membership;
+                    # lite tuples still carry Capstone's combined mnemonic.
+                    check_mnemonic = inst_mnemonic
+                    if check_mnemonic.startswith(("rep ", "repe ", "repne ")):
+                        check_mnemonic = check_mnemonic.split(" ", 1)[1]
+
+                    base = self._decoded_by_addr.get(inst_address)
+                    if base is not None:
+                        if self._should_sanitize(
+                            check_mnemonic, inst_op_str, inst_size
+                        ):
+                            asm.append(self.sanitize_row(base))
+                        else:
+                            asm.append(base)
+                        continue
+
+                    # Fallback when Capstone IR is missing.
+                    if self._should_sanitize(check_mnemonic, inst_op_str, inst_size):
                         result = self.sanitize(inst)
                     else:
                         result = (inst_mnemonic, inst_op_str)
-
                     display = " ".join(result)
                     asm.append(self._finalize_code_row(inst, display))
             elif section.type == SectionType.ADDR_TAB:

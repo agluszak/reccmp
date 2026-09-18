@@ -502,6 +502,7 @@ def _serialize_version_1(
                             "counterpart": entry.counterpart,
                             "counterpart_offset": entry.counterpart_offset,
                             "confidence": entry.confidence,
+                            **({"semantic": True} if entry.semantic else {}),
                         }
                         for entry in entity.inline_expansions
                     ]
@@ -633,6 +634,7 @@ def _parse_inline_expansions(
         counterpart = item.get("counterpart")
         counterpart_offset = item.get("counterpart_offset")
         confidence = item.get("confidence", 0.0)
+        semantic = item.get("semantic", False)
         if not isinstance(helper, str) or not isinstance(helper_orig, str):
             raise ReccmpReportDeserializeError
         if not isinstance(helper_recomp, str):
@@ -647,6 +649,8 @@ def _parse_inline_expansions(
             raise ReccmpReportDeserializeError
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
             raise ReccmpReportDeserializeError
+        if not isinstance(semantic, bool):
+            raise ReccmpReportDeserializeError
         entries.append(
             InlineExpansionEvidence(
                 helper_name=helper,
@@ -658,6 +662,7 @@ def _parse_inline_expansions(
                 counterpart=counterpart,
                 counterpart_offset=counterpart_offset,
                 confidence=float(confidence),
+                semantic=semantic,
             )
         )
     return tuple(entries)

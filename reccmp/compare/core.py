@@ -389,7 +389,11 @@ class Compare:
         if orig_max is not None:
             orig_size = min(orig_size, orig_max)
         orig_size = effective_orig_vtable_size(
-            self.orig_bin, match.orig_addr, orig_size
+            self.orig_bin,
+            match.orig_addr,
+            orig_size,
+            db=self._db,
+            image_id=ImageId.ORIG,
         )
         orig_table = self.orig_bin.read(match.orig_addr, orig_size)
         recomp_table = self.recomp_bin.read(match.recomp_addr, recomp_size)

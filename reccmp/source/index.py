@@ -27,7 +27,14 @@ from reccmp.parser.marker import MarkerType, ProjectAliases
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v3"
+_SCHEMA = "reccmp-source-index-v4"
+_SUPPORTED_SCHEMAS = frozenset(
+    {
+        _SCHEMA,
+        "reccmp-source-index-v3",
+        "reccmp-source-index-v2",
+    }
+)
 
 
 class SourceIndexError(ValueError):
@@ -104,6 +111,18 @@ class SourceField:
     source_file: str
     line: int
     pointer_depth: int | None = None
+    offset: int | None = None
+    size: int | None = None
+    bitfield_width: int | None = None
+    bitfield_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class SourceBaseOffset:
+    """Byte offset of one direct base subobject within a complete class."""
+
+    name: str
+    offset: int
 
 
 @dataclass(frozen=True)
@@ -132,6 +151,9 @@ class SourceClass:
     base_vtables: tuple[SourceBaseVtable, ...] = ()
     unit_id: str = ""
     target: str | None = None
+    size: int | None = None
+    alignment: int | None = None
+    base_offsets: tuple[SourceBaseOffset, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -467,17 +489,60 @@ def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:
     )
 
 
+def strip_type_qualifiers(type_name: str) -> str:
+    """Reduce a Clang type spelling to a record name usable for layout lookup."""
+    name = type_name.strip()
+    for prefix in ("const ", "volatile ", "struct ", "class ", "union "):
+        if name.startswith(prefix):
+            name = name[len(prefix) :].strip()
+    while name.endswith("*") or name.endswith("&"):
+        name = name[:-1].rstrip()
+    return name
+
+
+def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
+    data = dict(values)
+    for key in ("offset", "size", "bitfield_width", "bitfield_offset", "pointer_depth"):
+        if key in data and data[key] is None:
+            continue
+        if key not in data:
+            data[key] = None
+    return SourceField(
+        name=str(data["name"]),
+        type=str(data["type"]),
+        source_file=str(data["source_file"]),
+        line=int(data["line"]),
+        pointer_depth=data.get("pointer_depth"),
+        offset=data.get("offset"),
+        size=data.get("size"),
+        bitfield_width=data.get("bitfield_width"),
+        bitfield_offset=data.get("bitfield_offset"),
+    )
+
+
 def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     return SourceClass(
-        **{
-            **values,
-            "bases": tuple(values["bases"]),
-            "fields": tuple(SourceField(**field) for field in values["fields"]),
-            "virtual_declarations": tuple(values["virtual_declarations"]),
-            "base_vtables": tuple(
-                SourceBaseVtable(**item) for item in values.get("base_vtables", ())
-            ),
-        }
+        semantic_id=str(values["semantic_id"]),
+        qualified_name=str(values["qualified_name"]),
+        bases=tuple(values["bases"]),
+        fields=tuple(_field_from_dict(field) for field in values["fields"]),
+        virtual_declarations=tuple(values["virtual_declarations"]),
+        source_file=str(values["source_file"]),
+        line=int(values["line"]),
+        end_line=int(values["end_line"]),
+        asserted_size=values.get("asserted_size"),
+        vtable_address=values.get("vtable_address"),
+        base_vtables=tuple(
+            SourceBaseVtable(**item) for item in values.get("base_vtables", ())
+        ),
+        unit_id=str(values.get("unit_id") or ""),
+        target=values.get("target"),
+        size=values.get("size"),
+        alignment=values.get("alignment"),
+        base_offsets=tuple(
+            SourceBaseOffset(name=str(item["name"]), offset=int(item["offset"]))
+            for item in values.get("base_offsets") or ()
+        ),
     )
 
 
@@ -635,6 +700,56 @@ class SourceIndex:
         )
         self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
+        self._classes_by_name = {item.qualified_name: item for item in self.classes}
+
+    def class_named(self, qualified_name: str) -> SourceClass | None:
+        """Return the indexed class with this qualified name, if present."""
+        return self._classes_by_name.get(qualified_name)
+
+    def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
+        """Largest field whose byte offset is <= ``offset`` (layout must be known)."""
+        source_class = self._classes_by_name.get(qualified_name)
+        if source_class is None:
+            return None
+        best: SourceField | None = None
+        for item in source_class.fields:
+            if item.offset is None:
+                continue
+            if item.offset <= offset and (
+                best is None or item.offset > (best.offset or -1)
+            ):
+                best = item
+        return best
+
+    def field_path_at(self, qualified_name: str, offset: int) -> str | None:
+        """Dotted field path for a byte offset, descending into nested records."""
+        parts: list[str] = []
+        current = qualified_name
+        remaining = offset
+        for _ in range(8):
+            field = self.field_at(current, remaining)
+            if field is None or field.offset is None:
+                break
+            parts.append(field.name)
+            remaining -= field.offset
+            nested = strip_type_qualifiers(field.type)
+            if remaining == 0:
+                break
+            if nested not in self._classes_by_name:
+                if remaining:
+                    parts.append(f"+{remaining:#x}")
+                break
+            current = nested
+        if not parts:
+            return None
+        return ".".join(parts)
+
+    def has_layout(self, qualified_name: str) -> bool:
+        """True when the class carries Clang ASTRecordLayout field offsets."""
+        source_class = self._classes_by_name.get(qualified_name)
+        if source_class is None:
+            return False
+        return any(field.offset is not None for field in source_class.fields)
 
     @classmethod
     def from_units(
@@ -685,7 +800,7 @@ class SourceIndex:
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records."""
         schema = document.get("schema")
-        if schema not in {_SCHEMA, "reccmp-source-index-v2"}:
+        if schema not in _SUPPORTED_SCHEMAS:
             raise SourceIndexError("unsupported source-index schema")
         declarations = tuple(
             _declaration_from_dict(item) for item in document["declarations"]

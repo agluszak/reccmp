@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import NamedTuple, Sequence
+from typing import Literal, NamedTuple, Sequence
 
 from reccmp.compare.asm.model import STACK_ENTRY_REGEX
 from reccmp.compare.diagnosis import StackPermutationEntry
@@ -21,6 +21,60 @@ from reccmp.compare.diff import (
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpTypeKey
+
+StackRefKind = Literal["argument", "local", "spill", "saved", "unknown"]
+
+
+@dataclass(frozen=True)
+class CanonicalStackRef:
+    """Shared vocabulary for ebp/esp-relative slots across stackcmp and diagnosis."""
+
+    kind: StackRefKind
+    key: str | int
+    physical: tuple[str, int] | None = None
+
+    def label(self) -> str:
+        if self.kind == "argument":
+            return f"arg[{self.key}]"
+        if self.kind == "local":
+            return f"local[{self.key}]"
+        if self.kind == "spill":
+            return f"spill[{self.key}]"
+        if self.kind == "saved":
+            return f"saved[{self.key}]"
+        return f"stack[{self.key}]"
+
+
+def canonical_stack_ref(
+    register: str,
+    offset: int,
+    *,
+    known_spills: set[int] | frozenset[int] | None = None,
+) -> CanonicalStackRef:
+    """Map a physical (reg, offset) pair to a canonical stack reference.
+
+    Heuristics (MSVC thiscall/cdecl frame):
+    - ``ebp`` with positive offset → argument (``ebp+8`` is arg 0)
+    - ``ebp`` with negative offset → local
+    - ``ebp``/``ebp+4`` → saved frame / return address
+    - ``esp`` → spill when listed in ``known_spills``, else unknown
+    """
+    reg = register.lower()
+    physical = (reg, offset)
+    if reg == "ebp":
+        if offset == 0:
+            return CanonicalStackRef("saved", "ebp", physical)
+        if offset == 4:
+            return CanonicalStackRef("saved", "return", physical)
+        if offset > 0:
+            arg_index = (offset - 8) // 4 if offset >= 8 else offset
+            return CanonicalStackRef("argument", arg_index, physical)
+        return CanonicalStackRef("local", offset, physical)
+    if reg == "esp":
+        if known_spills is not None and offset in known_spills:
+            return CanonicalStackRef("spill", offset, physical)
+        return CanonicalStackRef("unknown", offset, physical)
+    return CanonicalStackRef("unknown", offset, physical)
 
 
 @dataclass
@@ -34,6 +88,7 @@ class StackRegisterOffset:
     register: str
     offset: int
     symbol: StackSymbol | None = None
+    canonical: CanonicalStackRef | None = None
 
     def __str__(self) -> str:
         first_part = (
@@ -42,13 +97,18 @@ class StackRegisterOffset:
             else f"{self.register} - {-self.offset:#04x}"
         )
         second_part = f"  {self.symbol.name}" if self.symbol else ""
-        return first_part + second_part
+        canonical_part = ""
+        if self.canonical is not None:
+            canonical_part = f"  ({self.canonical.label()})"
+        return first_part + second_part + canonical_part
 
     def __hash__(self) -> int:
         return hash((self.register, self.offset))
 
     def copy(self) -> "StackRegisterOffset":
-        return StackRegisterOffset(self.register, self.offset, self.symbol)
+        return StackRegisterOffset(
+            self.register, self.offset, self.symbol, self.canonical
+        )
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -61,9 +121,19 @@ class StackRegisterOffset:
         return (self.register, self.offset)
 
     def label(self) -> str:
+        if self.canonical is not None:
+            return self.canonical.label()
         if self.offset >= 0:
             return f"{self.register}+{self.offset:#x}"
         return f"{self.register}-{ -self.offset:#x}"
+
+    def attach_canonical(
+        self, *, known_spills: set[int] | frozenset[int] | None = None
+    ) -> "StackRegisterOffset":
+        self.canonical = canonical_stack_ref(
+            self.register, self.offset, known_spills=known_spills
+        )
+        return self
 
 
 class StackPair(NamedTuple):
@@ -98,7 +168,20 @@ def extract_stack_offset_from_instruction(
     if not match:
         return None
     offset = int(match.group("sign") + match.group("offset"), 16)
-    return StackRegisterOffset(match.group("register"), offset)
+    slot = StackRegisterOffset(match.group("register"), offset)
+    slot.attach_canonical()
+    return slot
+
+
+def annotate_canonical_refs(
+    stack_pairs: StackPairs,
+    *,
+    known_spills: set[int] | frozenset[int] | None = None,
+) -> None:
+    """Attach or refresh CanonicalStackRef labels on every observed slot."""
+    for orig, recomp in stack_pairs:
+        orig.attach_canonical(known_spills=known_spills)
+        recomp.attach_canonical(known_spills=known_spills)
 
 
 def analyze_diff_block(
@@ -255,6 +338,7 @@ def analyze_stack_layout(
         return None
 
     annotate_recomp_symbols(stack_pairs, fn_symbol)
+    annotate_canonical_refs(stack_pairs)
     mapping, bijective = build_slot_bijection(stack_pairs)
     # Identity pairs do not need rewriting; only non-identity matter for score.
     non_identity = {k: v for k, v in mapping.items() if k != v}

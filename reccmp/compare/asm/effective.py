@@ -3468,6 +3468,215 @@ def _build_side_cfg(
     )
 
 
+def _block_code_indices(cfg: _SideCfg, block: int) -> list[int]:
+    return [
+        i for i in range(cfg.starts[block], cfg.ends[block]) if i not in cfg.owned_data
+    ]
+
+
+def _rebuild_cfg_keeping(
+    cfg: _SideCfg,
+    keep: list[int],
+    *,
+    redirect: dict[int, int] | None = None,
+) -> _SideCfg:
+    """Return a CFG containing only ``keep`` blocks (in that order).
+
+    ``redirect`` maps removed/old block ids onto a surviving old id before
+    the keep-list remapping is applied. Edge targets that cannot be
+    resolved become ``\"external\"``.
+    """
+    redirect = dict(redirect or {})
+    old_to_new = {old: new for new, old in enumerate(keep)}
+
+    def map_target(target: int | str) -> int | str:
+        if not isinstance(target, int):
+            return target
+        seen: set[int] = set()
+        while target in redirect and target not in seen:
+            seen.add(target)
+            target = redirect[target]
+        return old_to_new.get(target, "external")
+
+    return _SideCfg(
+        starts=[cfg.starts[b] for b in keep],
+        ends=[cfg.ends[b] for b in keep],
+        succ=[
+            {role: map_target(dest) for role, dest in cfg.succ[b].items()} for b in keep
+        ],
+        kinds=cfg.kinds,
+        owned_data=cfg.owned_data,
+        table_dests=cfg.table_dests,
+    )
+
+
+def _is_empty_jump_block(cfg: _SideCfg, block: int) -> bool:
+    """Single internal ``jmp`` with no other code — a jump-only trampoline."""
+    indices = _block_code_indices(cfg, block)
+    if len(indices) != 1:
+        return False
+    insn = indices[0]
+    if cfg.kinds[insn] != "jmp" or insn in cfg.table_dests:
+        return False
+    edges = cfg.succ[block]
+    if set(edges) != {"jmp"}:
+        return False
+    return isinstance(edges["jmp"], int)
+
+
+def _is_empty_ret_block(cfg: _SideCfg, block: int) -> bool:
+    indices = _block_code_indices(cfg, block)
+    return len(indices) == 1 and cfg.kinds[indices[0]] == "ret" and not cfg.succ[block]
+
+
+def _remove_empty_jump_blocks(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
+    """Thread A → empty-jmp → B into A → B. Conservative: leave unsure alone."""
+    n = len(cfg.starts)
+    redirect: dict[int, int] = {}
+    removed: set[int] = set()
+    for block in range(n):
+        if not _is_empty_jump_block(cfg, block):
+            continue
+        target = cfg.succ[block]["jmp"]
+        assert isinstance(target, int)
+        # Don't create a self-loop trampoline or remove a block that jumps
+        # into another trampoline we're already collapsing onto itself.
+        if target == block:
+            continue
+        redirect[block] = target
+        removed.add(block)
+
+    if not removed:
+        return cfg, False
+
+    # Resolve redirect chains (empty jmp → empty jmp → real).
+    def resolve(block: int) -> int:
+        seen: set[int] = set()
+        while block in redirect and block not in seen:
+            seen.add(block)
+            block = redirect[block]
+        return block
+
+    redirect = {b: resolve(t) for b, t in redirect.items()}
+    # Drop any redirect that still lands on a removed block (cycle).
+    redirect = {b: t for b, t in redirect.items() if t not in removed}
+    removed = {b for b in removed if b in redirect}
+    if not removed:
+        return cfg, False
+
+    # If the entry block is removed, its ultimate target becomes the new entry.
+    entry = 0
+    if entry in removed:
+        entry = redirect[entry]
+    keep = [entry] + [b for b in range(n) if b not in removed and b != entry]
+    return _rebuild_cfg_keeping(cfg, keep, redirect=redirect), True
+
+
+def _predecessor_counts(cfg: _SideCfg) -> list[int]:
+    counts = [0] * len(cfg.starts)
+    for edges in cfg.succ:
+        for dest in edges.values():
+            if isinstance(dest, int):
+                counts[dest] += 1
+    return counts
+
+
+def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
+    """Merge A --fall--> B when B has a single predecessor and ranges abut."""
+    preds = _predecessor_counts(cfg)
+    n = len(cfg.starts)
+    # child block -> parent that absorbs it (only direct pairs this pass)
+    absorb: dict[int, int] = {}
+    claimed_parents: set[int] = set()
+    for block_a in range(n):
+        if block_a in absorb or block_a in claimed_parents:
+            continue
+        edges = cfg.succ[block_a]
+        if set(edges) != {"fall"}:
+            continue
+        block_b = edges["fall"]
+        if not isinstance(block_b, int):
+            continue
+        if block_b == block_a or block_b in absorb or block_b in claimed_parents:
+            continue
+        if preds[block_b] != 1:
+            continue
+        if cfg.ends[block_a] != cfg.starts[block_b]:
+            continue
+        if _is_empty_jump_block(cfg, block_b):
+            continue
+        last_b = _block_terminator(
+            cfg.starts[block_b], cfg.ends[block_b], cfg.kinds, cfg.owned_data
+        )
+        if last_b in cfg.table_dests:
+            continue
+        absorb[block_b] = block_a
+        claimed_parents.add(block_a)
+
+    if not absorb:
+        return cfg, False
+
+    new_starts = list(cfg.starts)
+    new_ends = list(cfg.ends)
+    new_succ = [dict(edges) for edges in cfg.succ]
+    for child, parent in absorb.items():
+        new_ends[parent] = cfg.ends[child]
+        new_succ[parent] = dict(cfg.succ[child])
+
+    keep = [b for b in range(n) if b not in absorb]
+    old_to_new = {old: new for new, old in enumerate(keep)}
+    remapped_succ: list[dict[str, int | str]] = []
+    for old in keep:
+        remapped: dict[str, int | str] = {}
+        for role, dest in new_succ[old].items():
+            if isinstance(dest, int):
+                # Absorbed children are gone; edges to them should already
+                # have been rewritten on the parent. If any remain, external.
+                remapped[role] = old_to_new.get(dest, "external")
+            else:
+                remapped[role] = dest
+        remapped_succ.append(remapped)
+    return (
+        _SideCfg(
+            starts=[new_starts[b] for b in keep],
+            ends=[new_ends[b] for b in keep],
+            succ=remapped_succ,
+            kinds=cfg.kinds,
+            owned_data=cfg.owned_data,
+            table_dests=cfg.table_dests,
+        ),
+        True,
+    )
+
+
+def _collapse_duplicate_ret_blocks(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
+    """Point every empty ``ret`` block at a single canonical ret block."""
+    ret_blocks = [b for b in range(len(cfg.starts)) if _is_empty_ret_block(cfg, b)]
+    if len(ret_blocks) < 2:
+        return cfg, False
+    canonical = ret_blocks[0]
+    redirect = {b: canonical for b in ret_blocks[1:]}
+    keep = [b for b in range(len(cfg.starts)) if b not in redirect]
+    return _rebuild_cfg_keeping(cfg, keep, redirect=redirect), True
+
+
+def _canonicalize_side_cfg(cfg: _SideCfg) -> _SideCfg:
+    """Conservative CFG cleanup before isomorphic block pairing.
+
+    Removes empty jump-only trampolines, merges trivial fallthrough splits,
+    and collapses duplicated empty ``ret`` blocks. Transforms that are not
+    clearly safe are skipped.
+    """
+    current = cfg
+    for _ in range(len(cfg.starts) + 2):
+        current, jumped = _remove_empty_jump_blocks(current)
+        current, fell = _merge_trivial_fallthrough_splits(current)
+        current, rets = _collapse_duplicate_ret_blocks(current)
+        if not (jumped or fell or rets):
+            break
+    return current
+
+
 def _pair_cfg_blocks(
     cfg_o: _SideCfg,
     cfg_r: _SideCfg,
@@ -3866,6 +4075,8 @@ def verify_isomorphic_cfg_effective_match(
     )
     if cfg_o is None or cfg_r is None:
         return False
+    cfg_o = _canonicalize_side_cfg(cfg_o)
+    cfg_r = _canonicalize_side_cfg(cfg_r)
     pairs = _pair_cfg_blocks(cfg_o, cfg_r, recorder)
     if pairs is None:
         return False

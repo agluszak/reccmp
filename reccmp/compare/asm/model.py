@@ -125,3 +125,84 @@ def parse_instruction(line: str) -> Instruction:
         mnemonic, _, op_str = op_str.partition(" ")
     raw = tuple(split_operands(op_str)) if op_str else ()
     return Instruction(mnemonic, prefix, tuple(parse_operand(t) for t in raw), raw)
+
+
+def format_imm(value: int) -> str:
+    """Capstone Intel-syntax immediates: decimal for |n| < 10, else hex."""
+    if -9 <= value <= 9:
+        return str(value)
+    return hex(value)
+
+
+def format_operand(operand) -> str:
+    """Render a structured operand back to Capstone-like Intel text."""
+    kind = operand[0]
+    if kind == "reg":
+        return operand[1]
+    if kind == "st":
+        return f"st({operand[1]})"
+    if kind == "imm":
+        return format_imm(operand[1])
+    if kind == "sym":
+        return operand[1]
+    if kind != "mem":
+        raise Reject
+
+    size, seg, reg_terms, disp, syms = (
+        operand[1],
+        operand[2],
+        operand[3],
+        operand[4],
+        operand[5],
+    )
+    parts: list[str] = []
+    for name, scale in reg_terms:
+        token = name if scale == 1 else f"{name}*{scale}"
+        if not parts:
+            parts.append(token)
+        else:
+            parts.append(f"+ {token}")
+    for sign, name in syms:
+        if not parts:
+            parts.append(name if sign > 0 else f"-{name}")
+        else:
+            parts.append(f"+ {name}" if sign > 0 else f"- {name}")
+    if disp or (not parts and not syms):
+        if not parts:
+            parts.append(format_imm(disp))
+        elif disp > 0:
+            parts.append(f"+ {format_imm(disp)}")
+        elif disp < 0:
+            parts.append(f"- {format_imm(-disp)}")
+
+    body = " ".join(parts)
+    if seg:
+        body = f"{seg}:[{body}]"
+    else:
+        body = f"[{body}]"
+    if size:
+        return f"{size} ptr {body}"
+    return body
+
+
+def format_instruction(mnemonic: str, prefix: str, operands: tuple) -> str:
+    """Build a display line from structured fields.
+
+    Zero-operand instructions keep a trailing space (``\"nop \"``) for
+    compatibility with the historical ``\" \".join((mnemonic, op_str))`` form.
+    """
+    head = f"{prefix} {mnemonic}".strip() if prefix else mnemonic
+    if not operands:
+        return f"{head} "
+    return f"{head} {', '.join(format_operand(op) for op in operands)}"
+
+
+def split_mnemonic_prefix(mnemonic: str) -> tuple[str, str]:
+    """Split Capstone's combined ``rep movsd``-style mnemonic into prefix + op."""
+    for candidate in ("repne", "repe", "rep"):
+        if mnemonic == candidate:
+            return candidate, ""
+        prefix = candidate + " "
+        if mnemonic.startswith(prefix):
+            return candidate, mnemonic[len(prefix) :]
+    return "", mnemonic

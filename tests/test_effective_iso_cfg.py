@@ -978,3 +978,51 @@ def test_unresolved_switch_without_addrs_stays_jump_table_data():
         # No addrs → cannot resolve start+ entries.
     )
     assert recorder.failure_analysis().inconclusive_reason == "jump_table_data"
+
+
+# --- CFG canonicalization ----------------------------------------------------
+
+
+def test_empty_jump_only_block_canonicalizes_to_direct_edge():
+    """A → empty jmp → B is the same CFG as A → B after canonicalization.
+
+    Compilers sometimes emit a trampoline basic block that is only ``jmp``;
+    isomorphic matching should not fail solely because one side has it.
+    """
+    # orig: entry --jmp--> empty-jmp --jmp--> ret
+    orig = [
+        "xor eax, eax",
+        "jmp 0x2",
+        "jmp 0x3",
+        "ret",
+    ]
+    orig_targets: list[int | None] = [None, 2, 3, None]
+    # recomp: entry --jmp--> ret (no trampoline)
+    recomp = [
+        "xor eax, eax",
+        "jmp 0x2",
+        "ret",
+    ]
+    recomp_targets: list[int | None] = [None, 2, None]
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig, recomp, orig_targets, recomp_targets
+        )
+        is True
+    )
+
+
+def test_empty_jump_only_block_both_sides_still_match():
+    """Trampolines on both sides collapse to the same shape."""
+    side = [
+        "mov eax, ecx",
+        "jmp 0x2",
+        "jmp 0x3",
+        "mov dword ptr [esi], eax",
+        "ret",
+    ]
+    targets: list[int | None] = [None, 2, 3, None, None]
+    assert (
+        verify_isomorphic_cfg_effective_match(side, list(side), targets, list(targets))
+        is True
+    )

@@ -2,8 +2,8 @@
 
 One disassembly pass produces both the structured meta previously collected by
 ``collect_instruction_meta`` and the ``(addr, size, mnemonic, op_str)`` tuples
-``InstructGen`` uses for section discovery.  Operand sanitization / structured
-``parse_instruction`` happens later in ``ParseAsm``.
+``InstructGen`` uses for section discovery.  Typed operands are filled from
+Capstone detail here; address sanitization happens later in ``ParseAsm``.
 """
 
 from __future__ import annotations
@@ -25,11 +25,28 @@ from capstone import (  # type: ignore
 from capstone import x86_const  # type: ignore
 
 from .ir import AsmRole, DecodedInstruction
+from .model import (
+    REGISTERS,
+    ST_RE,
+    format_operand,
+    split_mnemonic_prefix,
+)
 
 _EFLAGS_READ_MASK = 0
 for _name in dir(x86_const):
     if _name.startswith("X86_EFLAGS_TEST_"):
         _EFLAGS_READ_MASK |= getattr(x86_const, _name)
+
+_SIZE_NAMES = {
+    1: "byte",
+    2: "word",
+    4: "dword",
+    8: "qword",
+    10: "xword",
+    16: "xmmword",
+    32: "ymmword",
+    64: "zmmword",
+}
 
 
 @cache
@@ -44,6 +61,49 @@ def stop_at_int3_detail(instructions) -> Iterable:
         if insn.mnemonic == "int3":
             break
         yield insn
+
+
+def _reg_operand(name: str):
+    """Map a Capstone register name to the parse_operand tuple shape."""
+    if name in REGISTERS:
+        return ("reg", name)
+    st_match = ST_RE.match(name)
+    if st_match:
+        return ("st", int(st_match.group(1) or 0))
+    return ("sym", name)
+
+
+def _mem_size_name(mnemonic: str, size: int) -> str:
+    # Capstone omits the size keyword for lea; match that in structured form.
+    if mnemonic == "lea":
+        return ""
+    return _SIZE_NAMES.get(size, "")
+
+
+def capstone_operand(insn, op, mnemonic: str):
+    """Convert one Capstone operand to the ``parse_operand`` tuple shape."""
+    if op.type == x86_const.X86_OP_REG:
+        return _reg_operand(insn.reg_name(op.reg))
+    if op.type == x86_const.X86_OP_IMM:
+        return ("imm", int(op.imm))
+    if op.type == x86_const.X86_OP_MEM:
+        mem = op.mem
+        reg_terms: list[tuple[str, int]] = []
+        if mem.base:
+            reg_terms.append((insn.reg_name(mem.base), 1))
+        if mem.index:
+            reg_terms.append((insn.reg_name(mem.index), int(mem.scale)))
+        seg = insn.reg_name(mem.segment) if mem.segment else ""
+        return (
+            "mem",
+            _mem_size_name(mnemonic, op.size),
+            seg or "",
+            reg_terms,
+            int(mem.disp),
+            (),
+        )
+    # Rare / unsupported (e.g. invalid): fall back to opaque symbol.
+    return ("sym", "?")
 
 
 def from_capstone(insn) -> DecodedInstruction:
@@ -62,32 +122,42 @@ def from_capstone(insn) -> DecodedInstruction:
     is_jump = insn.group(CS_GRP_JUMP)
     is_call = insn.group(CS_GRP_CALL)
     branch_target = None
-    operands = insn.operands
+    cs_operands = insn.operands
     if (
         (is_jump or is_call)
         and insn.group(CS_GRP_BRANCH_RELATIVE)
-        and len(operands) == 1
-        and operands[0].type == x86_const.X86_OP_IMM
+        and len(cs_operands) == 1
+        and cs_operands[0].type == x86_const.X86_OP_IMM
     ):
-        branch_target = operands[0].imm
+        branch_target = cs_operands[0].imm
 
-    display = (
-        f"{insn.mnemonic} {insn.op_str}".rstrip() if insn.op_str else insn.mnemonic
-    )
+    prefix, mnemonic = split_mnemonic_prefix(insn.mnemonic)
+    # Use the post-split mnemonic for lea size omission etc.
+    operands = tuple(capstone_operand(insn, op, mnemonic) for op in cs_operands)
+    raw_operands = tuple(format_operand(op) for op in operands)
+
+    # Preserve Capstone's own display text (including combined rep mnemonic).
+    # Zero-operand lines keep a trailing space to match historical
+    # ``" ".join((mnemonic, op_str))`` output used in reports/diffs.
+    if insn.op_str:
+        display = f"{insn.mnemonic} {insn.op_str}".rstrip()
+    else:
+        display = f"{insn.mnemonic} "
+
     return DecodedInstruction(
         address=insn.address,
         size=insn.size,
-        mnemonic=insn.mnemonic,
-        prefix="",
-        operands=(),
-        raw_operands=(),
+        mnemonic=mnemonic,
+        prefix=prefix,
+        operands=operands,
+        raw_operands=raw_operands,
         display=display,
         role=AsmRole.CODE,
         regs_read=regs_read,
         regs_written=regs_written,
         reads_flags=bool(insn.eflags & _EFLAGS_READ_MASK),
         writes_flags=bool(insn.eflags & ~_EFLAGS_READ_MASK),
-        accesses_memory=any(op.type == x86_const.X86_OP_MEM for op in operands),
+        accesses_memory=any(op.type == x86_const.X86_OP_MEM for op in cs_operands),
         is_jump=is_jump,
         is_call=is_call,
         is_ret=insn.group(CS_GRP_RET),
@@ -111,4 +181,8 @@ def disasm_detail(
 def as_lite_tuple(insn: DecodedInstruction) -> tuple[int, int, str, str]:
     """Compatibility view for InstructGen section analysis."""
     assert insn.address is not None
-    return (insn.address, insn.size, insn.mnemonic, insn.raw_op_str)
+    # InstructGen expects Capstone's combined mnemonic (e.g. ``rep movsd``).
+    mnemonic = (
+        f"{insn.prefix} {insn.mnemonic}".strip() if insn.prefix else insn.mnemonic
+    )
+    return (insn.address, insn.size, mnemonic, insn.raw_op_str)

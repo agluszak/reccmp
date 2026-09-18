@@ -20,6 +20,51 @@ InlineSide = Literal["orig", "recomp", "both"]
 
 # Trailing opcodes that belong to a standalone helper epilog, not an inline site.
 _EPILOG_MNEMONICS = frozenset({"ret", "retn", "retf"})
+_STORE_MNEMONICS = frozenset(
+    {"mov", "movzx", "movsx", "lea", "add", "sub", "or", "xor", "and", "xchg"}
+)
+# Dest-memory forms with ecx/this + optional displacement (thiscall helpers).
+_THIS_STORE = re.compile(
+    r"^(?:dword|word|byte|qword)\s+ptr\s+"
+    r"\[(?:ecx)(?:\s*([+-])\s*(?:0x)?([0-9a-f]+))?\]\s*,",
+    re.IGNORECASE,
+)
+_ARG_STORE = re.compile(
+    r"^(?:dword|word|byte|qword)\s+ptr\s+"
+    r"\[(?:esp|ebp)(?:\s*([+-])\s*(?:0x)?([0-9a-f]+))?\]\s*,",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_FOR_SUMMARY = frozenset(
+    {
+        "call",
+        "int",
+        "syscall",
+        "sysenter",
+        "cpuid",
+        "rdtsc",
+        "in",
+        "out",
+        "ins",
+        "outs",
+    }
+)
+
+
+@dataclass(frozen=True)
+class StoreEffect:
+    """One observed store through this/arg + constant displacement."""
+
+    base: Literal["this", "arg", "stack"]
+    displacement: int
+
+
+@dataclass(frozen=True)
+class HelperEffectSummary:
+    """Lightweight net-effect fingerprint for a short helper body."""
+
+    inputs: tuple[str, ...]
+    stores: tuple[StoreEffect, ...]
+    return_kind: Literal["void", "register", "stack", "unknown"] = "unknown"
 
 
 @dataclass(frozen=True)
@@ -46,6 +91,7 @@ class InlineExpansionEvidence:
     counterpart: Counterpart
     counterpart_offset: int | None = None
     confidence: float = 0.0
+    semantic: bool = False
 
 
 @dataclass
@@ -66,6 +112,87 @@ class HelperCatalogEntry:
     # How many helpers share this exact fingerprint across the catalog.
     # Used as an inverse-frequency confidence weight (1.0 = unique).
     uniqueness: float = 1.0
+    effect_summary: HelperEffectSummary | None = None
+
+
+def summarize_helper_effects(
+    fingerprint: Fingerprint,
+    *,
+    max_length: int = 32,
+) -> HelperEffectSummary | None:
+    """Derive a cheap effect summary from a helper fingerprint.
+
+    Prefer short bodies without unsupported ops. Returns ``None`` when the
+    helper is too long or cannot be summarized safely. Full symbolic
+    ``execute()`` is optional future work; displacement-pattern parsing is the MVP.
+    """
+    if not fingerprint or len(fingerprint) > max_length:
+        return None
+    if any(mnemonic.lower() in _UNSUPPORTED_FOR_SUMMARY for mnemonic, _ in fingerprint):
+        return None
+
+    inputs: set[str] = set()
+    stores: list[StoreEffect] = []
+    return_kind: Literal["void", "register", "stack", "unknown"] = "void"
+
+    for mnemonic, operand in fingerprint:
+        lower = mnemonic.lower()
+        operand_l = operand.lower()
+        if "ecx" in operand_l:
+            inputs.add("ecx")
+        if "edx" in operand_l:
+            inputs.add("edx")
+        if "eax" in operand_l and lower.startswith("mov") and "," in operand_l:
+            # mov eax, ... counts as producing a register return.
+            dest = operand_l.split(",", 1)[0].strip()
+            if dest == "eax":
+                return_kind = "register"
+
+        if lower not in _STORE_MNEMONICS:
+            if lower in _EPILOG_MNEMONICS:
+                continue
+            continue
+
+        this_match = _THIS_STORE.match(operand)
+        if this_match and "," in operand:
+            # Only count when the memory operand is the destination.
+            dest = operand.split(",", 1)[0].strip().lower()
+            if dest.startswith(("dword", "word", "byte", "qword")) and "ecx" in dest:
+                sign, digits = this_match.group(1), this_match.group(2)
+                disp = int(f"{sign or '+'}{digits or '0'}", 16)
+                stores.append(StoreEffect("this", disp))
+                inputs.add("ecx")
+                continue
+
+        arg_match = _ARG_STORE.match(operand)
+        if arg_match and "," in operand:
+            dest = operand.split(",", 1)[0].strip().lower()
+            if dest.startswith(("dword", "word", "byte", "qword")):
+                sign, digits = arg_match.group(1), arg_match.group(2)
+                disp = int(f"{sign or '+'}{digits or '0'}", 16)
+                base: Literal["arg", "stack"] = (
+                    "arg" if "ebp" in dest and disp >= 8 else "stack"
+                )
+                stores.append(StoreEffect(base, disp))
+
+    # Deduplicate while preserving order.
+    unique_stores: list[StoreEffect] = []
+    seen: set[tuple[str, int]] = set()
+    for store in stores:
+        key = (store.base, store.displacement)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_stores.append(store)
+
+    if not unique_stores and return_kind == "void" and not inputs:
+        return None
+
+    return HelperEffectSummary(
+        inputs=tuple(sorted(inputs)),
+        stores=tuple(unique_stores),
+        return_kind=return_kind,
+    )
 
 
 @dataclass(frozen=True)
@@ -324,6 +451,32 @@ def _inline_confidence(
     return round(score, 4)
 
 
+def _semantic_match(helper: HelperCatalogEntry, span_fingerprint: Fingerprint) -> bool:
+    """True when helper and inlined span share the same effect summary."""
+    if helper.effect_summary is None:
+        return False
+    span_summary = summarize_helper_effects(span_fingerprint)
+    return span_summary is not None and span_summary == helper.effect_summary
+
+
+def _evidence_confidence(
+    helper: HelperCatalogEntry,
+    host_fp: Fingerprint,
+    span: tuple[int, int] | None,
+    *,
+    call_backed: bool,
+) -> tuple[float, bool]:
+    confidence = _inline_confidence(helper, len(host_fp), call_backed=call_backed)
+    semantic = False
+    if span is not None:
+        start, length = span
+        span_fp = host_fp[start : start + length]
+        if _semantic_match(helper, span_fp):
+            semantic = True
+            confidence = min(1.0, round(confidence + 0.2, 4))
+    return confidence, semantic
+
+
 def find_inline_expansions(
     helper_fingerprint: Fingerprint,
     hosts: Sequence[tuple[int, str, int]],
@@ -522,6 +675,12 @@ def analyze_inline_layout(
             kept_recomp.discard((helper.orig_addr, pairing.recomp_span[0]))
             orig_elide.append((*pairing.orig_span, placeholder))
             recomp_elide.append((*pairing.recomp_span, placeholder))
+            confidence, semantic = _evidence_confidence(
+                helper,
+                orig_fp,
+                pairing.orig_span,
+                call_backed=False,
+            )
             expansions.append(
                 InlineExpansionEvidence(
                     helper_name=helper.name,
@@ -532,7 +691,8 @@ def analyze_inline_layout(
                     match_length=pairing.orig_span[1],
                     counterpart="inline",
                     counterpart_offset=pairing.recomp_span[0],
-                    confidence=pairing.confidence,
+                    confidence=confidence,
+                    semantic=semantic,
                 )
             )
         elif pairing.kind == "orig_inline":
@@ -545,6 +705,12 @@ def analyze_inline_layout(
             used_recomp_calls.add(pairing.recomp_call)
             orig_elide.append((*pairing.orig_span, placeholder))
             recomp_collapse.append((pairing.recomp_call, placeholder))
+            confidence, semantic = _evidence_confidence(
+                helper,
+                orig_fp,
+                pairing.orig_span,
+                call_backed=True,
+            )
             expansions.append(
                 InlineExpansionEvidence(
                     helper_name=helper.name,
@@ -555,7 +721,8 @@ def analyze_inline_layout(
                     match_length=pairing.orig_span[1],
                     counterpart="call",
                     counterpart_offset=pairing.recomp_call,
-                    confidence=pairing.confidence,
+                    confidence=confidence,
+                    semantic=semantic,
                 )
             )
         elif pairing.kind == "recomp_inline":
@@ -568,6 +735,12 @@ def analyze_inline_layout(
             used_orig_calls.add(pairing.orig_call)
             recomp_elide.append((*pairing.recomp_span, placeholder))
             orig_collapse.append((pairing.orig_call, placeholder))
+            confidence, semantic = _evidence_confidence(
+                helper,
+                recomp_fp,
+                pairing.recomp_span,
+                call_backed=True,
+            )
             expansions.append(
                 InlineExpansionEvidence(
                     helper_name=helper.name,
@@ -578,7 +751,8 @@ def analyze_inline_layout(
                     match_length=pairing.recomp_span[1],
                     counterpart="call",
                     counterpart_offset=pairing.orig_call,
-                    confidence=pairing.confidence,
+                    confidence=confidence,
+                    semantic=semantic,
                 )
             )
 

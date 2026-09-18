@@ -23,6 +23,7 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -506,17 +507,42 @@ class Indexer {
     llvm::json::Array bases;
     for (const CXXBaseSpecifier& base : record->bases()) bases.push_back(typeName(base.getType()));
 
+    const ASTRecordLayout* layout = nullptr;
+    if (record->isCompleteDefinition()) layout = &context_.getASTRecordLayout(record);
+
     llvm::json::Array fields;
     for (const FieldDecl* field : record->fields()) {
       if (!field->getIdentifier()) continue;
       Location where = locate(field);
-      fields.push_back(llvm::json::Object{
+      llvm::json::Object entry{
           {"name", field->getNameAsString()},
           {"type", typeName(field->getType())},
           {"pointer_depth", pointerDepth(field->getType())},
           {"source_file", relative(where.file)},
           {"line", where.line},
-      });
+      };
+      if (layout) {
+        const uint64_t bitOffset = layout->getFieldOffset(field->getFieldIndex());
+        entry["offset"] = static_cast<int64_t>(bitOffset / 8);
+        entry["size"] = context_.getTypeSizeInChars(field->getType()).getQuantity();
+        if (field->isBitField()) {
+          entry["bitfield_width"] = field->getBitWidthValue(context_);
+          entry["bitfield_offset"] = static_cast<int64_t>(bitOffset % 8);
+        }
+      }
+      fields.push_back(std::move(entry));
+    }
+
+    llvm::json::Array baseOffsets;
+    if (layout) {
+      for (const CXXBaseSpecifier& base : record->bases()) {
+        const CXXRecordDecl* baseRecord = base.getType()->getAsCXXRecordDecl();
+        if (!baseRecord) continue;
+        baseOffsets.push_back(llvm::json::Object{
+            {"name", typeName(base.getType())},
+            {"offset", layout->getBaseClassOffset(baseRecord).getQuantity()},
+        });
+      }
     }
 
     // Every virtual introduced or overridden by this class, in declaration
@@ -529,7 +555,7 @@ class Indexer {
           semanticId(function, qualify(qualifiedName, function->getNameAsString())));
     }
 
-    emit(llvm::json::Object{
+    llvm::json::Object payload{
         {"record", "class"},
         {"semantic_id", ("record:" + qualifiedName).str()},
         {"qualified_name", qualifiedName},
@@ -539,7 +565,13 @@ class Indexer {
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-    });
+    };
+    if (layout) {
+      payload["size"] = layout->getSize().getQuantity();
+      payload["alignment"] = layout->getAlignment().getQuantity();
+      payload["base_offsets"] = std::move(baseOffsets);
+    }
+    emit(std::move(payload));
   }
 
   template <typename Predicate>

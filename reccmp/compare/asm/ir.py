@@ -1,9 +1,10 @@
 """Canonical instruction IR for the compare pipeline.
 
 ``DecodedInstruction`` is the single representation produced by Capstone
-detail-mode decode + sanitization. Display strings exist only for humans and
-JSON diffs. Matching, stack scoring, inline fingerprints, and (eventually) the
-effective verifier consume structured fields.
+detail-mode decode (typed operands from detail) + sanitization. Display
+strings exist only for humans and JSON diffs. Matching, stack scoring,
+inline fingerprints, and (eventually) the effective verifier consume
+structured fields.
 """
 
 from __future__ import annotations

@@ -46,8 +46,11 @@ from reccmp.compare.inlines import (
     asm_fingerprint_from_lines,
     find_inline_expansions,
     strip_helper_epilog,
+    summarize_helper_effects,
 )
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
+from reccmp.source import SourceIndex
+from reccmp.source.index import SourceIndexError
 from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.cvinfo import CvdumpTypeKey, CvdumpTypeMap
@@ -202,6 +205,8 @@ class FunctionComparator:
     # Proven-equivalent original addresses (member -> canonical): references to
     # any group member sanitize to the canonical name on both sides.
     equivalence_groups: dict[int, int] = field(default_factory=dict)
+    # Optional Clang-backed layout/ownership index for mismatch enrichment.
+    source_index: SourceIndex | None = None
 
     def __post_init__(self):
         self._call_abi_cache: dict[str, CallAbi | None] | None = None
@@ -271,20 +276,94 @@ class FunctionComparator:
         facts = {**side.facts, **extra}
         return DifferenceSide(side.instruction_index, side.address, facts)
 
+    def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
+        """Resolve the class that owns ``this`` for layout enrichment."""
+        if match is None:
+            return None
+        if self.source_index is not None:
+            try:
+                owners = self.source_index.functions_by_address()
+            except SourceIndexError:
+                owners = {}
+            marker = owners.get(match.orig_addr)
+            if (
+                marker is not None
+                and marker.declaration is not None
+                and marker.declaration.owning_class
+            ):
+                return marker.declaration.owning_class
+            for declaration in self.source_index.declarations:
+                if declaration.owning_class and declaration.qualified_name in {
+                    match.name,
+                    match.best_name(),
+                }:
+                    return declaration.owning_class
+        name = match.best_name() or match.name or ""
+        if "::" in name:
+            return name.rsplit("::", 1)[0]
+        return None
+
+    def _layout_facts_for_displacement(
+        self, class_name: str | None, facts: dict[str, FactValue]
+    ) -> dict[str, FactValue]:
+        if (
+            self.source_index is None
+            or not class_name
+            or not isinstance(facts.get("displacement"), int)
+        ):
+            return {}
+        displacement = int(facts["displacement"])
+        field = self.source_index.field_at(class_name, displacement)
+        if field is None or field.offset is None:
+            return {}
+        path = self.source_index.field_path_at(class_name, displacement)
+        return {
+            "class_name": class_name,
+            "field_name": field.name,
+            "field_offset": field.offset,
+            "field_type": field.type,
+            "field_path": path or field.name,
+        }
+
     def _enrich_analysis_with_source(
-        self, analysis: ComparisonAnalysis
+        self,
+        analysis: ComparisonAnalysis,
+        *,
+        match: ReccmpMatch | None = None,
     ) -> ComparisonAnalysis:
-        """Pin mismatch / inconclusive locations to recomp source lines."""
+        """Pin mismatch / inconclusive locations to recomp source lines.
+
+        When layout is available, also annotate ``memory_address`` diffs with
+        class/field facts for the owning class of the compared function.
+        """
         if (
             analysis.status == ComparisonStatus.MISMATCH
             and analysis.difference is not None
         ):
             diff = analysis.difference
-            enriched = ComparisonDifference(
-                diff.kind,
-                diff.orig,
-                self._enrich_side_with_source(diff.recomp),
-            )
+            orig_side = diff.orig
+            recomp_side = self._enrich_side_with_source(diff.recomp)
+            if diff.kind == "memory_address":
+                class_name = self._owning_class_for_match(match)
+                orig_layout = self._layout_facts_for_displacement(
+                    class_name, orig_side.facts
+                )
+                recomp_layout = self._layout_facts_for_displacement(
+                    class_name, recomp_side.facts
+                )
+                if orig_layout:
+                    orig_side = DifferenceSide(
+                        orig_side.instruction_index,
+                        orig_side.address,
+                        {**orig_side.facts, **orig_layout},
+                    )
+                if recomp_layout:
+                    recomp_side = DifferenceSide(
+                        recomp_side.instruction_index,
+                        recomp_side.address,
+                        {**recomp_side.facts, **recomp_layout},
+                    )
+            enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
             return ComparisonAnalysis.mismatch(
                 enriched, semantic_similarity=analysis.semantic_similarity
             )
@@ -467,6 +546,7 @@ class FunctionComparator:
             name=name,
             fingerprint=needle,
             byte_size=recomp_size,
+            effect_summary=summarize_helper_effects(needle),
         )
         cache[entity.orig_addr] = entry
         return entry
@@ -548,6 +628,7 @@ class FunctionComparator:
                 fingerprint=entry.fingerprint,
                 byte_size=entry.byte_size,
                 uniqueness=1.0 / freq[entry.fingerprint],
+                effect_summary=entry.effect_summary,
             )
             for entry in catalog
         ]
@@ -588,6 +669,7 @@ class FunctionComparator:
                 fingerprint=entry.fingerprint,
                 byte_size=entry.byte_size,
                 uniqueness=1.0 / freq[entry.fingerprint],
+                effect_summary=entry.effect_summary,
             )
             for entry in helpers_by_orig.values()
         ]
@@ -1077,7 +1159,7 @@ class FunctionComparator:
                 recomp_meta=recomp_meta,
             )
 
-        analysis = self._enrich_analysis_with_source(analysis)
+        analysis = self._enrich_analysis_with_source(analysis, match=match)
 
         inline_layout = None
         if ratio < 1.0 and match is not None and not analysis.is_effective:

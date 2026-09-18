@@ -18,6 +18,7 @@ from reccmp.compare.stack_layout import (
     StackSymbol,
     Warnings,
     analyze_diff_block,
+    annotate_canonical_refs,
     annotate_recomp_symbols,
     collect_stack_pairs,
     extract_stack_offset_from_instruction,
@@ -110,6 +111,7 @@ def compare_function_stacks(udiff: CombinedDiffOutput, fn_symbol: SymbolsEntry):
                 )
 
     stack_symbols = annotate_recomp_symbols(stack_pairs, fn_symbol)
+    annotate_canonical_refs(stack_pairs)
 
     print_by_original_stack(stack_pairs, warnings)
     print_by_recomp_stack(stack_pairs, stack_symbols, warnings)
