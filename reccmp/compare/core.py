@@ -1,12 +1,15 @@
 import logging
+import hashlib
 import difflib
 import struct
 from itertools import zip_longest
+from pathlib import Path
 from typing import Callable, Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
 from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.verification import admit_exact_analysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
 from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
@@ -78,6 +81,20 @@ from .verify import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _image_digest(image: Image) -> str | None:
+    """SHA-256 of the original image bytes, used as report source identity."""
+    data = getattr(image, "data", None)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(data)).hexdigest()
+    path = getattr(image, "filepath", None)
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 class Compare:
@@ -545,9 +562,13 @@ class Compare:
             ),
             match_ratio=ratio,
             analysis=(
-                ComparisonAnalysis.exact()
-                if ratio == 1.0
-                else ComparisonAnalysis.inconclusive("analysis_limit")
+                admit_exact_analysis(
+                    displays_equal=ratio == 1.0,
+                    topology_equal=True,
+                    keys_equal=ratio == 1.0,
+                    extent_closed=True,
+                )
+                or ComparisonAnalysis.inconclusive("analysis_limit")
             ),
         )
 
@@ -631,6 +652,7 @@ class Compare:
             is_stub=match.get("stub", False),
             is_library=match.get("library", False),
             rdiff=result.diff,
+            display_similarity=result.display_similarity,
             stack_permutation=result.stack_permutation,
             accuracy_modulo_stack=result.accuracy_modulo_stack,
             inline_expansions=result.inline_expansions,
@@ -639,10 +661,18 @@ class Compare:
             equivalence_level=result.equivalence_level,
         )
 
+    @property
+    def orig_source_digest(self) -> str | None:
+        return _image_digest(self.orig_bin)
+
     ## Public API
 
     def get_all(self) -> Iterator[ReccmpEntity]:
         return self._db.get_all()
+
+    def get_match(self, orig_addr: int) -> ReccmpMatch | None:
+        """Public lookup for a paired original address."""
+        return self._db.get_one_match(orig_addr)
 
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
@@ -776,7 +806,9 @@ class Compare:
         include_exact_diff: bool = True,
     ) -> ReccmpStatusReport:
         """Creates a ReccmpStatusReport using the current reccmp state."""
-        report = ReccmpStatusReport(filename=filename)
+        report = ReccmpStatusReport(
+            filename=filename, source_digest=_image_digest(self.orig_bin)
+        )
         for match in self.compare_all(
             filter_fn,
             include_diff=include_diff,

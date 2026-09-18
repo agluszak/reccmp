@@ -26,6 +26,7 @@ from reccmp.compare.asm.ir import (
     excerpt_displays,
     instruction_match_key,
     instruction_semantic_key,
+    rebind_local_identities,
     resolve_asm_stream,
 )
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
@@ -43,7 +44,7 @@ from reccmp.compare.diagnosis import (
     FactValue,
 )
 from reccmp.compare.verification import (
-    admit_effective_analysis,
+    admit_effective,
     admit_exact_analysis,
     admit_proof,
 )
@@ -423,6 +424,17 @@ class FunctionComparator:
             for index, row in enumerate(excerpt)
         )
         tables = tuple(sanitizer.jump_tables)
+        stamped = rebind_local_identities(
+            stamped,
+            start_addr=start_addr,
+            extent=extent,
+            jump_tables=tables,
+            image_id=(
+                sanitizer.image_id.name.lower()
+                if sanitizer.image_id is not None
+                else "unknown"
+            ),
+        )
         return FunctionImage(
             start_addr=start_addr,
             extent=extent,
@@ -546,15 +558,17 @@ class FunctionComparator:
             and match.orig_addr in self.equivalence_groups
             and _is_bare_jmp_island(orig_raw)
         ):
-            alias = admit_effective_analysis(
+            # The island is a modeled thunk to a grouped body; its guessed
+            # byte window is not the function extent this proof depends on.
+            alias = admit_effective(
                 ("folded_symbol_alias",),
                 coverage_incomplete=(
                     orig_image.coverage_incomplete or recomp_image.coverage_incomplete
                 ),
-                extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
+                extent_closed=True,
             )
             if alias is not None:
-                result = dataclasses.replace(result, analysis=alias)
+                return dataclasses.replace(result, analysis=alias.analysis)
 
         analysis = admit_proof(
             result.analysis,
@@ -905,6 +919,7 @@ class FunctionComparator:
                 return discovered
             self.db.bulk_match(pairs)
             discovered.extend(pairs)
+            self.rebuild_lookups()
 
     def discover_unpaired_function_bodies(self) -> list[tuple[int, int]]:
         """Discover differently named function pairs to a conservative fixed point.
@@ -969,6 +984,7 @@ class FunctionComparator:
             if pairs:
                 self.db.bulk_match(pairs)
                 discovered.extend(pairs)
+                self.rebuild_lookups()
                 continue
 
             # Alias identities can themselves unlock mutually unique callers,
@@ -982,6 +998,7 @@ class FunctionComparator:
             )
             if not orig_added and not recomp_added:
                 break
+            self.rebuild_lookups()
         return discovered
 
     def raw_pair_alias_equivalent(
@@ -991,7 +1008,8 @@ class FunctionComparator:
         size: int,
         *,
         _depth: int = 0,
-        _seen: set[tuple[int, int]] | None = None,
+        _active: set[tuple[int, int]] | None = None,
+        _proved: dict[tuple[int, int], bool] | None = None,
     ) -> bool:
         """Recomputed, conservative compiler-alias equivalence for one
         (orig, recomp) body pair that is not an annotated match.
@@ -1015,11 +1033,34 @@ class FunctionComparator:
 
         if size <= 0 or _depth > 3:
             return False
-        seen = _seen if _seen is not None else set()
-        if (orig_addr, recomp_addr) in seen:
-            # Re-entering an unresolved pair is not a completed proof.
+        pair = (orig_addr, recomp_addr)
+        active = _active if _active is not None else set()
+        proved = _proved if _proved is not None else {}
+        cached = proved.get(pair)
+        if cached is not None:
+            return cached
+        if pair in active:
+            # Re-entering an unresolved pair is a cycle, not a completed proof.
             return False
-        seen.add((orig_addr, recomp_addr))
+        active.add(pair)
+        try:
+            result = self._raw_pair_alias_equivalent_body(
+                orig_addr, recomp_addr, size, _depth, active, proved
+            )
+        finally:
+            active.discard(pair)
+        proved[pair] = result
+        return result
+
+    def _raw_pair_alias_equivalent_body(
+        self,
+        orig_addr: int,
+        recomp_addr: int,
+        size: int,
+        depth: int,
+        active: set[tuple[int, int]],
+        proved: dict[tuple[int, int], bool],
+    ) -> bool:
         try:
             orig_raw = self.orig_bin.read(orig_addr, size)
             recomp_raw = self.recomp_bin.read(recomp_addr, size)
@@ -1034,7 +1075,12 @@ class FunctionComparator:
             if island_target == orig_addr:
                 return False
             return self.raw_pair_alias_equivalent(
-                island_target, recomp_addr, size, _depth=_depth + 1, _seen=seen
+                island_target,
+                recomp_addr,
+                size,
+                _depth=depth + 1,
+                _active=active,
+                _proved=proved,
             )
         orig_asm = self.orig_sanitize.parse_asm(orig_raw, orig_addr)
         recomp_asm = self.recomp_sanitize.parse_asm(recomp_raw, recomp_addr)
@@ -1055,7 +1101,7 @@ class FunctionComparator:
             if orig_line == recomp_line and "<OFFSET" not in orig_line:
                 continue
             if not self._transfer_targets_alias_equivalent(
-                orig_insts[index], recomp_insts[index], _depth, seen
+                orig_insts[index], recomp_insts[index], depth, active, proved
             ):
                 return False
         return True
@@ -1065,7 +1111,8 @@ class FunctionComparator:
         orig_inst: tuple[int, int, str, str],
         recomp_inst: tuple[int, int, str, str],
         depth: int,
-        seen: set[tuple[int, int]],
+        active: set[tuple[int, int]],
+        proved: dict[tuple[int, int], bool],
     ) -> bool:
         """Whether a diverging instruction pair is a direct transfer whose
         two targets are themselves alias-equivalent bodies. The target size
@@ -1088,7 +1135,12 @@ class FunctionComparator:
         if target_size is None or target_size <= 0:
             return False
         return self.raw_pair_alias_equivalent(
-            orig_target, recomp_target, target_size, _depth=depth + 1, _seen=seen
+            orig_target,
+            recomp_target,
+            target_size,
+            _depth=depth + 1,
+            _active=active,
+            _proved=proved,
         )
 
     # ------------------------------------------------------------------
@@ -1238,10 +1290,12 @@ class FunctionComparator:
         recomp_keys = [instruction_match_key(row) for row in recomp_rows]
         orig_sem = [instruction_semantic_key(row) for row in orig_rows]
         recomp_sem = [instruction_semantic_key(row) for row in recomp_rows]
-        diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
+        display_diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
+        semantic_diff = SequenceMatcherWithPins(orig_sem, recomp_sem, split_points)
 
-        ratio = diff.ratio()
-        opcodes = diff.get_opcodes()
+        ratio = semantic_diff.ratio()
+        display_similarity = display_diff.ratio()
+        opcodes = display_diff.get_opcodes()
         operands_complete = all(
             row.operand_model_complete for row in (*orig_rows, *recomp_rows)
         )
@@ -1270,8 +1324,7 @@ class FunctionComparator:
                 metadata = self._function_metadata(match)
             if orig_meta is None:
                 orig_meta = [
-                    meta_from_decoded(row) if row.is_code else None
-                    for row in orig_rows
+                    meta_from_decoded(row) if row.is_code else None for row in orig_rows
                 ]
             if recomp_meta is None:
                 recomp_meta = [
@@ -1287,6 +1340,8 @@ class FunctionComparator:
                 orig_meta=orig_meta,
                 recomp_addrs=excerpt_addrs(recomp_rows),
                 recomp_meta=recomp_meta,
+                coverage_incomplete=coverage_incomplete,
+                extent_closed=extent_closed,
             )
         analysis = admit_proof(
             analysis,
@@ -1302,10 +1357,46 @@ class FunctionComparator:
                 match, orig_rows, recomp_rows
             )
 
+        stack_layout = None
+        if ratio < 1.0:
+            stack_rdiff = RawDiffOutput(
+                codes=opcodes,
+                orig_inst=[
+                    (
+                        hex(row.address) if row.address is not None else "",
+                        row.display,
+                    )
+                    for row in orig_rows
+                ],
+                recomp_inst=[
+                    (
+                        hex(row.address) if row.address is not None else "",
+                        row.display,
+                    )
+                    for row in recomp_rows
+                ],
+            )
+            stack_layout = analyze_stack_layout(
+                stack_rdiff,
+                orig_asm,
+                recomp_asm,
+                fn_symbol=self._fn_symbol_entry(match),
+                types=self.types,
+            )
+
         if not include_diff or (ratio == 1.0 and not include_exact_diff):
             result = EntityCompareResult(
                 match_ratio=ratio,
+                display_similarity=display_similarity,
                 analysis=analysis,
+                stack_permutation=(
+                    stack_layout.permutation if stack_layout is not None else ()
+                ),
+                accuracy_modulo_stack=(
+                    stack_layout.accuracy_modulo_stack
+                    if stack_layout is not None
+                    else None
+                ),
                 inline_expansions=(
                     inline_layout.expansions if inline_layout is not None else ()
                 ),
@@ -1343,19 +1434,10 @@ class FunctionComparator:
             recomp_inst=recomp_for_printing,
         )
 
-        stack_layout = None
-        if ratio < 1.0:
-            stack_layout = analyze_stack_layout(
-                rdiff,
-                orig_asm,
-                recomp_asm,
-                fn_symbol=self._fn_symbol_entry(match),
-                types=self.types,
-            )
-
         result = EntityCompareResult(
             diff=rdiff,
             match_ratio=ratio,
+            display_similarity=display_similarity,
             analysis=analysis,
             stack_permutation=(
                 stack_layout.permutation if stack_layout is not None else ()

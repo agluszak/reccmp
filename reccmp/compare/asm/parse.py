@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from functools import cache
+from typing import Hashable
 from typing_extensions import Buffer
 
 from reccmp.types import ImageId
@@ -107,8 +108,26 @@ class ParseAsm:
     ) -> str | None:
         """Wrapper for user-provided name lookup"""
         if callable(self.name_lookup):
-            return self.name_lookup(addr, exact=exact, indirect=indirect)
+            result = self.name_lookup(addr, exact=exact, indirect=indirect)
+            if isinstance(result, Reference):
+                return result.display
+            return result
 
+        return None
+
+    def lookup_identity(
+        self, addr: int, exact: bool = False, indirect: bool = False
+    ) -> Hashable | None:
+        """Proof identity from the entity resolver, if it supplied one."""
+        lookup = self.name_lookup
+        if lookup is None:
+            return None
+        ident_fn = getattr(lookup, "identity", None)
+        if callable(ident_fn):
+            return ident_fn(addr, exact=exact, indirect=indirect)
+        result = lookup(addr, exact=exact, indirect=indirect) if callable(lookup) else None
+        if isinstance(result, Reference):
+            return result.identity
         return None
 
     def _next_placeholder(self) -> str:
@@ -139,15 +158,35 @@ class ParseAsm:
     def reference(self, addr: int, exact: bool = False) -> Reference:
         """Display token plus the identity proofs must compare."""
         display = self.replace(addr, exact=exact)
-        return Reference(display, self._reference_identity(addr, display))
+        return Reference(display, self._reference_identity(addr, display, exact=exact))
 
     def indirect_reference(self, addr: int) -> Reference:
         display = self.indirect_replace(addr)
-        return Reference(display, self._reference_identity(addr, display))
+        return Reference(
+            display, self._reference_identity(addr, display, exact=True)
+        )
 
-    def _reference_identity(self, addr: int, display: str):
-        if not _OFFSET_PLACEHOLDER.match(display):
-            return ("named", display)
+    def _reference_identity(self, addr: int, display: str, *, exact: bool = False):
+        resolved = self.lookup_identity(addr, exact=exact)
+        if resolved is not None:
+            return resolved
+        if _OFFSET_PLACEHOLDER.match(display):
+            start = self._body_start
+            end = self._body_end
+            if start is not None and end is not None and start <= addr < end:
+                return ("local", addr - start)
+            return ("unresolved", self._side_name(), addr)
+        # A display name from a string-only lookup is not a paired entity.
+        return ("unmatched", self._side_name(), addr)
+
+    def control_identity(self, addr: int) -> Hashable:
+        """Proof identity of a jump destination without creating a placeholder."""
+        resolved = self.lookup_identity(addr, exact=True)
+        if resolved is not None:
+            return resolved
+        name = self.lookup(addr, exact=True)
+        if name is not None:
+            return self._reference_identity(addr, name, exact=True)
         start = self._body_start
         end = self._body_end
         if start is not None and end is not None and start <= addr < end:
@@ -296,7 +335,13 @@ class ParseAsm:
         if mnemonic == "cmp":
             name = self.lookup(value)
             if name is not None:
-                return ("sym", Reference(name, ("named", name)))
+                return (
+                    "sym",
+                    Reference(
+                        name,
+                        self._reference_identity(value, name),
+                    ),
+                )
             return operand
         if self.is_addr(value):
             return ("sym", self.reference(value))
@@ -315,26 +360,43 @@ class ParseAsm:
             and operands[0][0] == "imm"
         ):
             addr_val = operands[0][1]
+            control_target = None
             if mnemonic == "call":
-                operands[0] = ("sym", self.reference(addr_val, exact=True))
+                ref = self.reference(addr_val, exact=True)
+                operands[0] = ("sym", ref)
+                control_target = ref.identity
             elif mnemonic == "push":
                 if self.is_addr(addr_val):
                     operands[0] = ("sym", self.reference(addr_val))
             elif mnemonic == "jmp":
                 potential_name = self.lookup(addr_val, exact=True)
                 if potential_name is not None:
-                    operands[0] = ("sym", Reference(potential_name, ("named", potential_name)))
+                    ref = Reference(
+                        potential_name,
+                        self._reference_identity(
+                            addr_val, potential_name, exact=True
+                        ),
+                    )
+                    operands[0] = ("sym", ref)
+                    control_target = ref.identity
                 else:
                     operands[0] = (
                         "imm",
                         addr_val - (insn.address + insn.size),
                     )
                     jump_disp_hex = True
+                    control_target = self.control_identity(addr_val)
             else:
                 # Other jumps: show relative displacement via hex().
                 operands[0] = ("imm", addr_val - (insn.address + insn.size))
                 jump_disp_hex = True
+                control_target = self.control_identity(addr_val)
         else:
+            control_target = (
+                self.control_identity(insn.branch_target)
+                if insn.branch_target is not None
+                else None
+            )
             for i, op in enumerate(operands):
                 if op[0] == "mem":
                     if mnemonic == "call":
@@ -355,17 +417,27 @@ class ParseAsm:
         else:
             raw_operands = tuple(format_operand(op) for op in ops_tuple)
             display = format_instruction(mnemonic, insn.prefix, ops_tuple)
+        if control_target is None and insn.branch_target is not None:
+            control_target = self.control_identity(insn.branch_target)
         return replace(
             insn,
             operands=ops_tuple,
             raw_operands=raw_operands,
             display=display,
+            control_target=control_target,
         )
 
     def _should_sanitize(self, mnemonic: str, op_str: str, size: int) -> bool:
         return "0x" in op_str and (
             mnemonic in JUMP_MNEMONICS or size > 4 or not self.is_32bit
         )
+
+    def _stamp_control_target(self, insn: DecodedInstruction) -> DecodedInstruction:
+        if insn.control_target is not None or insn.branch_target is None:
+            return insn
+        if not (insn.is_jump or insn.is_call):
+            return insn
+        return replace(insn, control_target=self.control_identity(insn.branch_target))
 
     def _finalize_code_row(
         self, lite: DisasmLiteTuple, display: str
@@ -377,7 +449,7 @@ class ParseAsm:
             parsed = parse_instruction(display)
         except Reject:
             if base is not None:
-                return base.with_display(display)
+                return self._stamp_control_target(base.with_display(display))
             return DecodedInstruction(
                 address=addr,
                 size=size,
@@ -390,13 +462,15 @@ class ParseAsm:
                 raw_op_str=raw_op,
             )
         if base is not None:
-            return replace(
-                base,
-                display=display,
-                mnemonic=parsed.mnemonic,
-                prefix=parsed.prefix,
-                operands=parsed.operands,
-                raw_operands=parsed.raw_operands,
+            return self._stamp_control_target(
+                replace(
+                    base,
+                    display=display,
+                    mnemonic=parsed.mnemonic,
+                    prefix=parsed.prefix,
+                    operands=parsed.operands,
+                    raw_operands=parsed.raw_operands,
+                )
             )
         return DecodedInstruction(
             address=addr,
@@ -446,7 +520,7 @@ class ParseAsm:
                         ):
                             asm.append(self.sanitize_row(base))
                         else:
-                            asm.append(base)
+                            asm.append(self._stamp_control_target(base))
                         continue
 
                     # Fallback when Capstone IR is missing.

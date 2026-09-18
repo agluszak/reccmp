@@ -293,11 +293,18 @@ class VariableComparator:
                 continue
             leaf = resolved.leaf
             size = leaf.size
+            is_pointer = (leaf.pointer_depth or 0) > 0
+            if (
+                leaf.storage_kind == "array"
+                and leaf.array_stride
+                and leaf.array_stride > 0
+            ):
+                size = leaf.array_stride
+                is_pointer = leaf.array_element_kind in ("pointer", "reference")
             if size is None or size <= 0:
                 members.append((DataOffset(offset=offset, name="", pointer=False), 1))
                 offset += 1
                 continue
-            is_pointer = (leaf.pointer_depth or 0) > 0
             if is_pointer:
                 pointer_width = 4
                 if self.source_index is not None and self.source_index.abi is not None:

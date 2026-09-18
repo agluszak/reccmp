@@ -1,6 +1,6 @@
 import bisect
 from functools import cache
-from typing import Callable, Protocol
+from typing import Callable, Hashable, Protocol
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.types import EntityType, ImageId
@@ -98,6 +98,72 @@ def canonical_callee_name(
     return f"{display} [CALLEE {identity}]"
 
 
+def entity_proof_identity(
+    db: EntityDb,
+    image_id: ImageId,
+    entity: ReccmpEntity,
+    offset: int = 0,
+    equivalence_groups: dict[int, int] | None = None,
+) -> Hashable:
+    """Structured proof identity for a resolved entity.
+
+    Display names are diagnostics. Matched or aliased entities share the
+    canonical original address. Unmatched data, strings, and locals stay
+    side-local so identical names cannot prove correspondence.
+    """
+    if entity.entity_type in _CALLABLE_TYPES:
+        entity_addr = entity.addr(image_id)
+        discovered_orig = (
+            db.alias_canonical_orig(image_id, entity_addr)
+            if entity_addr is not None
+            else None
+        )
+        canonical_orig = (
+            discovered_orig if discovered_orig is not None else entity.orig_addr
+        )
+        configured_alias = False
+        if canonical_orig is not None and equivalence_groups:
+            configured_orig = equivalence_groups.get(canonical_orig)
+            configured_alias = configured_orig is not None
+            canonical_orig = (
+                configured_orig if configured_orig is not None else canonical_orig
+            )
+        symbol = entity.get("symbol")
+        if canonical_orig is not None and (
+            configured_alias or entity.matched
+        ):
+            return ("entity", canonical_orig, offset)
+        if entity.entity_type == EntityType.IMPORT:
+            return ("import", entity.best_name() or entity.get("symbol"))
+        if symbol:
+            return ("symbol", symbol, offset)
+        addr = entity.addr(image_id)
+        assert addr is not None
+        return ("unmatched", image_id.name.lower(), addr, offset)
+
+    entity_addr = entity.addr(image_id)
+    discovered_orig = (
+        db.alias_canonical_orig(image_id, entity_addr)
+        if entity_addr is not None
+        else None
+    )
+    canonical_orig = (
+        discovered_orig if discovered_orig is not None else entity.orig_addr
+    )
+    configured_alias = False
+    if canonical_orig is not None and equivalence_groups:
+        configured_orig = equivalence_groups.get(canonical_orig)
+        configured_alias = configured_orig is not None
+        canonical_orig = (
+            configured_orig if configured_orig is not None else canonical_orig
+        )
+    if canonical_orig is not None and (configured_alias or entity.matched):
+        return ("entity", canonical_orig, offset)
+    addr = entity.addr(image_id)
+    assert addr is not None
+    return ("unmatched", image_id.name.lower(), addr, offset)
+
+
 def _resolve_raw_jump_entity(
     db: EntityDb,
     image_id: ImageId,
@@ -153,9 +219,10 @@ def create_name_lookup(
     # annotation. Prefix maximum ends let each lookup stop as soon as no
     # earlier interval can contain the requested address.
     @cache
-    def paired_index() -> (
-        tuple[list[tuple[int, int, ReccmpEntity]], list[int], list[int]]
-    ):
+    def paired_index(
+        _gen: int = 0,
+    ) -> tuple[list[tuple[int, int, ReccmpEntity]], list[int], list[int]]:
+        del _gen
         paired_ranges: list[tuple[int, int, ReccmpEntity]] = []
         for candidate in db.all(image_id):
             base = candidate.addr(image_id)
@@ -177,7 +244,7 @@ def create_name_lookup(
         return paired_ranges, paired_starts, paired_max_ends
 
     def paired_containing(addr: int) -> ReccmpEntity | None:
-        paired_ranges, paired_starts, paired_max_ends = paired_index()
+        paired_ranges, paired_starts, paired_max_ends = paired_index(db.generation)
         candidates: list[tuple[int, int, ReccmpEntity]] = []
         index = bisect.bisect_right(paired_starts, addr) - 1
         while index >= 0 and paired_max_ends[index] > addr:
@@ -293,23 +360,36 @@ def create_name_lookup(
         # The 'addr' variable still points at the indirect addr.
         return get_name(entity, offset=0)
 
-    @cache
-    def lookup(addr: int, exact: bool = False, indirect: bool = False) -> str | None:
-        """Returns the name that represents the entity at the given address.
-        If there is no suitable name, return None and let the caller choose one (i.e. placeholder).
-        * exact:    If the addr is an offset of an entity (e.g. struct/array) we may return
-                    a name like 'variable+8'. If exact is True, return a name only if the entity's addr
-                    matches the addr parameter.
-        * indirect: If True, the given addr is a pointer so we have the option to read the address
-                    from the binary to find the name."""
+    def follow_thunk(entity: ReccmpEntity) -> ReccmpEntity:
+        if entity.entity_type != EntityType.THUNK:
+            return entity
+        ref_addr = entity.get(ref_key)
+        if isinstance(ref_addr, int):
+            target = db.get(image_id, ref_addr, exact=True)
+            if target is not None and target.entity_type == EntityType.FUNCTION:
+                return target
+        return entity
+
+    def resolve_entity(
+        addr: int, exact: bool = False, indirect: bool = False
+    ) -> tuple[ReccmpEntity, int] | None:
         if indirect:
-            return indirect_lookup(addr)
+            entity = db.get(image_id, addr, exact=True)
+            if entity is not None:
+                if entity.entity_type == EntityType.DATA:
+                    return entity, 0
+                if entity.entity_type == EntityType.IMPORT:
+                    return entity, 0
+            entity = follow_indirect(addr)
+            if entity is None:
+                return None
+            return entity, 0
 
         entity = db.get(image_id, addr, exact=True)
         if entity is None or entity.entity_type == EntityType.THUNK:
             raw_entity = _resolve_raw_jump_entity(db, image_id, addr, jump_target)
             if raw_entity is not None:
-                return get_name(raw_entity, offset=0)
+                return raw_entity, 0
 
         if not exact:
             entity = (
@@ -321,7 +401,48 @@ def create_name_lookup(
 
         base_addr = entity.addr(image_id)
         assert base_addr is not None
-        offset = addr - base_addr
+        return entity, addr - base_addr
+
+    @cache
+    def lookup_cached(
+        _gen: int, addr: int, exact: bool, indirect: bool
+    ) -> str | None:
+        del _gen
+        resolved = resolve_entity(addr, exact=exact, indirect=indirect)
+        if resolved is None:
+            return None
+        entity, offset = resolved
         return get_name(entity, offset)
 
+    def lookup(addr: int, exact: bool = False, indirect: bool = False) -> str | None:
+        """Returns the name that represents the entity at the given address.
+        If there is no suitable name, return None and let the caller choose one (i.e. placeholder).
+        * exact:    If the addr is an offset of an entity (e.g. struct/array) we may return
+                    a name like 'variable+8'. If exact is True, return a name only if the entity's addr
+                    matches the addr parameter.
+        * indirect: If True, the given addr is a pointer so we have the option to read the address
+                    from the binary to find the name."""
+        return lookup_cached(db.generation, addr, exact, indirect)
+
+    @cache
+    def identity_cached(
+        _gen: int, addr: int, exact: bool, indirect: bool
+    ) -> Hashable | None:
+        del _gen
+        resolved = resolve_entity(addr, exact=exact, indirect=indirect)
+        if resolved is None:
+            return None
+        entity, offset = resolved
+        if offset == 0:
+            entity = follow_thunk(entity)
+        return entity_proof_identity(
+            db, image_id, entity, offset, equivalence_groups
+        )
+
+    def identity(
+        addr: int, exact: bool = False, indirect: bool = False
+    ) -> Hashable | None:
+        return identity_cached(db.generation, addr, exact, indirect)
+
+    lookup.identity = identity  # type: ignore[attr-defined]
     return lookup

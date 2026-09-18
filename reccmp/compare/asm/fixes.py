@@ -29,7 +29,11 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
 )
-from reccmp.compare.verification import admit_exact_analysis, admit_proof
+from reccmp.compare.verification import (
+    admit_effective,
+    admit_exact_analysis,
+    admit_proof,
+)
 from reccmp.compare.pinned_sequences import DiffOpcode
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,9 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     orig_meta: list[InstructionMeta | None] | None = None,
     recomp_addrs: Sequence[int | None] | None = None,
     recomp_meta: list[InstructionMeta | None] | None = None,
+    *,
+    coverage_incomplete: bool = False,
+    extent_closed: bool = True,
 ) -> ComparisonAnalysis:
     """Canonical semantic analysis of two sanitized instruction streams.
 
@@ -112,20 +119,35 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         keys_equal=orig_sem == recomp_sem,
         operands_complete=False,
         control_flow_complete=False,
+        coverage_incomplete=coverage_incomplete,
+        extent_closed=extent_closed,
     )
     if exact is not None:
         return exact
 
+    def finish_effective(reasons) -> ComparisonAnalysis:
+        reason_set = set(reasons)
+        if not reason_set:
+            reason_set.add("instruction_reorder")
+        admitted = admit_effective(
+            reason_set,
+            coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
+        )
+        if admitted is None:
+            return ComparisonAnalysis.inconclusive(
+                "incomplete_coverage" if coverage_incomplete else "open_extent"
+            )
+        return admitted.analysis
+
     def finish(analysis: ComparisonAnalysis) -> ComparisonAnalysis:
-        # A proof over textually-different streams with no specific reason
-        # means the differences were pure scheduling absorbed by the value
-        # flow (renames, swaps and inversions all carry their own label).
-        if (
-            analysis.status == ComparisonStatus.EFFECTIVE
-            and not analysis.effective_reasons
-        ):
-            analysis = ComparisonAnalysis.effective(("instruction_reorder",))
-        return admit_proof(analysis)
+        if analysis.status == ComparisonStatus.EFFECTIVE:
+            return finish_effective(analysis.effective_reasons)
+        return admit_proof(
+            analysis,
+            coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
+        )
 
     def new_recorder() -> AnalysisRecorder:
         return AnalysisRecorder(orig_addr_list, recomp_addr_list)
@@ -157,7 +179,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         extra_reasons = {"padding"} if padding else set()
         if relocation_normalized is not None:
             extra_reasons.add("instruction_reorder")
-        return finish(lockstep.effective_analysis(extra_reasons))
+        return finish_effective(lockstep.effective_reasons(extra_reasons))
 
     # Diff-aligned pairing: handles length differences (one-sided entries
     # for whitelisted unobservable instructions, e.g. a redundant
@@ -173,14 +195,14 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         recorder=diff_aligned,
     ):
         logger.debug("effective match: diff-aligned")
-        return finish(diff_aligned.effective_analysis())
+        return finish_effective(diff_aligned.effective_reasons())
 
     relocation = new_recorder()
     if relocation_normalized is not None and verify_effective_match(
         orig, relocation_normalized, metadata=metadata, recorder=relocation
     ):
         logger.debug("effective match: instruction relocation")
-        return finish(relocation.effective_analysis({"instruction_reorder"}))
+        return finish_effective(relocation.effective_reasons({"instruction_reorder"}))
 
     # CFG-aware verification: needs branch targets for both sides.
     orig_targets = _branch_targets(trimmed_orig, orig_addrs, orig_meta)
@@ -202,7 +224,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         cfg_effective = False
     if cfg_effective:
         logger.debug("effective match: cfg")
-        return finish(cfg.effective_analysis({"padding"} if padding else ()))
+        return finish_effective(cfg.effective_reasons({"padding"} if padding else ()))
 
     # Isomorphic-CFG verification: per-side block graphs matched by
     # structure. Tolerates different instruction counts (folded loads,
@@ -228,7 +250,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         iso_effective = False
     if iso_effective:
         logger.debug("effective match: isomorphic cfg")
-        return finish(iso.effective_analysis())
+        return finish_effective(iso.effective_reasons())
 
     def failure(recorder: AnalysisRecorder) -> ComparisonAnalysis:
         analysis = recorder.failure_analysis()

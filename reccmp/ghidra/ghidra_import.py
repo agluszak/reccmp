@@ -76,12 +76,14 @@ def main():
             if not target.ghidra_config.allow_hash_mismatch:
                 return 1
 
+        commit = False
         transaction = program.startTransaction(TRANSACTION_NAME)
-        api = FlatProgramAPI(program)
-        import_target_into_ghidra(target, api, image_id=args.image_id)
-
-        commit = True
-        program.endTransaction(transaction, commit)
+        try:
+            api = FlatProgramAPI(program)
+            import_target_into_ghidra(target, api, image_id=args.image_id)
+            commit = True
+        finally:
+            program.endTransaction(transaction, commit)
 
     logger.info("Done!")
     return 0

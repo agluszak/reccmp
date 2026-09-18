@@ -28,6 +28,7 @@ class EntityCompareResult:
     # pylint: disable=too-many-instance-attributes
     diff: RawDiffOutput = dataclasses.field(default_factory=RawDiffOutput)
     match_ratio: float = 0.0
+    display_similarity: float | None = None
     analysis: ComparisonAnalysis = dataclasses.field(
         default_factory=lambda: ComparisonAnalysis.inconclusive("analysis_limit")
     )

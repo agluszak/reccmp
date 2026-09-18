@@ -7,7 +7,7 @@ import struct
 from dataclasses import dataclass
 from functools import cache
 from enum import Enum, auto
-from typing import Iterable, Literal, NamedTuple
+from typing import Hashable, Iterable, Literal, NamedTuple
 from capstone import (  # type: ignore
     CS_ARCH_X86,
     CS_MODE_16,
@@ -102,29 +102,38 @@ class InstructGen:
         self.sections.append(TabSection(type_, stuff))
         if type_ == SectionType.ADDR_TAB and stuff:
             table_addr = stuff[0][0]
-            dispatch = self._dispatch_for_table(table_addr)
+            dispatch, index_reg = self._dispatch_for_table(table_addr)
             self.jump_tables.append(
                 JumpTable(
                     address=table_addr,
                     entries=tuple(stuff),
                     dispatch_address=dispatch,
+                    scale=4,
+                    entry_width=4,
+                    index_register=index_reg,
                 )
             )
 
-    def _dispatch_for_table(self, table_addr: int) -> int | None:
-        """Find a ``jmp`` whose memory displacement points at ``table_addr``."""
+    def _dispatch_for_table(self, table_addr: int) -> tuple[int | None, str | None]:
+        """Find a scale-4 ``jmp dword ptr [idx*4 + table]`` at ``table_addr``."""
         for addr, insn in self.decoded_by_addr.items():
             if not insn.is_jump or insn.mnemonic != "jmp":
                 continue
             for op in insn.operands:
                 if not isinstance(op, tuple) or op[0] != "mem":
                     continue
-                # Capstone absolute displacement before sanitization.
-                if op[4] == table_addr:
-                    return addr
-                if any(scale == 4 for _reg, scale in op[3]) and op[4] == table_addr:
-                    return addr
-        return None
+                _size, _seg, reg_terms, disp, _syms = (
+                    op[1],
+                    op[2],
+                    op[3],
+                    op[4],
+                    op[5],
+                )
+                index_reg = next((reg for reg, scale in reg_terms if scale == 4), None)
+                if index_reg is None or disp != table_addr:
+                    continue
+                return addr, index_reg
+        return None, None
 
     def _insert_confirmed_addr(self, addr: int, type_: SectionType):
         # Ignore address outside the bounds of the function
@@ -355,6 +364,7 @@ class InstructionMeta:
     register_access_known: bool = True
     operand_model_complete: bool = True
     control_flow_known: bool = True
+    control_target: Hashable | None = None
 
 
 def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
@@ -375,6 +385,7 @@ def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
         register_access_known=insn.register_access_known,
         operand_model_complete=insn.operand_model_complete,
         control_flow_known=insn.control_flow_known,
+        control_target=insn.control_target,
     )
 
 

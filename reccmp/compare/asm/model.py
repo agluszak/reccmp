@@ -145,6 +145,8 @@ class Instruction:
     prefix: str  # rep/repe/repne or ""
     operands: tuple
     raw_operands: tuple[str, ...]
+    # Proof identity of a jump/call destination (not the display displacement).
+    control_target: Hashable | None = None
 
 
 def parse_instruction(line: str) -> Instruction:

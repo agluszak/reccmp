@@ -56,6 +56,10 @@ def iter_cvdump_sections(stream: Iterable[str]) -> Iterator[tuple[str, str]]:
         yield (section, "".join(lines))
 
 
+class CvdumpError(RuntimeError):
+    """cvdump subprocess failed."""
+
+
 class Cvdump:
     def __init__(self, pdb: str) -> None:
         self._pdb: str = pdb
@@ -120,5 +124,8 @@ class Cvdump:
             wrap = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="ignore")
             for name, section in iter_cvdump_sections(wrap):
                 parser.read_section(name, section)
+            returncode = proc.wait()
+        if returncode:
+            raise CvdumpError(f"cvdump exited with status {returncode}")
 
         return parser

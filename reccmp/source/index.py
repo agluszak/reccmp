@@ -125,6 +125,9 @@ class SourceField:
     array_element_type: str | None = None
     array_stride: int | None = None
     array_count: int | None = None
+    # Physical storage of one array element: scalar, pointer, reference,
+    # embedded_record, array.
+    array_element_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -670,7 +673,7 @@ def field_is_indirection(field: SourceField) -> bool:
     if field.storage_kind in ("pointer", "reference"):
         return True
     if field.storage_kind == "array":
-        return False
+        return field.array_element_kind in ("pointer", "reference")
     if (field.pointer_depth or 0) > 0:
         return True
     return type_spelling_is_indirection(field.type)
@@ -694,6 +697,7 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         "array_element_type",
         "array_stride",
         "array_count",
+        "array_element_kind",
     ):
         if key in data and data[key] is None:
             continue
@@ -714,6 +718,7 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         array_element_type=data.get("array_element_type"),
         array_stride=data.get("array_stride"),
         array_count=data.get("array_count"),
+        array_element_kind=data.get("array_element_kind"),
     )
 
 
@@ -990,6 +995,11 @@ class SourceIndex:
         Only for *embedded* record storage. Pointer/reference fields keep the
         pointee id for metadata but are not physical containment.
         """
+        if field.storage_kind == "array" and field.array_element_kind not in (
+            None,
+            "embedded_record",
+        ):
+            return None
         if field_is_indirection(field):
             return None
         if field.record_semantic_id:

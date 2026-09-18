@@ -68,6 +68,7 @@ class ReccmpComparedEntity:
     """True if this entity had no fixed recomp address across the
     samples combined by reccmp-aggregate."""
 
+    display_similarity: float | None = None
     stack_permutation: tuple[StackPermutationEntry, ...] = ()
     accuracy_modulo_stack: float | None = None
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
@@ -86,6 +87,13 @@ class ReccmpComparedEntity:
     @property
     def is_effective_match(self) -> bool:
         return self.analysis.status == ComparisonStatus.EFFECTIVE
+
+    @property
+    def is_proven_match(self) -> bool:
+        return self.analysis.status in (
+            ComparisonStatus.EXACT,
+            ComparisonStatus.EFFECTIVE,
+        )
 
     @property
     def effective_accuracy(self) -> float:
@@ -124,6 +132,11 @@ class ReccmpStatusReport:
     from_version: int | None
     """Only set during deserialize. (Not used yet)"""
 
+    source_digest: str | None = None
+    """SHA-256 of the original binary, when known. Two reports with
+    different digests are not aggregate-compatible even if they share a
+    filename."""
+
     function_count: int = 0
     """Function count used to determine progress percentage and other statistics.
     We can compute this value from the report's entities or use a user-provided value.
@@ -134,9 +147,11 @@ class ReccmpStatusReport:
         filename: str,
         timestamp: datetime | None = None,
         from_version: int | None = None,
+        source_digest: str | None = None,
     ) -> None:
         self.filename = filename
         self.from_version = from_version
+        self.source_digest = source_digest
         self.function_count = 0
         if timestamp is not None:
             self.timestamp = timestamp
@@ -149,7 +164,12 @@ class ReccmpStatusReport:
         self.entities[match.orig_addr] = match
 
     def has_same_source(self, other: "ReccmpStatusReport") -> bool:
-        """Were both reports derived from the same reccmp target?"""
+        """Were both reports derived from the same original binary?"""
+        if self.source_digest is not None or other.source_digest is not None:
+            return (
+                self.source_digest is not None
+                and self.source_digest == other.source_digest
+            )
         return self.filename.lower() == other.filename.lower()
 
     def update_function_count(self) -> None:
@@ -237,15 +257,14 @@ def _get_entity_for_addr(
 
 def _accuracy_sort_key(entity: ReccmpComparedEntity) -> float:
     """Helper to sort entity samples by accuracy score.
-    100% match is preferred over effective match.
-    Effective match is preferred over any accuracy.
+    Proven exact match is preferred over effective.
+    Effective match is preferred over any unproven accuracy.
     Stubs rank lower than any accuracy score."""
     if entity.is_stub:
         return -1.0
 
-    if entity.accuracy == 1.0:
-        if not entity.is_effective_match:
-            return 1000.0
+    if entity.analysis.status == ComparisonStatus.EXACT:
+        return 1000.0
 
     if entity.is_effective_match:
         return 1.0
@@ -262,7 +281,9 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
     if not all(samples[0].has_same_source(s) for s in samples):
         raise ReccmpReportSameSourceError
 
-    output = ReccmpStatusReport(filename=samples[0].filename)
+    output = ReccmpStatusReport(
+        filename=samples[0].filename, source_digest=samples[0].source_digest
+    )
 
     # Use the highest function total across all samples.
     # Some functions may have been inlined in some reports.
@@ -361,6 +382,7 @@ class JSONReportVersion1(BaseModel):
     timestamp: float
     data: list[JSONEntityVersion1]
     function_count: int | None = None
+    source_digest: str | None = None
 
 
 def _side_json(side: DifferenceSide) -> dict[str, object]:
@@ -527,6 +549,7 @@ def _serialize_version_1(
         timestamp=report.timestamp.timestamp(),
         data=entities,
         function_count=report.function_count,
+        source_digest=report.source_digest,
     )
 
 
@@ -535,6 +558,7 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
         filename=obj.file,
         timestamp=datetime.fromtimestamp(obj.timestamp),
         from_version=1,
+        source_digest=obj.source_digest,
     )
     report.function_count = obj.function_count or 0
 

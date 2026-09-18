@@ -291,10 +291,19 @@ class EntityDb:
 
         self._sections = {ImageId.ORIG: [], ImageId.RECOMP: []}
         self._frozen = False
+        self._generation = 0
 
     @property
     def frozen(self) -> bool:
         return getattr(self, "_frozen", False)
+
+    @property
+    def generation(self) -> int:
+        """Identity-cache generation; increments when pairings or aliases change."""
+        return getattr(self, "_generation", 0)
+
+    def _bump_generation(self) -> None:
+        self._generation = getattr(self, "_generation", 0) + 1
 
     def freeze(self) -> None:
         """Seal pairing/identity after ingest. Resolver caches may follow."""
@@ -337,6 +346,7 @@ class EntityDb:
                 entities[addr]._kvstore.update(values)
 
         self._update_addr_index(image, new_addrs)
+        self._bump_generation()
 
     def bulk_match(self, pairs: Iterable[tuple[int, int]]):
         """Expects iterable of `(orig_addr, recomp_addr)`."""
@@ -384,6 +394,7 @@ class EntityDb:
 
         self._update_addr_index(ImageId.ORIG, new_x)
         self._update_addr_index(ImageId.RECOMP, new_y)
+        self._bump_generation()
 
     def add_section(self, img: ImageId, range_: range):
         self._require_mutable()
@@ -456,6 +467,7 @@ class EntityDb:
         if existing is not None:
             return False
         self._aliases[image_id][addr] = canonical_orig
+        self._bump_generation()
         return True
 
     def alias_canonical_orig(self, image_id: ImageId, addr: int) -> int | None:

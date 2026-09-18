@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 def _resolve_helper(compare: Compare, helper: str):
     if helper.lower().startswith("0x"):
         addr = int(helper, 16)
-        match = compare.db.get_one_match(addr)
+        match = compare.get_match(addr)
         if match is None or match.entity_type != EntityType.FUNCTION:
             return None
         return match

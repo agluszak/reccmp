@@ -204,9 +204,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
 
     note = triage_status_note(match.analysis)
 
-    if match.effective_accuracy == 1.0:
+    if match.is_proven_match:
         ok_text = reccmp.color.Fore.GREEN + "✨ OK! ✨" + reccmp.color.Style.RESET_ALL
-        if match.accuracy == 1.0:
+        if match.analysis.status == ComparisonStatus.EXACT:
             print(f"{addrs}: {match.name} 100% match.\n\n{ok_text}\n\n")
         else:
             print_combined_diff(udiff, show_both_addrs)
@@ -565,7 +565,10 @@ def main() -> int:
         or (args.json is not None and not args.json_diet)
     )
     if selected:
-        report = ReccmpStatusReport(filename=target.original_path.name)
+        report = ReccmpStatusReport(
+            filename=target.original_path.name,
+            source_digest=compare.orig_source_digest,
+        )
         for entity in compare.compare_addresses(
             args.orig_address,
             args.recomp_address,

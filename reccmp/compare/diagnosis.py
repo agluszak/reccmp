@@ -417,16 +417,8 @@ class AnalysisRecorder:
             return self.candidate_difference
         return self.difference
 
-    def effective_analysis(self, extra_reasons=()) -> ComparisonAnalysis:
-        from reccmp.compare.verification import admit_effective_analysis
-
-        admitted = admit_effective_analysis(self.reasons | set(extra_reasons))
-        if admitted is None:
-            return ComparisonAnalysis.inconclusive(
-                self.inconclusive_reason or "analysis_limit",
-                self.inconclusive_location,
-            )
-        return admitted
+    def effective_reasons(self, extra_reasons=()) -> frozenset[str]:
+        return frozenset(self.reasons | set(extra_reasons))
 
     def failure_analysis(self) -> ComparisonAnalysis:
         if self.best_difference is not None:

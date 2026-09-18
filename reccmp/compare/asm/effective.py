@@ -1059,6 +1059,15 @@ STRING_OPS = {
 }
 
 
+def _branch_obs_dest(ins: Instruction) -> object:
+    """Proof identity of a direct transfer; never a relative displacement."""
+    if ins.control_target is not None:
+        return ins.control_target
+    if ins.raw_operands:
+        return ins.raw_operands[0]
+    return None
+
+
 def execute(
     state: SideState, ctx: Context, idx: int, ins: Instruction, obs: list
 ) -> None:
@@ -1238,9 +1247,7 @@ def execute(
         # ABI says it is an argument — never merely because the call looked
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
-            entry.append(
-                _receiver_equivalence_class(state.read_reg("ecx"), ctx)
-            )
+            entry.append(_receiver_equivalence_class(state.read_reg("ecx"), ctx))
             if abi is not None and abi.uses_edx:
                 entry.append(state.read_reg("edx"))
         else:
@@ -1288,14 +1295,16 @@ def execute(
             obs.append(("retval", state.read_reg("eax")))
     elif mnemonic in JCC_MNEMONICS and len(ops) == 1:
         pred = canon_condition(JCC_MNEMONICS[mnemonic], state)
-        obs.append(("branch", pred, ins.raw_operands[0]))
+        obs.append(("branch", pred, _branch_obs_dest(ins)))
     elif mnemonic == "jmp" and len(ops) == 1:
         if ops[0][0] == "mem":
             obs.append(("jmpind", read_operand(state, ctx, ops[0])))
         else:
-            obs.append(("jmp", ins.raw_operands[0]))
+            obs.append(("jmp", _branch_obs_dest(ins)))
     elif mnemonic in ("loop", "loope", "loopne", "jcxz", "jecxz") and len(ops) == 1:
-        obs.append((mnemonic, state.read_reg("ecx"), state.flags, ins.raw_operands[0]))
+        obs.append(
+            (mnemonic, state.read_reg("ecx"), state.flags, _branch_obs_dest(ins))
+        )
         if mnemonic.startswith("loop"):
             state.write_reg("ecx", ("loopdec", state.read_reg("ecx")))
     elif mnemonic.startswith("set") and mnemonic[3:] in CC_CANON and len(ops) == 1:
@@ -1535,17 +1544,13 @@ def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> 
             continue
         if _is_scratch(value_o) and _is_scratch(value_r):
             continue
-        if family in CALLER_SAVED and (
-            _is_scratch(value_o) or _is_scratch(value_r)
-        ):
+        if family in CALLER_SAVED and (_is_scratch(value_o) or _is_scratch(value_r)):
             continue
         return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
     for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-        if slot_o != slot_r and not (
-            _is_scratch(slot_o) and _is_scratch(slot_r)
-        ):
+        if slot_o != slot_r and not (_is_scratch(slot_o) and _is_scratch(slot_r)):
             return False
     return True
 
@@ -1563,13 +1568,19 @@ def _control_destination(
     meta: InstructionMeta | None,
     addrs: list[int | None] | None,
 ) -> object:
-    """Prefer local instruction-id over encoding displacement when known."""
-    if meta is None or meta.branch_target is None or addrs is None:
+    """Prefer local instruction-id; never a relative displacement."""
+    if meta is None:
         return raw_operand
-    try:
-        return ("L", addrs.index(meta.branch_target))
-    except ValueError:
-        return raw_operand
+    if meta.branch_target is not None and addrs is not None:
+        try:
+            return ("L", addrs.index(meta.branch_target))
+        except ValueError:
+            pass
+    if meta.control_target is not None:
+        return ("ext", meta.control_target)
+    if meta.branch_target is not None:
+        return ("ext", ("unresolved", None, meta.branch_target))
+    return raw_operand
 
 
 def _rewrite_control_observables(
@@ -2276,9 +2287,7 @@ def verify_effective_match(
                     if recomp_meta is not None and index_r is not None
                     else None
                 )
-                if admit_unsupported_identical(
-                    orig, recomp, ctx, idx, meta_o, meta_r
-                ):
+                if admit_unsupported_identical(orig, recomp, ctx, idx, meta_o, meta_r):
                     continue
                 if recorder is not None:
                     recorder.mark_inconclusive(
@@ -2372,8 +2381,7 @@ def verify_effective_match(
             # "scratch" initials of different families.
             if any(entry[0] in CONTROL_TAGS for entry in obs_o):
                 conditional = any(
-                    entry[0]
-                    in {"branch", "loop", "loope", "loopne", "jcxz", "jecxz"}
+                    entry[0] in {"branch", "loop", "loope", "loopne", "jcxz", "jecxz"}
                     for entry in obs_o
                 )
                 if conditional and orig.regs != recomp.regs:
@@ -3117,7 +3125,9 @@ def _join_states(
         receiver_values,
         entry.escaped or incoming.escaped,
         matched_nodes=set(entry.matched_nodes) | set(incoming.matched_nodes),
-        matched_ids={id(node) for node in (entry.matched_nodes | incoming.matched_nodes)},
+        matched_ids={
+            id(node) for node in (entry.matched_nodes | incoming.matched_nodes)
+        },
         keepalive=list(entry.matched_nodes | incoming.matched_nodes),
         save_stack=[list(record) for record in entry.save_stack],
         scratch_pushes=_remap_scratch(
@@ -3623,8 +3633,8 @@ def _control_kind_at(stream: ResolvedAsm, index: int) -> str:
     return "code"
 
 
-def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> bool:
-    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
+def _scale4_mem_jmp(line: str, *, ins: Instruction | None = None) -> bool:
+    """True for ``jmp dword ptr [idx*4 + …]`` regardless of table base."""
     if ins is None:
         try:
             ins = parse_instruction(line)
@@ -3635,9 +3645,21 @@ def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> b
     op = ins.operands[0]
     if not isinstance(op, tuple) or op[0] != "mem":
         return False
-    _size, _seg, reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
-    if not any(scale == 4 for _reg, scale in reg_terms):
+    _size, _seg, reg_terms, _disp, _syms = op[1], op[2], op[3], op[4], op[5]
+    return any(scale == 4 for _reg, scale in reg_terms)
+
+
+def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> bool:
+    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
+    if ins is None:
+        try:
+            ins = parse_instruction(line)
+        except (Reject, IndexError, KeyError, ValueError, TypeError):
+            return False
+    if not _scale4_mem_jmp(line, ins=ins):
         return False
+    op = ins.operands[0]
+    _size, _seg, _reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
     # Require an identifiable table base (sanitized symbol and/or displacement).
     return bool(syms) or disp != 0
 
@@ -3684,14 +3706,23 @@ def _extract_switch_tables(
 
     # Prefer first-class JumpTable objects from InstructGen when addresses align.
     if stream.jump_tables and addrs is not None:
-        addr_to_index = {
-            addr: i for i, addr in enumerate(addrs) if addr is not None
-        }
+        addr_to_index = {addr: i for i, addr in enumerate(addrs) if addr is not None}
         for table in stream.jump_tables:
             if table.dispatch_address is None:
                 continue
             dispatch_i = addr_to_index.get(table.dispatch_address)
             if dispatch_i is None or kinds[dispatch_i] != "jmp":
+                continue
+            switch_ins = None
+            try:
+                switch_ins = instruction_at(stream, dispatch_i)
+            except (Reject, IndexError, KeyError, ValueError, TypeError):
+                switch_ins = None
+            # First-class tables still have to be a scale-4 indexed mem jmp.
+            # Metadata alone (a dispatch address on any jmp) is not enough.
+            if not table.is_recognized_switch() or not _scale4_mem_jmp(
+                asm[dispatch_i], ins=switch_ins
+            ):
                 continue
             dests: list[int] = []
             entry_indices: list[int] = []

@@ -139,9 +139,9 @@ def _file_digest_factory():
         cached = digests.get(path)
         if cached is not None:
             return cached
-        payload = path.read_bytes()
-        digests[path] = payload
-        return payload
+        digest = hashlib.sha256(path.read_bytes()).digest()
+        digests[path] = digest
+        return digest
 
     return file_digest
 

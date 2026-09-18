@@ -196,13 +196,25 @@ class Indexer {
       entry["storage_kind"] = "pointer";
       return;
     }
-    if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+      if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
       QualType element = array->getElementType();
       entry["storage_kind"] = "array";
       entry["array_element_type"] = typeName(element);
       entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
       if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
         entry["array_count"] = static_cast<int64_t>(constant->getSize().getZExtValue());
+      }
+      QualType element_canonical = element.getCanonicalType();
+      if (element_canonical->getAs<ReferenceType>()) {
+        entry["array_element_kind"] = "reference";
+      } else if (element_canonical->getAs<PointerType>() || pointerDepth(element) > 0) {
+        entry["array_element_kind"] = "pointer";
+      } else if (element_canonical->getAsArrayTypeUnsafe()) {
+        entry["array_element_kind"] = "array";
+      } else if (element_canonical->getAsCXXRecordDecl()) {
+        entry["array_element_kind"] = "embedded_record";
+      } else {
+        entry["array_element_kind"] = "scalar";
       }
       return;
     }
