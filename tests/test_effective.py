@@ -1029,13 +1029,24 @@ def test_meta_step_over_unmodeled_instruction():
     ]
     # Without metadata: bswap requires full sync, but eax/edx diverge.
     assert verify_effective_match(orig, recomp) is False
-    orig_meta = [None, None, meta("bswap", ("ecx",), ("ecx",), 4), None]
-    assert verify_effective_match(orig, recomp, orig_meta=orig_meta) is True
+    bswap_meta = meta("bswap", ("ecx",), ("ecx",), 4)
+    orig_meta = [None, None, bswap_meta, None]
+    recomp_meta = [None, None, bswap_meta, None]
+    assert verify_effective_match(
+        orig, recomp, orig_meta=orig_meta, recomp_meta=recomp_meta
+    ) is True
     # If the bswap reads a diverged register, it must still reject.
-    orig_meta = [None, None, meta("bswap", ("eax",), ("eax",), 4), None]
+    bad_meta = meta("bswap", ("eax",), ("eax",), 4)
+    orig_meta = [None, None, bad_meta, None]
+    recomp_meta = [None, None, bad_meta, None]
     recomp2 = [recomp[0], recomp[1], "bswap eax", "mov dword ptr [ebx], ecx"]
     orig2 = [orig[0], orig[1], "bswap eax", "mov dword ptr [ebx], ecx"]
-    assert verify_effective_match(orig2, recomp2, orig_meta=orig_meta) is False
+    assert (
+        verify_effective_match(
+            orig2, recomp2, orig_meta=orig_meta, recomp_meta=recomp_meta
+        )
+        is False
+    )
 
 
 def test_unknown_register_access_meta_cannot_step_divergent_state():

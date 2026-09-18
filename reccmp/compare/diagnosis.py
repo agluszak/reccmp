@@ -205,6 +205,7 @@ INCONCLUSIVE_REASONS = frozenset(
         "alignment_failure",
         "missing_metadata",
         "analysis_limit",
+        "incomplete_coverage",
     }
 )
 

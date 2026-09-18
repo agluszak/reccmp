@@ -74,6 +74,7 @@ class ParseAsm:
         self._sections: list[FuncSection] = []
         self._decoded_by_addr: dict[int, DecodedInstruction] = {}
         self.jump_tables: tuple[JumpTable, ...] = ()
+        self.coverage_incomplete: bool = False
 
     def reset(self):
         self.replacements = {}
@@ -377,6 +378,7 @@ class ParseAsm:
         self._sections = ig.sections
         self._decoded_by_addr = dict(ig.decoded_by_addr)
         self.jump_tables = tuple(ig.jump_tables)
+        self.coverage_incomplete = ig.coverage_incomplete
 
         # Project meta from the single decode pass (no second Capstone walk).
         self.meta = {

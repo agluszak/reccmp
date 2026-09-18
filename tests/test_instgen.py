@@ -129,9 +129,15 @@ def test_thunk_case():
     """Adjuster thunk incorrectly annotated.
     We are reading way more bytes than we should for this function."""
     ig = InstructGen(THUNK_TEST, 0x1000FB50)
-    # No switch cases here, so the only section is code.
-    # This caused an infinite loop during testing so the goal is just to finish.
-    assert len(ig.sections) == 1
+    # The body begins with ``sub``/``jmp`` over int3 padding into the real
+    # implementation. Pending-target drainage must visit that landing site
+    # (a second CODE section) without looping forever on truncated trailing
+    # bytes from the next function.
+    assert len(ig.sections) == 2
+    assert all(section.type == SectionType.CODE for section in ig.sections)
+    assert ig.sections[0].contents[0][2] == "sub"
+    assert ig.sections[0].contents[1][2] == "jmp"
+    assert ig.sections[1].contents[0][2] == "push"
 
     # TODO: We might detect the 0xCC padding bytes and cut off the function.
     # If we did that, we would correctly read only 2 instructions.

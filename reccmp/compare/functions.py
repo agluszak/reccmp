@@ -431,6 +431,10 @@ class FunctionComparator:
 
         orig_combined = self.orig_sanitize.parse_asm(orig_raw, match.orig_addr)
         recomp_combined = self.recomp_sanitize.parse_asm(recomp_raw, match.recomp_addr)
+        coverage_incomplete = (
+            self.orig_sanitize.coverage_incomplete
+            or self.recomp_sanitize.coverage_incomplete
+        )
 
         # Check for assert calls only if we expect to find them
         if has_asserts(self.orig_bin):
@@ -468,6 +472,15 @@ class FunctionComparator:
             result = dataclasses.replace(
                 result,
                 analysis=ComparisonAnalysis.effective(("folded_symbol_alias",)),
+            )
+            result.refresh_equivalence_level()
+
+        # Incomplete reachable coverage is not a successful proof: refuse
+        # EXACT/EFFECTIVE even when the extracted excerpt happens to match.
+        if coverage_incomplete and result.analysis.is_effective:
+            result = dataclasses.replace(
+                result,
+                analysis=ComparisonAnalysis.inconclusive("incomplete_coverage"),
             )
             result.refresh_equivalence_level()
 
@@ -923,7 +936,8 @@ class FunctionComparator:
             return False
         seen = _seen if _seen is not None else set()
         if (orig_addr, recomp_addr) in seen:
-            return True
+            # Re-entering an unresolved pair is not a completed proof.
+            return False
         seen.add((orig_addr, recomp_addr))
         try:
             orig_raw = self.orig_bin.read(orig_addr, size)
@@ -936,6 +950,8 @@ class FunctionComparator:
             island_target = (
                 orig_addr + 5 + int.from_bytes(orig_raw[1:5], "little", signed=True)
             )
+            if island_target == orig_addr:
+                return False
             return self.raw_pair_alias_equivalent(
                 island_target, recomp_addr, size, _depth=_depth + 1, _seen=seen
             )

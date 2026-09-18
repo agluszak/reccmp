@@ -983,14 +983,49 @@ def canon_condition(cc: str, state: SideState) -> Value:
     if entry is not None and isinstance(flags, tuple) and flags[0] == "cmp":
         pred, swap = entry
         a, b = flags[1], flags[2]
+        width = flags[3] if len(flags) > 3 else None
         if pred in ("eq", "ne"):
-            return (pred, _vsort(a, b))
-        return (pred, b, a) if swap else (pred, a, b)
+            base = (pred, _vsort(a, b))
+        else:
+            base = (pred, b, a) if swap else (pred, a, b)
+        return base if width is None else (*base, width)
+    if (
+        cc in ("o", "no")
+        and isinstance(flags, tuple)
+        and flags[0] == "sahf"
+        and len(flags) > 2
+    ):
+        # OF is preserved across SAHF; observe the prior flag producer.
+        return ("cc", cc, flags[2])
     if cc in CF_CONDITIONS:
         # The carry flag may have a different (older) producer than the
         # rest of the flags.
         return ("cc", cc, flags, state.carry)
     return ("cc", cc, flags)
+
+
+_PART_BYTES = {"l8": 1, "h8": 1, "r8": 1, "r8h": 1, "r16": 2, "r32": 4}
+
+
+def _compare_width(op_a, op_b) -> int | str:
+    """Byte width of a CMP/TEST, used so signed/unsigned outcomes stay distinct."""
+    for op in (op_a, op_b):
+        if not isinstance(op, tuple) or not op:
+            continue
+        if op[0] == "reg":
+            part = REGISTERS.get(op[1], (None, None))[1]
+            if part in _PART_BYTES:
+                return _PART_BYTES[part]
+        if op[0] == "mem":
+            size = op[1]
+            if size in _WIDTHS:
+                return _WIDTHS[size]
+            if isinstance(size, str) and size.startswith("size"):
+                try:
+                    return int(size[4:])
+                except ValueError:
+                    return size
+    return "unk"
 
 
 JCC_MNEMONICS = {
@@ -1064,7 +1099,8 @@ def execute(
         elif mnemonic in ("and", "or") and a == b:
             # SF/ZF/PF reflect the value; CF and OF are cleared: exactly
             # the flag state of `cmp value, 0`.
-            state.flags = ("cmp", a, ("imm", 0))
+            width = _compare_width(ops[0], ops[0])
+            state.flags = ("cmp", a, ("imm", 0), width)
         else:
             state.flags = ("flags", mnemonic, *pair)
         # and/or/xor clear CF; add/imul produce a carry-out.
@@ -1114,24 +1150,26 @@ def execute(
     elif mnemonic == "cmp" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
+        width = _compare_width(ops[0], ops[1])
         if a == b:
             state.flags = ZERO_FLAGS
         else:
-            state.flags = ("cmp", a, b)
+            state.flags = ("cmp", a, b, width)
         # `x < x` and `x < 0` (unsigned) are always false.
         if b in (a, ("imm", 0)):
             state.carry = ("cf0",)
         else:
-            state.carry = ("lt_u", a, b)
+            state.carry = ("lt_u", a, b, width)
     elif mnemonic == "test" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
+        width = _compare_width(ops[0], ops[1])
         if a == b:
             # `test r, r` sets SF/ZF/PF from the value and clears CF/OF:
             # exactly the flag state of `cmp r, 0`.
-            state.flags = ("cmp", a, ("imm", 0))
+            state.flags = ("cmp", a, ("imm", 0), width)
         else:
-            state.flags = ("test", *_vsort(a, b))
+            state.flags = ("test", *_vsort(a, b), width)
         state.carry = ("cf0",)
     elif mnemonic in ("mul", "imul") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
@@ -1153,7 +1191,8 @@ def execute(
     elif mnemonic == "cwde":
         state.write_reg("eax", ("cwde", state.read_reg("ax")))
     elif mnemonic == "sahf":
-        state.flags = ("sahf", state.read_reg("ah"))
+        # SAHF loads SF/ZF/AF/PF/CF from AH; OF is preserved.
+        state.flags = ("sahf", state.read_reg("ah"), state.flags)
         state.carry = ("sahf_cf", state.read_reg("ah"))
     elif mnemonic == "push" and len(ops) == 1:
         value = read_operand(state, ctx, ops[0])
@@ -1192,15 +1231,28 @@ def execute(
         target = read_operand(state, ctx, ops[0])
         virtual_target = _canonical_virtual_target(target, ctx)
         entry = ["call", virtual_target or target]
-        if virtual_target is None:
+        # A known virtual target is not proof that arguments agree. Always
+        # observe the actual this/receiver (ecx). Include edx only when the
+        # ABI says it is an argument — never merely because the call looked
+        # virtual (edx often holds the vtable pointer, not an argument).
+        if virtual_target is not None:
+            entry.append(
+                _receiver_equivalence_class(state.read_reg("ecx"), ctx)
+            )
+            if abi is not None and abi.uses_edx:
+                entry.append(state.read_reg("edx"))
+        else:
             if abi is None or abi.uses_ecx:
                 entry.append(state.read_reg("ecx"))
             if abi is None or abi.uses_edx:
                 entry.append(state.read_reg("edx"))
         obs.append(tuple(entry))
+        incoming_esp = state.read_reg("esp")
         for reg in ("eax", "ecx", "edx"):
             state.write_reg(reg, ("callret", idx, reg))
-        state.write_reg("esp", ("callesp", idx))
+        # Preserve dependence on incoming SP; unknown cleanup must not
+        # erase a pre-call stack discrepancy.
+        state.write_reg("esp", ("callesp", idx, incoming_esp))
         state.flags = ("callflags", idx)
         state.carry = ("callcf", idx)
         state.x87 = X87Stack(epoch=idx + 1)
@@ -1453,29 +1505,66 @@ CONTROL_TAGS = frozenset(
 )
 
 
+def _collect_expr_values(value: Value, acc: set) -> None:
+    """Collect expression nodes that may justify a live register at a branch."""
+    if value in acc:
+        return
+    acc.add(value)
+    if isinstance(value, tuple):
+        for item in value[1:]:
+            if isinstance(item, (tuple, str, int)):
+                _collect_expr_values(item, acc)  # type: ignore[arg-type]
+
+
 def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> bool:
-    """At a control transfer, the current state escapes the linear flow.
-    Every divergent register or x87 slot must already be justified: proven
-    equal (consumed by a matched expression), inserted-part equal, or
-    untouched scratch. A later overwrite on the fallthrough path must not
-    be allowed to hide a real divergence that a jump path can observe."""
+    """At a control transfer, refuse unjustified live divergent register state.
+
+    ``matched_nodes`` membership alone is not a liveness proof (the same
+    immediate can be matched in one register and later live in another).
+    Values that participate in the branch predicate's flag/carry producer on
+    both sides may still differ when a commutative compare swapped operands.
+    Scratch pairs remain allowed.
+    """
+    del ctx
+    predicate_vals: set = set()
+    _collect_expr_values(orig.flags, predicate_vals)
+    _collect_expr_values(recomp.flags, predicate_vals)
+    _collect_expr_values(orig.carry, predicate_vals)
+    _collect_expr_values(recomp.carry, predicate_vals)
+
     for family in FAMILIES:
         value_o, value_r = orig.regs[family], recomp.regs[family]
         if value_o == value_r:
             continue
-        if _ins_split_ok(value_o, value_r, ctx):
+        if (
+            isinstance(value_o, tuple)
+            and isinstance(value_r, tuple)
+            and len(value_o) == 3
+            and len(value_r) == 3
+            and value_o[0] == value_r[0]
+            and str(value_o[0]).startswith("ins_")
+            and value_o[2] == value_r[2]
+            and _is_scratch(value_o[1])
+            and _is_scratch(value_r[1])
+        ):
             continue
-        for value in (value_o, value_r):
-            if _is_scratch(value):
-                continue
-            if not _contained(value, ctx):
-                return False
+        if _is_scratch(value_o) and _is_scratch(value_r):
+            continue
+        if family in CALLER_SAVED and (
+            _is_scratch(value_o) or _is_scratch(value_r)
+        ):
+            continue
+        # Both values feed the branch predicate (e.g. swapped cmp operands).
+        if value_o in predicate_vals and value_r in predicate_vals:
+            continue
+        return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
     for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-        if slot_o != slot_r:
-            if not (_contained(slot_o, ctx) and _contained(slot_r, ctx)):
-                return False
+        if slot_o != slot_r and not (
+            _is_scratch(slot_o) and _is_scratch(slot_r)
+        ):
+            return False
     return True
 
 
@@ -2045,8 +2134,12 @@ def verify_effective_match(
                     if recomp_meta is not None and index_r is not None
                     else None
                 )
-                meta = meta_o or meta_r
-                if meta is not None and _meta_step(orig, recomp, meta, idx):
+                if (
+                    meta_o is not None
+                    and meta_r is not None
+                    and _same_meta_effects(meta_o, meta_r)
+                    and _meta_step(orig, recomp, meta_o, idx)
+                ):
                     continue
                 if not fully_synced(orig, recomp):
                     if recorder is not None:
