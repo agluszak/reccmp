@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Hashable, Sequence, Union
+from collections.abc import Hashable, Sequence
+from typing import Union
 
 from .model import (
     STACK_ENTRY_REGEX,
@@ -149,6 +150,7 @@ def rebind_local_identities(
 
 @dataclass(frozen=True)
 class FunctionImage:
+    # pylint: disable=too-many-instance-attributes
     """Lossless view of one decoded function for comparison.
 
     Owns the extent evidence, decoded excerpt, jump tables, and coverage
@@ -489,7 +491,7 @@ def control_flow_topology_keys(
             keys.append(("ret",))
             continue
         proof = _branch_proof_identity(row, addr_to_id)
-        if proof is not None and proof[0] == "local":
+        if isinstance(proof, tuple) and proof[0] == "local":
             keys.append(proof)
             continue
         if proof is not None and row.branch_target is not None:
@@ -596,6 +598,7 @@ def compute_extent_closed(
     jump_tables: Sequence[JumpTable] = (),
     extent_kind: ExtentKind = ExtentKind.KNOWN,
 ) -> bool:
+    # pylint: disable=too-many-nested-blocks,too-many-return-statements
     """True when every reachable path ends inside a modeled terminal.
 
     A coverage walk can only prove the supplied byte window. Implicit
@@ -611,9 +614,9 @@ def compute_extent_closed(
     code = [row for row in excerpt if row.is_code and row.address is not None]
     if not code:
         return False
-    addr_to_row = {row.address: row for row in code}
+    addr_to_row = {row.address: row for row in code if row.address is not None}
     window = range(start_addr, start_addr + extent)
-    pending = [code[0].address]
+    pending = list(addr_to_row)[:1]
     seen: set[int] = set()
     while pending:
         addr = pending.pop()

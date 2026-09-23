@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 import dataclasses
 from dataclasses import dataclass, field
 from functools import cache
@@ -79,6 +80,7 @@ from reccmp.formats.exceptions import (
 )
 from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
+from reccmp.compare.inlines import find_call_sites
 
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
 
@@ -630,22 +632,22 @@ class FunctionComparator:
         shape remain part of the key.
         """
         cache_key = (image_id, addr, size)
-        cache = getattr(self, "_fp_cache", None)
-        if cache is not None and cache_key in cache:
-            return cache[cache_key]
+        memo = getattr(self, "_fp_cache", None)
+        if memo is not None and cache_key in memo:
+            return memo[cache_key]
 
         image = self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin
         valid_addr = create_valid_addr_lookup(self.db, image_id, image)
         try:
             raw = image.read(addr, size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
-            if cache is not None:
-                cache[cache_key] = None
+            if memo is not None:
+                memo[cache_key] = None
             return None
         instructions = _code_instructions(raw, addr, self.is_32bit)
         if instructions is None:
-            if cache is not None:
-                cache[cache_key] = None
+            if memo is not None:
+                memo[cache_key] = None
             return None
 
         def normalize_operand(operand: str) -> str:
@@ -659,33 +661,33 @@ class FunctionComparator:
             (mnemonic, normalize_operand(operand))
             for _, _, mnemonic, operand in instructions
         )
-        if cache is not None:
-            cache[cache_key] = fingerprint
+        if memo is not None:
+            memo[cache_key] = fingerprint
         return fingerprint
 
     def _helper_entry_for_match(self, entity: ReccmpMatch) -> HelperCatalogEntry | None:
         """Lazily fingerprint one paired helper (memoized in the catalog map)."""
-        cache = getattr(self, "_helper_by_orig", None)
-        if cache is None:
+        memo = getattr(self, "_helper_by_orig", None)
+        if memo is None:
             self._helper_by_orig = {}
-            cache = self._helper_by_orig
-        if entity.orig_addr in cache:
-            return cache[entity.orig_addr]
+            memo = self._helper_by_orig
+        if entity.orig_addr in memo:
+            return memo[entity.orig_addr]
 
         recomp_size = entity.size(ImageId.RECOMP)
         if recomp_size is None or recomp_size <= 0:
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         try:
             raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
         fingerprint = asm_fingerprint_from_ir(excerpt)
         needle = strip_helper_epilog(fingerprint)
         if len(needle) < 3:
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         name = entity.best_name() or f"sub_{entity.orig_addr:x}"
         entry = HelperCatalogEntry(
@@ -696,7 +698,7 @@ class FunctionComparator:
             byte_size=recomp_size,
             effect_summary=summarize_helper_effects(needle),
         )
-        cache[entity.orig_addr] = entry
+        memo[entity.orig_addr] = entry
         return entry
 
     def _ensure_helper_identity_index(self) -> None:
@@ -791,8 +793,6 @@ class FunctionComparator:
         recomp_asm: AsmExcerpt,
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
-        from reccmp.compare.inlines import find_call_sites
-
         orig_fp = fingerprint_from_asm(orig_asm)
         recomp_fp = fingerprint_from_asm(recomp_asm)
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}
@@ -1098,6 +1098,7 @@ class FunctionComparator:
         active: set[tuple[int, int]],
         proved: dict[tuple[int, int], bool],
     ) -> bool:
+        # pylint: disable=too-many-positional-arguments,too-many-return-statements
         try:
             orig_raw = self.orig_bin.read(orig_addr, size)
             recomp_raw = self.recomp_bin.read(recomp_addr, size)
@@ -1545,6 +1546,7 @@ class FunctionComparator:
         recomp_meta: list[InstructionMeta | None] | None = None,
         coverage_incomplete: bool = False,
     ) -> EntityCompareResult:
+        # pylint: disable=too-many-arguments
         """Test/legacy wrapper that lifts excerpts into ephemeral function images."""
         orig_image = FunctionImage(
             start_addr=0,

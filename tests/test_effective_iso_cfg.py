@@ -10,6 +10,8 @@ copy and mirrored one compare region — shifting the length of the function
 and every crossing branch displacement.
 """
 
+# pylint: disable=too-many-lines
+
 import difflib
 from pathlib import Path
 

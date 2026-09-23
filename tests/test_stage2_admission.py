@@ -62,14 +62,16 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
 
 def test_admit_exact_does_not_default_keys_equal():
     with pytest.raises(TypeError):
-        admit_exact_analysis(
+        admit_exact_analysis(  # type: ignore[call-arg]  # pylint: disable=missing-kwoa
             displays_equal=True, topology_equal=True, extent_closed=True
         )
 
 
 def test_admit_effective_requires_closed_extent():
     with pytest.raises(TypeError):
-        admit_effective({"register_allocation"})
+        admit_effective(  # type: ignore[call-arg]  # pylint: disable=missing-kwoa
+            {"register_allocation"}
+        )
     minted = admit_effective(
         {"register_allocation"}, coverage_incomplete=False, extent_closed=True
     )

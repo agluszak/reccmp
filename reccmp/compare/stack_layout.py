@@ -21,6 +21,8 @@ from reccmp.compare.diff import (
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpTypeKey
+from reccmp.compare.asm.ir import rewrite_stack_displacements
+from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 StackRefKind = Literal["argument", "local", "spill", "saved", "unknown"]
 
@@ -57,6 +59,7 @@ def canonical_stack_ref(
     known_spills: set[int] | frozenset[int] | None = None,
     pdb_slots: Sequence[tuple[int, int, str, StackRefKind]] | None = None,
 ) -> CanonicalStackRef:
+    # pylint: disable=too-many-return-statements
     """Map a physical (reg, offset) pair to a canonical stack reference.
 
     When ``pdb_slots`` is provided (``(start, size, name, kind)`` covering
@@ -385,9 +388,6 @@ def accuracy_after_stack_map(
     mapping: dict[tuple[str, int], tuple[str, int]],
 ) -> float:
     """SequenceMatcher ratio after rewriting orig stack offsets toward recomp."""
-    from reccmp.compare.asm.ir import rewrite_stack_displacements
-    from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
-
     if not mapping:
         return SequenceMatcherWithPins(list(orig_asm), list(recomp_asm), []).ratio()
 

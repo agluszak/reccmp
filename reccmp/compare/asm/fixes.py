@@ -33,7 +33,6 @@ from reccmp.compare.diagnosis import (
 from reccmp.compare.verification import (
     admit_effective,
     admit_exact_analysis,
-    admit_proof,
 )
 from reccmp.compare.pinned_sequences import DiffOpcode
 
@@ -140,15 +139,6 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
                 "incomplete_coverage" if coverage_incomplete else "open_extent"
             )
         return admitted.analysis
-
-    def finish(analysis: ComparisonAnalysis) -> ComparisonAnalysis:
-        if analysis.status == ComparisonStatus.EFFECTIVE:
-            return finish_effective(analysis.effective_reasons)
-        return admit_proof(
-            analysis,
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        )
 
     def new_recorder() -> AnalysisRecorder:
         return AnalysisRecorder(orig_addr_list, recomp_addr_list)
@@ -303,6 +293,7 @@ def _display_topology_equal(
     recomp_addrs: Sequence[int | None] | None,
     recomp_meta: Sequence[InstructionMeta | None] | None,
 ) -> bool:
+    # pylint: disable=too-many-positional-arguments
     """True when local branch destinations (instruction ids) are known and agree.
 
     Jump-free streams are vacuously equal. Jump-bearing streams without

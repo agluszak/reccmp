@@ -146,8 +146,8 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
     assert resolve_source_index_path(target, explicit=index_path) == index_path
     scoped = load_source_index_for_target(target, explicit=index_path)
     assert scoped is not None
-    assert scoped.class_named("Foo") is not None
-    assert scoped.class_named("Foo").size == 8
+    source_class = scoped.class_named("Foo")
+    assert source_class is not None and source_class.size == 8
     assert scoped.abi is not None
     assert scoped.abi.pointer_width == 32
 

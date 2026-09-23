@@ -1,4 +1,4 @@
-from reccmp.compare.asm.instgen import InstructGen, SectionType
+from reccmp.compare.asm.instgen import CodeSection, InstructGen, SectionType
 
 
 def test_ret():
@@ -134,10 +134,11 @@ def test_thunk_case():
     # (a second CODE section) without looping forever on truncated trailing
     # bytes from the next function.
     assert len(ig.sections) == 2
-    assert all(section.type == SectionType.CODE for section in ig.sections)
-    assert ig.sections[0].contents[0][2] == "sub"
-    assert ig.sections[0].contents[1][2] == "jmp"
-    assert ig.sections[1].contents[0][2] == "push"
+    first, second = ig.sections[0], ig.sections[1]
+    assert isinstance(first, CodeSection) and isinstance(second, CodeSection)
+    assert first.contents[0][2] == "sub"
+    assert first.contents[1][2] == "jmp"
+    assert second.contents[0][2] == "push"
 
     # TODO: We might detect the 0xCC padding bytes and cut off the function.
     # If we did that, we would correctly read only 2 instructions.

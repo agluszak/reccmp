@@ -11,7 +11,6 @@ from reccmp.compare.report import (
     combine_reports,
     deserialize_reccmp_report,
     serialize_reccmp_report,
-    ReccmpReportDeserializeError,
     ReccmpReportSameSourceError,
 )
 from reccmp.compare.diagnosis import (

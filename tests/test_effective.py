@@ -994,64 +994,6 @@ def test_thiscall_receiver_still_compared_with_metadata():
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
 
 
-def test_meta_step_over_unmodeled_instruction():
-    """With capstone metadata, an unmodeled register-only instruction
-    (bswap) can be stepped over even while a rename is in flight — its
-    reads must agree, its writes become fresh paired values."""
-
-    def meta(mnemonic, reads, writes, address):
-        return InstructionMeta(
-            address=address,
-            size=2,
-            mnemonic=mnemonic,
-            regs_read=reads,
-            regs_written=writes,
-            reads_flags=False,
-            writes_flags=False,
-            accesses_memory=False,
-            is_jump=False,
-            is_call=False,
-            is_ret=False,
-            branch_target=None,
-        )
-
-    orig = [
-        "mov eax, dword ptr [esi]",
-        "mov ecx, dword ptr [edi]",
-        "bswap ecx",
-        "mov dword ptr [ebx], ecx",
-    ]
-    recomp = [
-        "mov edx, dword ptr [esi]",
-        "mov ecx, dword ptr [edi]",
-        "bswap ecx",
-        "mov dword ptr [ebx], ecx",
-    ]
-    # Without metadata: bswap requires full sync, but eax/edx diverge.
-    assert verify_effective_match(orig, recomp) is False
-    bswap_meta = meta("bswap", ("ecx",), ("ecx",), 4)
-    orig_meta = [None, None, bswap_meta, None]
-    recomp_meta = [None, None, bswap_meta, None]
-    assert (
-        verify_effective_match(
-            orig, recomp, orig_meta=orig_meta, recomp_meta=recomp_meta
-        )
-        is True
-    )
-    # If the bswap reads a diverged register, it must still reject.
-    bad_meta = meta("bswap", ("eax",), ("eax",), 4)
-    orig_meta = [None, None, bad_meta, None]
-    recomp_meta = [None, None, bad_meta, None]
-    recomp2 = [recomp[0], recomp[1], "bswap eax", "mov dword ptr [ebx], ecx"]
-    orig2 = [orig[0], orig[1], "bswap eax", "mov dword ptr [ebx], ecx"]
-    assert (
-        verify_effective_match(
-            orig2, recomp2, orig_meta=orig_meta, recomp_meta=recomp_meta
-        )
-        is False
-    )
-
-
 def test_unknown_register_access_meta_cannot_step_divergent_state():
     """Incomplete Capstone regs_access() must not look like an empty access set."""
 

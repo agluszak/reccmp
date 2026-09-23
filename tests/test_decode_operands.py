@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore[import-untyped]
 from capstone import x86_const
 
 from reccmp.compare.asm.decode import capstone_operand, disasm_detail, from_capstone
@@ -73,6 +73,7 @@ def test_opaque_operands_remain_distinct_in_match_keys():
     right, right_ok = capstone_operand(insn_b, op, "ud2", 0)
     assert left_ok is False and right_ok is False
     assert left != right
+    assert isinstance(left, tuple) and isinstance(right, tuple)
     assert left[0] == "opaque" and right[0] == "opaque"
 
     row_a = DecodedInstruction(
@@ -108,6 +109,7 @@ def test_unknown_mem_size_stays_distinct_and_incomplete():
     op = SimpleNamespace(type=x86_const.X86_OP_MEM, size=3, mem=mem)
     operand, complete = capstone_operand(insn, op, "mov", 0)
     assert complete is False
+    assert isinstance(operand, tuple)
     assert operand[0] == "mem"
     assert operand[1] == "size3"
 
@@ -150,7 +152,7 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
         report=MagicMock(),
         types=MagicMock(),
     )
-    result = comparator._compare_function_assembly(
+    result = comparator._compare_function_assembly(  # pylint: disable=protected-access
         [row_a],
         [row_b],
         [],

@@ -81,6 +81,7 @@ from .mutate import (
 from .verify import (
     check_vtables,
 )
+from .source_capability import load_source_index_for_target
 
 logger = logging.getLogger(__name__)
 
@@ -271,13 +272,14 @@ class Compare:
             truncate=truncate,
             equivalence_groups=self.equivalence_groups,
         )
-        match_folded_function_aliases(
-            self._db,
-            self.codebase,
-            self._lines_db,
-            self.report,
-            truncate=truncate,
-        )
+        if self.codebase is not None:
+            match_folded_function_aliases(
+                self._db,
+                self.codebase,
+                self._lines_db,
+                self.report,
+                truncate=truncate,
+            )
         match_vtables(self._db, self.report)
         classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         match_static_variables(self._db, self.report)
@@ -348,8 +350,6 @@ class Compare:
         use_cache: bool = True,
         source_index: SourceIndex | None = None,
     ) -> Self:
-        from .source_capability import load_source_index_for_target
-
         loaded = load_target_analysis(
             target,
             orig_addrs=orig_addrs,

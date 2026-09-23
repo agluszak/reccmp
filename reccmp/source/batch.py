@@ -52,7 +52,7 @@ def _run(command: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
 
 def _lock_exclusive(lock_file) -> None:
     try:
-        import fcntl
+        import fcntl  # pylint: disable=import-outside-toplevel  # POSIX only
     except ImportError:
         return
     fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -162,6 +162,7 @@ def collect_compile_database(
     force: bool,
     aliases: ProjectAliases | None,
 ) -> SourceIndex:
+    # pylint: disable=too-many-statements
     """Index wanted TUs natively and derive the multi-target SourceIndex.
 
     Only the expensive Clang NDJSON artifacts are cached. Python merge code,

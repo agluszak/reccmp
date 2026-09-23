@@ -46,15 +46,13 @@ from reccmp.compare.asm.ir import (
     is_data_row,
     resolve_asm_stream,
 )
-from reccmp.compare.asm.model import (  # noqa: F401 — re-export for callers
+from reccmp.compare.asm.model import (
     Instruction,
     REGISTERS,
     Reject,
     operand_display,
     operand_identity,
     parse_instruction,
-    parse_operand,
-    split_operands,
 )
 
 # A symbolic value. Nested tuples of str/int; compared structurally.
@@ -986,6 +984,7 @@ def canon_condition(cc: str, state: SideState) -> Value:
         pred, swap = entry
         a, b = flags[1], flags[2]
         width = flags[3] if len(flags) > 3 else None
+        base: tuple
         if pred in ("eq", "ne"):
             base = (pred, _vsort(a, b))
         else:
@@ -1517,6 +1516,7 @@ CONTROL_TAGS = frozenset(
 
 
 def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> bool:
+    # pylint: disable=too-many-boolean-expressions
     """At a control transfer, refuse unjustified live divergent register state.
 
     Linear verification cannot prove live-out on both successors of a
@@ -1807,6 +1807,7 @@ def _one_sided_ok(
     is_data: bool = False,
 ) -> bool:
     # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-arguments
     """Execute an instruction that exists on only one side. Any instruction
     with no observable effect (no store, call, branch or return) is allowed:
     its register and flag writes are validated downstream by the observables
@@ -1953,6 +1954,7 @@ def admit_unsupported_identical(
     meta_o: InstructionMeta | None,
     meta_r: InstructionMeta | None,
 ) -> bool:
+    # pylint: disable=too-many-positional-arguments
     """Shared policy for identical unsupported instructions on both sides."""
     if (
         meta_o is not None
@@ -2912,22 +2914,6 @@ def _obligation_keys(state: _CfgState) -> tuple:
     return tuple(sorted(keys, key=repr))
 
 
-def _unique_obligations(
-    records: list[tuple], orig: SideState, recomp: SideState
-) -> list[tuple]:
-    seen: set[tuple] = set()
-    unique: list[tuple] = []
-    for record in records:
-        other = record[0]
-        side = "orig" if other is orig else "recomp"
-        key = (side, *record[1:])
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(record)
-    return unique
-
-
 def _save_keys(state: _CfgState) -> tuple:
     return tuple(tuple(record) for record in state.save_stack)
 
@@ -3658,6 +3644,7 @@ def _extract_switch_tables(
     kinds: list[str],
     addrs: list[int | None] | None,
 ) -> tuple[dict[int, list[int]], set[int]] | None:
+    # pylint: disable=too-many-nested-blocks,too-many-statements
     """Map recognized switch jmps to case destination indices.
 
     Returns ``(jmp_index -> dest line indices, owned data line indices)``.
@@ -3934,8 +3921,8 @@ def _build_side_cfg(
     index = {start: n for n, start in enumerate(order)}
     ends = [order[n + 1] if n + 1 < len(order) else total for n in range(len(order))]
     succ: list[dict[str, int | str]] = []
-    for n in range(len(order)):
-        last = _block_terminator(order[n], ends[n], kinds, owned_data)
+    for n, start in enumerate(order):
+        last = _block_terminator(start, ends[n], kinds, owned_data)
         kind = kinds[last]
         edges: dict[str, int | str] = {}
         if kind == "jcc":

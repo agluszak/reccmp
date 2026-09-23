@@ -20,6 +20,7 @@ from reccmp.cvdump.types import (
     CvdumpIntegrityError,
 )
 from reccmp.types import ImageId
+from reccmp.source.index import strip_type_qualifiers, variable_type_is_indirection
 
 if TYPE_CHECKING:
     from reccmp.source import SourceIndex
@@ -251,10 +252,6 @@ class VariableComparator:
         """
         if self.source_index is None or not var.name:
             return None
-        from reccmp.source.index import (
-            strip_type_qualifiers,
-            variable_type_is_indirection,
-        )
 
         for item in self.source_index.variables:
             if item.qualified_name != var.name and not item.qualified_name.endswith(

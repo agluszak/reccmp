@@ -5,21 +5,19 @@ from __future__ import annotations
 import struct
 from unittest.mock import Mock
 
-import pytest
-
 from reccmp.compare.asm.effective import verify_effective_match
 from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diagnosis import ComparisonStatus
 from reccmp.compare.report import ReccmpComparedEntity
-from reccmp.compare.verification import admit_exact_analysis
 from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.tools.asmcmp import print_match_verbose
 from reccmp.types import EntityType, ImageId
+from reccmp.compare.asm.replacement import create_name_lookup
 
 # cmp ecx,0; je +5; push 0 (imm32); add eax,1; ret
 _TOPOLOGY_ORIG = bytes.fromhex("83F9007405680000000083C001C3")
@@ -65,65 +63,6 @@ def _compare_bytes(orig: bytes, recomp: bytes, db: EntityDb | None = None):
             },
         )
     )
-
-
-def test_admit_exact_requires_topology_not_just_displays():
-    assert (
-        admit_exact_analysis(
-            displays_equal=True,
-            topology_equal=True,
-            keys_equal=True,
-            extent_closed=True,
-        )
-        is not None
-    )
-    assert (
-        admit_exact_analysis(
-            displays_equal=True,
-            topology_equal=False,
-            keys_equal=True,
-            extent_closed=True,
-        )
-        is None
-    )
-    assert (
-        admit_exact_analysis(
-            displays_equal=True,
-            topology_equal=True,
-            keys_equal=True,
-            coverage_incomplete=True,
-            extent_closed=True,
-        )
-        is None
-    )
-    admitted = admit_exact_analysis(
-        displays_equal=False,
-        topology_equal=True,
-        keys_equal=True,
-        operands_complete=True,
-        control_flow_complete=True,
-        extent_closed=True,
-    )
-    assert admitted is not None
-    assert admitted.status == ComparisonStatus.EXACT
-    assert (
-        admit_exact_analysis(
-            displays_equal=True,
-            topology_equal=True,
-            keys_equal=False,
-            extent_closed=True,
-        )
-        is None
-    )
-
-
-def test_admit_exact_requires_keys_equal_argument():
-    with pytest.raises(TypeError):
-        admit_exact_analysis(
-            displays_equal=True,
-            topology_equal=True,
-            extent_closed=True,
-        )
 
 
 def test_encoding_length_shift_is_not_exact_or_effective():
@@ -320,7 +259,6 @@ def test_unproven_display_match_is_not_printed_ok(capsys):
 
 
 def db_lookup(db: EntityDb, image_id: ImageId):
-    from reccmp.compare.asm.replacement import create_name_lookup
 
     return create_name_lookup(
         db,

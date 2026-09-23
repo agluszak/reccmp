@@ -59,6 +59,7 @@ def _in_executable_section(binfile: Image, addr: int) -> bool:
 
 
 def _decodes_as_instruction(binfile: Image, addr: int) -> bool:
+    # pylint: disable=too-many-return-statements
     """True when Capstone decodes a non-padding instruction at *addr*."""
     try:
         view, remaining = binfile.seek(addr)

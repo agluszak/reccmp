@@ -269,6 +269,7 @@ class EntityBatch:
 
 class EntityDb:
     # pylint: disable=too-many-public-methods
+    # pylint: disable=too-many-instance-attributes
     _entities: dict[ImageId, dict[int, ReccmpEntity]]
     _matches: dict[ImageId, dict[int, int]]
     _addr_set: dict[ImageId, set[int]]
