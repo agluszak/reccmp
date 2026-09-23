@@ -4275,26 +4275,32 @@ _GAP = 5
 _X87_MEM_WRITERS_DP = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbstp"})
 
 
-@cache
-def _dp_line_class(line: str) -> str:
+@dataclass(frozen=True)
+class _DpLine:
+    """Alignment view of one instruction, derived once from its structure."""
+
+    display: str
+    # Leading token of the instruction text: the prefix when present
+    # ("rep", "lock"), else the mnemonic.
+    head: str
+    # Coarse observable class: lines with an observable effect only pair
+    # within their class and never go one-sided (the verifier would reject
+    # that anyway).
+    line_class: str
+    # Instruction shape with register identities erased; None if unknown.
+    skeleton: tuple | None
+
+
+def _dp_line_class(ins: Instruction) -> str:
     # pylint: disable=too-many-return-statements
-    """Coarse observable class used to constrain the block-local alignment:
-    lines with an observable effect only pair within their class and never
-    go one-sided (the verifier would reject that anyway)."""
-    mnemonic, _, _ = line.partition(" ")
+    mnemonic = ins.mnemonic
     if mnemonic == "call":
         return "call"
     if mnemonic == "push":
         # Pushes pair with pushes, but may also go one-sided (a scratch
         # spill on one side only); the verifier gates the soundness.
         return "push"
-    if mnemonic in STRING_OPS or mnemonic.startswith("rep"):
-        return "store"
-    try:
-        ins = parse_instruction(line)
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return "opaque"
-    if ins.prefix:
+    if mnemonic in STRING_OPS or ins.prefix:
         return "store"
     if mnemonic in _X87_MEM_WRITERS_DP:
         return "store" if any(op[0] == "mem" for op in ins.operands) else "none"
@@ -4305,15 +4311,9 @@ def _dp_line_class(line: str) -> str:
     return "none"
 
 
-@cache
-def _dp_skeleton(line: str):
-    """Instruction shape with register identities erased: mnemonic plus
-    operand kinds, keeping immediates, symbols, widths, displacements and
-    scale multisets."""
-    try:
-        ins = parse_instruction(line)
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return None
+def _dp_skeleton(ins: Instruction) -> tuple:
+    """Mnemonic plus operand kinds, keeping immediates, symbols, widths,
+    displacements and scale multisets."""
     shape: list[tuple] = []
     for op in ins.operands:
         kind = op[0]
@@ -4336,28 +4336,42 @@ def _dp_skeleton(line: str):
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 
-def _dp_sub_cost(line_o: str, line_r: str) -> float | None:
-    if line_o == line_r:
+def _dp_line(stream: ResolvedAsm, index: int) -> _DpLine:
+    display = stream.displays[index]
+    try:
+        ins = instruction_at(stream, index)
+    except (Reject, IndexError, KeyError, ValueError, TypeError):
+        # Only reachable for text streams the model cannot parse; decoded
+        # IR rows always carry an instruction. Calls and pushes keep their
+        # class so an unmodeled operand does not change the pairing.
+        head = display.partition(" ")[0]
+        if head in ("call", "push"):
+            line_class = head
+        elif head in STRING_OPS or head.startswith("rep"):
+            line_class = "store"
+        else:
+            line_class = "opaque"
+        return _DpLine(display, head, line_class, None)
+    head = ins.prefix or ins.mnemonic
+    return _DpLine(display, head, _dp_line_class(ins), _dp_skeleton(ins))
+
+
+def _dp_sub_cost(line_o: _DpLine, line_r: _DpLine) -> float | None:
+    if line_o.display == line_r.display:
         return _SUB_EXACT
-    class_o = _dp_line_class(line_o)
-    class_r = _dp_line_class(line_r)
-    if class_o != class_r or class_o == "opaque":
+    if line_o.line_class != line_r.line_class or line_o.line_class == "opaque":
         return None
-    skeleton_o = _dp_skeleton(line_o)
-    skeleton_r = _dp_skeleton(line_r)
-    if skeleton_o is not None and skeleton_o == skeleton_r:
+    if line_o.skeleton is not None and line_o.skeleton == line_r.skeleton:
         return _SUB_SKELETON
-    mnemonic_o = line_o.partition(" ")[0]
-    mnemonic_r = line_r.partition(" ")[0]
-    if mnemonic_o == mnemonic_r or (
-        mnemonic_o in JCC_MNEMONICS and mnemonic_r in JCC_MNEMONICS
+    if line_o.head == line_r.head or (
+        line_o.head in JCC_MNEMONICS and line_r.head in JCC_MNEMONICS
     ):
         return _SUB_MNEMONIC
     return _SUB_CLASS
 
 
 def _align_block_lines(
-    lines_o: list[str], lines_r: list[str]
+    lines_o: list[_DpLine], lines_r: list[_DpLine]
 ) -> list[tuple[int | None, int | None]] | None:
     """Pair up two blocks' instructions with a cost-minimizing alignment.
     Returns block-local index pairs; None when the blocks cannot be aligned
@@ -4370,8 +4384,8 @@ def _align_block_lines(
     cost = [[inf] * (m + 1) for _ in range(n + 1)]
     cost[0][0] = 0.0
     gap_classes = ("none", "push")
-    gap_o = [_GAP if _dp_line_class(line) in gap_classes else inf for line in lines_o]
-    gap_r = [_GAP if _dp_line_class(line) in gap_classes else inf for line in lines_r]
+    gap_o = [_GAP if line.line_class in gap_classes else inf for line in lines_o]
+    gap_r = [_GAP if line.line_class in gap_classes else inf for line in lines_r]
     for i in range(1, n + 1):
         cost[i][0] = cost[i - 1][0] + gap_o[i - 1]
     for j in range(1, m + 1):
@@ -4489,8 +4503,8 @@ def verify_isomorphic_cfg_effective_match(
         indices_o = [i for i in range(start_o, end_o) if i not in cfg_o.owned_data]
         indices_r = [i for i in range(start_r, end_r) if i not in cfg_r.owned_data]
         aligned = _align_block_lines(
-            [orig_asm[i] for i in indices_o],
-            [recomp_asm[i] for i in indices_r],
+            [_dp_line(orig_stream, i) for i in indices_o],
+            [_dp_line(recomp_stream, i) for i in indices_r],
         )
         if aligned is None:
             if recorder is not None:
