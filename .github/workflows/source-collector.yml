@@ -1,0 +1,24 @@
+name: Source collector
+
+on: [push, pull_request]
+
+jobs:
+  collector:
+    name: Clang collector (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Build pinned analysis image with prebuilt indexer
+      run: docker build -f reccmp/source/Dockerfile.collector -t reccmp-source-test .
+
+    - name: Run collector tests inside the analysis image
+      run: |
+        docker run --rm \
+          --volume "$PWD:/work" \
+          --volume /tmp/reccmp-uv-cache:/root/.cache/uv \
+          --workdir /work \
+          --env RECCMP_SOURCE_INDEXER=/usr/local/bin/reccmp-source-indexer \
+          reccmp-source-test \
+          bash -lc 'uv venv -q /tmp/reccmp-venv && uv pip install -q --python /tmp/reccmp-venv -e . -r requirements-tests.txt && /tmp/reccmp-venv/bin/python -m pytest tests/test_source_index.py tests/test_source_records.py tests/test_source_batch.py -q --tb=short'
