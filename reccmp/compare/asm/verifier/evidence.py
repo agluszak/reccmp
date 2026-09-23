@@ -4,21 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import re
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-)
+
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.model import (
     Instruction,
     operand_display,
 )
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
-    Context,
     JCC_MNEMONICS,
+    Context,
 )
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 
 def _clean_symbol(text: str) -> str:

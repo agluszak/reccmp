@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-)
+from dataclasses import dataclass
+
 from reccmp.compare.asm.ir import (
     ResolvedAsm,
     instruction_at,
 )
 from reccmp.compare.asm.model import (
-    Instruction,
     REGISTERS,
+    Instruction,
     Reject,
 )
 from reccmp.compare.asm.verifier.state import (

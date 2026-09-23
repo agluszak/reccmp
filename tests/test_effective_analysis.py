@@ -1,5 +1,5 @@
 import difflib
-from reccmp.compare.asm.fixes import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.diagnosis import ComparisonStatus
 
 

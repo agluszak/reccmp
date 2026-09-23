@@ -13,7 +13,7 @@ from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.verifier import (
     verify_effective_match,
 )
-from reccmp.compare.asm.fixes import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb

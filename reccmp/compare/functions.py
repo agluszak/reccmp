@@ -13,7 +13,8 @@ from reccmp.compare.asm.verifier import (
     CallAbi,
     FunctionMetadata,
 )
-from reccmp.compare.asm.fixes import analyze_effective_match, assert_fixup
+from reccmp.compare.asm.verifier import analyze_effective_match
+from reccmp.compare.asm.parse import assert_fixup
 from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.instgen import (
     InstructGen,

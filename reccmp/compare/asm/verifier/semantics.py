@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from reccmp.compare.asm.model import (
-    Instruction,
     REGISTERS,
+    Instruction,
     Reject,
     operand_display,
     operand_identity,
@@ -16,19 +16,19 @@ from reccmp.compare.asm.verifier.addresses import (
     _unwind_spadd,
 )
 from reccmp.compare.asm.verifier.state import (
+    _WIDTHS,
     CARRY_BINOPS,
     CC_CANON,
     COMMUTATIVE_BINOPS,
-    Context,
     JCC_MNEMONICS,
     ORDERED_BINOPS,
     STRING_OPS,
-    SideState,
-    X87Stack,
     X87_CONSTANTS,
     X87_UNARY,
     ZERO_FLAGS,
-    _WIDTHS,
+    Context,
+    SideState,
+    X87Stack,
     _commutative_result,
     _load_tag,
     _vsort,

@@ -571,3 +571,15 @@ class ParseAsm:
             for addr, insn in self._decoded_by_addr.items()
         }
         return self.meta
+
+
+def assert_fixup(asm: AsmExcerpt):
+    """Detect assert calls and replace the code filename and line number
+    values with macros (from assert.h)."""
+    for i, row in enumerate(asm):
+        if "_assert" in row.display and row.display.startswith("call"):
+            try:
+                asm[i - 3] = asm[i - 3].with_display("push __LINE__")
+                asm[i - 2] = asm[i - 2].with_display("push __FILE__")
+            except IndexError:
+                continue

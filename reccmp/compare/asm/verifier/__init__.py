@@ -27,23 +27,20 @@ whole function is rejected (not an effective match).
 
 Layers, each importing only from the ones above it: addresses, state,
 evidence, semantics, obligations; then the strategies lockstep, cfg and
-iso_cfg, with relocation, cfg_build and block_align supporting them.
+iso_cfg, with relocation, cfg_build and block_align supporting them; analysis
+runs the strategies in turn.
 """
 
-from .state import CallAbi, FunctionMetadata, JCC_MNEMONICS
-from .relocation import LineEffects, effects_conflict, flags_dead_at, sequence_effects
-from .lockstep import verify_effective_match
+from .analysis import analyze_effective_match
 from .cfg import verify_cfg_effective_match
 from .iso_cfg import verify_isomorphic_cfg_effective_match
+from .lockstep import verify_effective_match
+from .state import CallAbi, FunctionMetadata
 
 __all__ = [
     "CallAbi",
     "FunctionMetadata",
-    "JCC_MNEMONICS",
-    "LineEffects",
-    "effects_conflict",
-    "flags_dead_at",
-    "sequence_effects",
+    "analyze_effective_match",
     "verify_cfg_effective_match",
     "verify_effective_match",
     "verify_isomorphic_cfg_effective_match",

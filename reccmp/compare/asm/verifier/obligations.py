@@ -5,12 +5,11 @@ swaps, frame slots and the end-of-run admission checklist."""
 from __future__ import annotations
 
 import re
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-)
+
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.model import (
-    Instruction,
     REGISTERS,
+    Instruction,
     Reject,
     parse_instruction,
 )
@@ -30,15 +29,15 @@ from reccmp.compare.asm.verifier.semantics import (
     read_operand,
 )
 from reccmp.compare.asm.verifier.state import (
+    _WIDTHS,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
     CONTROL_TAGS,
-    Context,
     FAMILIES,
     JCC_MNEMONICS,
     STRING_OPS,
+    Context,
     SideState,
-    _WIDTHS,
     _commit_clobber,
     _commutative_result,
     _frame_pointer_value,
@@ -46,9 +45,7 @@ from reccmp.compare.asm.verifier.state import (
     _vsort,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 # ---------------------------------------------------------------------------
 # Lockstep driver

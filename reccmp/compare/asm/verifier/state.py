@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Callable
 from dataclasses import (
     dataclass,
     field,
 )
+from typing import Callable
+
 from reccmp.compare.asm.model import (
     REGISTERS,
     Reject,
@@ -19,9 +20,7 @@ from reccmp.compare.asm.verifier.addresses import (
     _stack_rooted,
     _unwind_spadd,
 )
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
 

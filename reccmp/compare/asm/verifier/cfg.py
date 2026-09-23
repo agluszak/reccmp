@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable
 from dataclasses import (
     dataclass,
     field,
 )
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-)
+from typing import Callable
+
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.ir import (
     AsmStream,
     ResolvedAsm,
@@ -17,12 +16,8 @@ from reccmp.compare.asm.ir import (
     is_data_row,
     resolve_asm_stream,
 )
-from reccmp.compare.asm.model import (
-    Reject,
-)
-from reccmp.compare.asm.verifier.addresses import (
-    Value,
-)
+from reccmp.compare.asm.model import Reject
+from reccmp.compare.asm.verifier.addresses import Value
 from reccmp.compare.asm.verifier.evidence import (
     _record_operand_candidate,
     _target_facts,
@@ -33,15 +28,13 @@ from reccmp.compare.asm.verifier.obligations import (
     _discharge_run_obligations,
     admit_unsupported_identical,
 )
-from reccmp.compare.asm.verifier.semantics import (
-    execute,
-)
+from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
-    Context,
     FAMILIES,
-    FunctionMetadata,
     JCC_MNEMONICS,
+    Context,
+    FunctionMetadata,
     SideState,
     _clone_state,
     _commit_memory,

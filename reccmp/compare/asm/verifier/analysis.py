@@ -1,20 +1,13 @@
+"""Strategy orchestration: EXACT admission, then each verifier strategy in
+turn, and the choice of the reported difference or blocker when none proves
+equivalence."""
+
 import dataclasses
 import logging
 from typing import Sequence
 
-from reccmp.compare.asm.verifier import (
-    JCC_MNEMONICS,
-    FunctionMetadata,
-    LineEffects,
-    effects_conflict,
-    flags_dead_at,
-    sequence_effects,
-    verify_cfg_effective_match,
-    verify_effective_match,
-    verify_isomorphic_cfg_effective_match,
-)
-from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.const import JUMP_MNEMONICS
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.ir import (
     AsmStream,
     ResolvedAsm,
@@ -23,20 +16,22 @@ from reccmp.compare.asm.ir import (
     resolve_asm_stream,
 )
 from reccmp.compare.asm.model import Reject
-from reccmp.compare.asm.parse import AsmExcerpt
+from reccmp.compare.asm.verifier.cfg import verify_cfg_effective_match
+from reccmp.compare.asm.verifier.iso_cfg import verify_isomorphic_cfg_effective_match
+from reccmp.compare.asm.verifier.lockstep import verify_effective_match
+from reccmp.compare.asm.verifier.relocation import undo_relocations
+from reccmp.compare.asm.verifier.state import FunctionMetadata
 from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
     StrategyAttempt,
 )
-from reccmp.compare.verification import (
-    admit_effective,
-    admit_exact_analysis,
-)
 from reccmp.compare.pinned_sequences import DiffOpcode
+from reccmp.compare.verification import admit_effective, admit_exact_analysis
 
 logger = logging.getLogger(__name__)
+
 
 # Alignment padding emitted between functions. int3 traps if executed, so
 # it is only trimmed as trailing padding behind an instruction that does
@@ -326,180 +321,3 @@ def _branch_targets(
             target = None
         result.append(index_of.get(target) if target is not None else None)
     return result
-
-
-def undo_relocations(
-    codes: Sequence[DiffOpcode],
-    orig_asm: AsmStream,
-    recomp_asm: AsmStream,
-    orig_addrs: Sequence[int | None] | None = None,
-) -> ResolvedAsm | None:
-    """If every diff insertion can be paired with an equal-text deletion
-    whose move is proven independent of all crossed instructions, return
-    recomp_asm reordered into orig's instruction order. Returns None when
-    the diffs are not (only) relocations."""
-    # pylint: disable=too-many-return-statements
-    orig = resolve_asm_stream(orig_asm)
-    recomp = resolve_asm_stream(recomp_asm)
-    if len(orig) != len(recomp):
-        return None
-
-    # Sorted for deterministic matching when several identical lines
-    # could pair up. (GH #324)
-    deletes = sorted(
-        i for code, i1, i2, _, __ in codes for i in range(i1, i2) if code == "delete"
-    )
-    # `i1` is the index of the orig_asm list where this line will be inserted.
-    # This is not necessarily equal to `j1`, the index of the inserted line in recomp_asm.
-    # Therefore we need to save `i1` so that we verify each line between the start and end of the move. (GH #332)
-    inserts = [
-        (i1, j)
-        for code, i1, __, j1, j2 in codes
-        for j in range(j1, j2)
-        if code == "insert"
-    ]
-
-    if not inserts or len(inserts) != len(deletes):
-        return None
-
-    effects = sequence_effects(orig)
-    if effects is None:
-        return None
-
-    addr_index: dict[int, int] | None = None
-    if orig_addrs is not None:
-        addr_index = {addr: k for k, addr in enumerate(orig_addrs) if addr is not None}
-
-    pairs: dict[int, int] = {}
-    remaining = list(deletes)
-    for orig_dest, j in inserts:
-        line = recomp.displays[j]
-        matched = None
-        for i in remaining:
-            if orig.displays[i] != line:
-                continue
-            if _can_relocate(
-                effects, orig.displays, i, orig_dest, orig_addrs, addr_index
-            ):
-                matched = i
-                break
-        if matched is None:
-            return None
-        pairs[j] = matched
-        remaining.remove(matched)
-
-    # Sort recomp lines by their position in orig's coordinate system:
-    # matching lines keep their diff-aligned position, relocated lines take
-    # the position of their paired deletion.
-    key: dict[int, int] = {}
-    for code, i1, i2, j1, j2 in codes:
-        if code in ("equal", "replace"):
-            if (i2 - i1) != (j2 - j1):
-                return None
-            for i, j in zip(range(i1, i2), range(j1, j2)):
-                key[j] = i
-        elif code == "insert":
-            for j in range(j1, j2):
-                key[j] = pairs[j]
-
-    if len(key) != len(recomp):
-        return None
-
-    order = sorted(range(len(recomp)), key=key.__getitem__)
-    reordered = recomp.reorder(order)
-    return None if reordered.displays == recomp.displays else reordered
-
-
-def _can_relocate(  # pylint: disable=too-many-positional-arguments
-    effects: list[LineEffects],
-    orig_asm: list[str],
-    i: int,
-    orig_dest: int,
-    orig_addrs: Sequence[int | None] | None,
-    addr_index: dict[int, int] | None,
-) -> bool:
-    """May the instruction at orig index `i` move to position `orig_dest`?
-    Only if it is independent of every instruction it crosses: no register
-    or flag dependency, no possibly-aliasing memory access, no x87 stack
-    interaction and no control-flow barrier in between. (GH #324)"""
-    moved = effects[i]
-    if moved.barrier:
-        return False
-
-    # To account for a move in either direction:
-    # the deleted line can precede or follow the inserted line.
-    reloc_start = min(i, orig_dest)
-    reloc_end = max(i, orig_dest)
-
-    crossed_flag_writer = False
-    for k in range(reloc_start, reloc_end):
-        if k == i:
-            continue
-        other = effects[k]
-        if other.barrier:
-            # Exception: a forward conditional jump whose target lies within
-            # the crossed region. The moved instruction then executes on
-            # both the taken and the fallthrough path in both placements
-            # (and it must not touch the flags the jump reads).
-            if not moved.writes_flags and _forward_jcc_within(
-                orig_asm, k, reloc_end, orig_addrs, addr_index
-            ):
-                continue
-            return False
-        if effects_conflict(moved, other):
-            return False
-        if other.writes_flags:
-            crossed_flag_writer = True
-
-    # If both the moved instruction and a crossed instruction write the
-    # flags, the move changes which value the flags hold at the end of the
-    # region: the flags must be dead there.
-    if moved.writes_flags and crossed_flag_writer:
-        after = reloc_end + 1 if reloc_end == i else reloc_end
-        if not flags_dead_at(effects, after):
-            return False
-
-    return True
-
-
-def _forward_jcc_within(
-    orig_asm: list[str],
-    k: int,
-    reloc_end: int,
-    orig_addrs: Sequence[int | None] | None,
-    addr_index: dict[int, int] | None,
-) -> bool:
-    """Is orig_asm[k] a forward conditional jump whose target is at or
-    before index reloc_end? Requires instruction addresses to resolve the
-    displacement."""
-    if orig_addrs is None or addr_index is None or k + 1 >= len(orig_addrs):
-        return False
-
-    mnemonic, _, op_str = orig_asm[k].partition(" ")
-    if mnemonic not in JCC_MNEMONICS:
-        return False
-    try:
-        displacement = int(op_str, 16)
-    except ValueError:
-        return False
-    if displacement <= 0:
-        return False
-
-    next_addr = orig_addrs[k + 1]
-    if next_addr is None:
-        return False
-
-    target = addr_index.get(next_addr + displacement)
-    return target is not None and k < target <= reloc_end
-
-
-def assert_fixup(asm: AsmExcerpt):
-    """Detect assert calls and replace the code filename and line number
-    values with macros (from assert.h)."""
-    for i, row in enumerate(asm):
-        if "_assert" in row.display and row.display.startswith("call"):
-            try:
-                asm[i - 3] = asm[i - 3].with_display("push __LINE__")
-                asm[i - 2] = asm[i - 2].with_display("push __FILE__")
-            except IndexError:
-                continue

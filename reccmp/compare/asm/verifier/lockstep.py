@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-)
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.ir import (
     AsmStream,
     instruction_at,
     is_data_row,
     resolve_asm_stream,
 )
-from reccmp.compare.asm.model import (
-    Reject,
-)
+from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.evidence import (
     _record_observable_difference,
     _record_operand_candidate,
 )
 from reccmp.compare.asm.verifier.obligations import (
-    _record_pair_categories,
     _addrs_from_meta,
     _aligned_indices,
     _callee_save_swap,
@@ -27,12 +22,11 @@ from reccmp.compare.asm.verifier.obligations import (
     _divergences_justified,
     _invalidate_save_slots,
     _one_sided_ok,
+    _record_pair_categories,
     _rewrite_control_observables,
     admit_unsupported_identical,
 )
-from reccmp.compare.asm.verifier.semantics import (
-    execute,
-)
+from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     Context,
@@ -42,9 +36,7 @@ from reccmp.compare.asm.verifier.state import (
     _commit_memory,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 
 def verify_effective_match(

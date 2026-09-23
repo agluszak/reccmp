@@ -7,7 +7,7 @@ from reccmp.compare.asm.verifier import (
     verify_cfg_effective_match,
     verify_effective_match,
 )
-from reccmp.compare.asm.fixes import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructionMeta
 
 

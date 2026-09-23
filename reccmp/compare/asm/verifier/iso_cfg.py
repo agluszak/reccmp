@@ -3,9 +3,7 @@ with block-local alignment."""
 
 from __future__ import annotations
 
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-)
+from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.ir import (
     AsmRole,
     AsmStream,
@@ -14,16 +12,14 @@ from reccmp.compare.asm.ir import (
     is_data_row,
     resolve_asm_stream,
 )
-from reccmp.compare.asm.model import (
-    Reject,
-)
+from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.block_align import (
     _align_block_lines,
     _dp_line,
 )
 from reccmp.compare.asm.verifier.cfg import (
-    _CfgState,
     _capture_cfg_state,
+    _CfgState,
     _clone_cfg_state,
     _converged,
     _join_failure_facts,
@@ -37,9 +33,7 @@ from reccmp.compare.asm.verifier.cfg_build import (
     _canonicalize_side_cfg,
     _pair_cfg_blocks,
 )
-from reccmp.compare.asm.verifier.evidence import (
-    _record_operand_candidate,
-)
+from reccmp.compare.asm.verifier.evidence import _record_operand_candidate
 from reccmp.compare.asm.verifier.obligations import (
     _accept_agreeing_pair,
     _callee_save_swap,
@@ -48,9 +42,7 @@ from reccmp.compare.asm.verifier.obligations import (
     _switch_index_observation,
     admit_unsupported_identical,
 )
-from reccmp.compare.asm.verifier.semantics import (
-    execute,
-)
+from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     Context,
@@ -60,9 +52,7 @@ from reccmp.compare.asm.verifier.state import (
     _commit_memory,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 
 def verify_isomorphic_cfg_effective_match(

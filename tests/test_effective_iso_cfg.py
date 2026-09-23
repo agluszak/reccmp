@@ -30,7 +30,7 @@ from reccmp.compare.asm.verifier.cfg import (
 from reccmp.compare.asm.verifier.state import (
     SideState,
 )
-from reccmp.compare.asm.fixes import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins

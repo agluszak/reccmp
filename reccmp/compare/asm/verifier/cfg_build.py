@@ -7,6 +7,7 @@ from dataclasses import (
     dataclass,
     field,
 )
+
 from reccmp.compare.asm.ir import (
     AsmRole,
     AsmStream,
@@ -24,12 +25,8 @@ from reccmp.compare.asm.verifier.obligations import (
     DATA_LINE_RE,
     JUMP_TABLE_ENTRY_RE,
 )
-from reccmp.compare.asm.verifier.state import (
-    JCC_MNEMONICS,
-)
-from reccmp.compare.diagnosis import (
-    AnalysisRecorder,
-)
+from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 # ---------------------------------------------------------------------------
 # Isomorphic-CFG verification (structure-matched, alignment-free)
