@@ -1,4 +1,4 @@
-from reccmp.compare.asm.instgen import InstructGen, SectionType
+from reccmp.compare.asm.instgen import CodeSection, InstructGen, SectionType
 
 
 def test_ret():
@@ -129,9 +129,16 @@ def test_thunk_case():
     """Adjuster thunk incorrectly annotated.
     We are reading way more bytes than we should for this function."""
     ig = InstructGen(THUNK_TEST, 0x1000FB50)
-    # No switch cases here, so the only section is code.
-    # This caused an infinite loop during testing so the goal is just to finish.
-    assert len(ig.sections) == 1
+    # The body begins with ``sub``/``jmp`` over int3 padding into the real
+    # implementation. Pending-target drainage must visit that landing site
+    # (a second CODE section) without looping forever on truncated trailing
+    # bytes from the next function.
+    assert len(ig.sections) == 2
+    first, second = ig.sections[0], ig.sections[1]
+    assert isinstance(first, CodeSection) and isinstance(second, CodeSection)
+    assert first.contents[0][2] == "sub"
+    assert first.contents[1][2] == "jmp"
+    assert second.contents[0][2] == "push"
 
     # TODO: We might detect the 0xCC padding bytes and cut off the function.
     # If we did that, we would correctly read only 2 instructions.
