@@ -1,10 +1,14 @@
 """Test our detection of SEH data for PE images"""
 
+from unittest.mock import Mock
+
 from reccmp.formats import PEImage
+from reccmp.formats.image import ImageRegion
 from reccmp.analysis.funcinfo import (
     UnwindMapEntry,
     find_mov_eax_jmp_in_buffer,
     find_eh_handlers,
+    find_exception_registrations,
     find_funcinfo,
 )
 
@@ -45,3 +49,38 @@ def test_funcinfo_handlers(binfile: PEImage):
         UnwindMapEntry(-1, 0x100013FF),
         UnwindMapEntry(0, 0x100013ED),
     ]
+
+
+def test_find_exception_registrations_vc5_forms():
+    funcinfo = Mock()
+    handler_push = 0x12345678
+    handler_mov = 0x23456789
+    code = (
+        b"\x6a\xff\x68"
+        + handler_push.to_bytes(4, "little")
+        + b"\xb8"
+        + handler_mov.to_bytes(4, "little")
+        + b"\xe8\0\0\0\0"
+    )
+    image = Mock(spec=PEImage)
+    image.get_code_regions.return_value = [ImageRegion(0x1000, memoryview(code))]
+
+    registrations = list(
+        find_exception_registrations(
+            image,
+            iter(((handler_push, funcinfo), (handler_mov, funcinfo))),
+        )
+    )
+
+    assert [(item.addr, item.handler_addr) for item in registrations] == [
+        (0x1002, handler_push),
+        (0x1007, handler_mov),
+    ]
+
+
+def test_find_exception_registrations_requires_known_handler():
+    image = Mock(spec=PEImage)
+    image.get_code_regions.return_value = [
+        ImageRegion(0x1000, memoryview(b"\x68\x78\x56\x34\x12"))
+    ]
+    assert not list(find_exception_registrations(image, iter(())))

@@ -1,12 +1,19 @@
 import re
 import io
+import os
 from os import name as os_name
 from enum import Enum
+from functools import cache
 from typing import Iterable, Iterator
 import subprocess
 from reccmp.bin import lib_path_join
 from reccmp.dir import winepath_unix_to_win
 from .parser import CvdumpParser
+
+
+@cache
+def _wine_cvdump_path(path: str) -> str:
+    return winepath_unix_to_win(path)
 
 
 class DumpOpt(Enum):
@@ -50,9 +57,15 @@ def iter_cvdump_sections(stream: Iterable[str]) -> Iterator[tuple[str, str]]:
         yield (section, "".join(lines))
 
 
+class CvdumpError(RuntimeError):
+    """cvdump subprocess failed."""
+
+
 class Cvdump:
     def __init__(self, pdb: str) -> None:
         self._pdb: str = pdb
+        self._pdb_arg: str | None = None
+        self._module: int | None = None
         self.options: set[DumpOpt] = set()
 
     def lines(self):
@@ -79,6 +92,13 @@ class Cvdump:
         self.options.add(DumpOpt.MODULES)
         return self
 
+    def module(self, module_id: int):
+        """Restrict symbol output to one decimal cvdump module number."""
+        if module_id < 0:
+            raise ValueError("cvdump module ID cannot be negative")
+        self._module = module_id
+        return self
+
     def types(self):
         self.options.add(DumpOpt.TYPES)
         return self
@@ -87,18 +107,32 @@ class Cvdump:
         cvdump_exe = lib_path_join("cvdump.exe")
         flags = [cvdump_opt_map[opt] for opt in self.options if opt in cvdump_opt_map]
 
+        if self._module is not None:
+            flags.append(f"-M{self._module}")
+
         if os_name == "nt":
             return [cvdump_exe, *flags, self._pdb]
 
-        return ["wine", cvdump_exe, *flags, winepath_unix_to_win(self._pdb)]
+        if self._pdb_arg is None:
+            self._pdb_arg = _wine_cvdump_path(self._pdb)
+        return ["wine", cvdump_exe, *flags, self._pdb_arg]
 
     def run(self) -> CvdumpParser:
         parser = CvdumpParser()
         call = self.cmd_line()
-        with subprocess.Popen(call, stdout=subprocess.PIPE) as proc:
+        env = None
+        if os_name != "nt":
+            # cvdump is a console tool: wine's GUI/explorer diagnostics are noise
+            # on stderr. Respect an explicit WINEDEBUG if the caller set one.
+            env = dict(os.environ)
+            env.setdefault("WINEDEBUG", "-all")
+        with subprocess.Popen(call, stdout=subprocess.PIPE, env=env) as proc:
             assert proc.stdout is not None
             wrap = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="ignore")
             for name, section in iter_cvdump_sections(wrap):
                 parser.read_section(name, section)
+            returncode = proc.wait()
+        if returncode:
+            raise CvdumpError(f"cvdump exited with status {returncode}")
 
         return parser

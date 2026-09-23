@@ -3,7 +3,7 @@ https://www.openrce.org/articles/full_view/21"""
 
 import re
 import struct
-from typing import Iterator, NamedTuple
+from typing import Iterable, Iterator, NamedTuple
 from typing_extensions import Buffer
 from reccmp.formats import PEImage
 
@@ -26,6 +26,14 @@ class UnwindMapEntry(NamedTuple):
 class FuncInfo(NamedTuple):
     addr: int
     unwinds: tuple[UnwindMapEntry, ...]
+
+
+class ExceptionRegistration(NamedTuple):
+    """Reference from a VC5 exception-registration prologue to its handler."""
+
+    addr: int
+    handler_addr: int
+    funcinfo: FuncInfo
 
 
 def find_funcinfo_offsets_in_buffer(buf: Buffer) -> Iterator[int]:
@@ -86,3 +94,36 @@ def find_eh_handlers(image: PEImage) -> Iterator[tuple[int, FuncInfo]]:
             if (funcinfo := bytes_to_addr.get(funcinfo_bytes)) is not None:
                 # Return the EH handler address and the referenced FuncInfo struct
                 yield (handler_addr, funcinfo)
+
+
+def find_exception_registrations(
+    image: PEImage,
+    handlers: Iterable[tuple[int, FuncInfo]] | None = None,
+) -> Iterator[ExceptionRegistration]:
+    """Find VC5 function prologues that install a known EH handler.
+
+    VC5 emits the handler address either as ``push imm32`` in the inline
+    registration sequence or as ``mov eax, imm32`` before calling its shared
+    EH-prologue helper.  A handler address is accepted only after its body has
+    independently been related to a valid FuncInfo record.
+    """
+    if handlers is None:
+        handlers = find_eh_handlers(image)
+
+    handler_to_funcinfo = dict(handlers)
+    if not handler_to_funcinfo:
+        return
+
+    for region in image.get_code_regions():
+        buf = bytes(region.data)
+        # Both forms have a one-byte opcode followed by the handler address.
+        for offset in range(len(buf) - 4):
+            if buf[offset] not in (0x68, 0xB8):
+                continue
+
+            handler_addr = struct.unpack_from("<I", buf, offset + 1)[0]
+            funcinfo = handler_to_funcinfo.get(handler_addr)
+            if funcinfo is not None:
+                yield ExceptionRegistration(
+                    region.addr + offset, handler_addr, funcinfo
+                )
