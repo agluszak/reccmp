@@ -24,6 +24,19 @@ const dataDict = Object.fromEntries(
 );
 
 /**
+ * Current reports carry the verifier status in ``comparison``; reports from
+ * before that field only have the boolean ``effective``.
+ * @param {ReccmpComparedEntity} row
+ * @returns {boolean}
+ */
+function isEffectiveMatch(row) {
+  if (row.comparison !== undefined) {
+    return row.comparison.status === 'effective';
+  }
+  return row.effective === true;
+}
+
+/**
  * @param {string} addr
  * @returns {ReccmpComparedEntity}
  */
@@ -33,4 +46,4 @@ function getDataByAddr(addr) {
 
 // reccmp-pack-end
 
-export { global_reccmp_data, global_reccmp_metadata, getDataByAddr };
+export { global_reccmp_data, global_reccmp_metadata, getDataByAddr, isEffectiveMatch };

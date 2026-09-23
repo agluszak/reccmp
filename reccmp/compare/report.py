@@ -1,10 +1,32 @@
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Callable, Literal, Iterable, Iterator
+from dataclasses import dataclass, replace
+from typing import Callable, Iterable, Iterator, Literal
+
 from pydantic import BaseModel, ValidationError
 from pydantic_core import from_json
+
 from reccmp.types import EntityType
-from .diff import CombinedDiffOutput, RawDiffOutput, raw_diff_to_udiff
+
+from .comparison_json import (
+    analysis_json,
+    parse_analysis,
+    parse_diagnostic_normalizations,
+    parse_inline_expansions,
+    parse_stack_permutation,
+)
+from .diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    DiagnosticNormalization,
+    StackPermutationEntry,
+    derive_diagnostic_normalizations,
+)
+from .diff import (
+    CombinedDiffOutput,
+    RawDiffOutput,
+    raw_diff_to_udiff,
+)
+from .inlines import InlineExpansionEvidence
 
 
 def format_address(addr: int) -> str:
@@ -28,17 +50,17 @@ class ReccmpComparedEntity:
     orig_addr: int
     name: str
     accuracy: float
-    # Version 1 files have no type, so it is optional.
     type: EntityType | None = None
     recomp_addr: int | None = None
     """The meaning of `None` depends on `recomp_addr_varies`:
     recomp_addr_varies is False: This entity is unmatched.
     recomp_addr_varies is True:  This entity has no fixed recomp addr."""
 
-    is_effective_match: bool = False
+    analysis: ComparisonAnalysis = ComparisonAnalysis.inconclusive("analysis_limit")
     is_stub: bool = False
     is_library: bool = False
     rdiff: RawDiffOutput | None = None
+    report_diff: CombinedDiffOutput | None = None
 
     # Legacy field for importing version 1 files (aggregate).
     udiff: CombinedDiffOutput | None = None
@@ -46,6 +68,13 @@ class ReccmpComparedEntity:
     recomp_addr_varies: bool = False
     """True if this entity had no fixed recomp address across the
     samples combined by reccmp-aggregate."""
+
+    display_similarity: float | None = None
+    stack_permutation: tuple[StackPermutationEntry, ...] = ()
+    accuracy_modulo_stack: float | None = None
+    inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
+    accuracy_modulo_inline: float | None = None
+    diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
 
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies
@@ -56,8 +85,26 @@ class ReccmpComparedEntity:
         return self.type is None or self.type == EntityType.FUNCTION
 
     @property
+    def is_effective_match(self) -> bool:
+        return self.analysis.status == ComparisonStatus.EFFECTIVE
+
+    @property
+    def is_proven_match(self) -> bool:
+        return self.analysis.status in (
+            ComparisonStatus.EXACT,
+            ComparisonStatus.EFFECTIVE,
+        )
+
+    @property
     def effective_accuracy(self) -> float:
         return 1.0 if self.is_effective_match else self.accuracy
+
+    def refresh_diagnostic_normalizations(self) -> None:
+        self.diagnostic_normalizations = derive_diagnostic_normalizations(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
+        )
 
 
 class ReccmpStatusReport:
@@ -75,6 +122,11 @@ class ReccmpStatusReport:
     from_version: int | None
     """Only set during deserialize. (Not used yet)"""
 
+    source_digest: str | None = None
+    """SHA-256 of the original binary, when known. Two reports with
+    different digests are not aggregate-compatible even if they share a
+    filename."""
+
     function_count: int = 0
     """Function count used to determine progress percentage and other statistics.
     We can compute this value from the report's entities or use a user-provided value.
@@ -85,9 +137,12 @@ class ReccmpStatusReport:
         filename: str,
         timestamp: datetime | None = None,
         from_version: int | None = None,
+        source_digest: str | None = None,
     ) -> None:
         self.filename = filename
         self.from_version = from_version
+        self.source_digest = source_digest
+        self.function_count = 0
         if timestamp is not None:
             self.timestamp = timestamp
         else:
@@ -99,7 +154,12 @@ class ReccmpStatusReport:
         self.entities[match.orig_addr] = match
 
     def has_same_source(self, other: "ReccmpStatusReport") -> bool:
-        """Were both reports derived from the same reccmp target?"""
+        """Were both reports derived from the same original binary?"""
+        if self.source_digest is not None or other.source_digest is not None:
+            return (
+                self.source_digest is not None
+                and self.source_digest == other.source_digest
+            )
         return self.filename.lower() == other.filename.lower()
 
     def update_function_count(self) -> None:
@@ -187,15 +247,14 @@ def _get_entity_for_addr(
 
 def _accuracy_sort_key(entity: ReccmpComparedEntity) -> float:
     """Helper to sort entity samples by accuracy score.
-    100% match is preferred over effective match.
-    Effective match is preferred over any accuracy.
+    Proven exact match is preferred over effective.
+    Effective match is preferred over any unproven accuracy.
     Stubs rank lower than any accuracy score."""
     if entity.is_stub:
         return -1.0
 
-    if entity.accuracy == 1.0:
-        if not entity.is_effective_match:
-            return 1000.0
+    if entity.analysis.status == ComparisonStatus.EXACT:
+        return 1000.0
 
     if entity.is_effective_match:
         return 1.0
@@ -212,7 +271,9 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
     if not all(samples[0].has_same_source(s) for s in samples):
         raise ReccmpReportSameSourceError
 
-    output = ReccmpStatusReport(filename=samples[0].filename)
+    output = ReccmpStatusReport(
+        filename=samples[0].filename, source_digest=samples[0].source_digest
+    )
 
     # Use the highest function total across all samples.
     # Some functions may have been inlined in some reports.
@@ -230,13 +291,15 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
         # Our aggregate accuracy score is the highest from any report.
         e_list.sort(key=_accuracy_sort_key, reverse=True)
 
-        output.entities[addr] = e_list[0]
+        chosen = replace(e_list[0])
+        output.entities[addr] = chosen
 
         # Keep the recomp_addr if it is the same across all samples.
         # i.e. to detect where function alignment ends
         if not all(e_list[0].recomp_addr == e.recomp_addr for e in e_list):
-            output.entities[addr].recomp_addr = None
-            output.entities[addr].recomp_addr_varies = True
+            output.entities[addr] = replace(
+                chosen, recomp_addr=None, recomp_addr_varies=True
+            )
 
     # Recalculate the count against the functions we actually have.
     # This may be higher than the count from any one sample.
@@ -255,8 +318,10 @@ def get_udiff_for_entity(entity: ReccmpComparedEntity) -> CombinedDiffOutput | N
 
     If we return None, no diff is possible because the entity matches 100%, is a stub,
     or was created from a deserialized report without diff data."""
+    if entity.report_diff is not None:
+        return entity.report_diff
+
     if entity.udiff is not None:
-        # An aggregate report may already have a deserialized udiff.
         return entity.udiff
 
     if entity.rdiff is None:
@@ -275,7 +340,7 @@ def get_udiff_for_entity(entity: ReccmpComparedEntity) -> CombinedDiffOutput | N
     return None
 
 
-#### JSON schemas and conversion functions ####
+#### JSON schema and conversion functions ####
 
 
 @dataclass
@@ -284,6 +349,7 @@ class JSONEntityVersion1:
     address: str
     name: str
     matching: float
+    comparison: dict[str, object] | None = None
     # Optional fields
     recomp: str | None = None
     stub: bool | None = False
@@ -292,6 +358,11 @@ class JSONEntityVersion1:
     diff: CombinedDiffOutput | None = None
     # EntityType as int. Older reports do not include this field.
     type: int | None = None
+    accuracy_modulo_stack: float | None = None
+    stack_permutation: list[dict[str, object]] | None = None
+    accuracy_modulo_inline: float | None = None
+    inline_expansions: list[dict[str, object]] | None = None
+    diagnostic_normalizations: list[str] | None = None
 
 
 class JSONReportVersion1(BaseModel):
@@ -299,9 +370,8 @@ class JSONReportVersion1(BaseModel):
     format: Literal[1]
     timestamp: float
     data: list[JSONEntityVersion1]
-
-    # Did not exist before July 2026.
     function_count: int | None = None
+    source_digest: str | None = None
 
 
 MAGIC_STRING_VARIOUS = "various"
@@ -315,40 +385,75 @@ def _serialize_version_1(
     """The JSON report can exclude the diff to make deserialization faster."""
     entities = []
 
-    for addr, e in report.entities.items():
-        if not e.is_matched():
+    for addr, entity in report.entities.items():
+        if not entity.is_matched():
             continue
 
-        # The dict key and the entity's `orig_addr` property should never differ.
-        assert addr == e.orig_addr
-
-        report_ent = JSONEntityVersion1(
-            address=format_address(addr),
-            name=e.name,
-            matching=e.accuracy,
-            recomp=(
-                format_address(e.recomp_addr)
-                if e.recomp_addr is not None
-                else (MAGIC_STRING_VARIOUS if e.recomp_addr_varies else "")
-            ),
-            stub=e.is_stub,
-            library=e.is_library,
-            effective=e.is_effective_match,
-            diff=get_udiff_for_entity(e) if diff_included else None,
-            type=int(e.type) if e.type is not None else None,
+        assert addr == entity.orig_addr
+        entities.append(
+            JSONEntityVersion1(
+                address=format_address(addr),
+                name=entity.name,
+                matching=entity.accuracy,
+                comparison=analysis_json(entity.analysis),
+                recomp=(
+                    format_address(entity.recomp_addr)
+                    if entity.recomp_addr is not None
+                    else (MAGIC_STRING_VARIOUS if entity.recomp_addr_varies else "")
+                ),
+                stub=entity.is_stub,
+                library=entity.is_library,
+                diff=(get_udiff_for_entity(entity) if diff_included else None),
+                type=int(entity.type) if entity.type is not None else None,
+                accuracy_modulo_stack=entity.accuracy_modulo_stack,
+                stack_permutation=(
+                    [
+                        {
+                            "orig": entry.orig,
+                            "recomp": entry.recomp,
+                            **({"symbol": entry.symbol} if entry.symbol else {}),
+                        }
+                        for entry in entity.stack_permutation
+                    ]
+                    if entity.stack_permutation
+                    else None
+                ),
+                accuracy_modulo_inline=entity.accuracy_modulo_inline,
+                inline_expansions=(
+                    [
+                        {
+                            "helper": entry.helper_name,
+                            "helper_orig": format_address(entry.helper_orig_addr),
+                            "helper_recomp": format_address(entry.helper_recomp_addr),
+                            "side": entry.side,
+                            "offset": entry.match_offset,
+                            "length": entry.match_length,
+                            "counterpart": entry.counterpart,
+                            "counterpart_offset": entry.counterpart_offset,
+                            "confidence": entry.confidence,
+                            **({"semantic": True} if entry.semantic else {}),
+                        }
+                        for entry in entity.inline_expansions
+                    ]
+                    if entity.inline_expansions
+                    else None
+                ),
+                diagnostic_normalizations=(
+                    [tag.value for tag in entity.diagnostic_normalizations]
+                    if entity.diagnostic_normalizations
+                    else None
+                ),
+            )
         )
 
-        entities.append(report_ent)
-
-    # Recalculate before freezing the value.
     report.update_function_count()
-
     return JSONReportVersion1(
         file=report.filename,
         format=1,
         timestamp=report.timestamp.timestamp(),
         data=entities,
         function_count=report.function_count,
+        source_digest=report.source_digest,
     )
 
 
@@ -357,6 +462,7 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
         filename=obj.file,
         timestamp=datetime.fromtimestamp(obj.timestamp),
         from_version=1,
+        source_digest=obj.source_digest,
     )
     report.function_count = obj.function_count or 0
 
@@ -375,17 +481,38 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             recomp_addr = int(e.recomp, 16) if e.recomp is not None else None
             various = False
 
+        if e.comparison is not None:
+            analysis = parse_analysis(e.comparison)
+        elif e.effective:
+            # Legacy reports only recorded a boolean; reason codes are unknown.
+            analysis = ComparisonAnalysis.effective(())
+        elif e.matching == 1.0:
+            analysis = ComparisonAnalysis.exact()
+        else:
+            analysis = ComparisonAnalysis.inconclusive("analysis_limit")
+
         report.entities[orig_addr] = ReccmpComparedEntity(
             orig_addr=orig_addr,
             name=e.name,
             accuracy=e.matching,
             type=entity_type,
             recomp_addr=recomp_addr,
+            analysis=analysis,
             is_stub=bool(e.stub),
             is_library=bool(e.library),
-            is_effective_match=bool(e.effective),
             udiff=e.diff,
+            report_diff=e.diff,
             recomp_addr_varies=various,
+            accuracy_modulo_stack=e.accuracy_modulo_stack,
+            stack_permutation=parse_stack_permutation(e.stack_permutation),
+            accuracy_modulo_inline=e.accuracy_modulo_inline,
+            inline_expansions=parse_inline_expansions(e.inline_expansions),
+            diagnostic_normalizations=parse_diagnostic_normalizations(
+                e.diagnostic_normalizations,
+                analysis,
+                e.accuracy_modulo_stack,
+                e.accuracy_modulo_inline,
+            ),
         )
 
     report.update_function_count()
@@ -393,6 +520,7 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
 
 
 def deserialize_reccmp_report(json_str: str) -> ReccmpStatusReport:
+    """Read only the current structured format-1 schema."""
     try:
         obj = JSONReportVersion1.model_validate(from_json(json_str))
         return _deserialize_version_1(obj)
