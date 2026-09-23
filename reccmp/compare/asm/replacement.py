@@ -140,7 +140,10 @@ def entity_proof_identity(
                 configured_orig if configured_orig is not None else canonical_orig
             )
         symbol = entity.get("symbol")
-        if canonical_orig is not None and (configured_alias or entity.matched):
+        # alias_canonical_orig covers real pairs and proven aliases alike.
+        if canonical_orig is not None and (
+            configured_alias or entity.matched or discovered_orig is not None
+        ):
             return ("entity", canonical_orig, offset)
         if entity.entity_type == EntityType.IMPORT:
             return ("import", entity.best_name() or entity.get("symbol"))
@@ -166,7 +169,9 @@ def entity_proof_identity(
         canonical_orig = (
             configured_orig if configured_orig is not None else canonical_orig
         )
-    if canonical_orig is not None and (configured_alias or entity.matched):
+    if canonical_orig is not None and (
+        configured_alias or entity.matched or discovered_orig is not None
+    ):
         return ("entity", canonical_orig, offset)
     addr = entity.addr(image_id)
     assert addr is not None
