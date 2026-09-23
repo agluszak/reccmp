@@ -117,6 +117,8 @@ def get_or_create_class_namespace(
         logger.debug("Found existing class/namespace %s", namespace_path)
         if hasattr(result, "isClass") and result.isClass():
             return result
+        if result.isGlobal() or result.isLibrary():
+            return result
         symbols = api.getCurrentProgram().getSymbolTable()
         convert = getattr(symbols, "convertNamespaceToClass", None)
         if callable(convert):

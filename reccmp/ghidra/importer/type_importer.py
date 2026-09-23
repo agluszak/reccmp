@@ -339,7 +339,8 @@ class PdbTypeImporter:
         union_type: Union,
         members: list[FieldListItem],
     ) -> None:
-        union_type.deleteAll()
+        for ordinal in reversed(range(union_type.getNumComponents())):
+            union_type.delete(ordinal)
         for member in members:
             member_type = self.import_pdb_type_into_ghidra(member.type)
             try:
