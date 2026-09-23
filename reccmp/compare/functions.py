@@ -22,6 +22,7 @@ from reccmp.compare.asm.ir import (
     FunctionImage,
     compute_extent_closed,
     control_flow_topology_keys,
+    local_destination_keys,
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
@@ -1137,8 +1138,22 @@ class FunctionComparator:
                 _proved=proved,
             )
         orig_asm = self.orig_sanitize.parse_asm(orig_raw, orig_addr)
+        orig_topology = local_destination_keys(
+            orig_asm,
+            self.orig_sanitize.jump_tables,
+            start_addr=orig_addr,
+            extent=size,
+        )
         recomp_asm = self.recomp_sanitize.parse_asm(recomp_raw, recomp_addr)
+        recomp_topology = local_destination_keys(
+            recomp_asm,
+            self.recomp_sanitize.jump_tables,
+            start_addr=recomp_addr,
+            extent=size,
+        )
         if not orig_asm or len(orig_asm) != len(recomp_asm):
+            return False
+        if orig_topology is None or recomp_topology is None:
             return False
         orig_insts = _code_instructions(orig_raw, orig_addr, self.is_32bit)
         recomp_insts = _code_instructions(recomp_raw, recomp_addr, self.is_32bit)
@@ -1152,7 +1167,13 @@ class FunctionComparator:
         for index, (orig_row, recomp_row) in enumerate(zip(orig_asm, recomp_asm)):
             orig_line = orig_row.display
             recomp_line = recomp_row.display
-            if orig_line == recomp_line and "<OFFSET" not in orig_line:
+            # Local branches must reach the same instruction id: equal
+            # displacement text does not imply that when encodings differ.
+            if (
+                orig_line == recomp_line
+                and "<OFFSET" not in orig_line
+                and orig_topology[index] == recomp_topology[index]
+            ):
                 continue
             if not self._transfer_targets_alias_equivalent(
                 orig_insts[index], recomp_insts[index], depth, active, proved

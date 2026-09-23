@@ -503,6 +503,52 @@ def control_flow_topology_keys(
     return tuple(keys)
 
 
+def local_destination_keys(
+    excerpt: Sequence[DecodedInstruction],
+    jump_tables: Sequence[JumpTable] = (),
+    *,
+    start_addr: int,
+    extent: int,
+) -> tuple[Hashable, ...] | None:
+    """Per-row instruction ids of local branch and switch-case destinations.
+
+    Rows without a local destination contribute ``()``. Displays show local
+    branches as byte displacements, which identify the same instruction on
+    both sides only if every crossed instruction has the same encoding
+    length; these keys make the destination explicit. Returns None when a
+    destination falls inside the extent but not on an instruction boundary.
+    """
+    addr_to_id = {
+        row.address: (row.instruction_id if row.instruction_id is not None else index)
+        for index, row in enumerate(excerpt)
+        if row.address is not None
+    }
+    case_targets = {
+        entry_addr: target
+        for table in jump_tables
+        for entry_addr, target in table.entries
+    }
+
+    def key(target: int | None, tag: str) -> Hashable | None:
+        if target is None or not start_addr <= target < start_addr + extent:
+            return ()
+        local_id = addr_to_id.get(target)
+        return None if local_id is None else (tag, local_id)
+
+    keys: list[Hashable] = []
+    for row in excerpt:
+        if row.role == AsmRole.JUMP_TABLE_ENTRY and row.address is not None:
+            item = key(case_targets.get(row.address), "case")
+        elif row.is_jump:
+            item = key(row.branch_target, "local")
+        else:
+            item = ()
+        if item is None:
+            return None
+        keys.append(item)
+    return tuple(keys)
+
+
 _NO_FALLTHROUGH = frozenset({"ret", "jmp", "int3"})
 _MODELED_EXTERNAL = frozenset({"entity", "import", "unmatched", "symbol"})
 

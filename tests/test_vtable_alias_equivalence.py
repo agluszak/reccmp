@@ -170,3 +170,19 @@ def test_vtable_slot_accepts_only_proven_alias_targets(db: EntityDb) -> None:
     )
     assert not Compare._slot_alias_equivalent(fake_compare, ORIG_BODY, sized_zero)
     assert not Compare._slot_alias_equivalent(fake_compare, ORIG_BODY, None)
+
+
+def test_equal_displays_with_different_branch_destinations_are_not_alias_equivalent(
+    db: EntityDb,
+) -> None:
+    """``je +6`` reads the same on both sides, but because ``add eax, 1`` is
+    encoded in 3 or 6 bytes it skips two adds in one body and one in the
+    other. Display equality must not stand in for branch topology."""
+    add3 = b"\x83\xc0\x01"
+    add6 = b"\x81\xc0\x01\x00\x00\x00"
+    orig = b"\x74\x06" + add3 + add3 + add6 + b"\xc3"
+    recomp = b"\x74\x06" + add6 + add3 + add3 + b"\xc3"
+    comparator = _comparator(db, orig, recomp)
+    assert comparator.orig_sanitize.parse_asm(
+        orig, ORIG_BODY
+    ) and not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
