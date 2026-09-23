@@ -9,6 +9,8 @@ from reccmp.formats import PEImage, TextFile
 from reccmp.compare.ingest import load_markers
 from reccmp.compare.db import EntityDb
 from reccmp.compare.lines import LinesDb
+from reccmp.compare.match_folded import match_folded_function_aliases
+from reccmp.parser import DecompCodebase
 
 
 @pytest.fixture(name="db")
@@ -597,16 +599,13 @@ def test_load_code_line_marker(db: EntityDb, lines_db: LinesDb, binfile: PEImage
     assert entity.get("line") == 3
 
 
-def test_load_code_folded(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
-    """Should match functions with code folding where all occurrences are marked.
-    The LINES section in the PDB appears to choose only one copy of the function.
-    Make sure we can match whether the line corresponds to the first annotation
-    or a later one."""
+def test_load_code_folded(db: EntityDb, lines_db: LinesDb):
+    """Bind the canonical annotation first, then record the folded recomp body as an alias."""
     files = (
         TextFile(
             PurePath("test.cpp"),
             dedent("""\
-                // FUNCTION: TEST 0x10001000 FOLDED
+                // FUNCTION: TEST 0x10001000
                 void Pizza::Start()
                 {
                 }
@@ -617,42 +616,29 @@ def test_load_code_folded(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
                 }
                 """),
         ),
-        TextFile(
-            PurePath("test.h"),
-            dedent("""\
-                class Hello {
-                public:
-                    // FUNCTION: TEST 0x10002000 FOLDED
-                    virtual void vtable0x00() {}
-
-                    // FUNCTION: TEST 0x10002000 FOLDED
-                    virtual void vtable0x04() {}
-                }
-                """),
-        ),
     )
 
-    # Here the first occurrence of the folded function gets the line reference.
-    lines_db.add_line(PureWindowsPath("test.cpp"), 3, 0x1234)
-    # But here the second (or nth) occurrence gets the line.
-    lines_db.add_line(PureWindowsPath("test.h"), 7, 0x5555)
-    lines_db.mark_function_starts([0x1234, 0x5555])
+    orig_bin = Mock(spec=PEImage)
+    orig_bin.is_valid_vaddr.return_value = True
 
-    # Establish recomp entities as if we read the PDB first.
+    codebase = DecompCodebase(files, "TEST")
+    # Each recomp body has its own line entry; one is the canonical match and the
+    # other is recorded as a recomp-side alias after that match exists.
+    lines_db.add_line(PureWindowsPath("test.cpp"), 3, 0x1234)
+    lines_db.add_line(PureWindowsPath("test.cpp"), 7, 0x5678)
+    lines_db.mark_function_starts([0x1234, 0x5678])
+
     with db.batch() as batch:
-        batch.set(ImageId.RECOMP, 0x1234)
-        batch.set(ImageId.RECOMP, 0x5555)
-    load_markers(files, lines_db, binfile, "TEST", db)
+        batch.set(ImageId.RECOMP, 0x1234, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x5678, type=EntityType.FUNCTION)
+    load_markers(files, lines_db, orig_bin, "TEST", db, codebase=codebase)
+    match_folded_function_aliases(db, codebase, lines_db)
 
     entity = db.get(ImageId.ORIG, 0x10001000)
     assert entity is not None
     assert entity.recomp_addr == 0x1234
     assert entity.get("type") == EntityType.FUNCTION
-
-    entity = db.get(ImageId.ORIG, 0x10002000)
-    assert entity is not None
-    assert entity.recomp_addr == 0x5555
-    assert entity.get("type") == EntityType.FUNCTION
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x5678) == 0x10001000
 
 
 def test_load_code_with_alias(db: EntityDb, lines_db: LinesDb, binfile: PEImage):

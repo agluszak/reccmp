@@ -1,11 +1,12 @@
 from reccmp.types import EntityType
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.event import (
     ReccmpEvent,
     ReccmpReportProtocol,
     reccmp_report_nop,
 )
+from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.compare.queries import get_referencing_entity_matches
 from reccmp.types import ImageId
 
@@ -93,89 +94,148 @@ def match_symbols(
                 )
 
 
+def match_name(name: str) -> str:
+    """One comparable spelling for demangled-name matching.
+
+    MSVC's demangler separates pointer and reference sigils from template
+    arguments with a space (``T *>``) while annotation-side names may spell
+    them tight (``T*>``). The spacing carries no identity, so names match
+    on the tight form."""
+    return name.replace(" *", "*").replace(" &", "&")
+
+
 def match_functions(
     db: EntityDb,
     report: ReccmpReportProtocol = reccmp_report_nop,
     *,
     truncate: bool = False,
+    equivalence_groups: dict[int, int] | None = None,
 ):
-    # addr->symbol map. Used later in error message for non-unique match.
-    recomp_symbols: dict[int, str] = {}
+    """Match functions by name only when the identity is unique on both sides.
 
+    Multiple original addresses may carry the same name when the original
+    binary emitted the same body more than once (e.g. a per-TU COMDAT copy).
+    If the project declares those addresses equivalent in an
+    ``equivalence-groups`` file, they count as a single identity here: the
+    canonical member takes the real match and the other members become
+    original-side aliases of it. Distinct (non-equivalent) bodies that merely
+    share a name are still reported as ambiguous."""
+    groups = equivalence_groups or {}
+
+    recomp_symbols: dict[int, str] = {}
     name_index = EntityIndex()
 
-    # TODO: We allow a match if entity_type is null.
-    # This can be removed if we can more confidently declare a symbol is a function
-    # when adding from the PDB.
     for ent in db.unmatched(ImageId.RECOMP):
         symbol = ent.get("symbol")
         name = ent.get("name")
         if ent.get("type") and ent.get("type") != EntityType.FUNCTION:
             continue
-
         if not name:
             continue
-
-        # Truncate function name to 255 chars for older MSVC. See also: Warning C4786.
         if truncate:
             name = name[:255]
-
+        name = match_name(name)
         assert ent.recomp_addr is not None
         name_index.add(name, ent.recomp_addr)
-
-        # Get the symbol for the error message later.
         if symbol is not None:
             recomp_symbols[ent.recomp_addr] = symbol
 
-    # Report if the name used in the match is not unique.
-    # If the name list contained multiple addresses at the start,
-    # we should report even for the last address in the list.
-    non_unique_names = set()
+    orig_entities = [
+        ent
+        for ent in db.unmatched(ImageId.ORIG)
+        if ent.get("type") == EntityType.FUNCTION and ent.get("name")
+    ]
+    orig_by_addr: dict[int, ReccmpEntity] = {}
+    orig_name_identities: dict[str, set[int]] = {}
+    normalized_names: dict[int, str] = {}
+    for ent in orig_entities:
+        assert ent.orig_addr is not None
+        name = ent.get("name")
+        assert isinstance(name, str)
+        if truncate:
+            name = name[:255]
+        name = match_name(name)
+        normalized_names[ent.orig_addr] = name
+        orig_by_addr[ent.orig_addr] = ent
+        orig_name_identities.setdefault(name, set()).add(
+            canonical_orig_addr(groups, ent.orig_addr)
+        )
+
+    # For names that resolve to a single original identity, decide which
+    # entity owns the real match. Normally that is the entity itself; for an
+    # equivalence group it is the canonical member. If the canonical is not
+    # an unmatched entity under this name (already matched elsewhere or not
+    # an entity at all), the lowest-addressed member takes the match instead.
+    name_owners: dict[str, int] = {}
+    for name, identities in orig_name_identities.items():
+        if len(identities) != 1:
+            continue
+        canonical = next(iter(identities))
+        if db.get_one_match(canonical) is not None:
+            name_owners[name] = canonical
+            continue
+        owner = orig_by_addr.get(canonical)
+        if owner is None or normalized_names.get(canonical) != name:
+            owner = min(
+                (
+                    e
+                    for e in orig_entities
+                    if normalized_names.get(e.orig_addr or 0) == name
+                ),
+                key=lambda e: e.orig_addr or 0,
+            )
+        name_owners[name] = owner.orig_addr or 0
+
+    pending_aliases: list[tuple[int, int]] = []
 
     with db.batch() as batch:
-        for ent in db.unmatched(ImageId.ORIG):
-            name = ent.get("name")
-            if ent.get("type") != EntityType.FUNCTION:
-                continue
-
-            if not name:
-                continue
-
+        for ent in orig_entities:
             assert ent.orig_addr is not None
+            name = normalized_names[ent.orig_addr]
+            identities = orig_name_identities[name]
 
-            # Repeat the truncate for our match search
-            if truncate:
-                name = name[:255]
+            if len(identities) == 1 and ent.orig_addr != name_owners[name]:
+                # Equivalent duplicate: the owner takes the real match and
+                # this address becomes an original-side alias of it.
+                pending_aliases.append((ent.orig_addr, name_owners[name]))
+                continue
 
-            if name in name_index:
-                recomp_addr = name_index.pop(name)
-                # If match was not unique
-                if name in name_index:
-                    non_unique_names.add(name)
-
-                # If this name was ever matched non-uniquely
-                if name in non_unique_names:
-                    matched_symbol = recomp_symbols.get(recomp_addr, "None")
-                    other_symbols = [
-                        recomp_symbols.get(recomp_addr, "None")
-                        for recomp_addr in name_index.get(name)
-                    ]
-                    report(
-                        ReccmpEvent.AMBIGUOUS_MATCH,
-                        ent.orig_addr,
-                        msg=f"Ambiguous match 0x{ent.orig_addr:x} on name '{name}' to\n"
-                        + f"'{matched_symbol}'\n"
-                        + "Other candidates:\n"
-                        + ",\n".join(f"'{candidate}'" for candidate in other_symbols),
-                    )
-
-                batch.match(ent.orig_addr, recomp_addr)
-            else:
+            candidates = name_index.get(name)
+            if not candidates:
                 report(
                     ReccmpEvent.NO_MATCH,
                     ent.orig_addr,
                     msg=f"Failed to match function at 0x{ent.orig_addr:x} with name '{name}'",
                 )
+                continue
+
+            if len(identities) != 1 or len(candidates) != 1:
+                symbols = [recomp_symbols.get(addr, "None") for addr in candidates]
+                report(
+                    ReccmpEvent.AMBIGUOUS_MATCH,
+                    ent.orig_addr,
+                    msg=f"Ambiguous function name '{name}' has "
+                    f"{len(identities)} original and {len(candidates)} recomp candidates:\n"
+                    + ",\n".join(f"'{symbol}'" for symbol in symbols),
+                )
+                continue
+
+            batch.match(ent.orig_addr, name_index.pop(name))
+
+    for member_addr, owner_addr in pending_aliases:
+        # Aliases require a real canonical match. If the owner could not be
+        # matched its own report already covers the group.
+        if db.get_one_match(owner_addr) is None:
+            continue
+        if not db.set_alias(ImageId.ORIG, member_addr, owner_addr):
+            report(
+                ReccmpEvent.NO_MATCH,
+                member_addr,
+                msg=(
+                    f"Could not alias equivalent original 0x{member_addr:x} to "
+                    f"0x{owner_addr:x}"
+                ),
+            )
 
 
 def _find_vtable_match(
@@ -187,14 +247,14 @@ def _find_vtable_match(
     # Most classes will not use multiple inheritance, so try the regular vtable
     # first, unless a base class is provided.
     if base_class is None or base_class == class_name:
-        bare_vftable = f"{class_name}::`vftable'"
+        bare_vftable = match_name(f"{class_name}::`vftable'")
 
         if bare_vftable in vtable_name_index:
             return vtable_name_index.pop(bare_vftable)
 
     # If we didn't find a match above, search for the multiple inheritance vtable.
     for_name = base_class if base_class is not None else class_name
-    for_vftable = f"{class_name}::`vftable'{{for `{for_name}'}}"
+    for_vftable = match_name(f"{class_name}::`vftable'{{for `{for_name}'}}")
 
     if for_vftable in vtable_name_index:
         return vtable_name_index.pop(for_vftable)
@@ -228,12 +288,16 @@ def match_vtables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
             continue
 
         assert ent.recomp_addr is not None
-        vtable_name_index.add(name, ent.recomp_addr)
+        vtable_name_index.add(match_name(name), ent.recomp_addr)
 
     with db.batch() as batch:
         for ent in db.unmatched(ImageId.ORIG):
             class_name = ent.get("name")
-            if not class_name or ent.get("type") != EntityType.VTABLE:
+            if (
+                not class_name
+                or ent.get("type") != EntityType.VTABLE
+                or ent.get("inferred_vtable")
+            ):
                 continue
 
             assert ent.orig_addr is not None
@@ -403,6 +467,27 @@ def match_strings(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
                     ent.orig_addr,
                     msg=f"Failed to match string {text} at 0x{ent.orig_addr:x}",
                 )
+
+
+def classify_exact_string_aliases(db: EntityDb) -> None:
+    """Record side-local duplicate strings once a unique canonical pair exists."""
+    canonical: dict[tuple[EntityType, str], set[int]] = {}
+    for canonical_entity in db.get_matches():
+        entity_type = canonical_entity.get("type")
+        text = canonical_entity.get("name")
+        if entity_type in (EntityType.STRING, EntityType.WIDECHAR) and text:
+            canonical.setdefault((entity_type, text), set()).add(
+                canonical_entity.orig_addr
+            )
+
+    for image_id in (ImageId.ORIG, ImageId.RECOMP):
+        for candidate in tuple(db.unexplained(image_id)):
+            entity_type = candidate.get("type")
+            text = candidate.get("name")
+            identities = canonical.get((entity_type, text), set())
+            addr = candidate.addr(image_id)
+            if addr is not None and len(identities) == 1:
+                db.set_alias(image_id, addr, next(iter(identities)))
 
 
 def match_lines(

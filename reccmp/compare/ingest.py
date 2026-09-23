@@ -132,16 +132,19 @@ def load_cvdump_lines(
         ]
         lines_db.add_lines(filename, lines)
 
-    # The seen_addrs set has more than functions, but the intersection of
-    # these addrs and the code lines should be just the functions.
-    seen_addrs = set(
+    # Only PDB nodes known to be functions count as function starts. Data
+    # symbols that happen to sit on a covered line (e.g. a COMDAT-folded
+    # header variable) would otherwise register as candidate starts and make
+    # an unambiguous line lookup look like out-of-sync debug data.
+    function_starts = set(
         # TODO: Ideally this conversion and filtering would happen inside CvdumpAnalysis.
         recomp_bin.get_abs_addr(node.section, node.offset)
         for node in cvdump_analysis.nodes
-        if recomp_bin.is_valid_section(node.section)
+        if node.node_type == EntityType.FUNCTION
+        and recomp_bin.is_valid_section(node.section)
     )
 
-    lines_db.mark_function_starts(tuple(seen_addrs))
+    lines_db.mark_function_starts(tuple(function_starts))
 
 
 # pylint: disable=too-many-positional-arguments, too-many-arguments
@@ -154,9 +157,11 @@ def load_markers(
     encoding: str = "latin1",
     project_aliases: ProjectAliases | None = None,
     report: ReccmpReportProtocol = reccmp_report_nop,
+    codebase: DecompCodebase | None = None,
 ):
     lines_db.add_local_paths((f.path for f in code_files))
-    codebase = DecompCodebase(code_files, target_id, aliases=project_aliases)
+    if codebase is None:
+        codebase = DecompCodebase(code_files, target_id, aliases=project_aliases)
 
     # If the address of any annotation would cause an exception,
     # remove it and report an error.
@@ -183,6 +188,11 @@ def load_markers(
     # If we have two functions that share the same name, and one is
     # a lineref, we can match the nameref correctly because the lineref
     # was already removed from consideration.
+    #
+    # FOLDED annotations share a retail address with a canonical body. Do not
+    # bind them here: a second match() would be rejected, and a nameref would
+    # overwrite the canonical name. match_folded_function_aliases records them
+    # as side-local aliases after the primary pair exists.
     with db.batch() as batch:
         for fun in codebase.iter_line_functions():
             batch.set(
@@ -192,15 +202,21 @@ def load_markers(
                 stub=fun.should_skip(),
             )
 
+            if fun.is_folded:
+                continue
+
             assert fun.filename is not None
             recomp_addr = lines_db.find_function(
-                fun.filename, fun.line_number, fun.end_line, folded=fun.is_folded
+                fun.filename, fun.line_number, fun.end_line, folded=False
             )
 
             if recomp_addr is not None:
                 batch.match(fun.offset, recomp_addr)
 
         for fun in codebase.iter_name_functions():
+            if fun.is_folded:
+                continue
+
             batch.set(
                 ImageId.ORIG,
                 fun.offset,
