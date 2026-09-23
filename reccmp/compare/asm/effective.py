@@ -33,7 +33,6 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from functools import cache
 from typing import Callable
 
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
@@ -2429,19 +2428,12 @@ _RMW_BINOPS = frozenset(
 _X87_MEM_WRITERS = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbstp"})
 
 
-@cache
-def _line_base_effects(line: str) -> LineEffects:
-    """Textual effect summary for one sanitized instruction: register
-    families, flags, x87 use and barriers. Memory accesses are filled in
-    by sequence_effects. Anything not modeled (calls, jumps, string ops,
-    unparsable text) is a scheduling barrier."""
+def _line_base_effects(ins: Instruction) -> LineEffects:
+    """Effect summary for one instruction: register families, flags, x87
+    use and barriers. Memory accesses are filled in by sequence_effects.
+    Anything not modeled (calls, jumps, string ops) is a scheduling
+    barrier."""
     # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
-    if DATA_LINE_RE.match(line):
-        return BARRIER
-    try:
-        ins = parse_instruction(line)
-    except (Reject, IndexError, KeyError, ValueError):
-        return BARRIER
     if ins.prefix:
         return BARRIER
 
@@ -2563,20 +2555,28 @@ def _havoc(state: SideState, idx: int) -> None:
     state.x87 = X87Stack(epoch=-idx - 1)
 
 
-def sequence_effects(asm: list[str]) -> list[LineEffects] | None:
+def sequence_effects(asm: AsmStream) -> list[LineEffects] | None:
     """Symbolically execute one instruction sequence and return a per-line
     effect summary with memory addresses resolved to symbolic values.
     Returns None if the sequence cannot be analyzed at all."""
+    stream = resolve_asm_stream(asm)
     state = SideState(rename_slots=False)
     ctx = Context()
     result = []
     try:
-        for idx, line in enumerate(asm):
-            base = _line_base_effects(line)
+        for idx in range(len(stream)):
+            ins: Instruction | None = None
+            if not is_data_row(stream, idx):
+                try:
+                    ins = instruction_at(stream, idx)
+                except (Reject, IndexError, KeyError, ValueError, TypeError):
+                    ins = None
+            base = BARRIER if ins is None else _line_base_effects(ins)
             ctx.trace = []
             failed = False
             try:
-                ins = parse_instruction(line)
+                if ins is None:
+                    raise Reject
                 execute(state, ctx, idx, ins, [])
                 guard_state_size(state, ctx)
             except (Reject, IndexError, KeyError, ValueError, TypeError):

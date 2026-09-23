@@ -362,7 +362,7 @@ def undo_relocations(
     if not inserts or len(inserts) != len(deletes):
         return None
 
-    effects = sequence_effects(orig.displays)
+    effects = sequence_effects(orig)
     if effects is None:
         return None
 
