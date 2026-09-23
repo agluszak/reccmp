@@ -1,5 +1,8 @@
 """Tests for structured IR match keys and stack-normalized scoring."""
 
+import os
+import subprocess
+import sys
 from pathlib import PurePath
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -344,3 +347,25 @@ def test_longest_increasing_source_pins_beats_greedy():
     ]
     kept = _longest_increasing_by_recomp(annotations)  # type: ignore[arg-type]
     assert [a.name for a in kept] == ["b", "c", "d"]
+
+
+def _permutation_order(hash_seed: str) -> str:
+    code = (
+        "from reccmp.compare.stack_layout import *\n"
+        "pairs = {StackPair(StackRegisterOffset(r, 0x10), StackRegisterOffset(r, 0x10))"
+        " for r in ('esp', 'ebp', 'ebx', 'esi')}\n"
+        "print([e.orig for e in permutation_entries(pairs)])\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "PYTHONHASHSEED": hash_seed},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def test_permutation_entries_order_is_independent_of_hash_seed():
+    """Slots sharing an offset on different base registers must be ordered the
+    same in every process; string hashing (and so set order) is randomized."""
+    assert len({_permutation_order(seed) for seed in ("1", "2", "3", "4")}) == 1
