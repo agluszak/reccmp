@@ -1,26 +1,32 @@
 import logging
+import hashlib
 import difflib
 import struct
 from itertools import zip_longest
-from typing import Callable, Iterator
+from pathlib import Path
+from typing import Callable, Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
+from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.verification import admit_exact_analysis
+from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
-from reccmp.dir import source_code_search
+from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.functions import FunctionComparator
+from reccmp.compare.variables import VariableComparator
 from reccmp.formats import (
     Image,
     PEImage,
     TextFile,
-    detect_image,
 )
-from reccmp.cvdump import Cvdump, CvdumpTypesParser, CvdumpAnalysis
+from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.event import (
     ReccmpReportProtocol,
     create_logging_wrapper,
 )
+from reccmp.source.index import SourceIndex
 from .match_msvc import (
     match_lines,
     match_symbols,
@@ -29,18 +35,23 @@ from .match_msvc import (
     match_static_variables,
     match_variables,
     match_strings,
+    classify_exact_string_aliases,
     match_ref,
     match_imports,
 )
+from .match_folded import match_folded_function_aliases, match_seh
 from .db import EntityDb, ReccmpEntity, ReccmpMatch
 from .lines import LinesDb
 from .report import ReccmpComparedEntity, ReccmpStatusReport
+from .target_analysis import PreparedAnalysis, load_target_analysis
+from .thunk_resolve import effective_orig_vtable_size, resolve_vtable_slot
 from .analyze import (
     create_imports,
     create_import_thunks,
     create_thunks,
     create_analysis_floats,
     create_analysis_strings,
+    create_analysis_widechars,
     create_analysis_vtordisps,
     create_crt_functions,
     create_seh_entities,
@@ -49,6 +60,9 @@ from .analyze import (
     match_entry,
     match_exports,
     import_sections,
+    normalize_original_zero_size_data,
+    classify_exact_vtable_aliases,
+    match_inferred_vtables_by_slots,
 )
 from .ingest import (
     load_cvdump,
@@ -66,8 +80,23 @@ from .mutate import (
 from .verify import (
     check_vtables,
 )
+from .source_capability import load_source_index_for_target
 
 logger = logging.getLogger(__name__)
+
+
+def _image_digest(image: Image) -> str | None:
+    """SHA-256 of the original image bytes, used as report source identity."""
+    data = getattr(image, "data", None)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(data)).hexdigest()
+    path = getattr(image, "filepath", None)
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 class Compare:
@@ -84,8 +113,11 @@ class Compare:
     bin_encoding: str
     types: CvdumpTypesParser
     function_comparator: FunctionComparator
+    variable_comparator: VariableComparator
     data_sources: list[TextFile]
     project_aliases: ProjectAliases
+    codebase: DecompCodebase | None
+    source_index: SourceIndex | None
 
     # pylint: disable=too-many-arguments
     # pylint: disable=too-many-positional-arguments
@@ -99,6 +131,9 @@ class Compare:
         code_files: list[TextFile] | None = None,
         data_sources: list[TextFile] | None = None,
         project_aliases: ProjectAliases | None = None,
+        codebase: DecompCodebase | None = None,
+        equivalence_sources: list[TextFile] | None = None,
+        source_index: SourceIndex | None = None,
     ):
         self.orig_bin = orig_bin
         self.recomp_bin = recomp_bin
@@ -107,6 +142,7 @@ class Compare:
         self.src_encoding = encoding or "utf-8"
         self.bin_encoding = encoding or "latin1"
         self.project_aliases = normalize_project_aliases(project_aliases or {})
+        self.codebase = codebase
 
         if isinstance(code_files, list):
             self.code_files = code_files
@@ -118,6 +154,11 @@ class Compare:
         else:
             self.data_sources = []
 
+        self.equivalence_sources = (
+            equivalence_sources if isinstance(equivalence_sources, list) else []
+        )
+        self.equivalence_groups = parse_equivalence_groups(self.equivalence_sources)
+
         self._lines_db = LinesDb()
         self._db = EntityDb()
 
@@ -126,6 +167,7 @@ class Compare:
 
         self.types = CvdumpTypesParser()
 
+        self.source_index = source_index
         self.function_comparator = FunctionComparator(
             self._db,
             self._lines_db,
@@ -133,7 +175,57 @@ class Compare:
             self.recomp_bin,
             self.report,
             self.types,
+            equivalence_groups=self.equivalence_groups,
+            source_index=source_index,
         )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=source_index,
+        )
+
+    def _configure_function_nodes(self) -> None:
+        if isinstance(self.recomp_bin, PEImage):
+            for node in self.cvdump_analysis.nodes:
+                if self.recomp_bin.is_valid_section(node.section):
+                    node.addr = self.recomp_bin.get_abs_addr(node.section, node.offset)
+        self.function_comparator.func_nodes = {
+            node.addr: node
+            for node in self.cvdump_analysis.nodes
+            if node.addr is not None
+            and (node.symbol_entry is not None or node.decorated_name is not None)
+        }
+
+    def _prepared_analysis(self) -> PreparedAnalysis:
+        return PreparedAnalysis(self._db, self._lines_db, self.types)
+
+    def _restore_prepared_analysis(self, analysis: PreparedAnalysis) -> None:
+        self._db = analysis.db
+        self._lines_db = analysis.lines_db
+        self.types = analysis.types
+        self.function_comparator = FunctionComparator(
+            self._db,
+            self._lines_db,
+            self.orig_bin,
+            self.recomp_bin,
+            self.report,
+            self.types,
+            equivalence_groups=self.equivalence_groups,
+            source_index=self.source_index,
+        )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=self.source_index,
+        )
+        self._configure_function_nodes()
+        if not self._db.frozen:
+            self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     def run(self):
         if not isinstance(self.orig_bin, PEImage) or not isinstance(
@@ -148,6 +240,11 @@ class Compare:
         load_cvdump(self.cvdump_analysis, self._db, self.recomp_bin)
         load_cvdump_lines(self.cvdump_analysis, self._lines_db, self.recomp_bin)
 
+        # Function nodes (with their PDB type keys and decorated names) by
+        # recomp address: lets the function comparator derive return kinds
+        # and callee calling conventions for the effective-match verifier.
+        self._configure_function_nodes()
+
         match_entry(self._db, self.orig_bin, self.recomp_bin)
 
         load_markers(
@@ -159,15 +256,31 @@ class Compare:
             self.bin_encoding,
             self.project_aliases,
             self.report,
+            self.codebase,
         )
 
         load_data_sources(self._db, self.data_sources)
+        normalize_original_zero_size_data(self._db, self.orig_bin)
 
         # Match using PDB and annotation data
         truncate = self.cvdump_analysis.truncate_symbols
         match_symbols(self._db, self.report, truncate=truncate)
-        match_functions(self._db, self.report, truncate=truncate)
+        match_functions(
+            self._db,
+            self.report,
+            truncate=truncate,
+            equivalence_groups=self.equivalence_groups,
+        )
+        if self.codebase is not None:
+            match_folded_function_aliases(
+                self._db,
+                self.codebase,
+                self._lines_db,
+                self.report,
+                truncate=truncate,
+            )
         match_vtables(self._db, self.report)
+        classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         match_static_variables(self._db, self.report)
         match_variables(self._db, self.report)
         match_lines(self._db, self._lines_db, self.report)
@@ -193,7 +306,13 @@ class Compare:
 
         match_crt_startup(self._db, self.orig_bin, self.recomp_bin)
         check_vtables(self._db)
+        match_seh(self._db)
+
         match_ref(self._db, self.report)
+        self.function_comparator.discover_unique_called_functions()
+        self.function_comparator.discover_unpaired_function_bodies()
+        match_inferred_vtables_by_slots(self._db, self.orig_bin, self.recomp_bin)
+        classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)
 
@@ -209,61 +328,112 @@ class Compare:
             # Detect floats first because we can identify them with more confidence
             # and this eliminates them from consideration as strings.
             create_analysis_floats(self._db, img_id, binfile)
+            # Wide before Latin1: otherwise L"F1" is misread as the short string "F".
+            create_analysis_widechars(self._db, img_id, binfile)
             create_analysis_strings(self._db, img_id, binfile, self.bin_encoding)
             complete_partial_floats(self._db, img_id, binfile)
             complete_partial_strings(self._db, img_id, binfile, self.bin_encoding)
 
         match_strings(self._db, self.report)
+        classify_exact_string_aliases(self._db)
+        self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     @classmethod
-    def from_target(cls, target: RecCmpTarget) -> Self:
-        origfile = detect_image(filepath=target.original_path)
-        recompfile = detect_image(filepath=target.recompiled_path)
-
-        logger.info("Parsing %s ...", target.recompiled_pdb)
-        cvdump = (
-            Cvdump(str(target.recompiled_pdb))
-            .lines()
-            .globals()
-            .publics()
-            .symbols()
-            .section_contributions()
-            .types()
-            .run()
+    def from_target(
+        cls,
+        target: RecCmpTarget,
+        *,
+        orig_addrs: Iterable[int] = (),
+        recomp_addrs: Iterable[int] = (),
+        use_cache: bool = True,
+        source_index: SourceIndex | None = None,
+    ) -> Self:
+        loaded = load_target_analysis(
+            target,
+            orig_addrs=orig_addrs,
+            recomp_addrs=recomp_addrs,
+            use_cache=use_cache,
         )
-        pdb_file = CvdumpAnalysis(cvdump)
-
-        code_paths = source_code_search(target.source_paths)
-        code_files = list(
-            TextFile.from_files(
-                code_paths, allow_error=True, encoding=target.encoding or "utf-8"
-            )
-        )
-
-        data_sources = list(
-            TextFile.from_files(
-                target.data_sources,
-                allow_error=True,
-                encoding=target.encoding or "utf-8",
-            )
-        )
-
-        project_aliases = {target.target_id: target.marker_aliases}
-
+        if source_index is None:
+            source_index = load_source_index_for_target(target)
         compare = cls(
-            origfile,
-            recompfile,
-            pdb_file,
+            loaded.orig_bin,
+            loaded.recomp_bin,
+            loaded.pdb_file,
             target_id=target.target_id,
             encoding=target.encoding,
-            data_sources=data_sources,
-            code_files=code_files,
-            project_aliases=project_aliases,
+            data_sources=loaded.data_sources,
+            code_files=loaded.code_files,
+            project_aliases=loaded.project_aliases,
+            codebase=loaded.codebase,
+            equivalence_sources=loaded.equivalence_sources,
+            source_index=source_index,
         )
-        compare.run()
+        prepared = loaded.load_prepared()
+        if prepared is not None:
+            compare._restore_prepared_analysis(prepared)
+        else:
+            compare.run()
+            loaded.store_prepared(compare._prepared_analysis())
         return compare
 
-    def _compare_vtable(self, match: ReccmpMatch) -> EntityCompareResult:
+    def report_vtable_size_warnings(self, name_filter: str | None = None) -> None:
+        """Log oversized-vtable evidence, optionally limited by name."""
+        check_vtables(self._db, self.orig_bin, name_filter)
+
+    def _orig_addrs_equivalent(
+        self, orig_addr: int | None, recomp_orig_addr: int | None
+    ) -> bool:
+        """True when both original addresses belong to the same proven
+        equivalence group (fold islands / duplicate COMDATs)."""
+        if not self.equivalence_groups:
+            return False
+        if orig_addr is None or recomp_orig_addr is None:
+            return False
+        return canonical_orig_addr(
+            self.equivalence_groups, orig_addr
+        ) == canonical_orig_addr(self.equivalence_groups, recomp_orig_addr)
+
+    def _slot_alias_equivalent(
+        self, raw_orig: int, recomp: "ReccmpEntity | None"
+    ) -> bool:
+        """Recomputed compiler-alias acceptance for one vtable slot.
+
+        MSVC folds identical COMDAT bodies, so one original address may
+        serve slots whose rebuilt targets are distinct functions, and only
+        one of them (or none) can carry the annotation for the shared
+        original body. The slot is still correct when the original body at
+        the slot's target and the rebuilt body the recomp table installs
+        are provably the same compiled code; that equivalence is recomputed
+        from the bodies by {@link FunctionComparator.raw_pair_alias_equivalent}
+        and holds only when every relocated operand resolves to a named,
+        paired entity on both sides. Non-equivalent targets still fail.
+        """
+        if recomp is None or recomp.recomp_addr is None:
+            return False
+        # VTORDISP/THUNK slot entities are bare adjustor/jump stubs: their
+        # transfer target is a code address, so body equivalence still proves
+        # the slot. IMPORT_THUNK slots are excluded on purpose - the thunk body
+        # is just `jmp dword ptr [iat]` and sanitization would erase the only
+        # byte that distinguishes one import from another.
+        if recomp.get("type") not in (
+            EntityType.FUNCTION,
+            EntityType.VTORDISP,
+            EntityType.THUNK,
+            None,
+        ):
+            return False
+        size = recomp.size(ImageId.RECOMP)
+        if size is None or size <= 0:
+            return False
+        return self.function_comparator.raw_pair_alias_equivalent(
+            raw_orig, recomp.recomp_addr, size
+        )
+
+    def _compare_vtable(
+        self, match: ReccmpMatch, *, include_diff: bool = True
+    ) -> EntityCompareResult:
         recomp_size = match.any_size(ImageId.RECOMP)
 
         # The vtable size should always be a multiple of 4 because that
@@ -290,6 +460,16 @@ class Compare:
             )
             orig_size = 4 * (orig_size // 4)
 
+        orig_max = match.max_size(ImageId.ORIG)
+        if orig_max is not None:
+            orig_size = min(orig_size, orig_max)
+        orig_size = effective_orig_vtable_size(
+            self.orig_bin,
+            match.orig_addr,
+            orig_size,
+            db=self._db,
+            image_id=ImageId.ORIG,
+        )
         orig_table = self.orig_bin.read(match.orig_addr, orig_size)
         recomp_table = self.recomp_bin.read(match.recomp_addr, recomp_size)
 
@@ -335,24 +515,62 @@ class Compare:
 
         # Now compare each pointer from the two vtables.
         for i, (raw_orig, raw_recomp) in enumerate(raw_addrs):
+            index = f"vtable0x{i*4:02x}"
+            n_entries += 1
+
+            # Orig binaries may contain literal NULL vtable slots (reserved gap).
+            # MSVC cannot emit mid-table NULL entries, so accept any recomp slot.
+            if raw_orig == 0:
+                ratio += 1
+                orig_text.append((index, "0x0 (null slot)"))
+                recomp_text.append(
+                    (
+                        index,
+                        match_text(
+                            resolve_vtable_slot(
+                                self._db,
+                                ImageId.RECOMP,
+                                self.recomp_bin,
+                                raw_recomp,
+                            )
+                        ),
+                    )
+                )
+                continue
+
             orig = (
-                self._db.get(ImageId.ORIG, raw_orig) if raw_orig is not None else None
+                resolve_vtable_slot(self._db, ImageId.ORIG, self.orig_bin, raw_orig)
+                if raw_orig is not None
+                else None
             )
             recomp = (
-                self._db.get(ImageId.RECOMP, raw_recomp)
+                resolve_vtable_slot(
+                    self._db, ImageId.RECOMP, self.recomp_bin, raw_recomp
+                )
                 if raw_recomp is not None
                 else None
             )
 
-            if (
+            slot_matches = (
                 orig is not None
                 and recomp is not None
-                and orig.recomp_addr == recomp.recomp_addr
-            ):
+                and (
+                    orig.recomp_addr == recomp.recomp_addr
+                    or self._orig_addrs_equivalent(orig.orig_addr, recomp.orig_addr)
+                    or (
+                        recomp.recomp_addr is not None
+                        and self._db.alias_canonical_orig(
+                            ImageId.RECOMP, recomp.recomp_addr
+                        )
+                        == raw_orig
+                    )
+                )
+            )
+            if not slot_matches and raw_orig is not None:
+                slot_matches = self._slot_alias_equivalent(raw_orig, recomp)
+            if slot_matches:
                 ratio += 1
 
-            n_entries += 1
-            index = f"vtable0x{i*4:02x}"
             orig_text.append((index, match_text(orig, raw_orig)))
             recomp_text.append((index, match_text(recomp)))
 
@@ -365,12 +583,25 @@ class Compare:
         ).get_opcodes()
 
         return EntityCompareResult(
-            diff=RawDiffOutput(
-                codes=opcodes,
-                orig_inst=orig_text,
-                recomp_inst=recomp_text,
+            diff=(
+                RawDiffOutput(
+                    codes=opcodes,
+                    orig_inst=orig_text,
+                    recomp_inst=recomp_text,
+                )
+                if include_diff
+                else RawDiffOutput()
             ),
             match_ratio=ratio,
+            analysis=(
+                admit_exact_analysis(
+                    displays_equal=ratio == 1.0,
+                    topology_equal=True,
+                    keys_equal=ratio == 1.0,
+                    extent_closed=True,
+                )
+                or ComparisonAnalysis.inconclusive("analysis_limit")
+            ),
         )
 
     def _compare_non_match(self, ent: ReccmpEntity) -> ReccmpComparedEntity | None:
@@ -404,10 +635,16 @@ class Compare:
             is_library=ent.get("library", False),
         )
 
-    def _compare_match(self, match: ReccmpMatch) -> ReccmpComparedEntity | None:
+    def _compare_match(
+        self,
+        match: ReccmpMatch,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> ReccmpComparedEntity | None:
         """Router for comparison type"""
 
-        if match.size is None or match.any_size() == 0:
+        if match.any_size() == 0:
             return None
 
         if match.get("skip", False):
@@ -420,11 +657,15 @@ class Compare:
         if match.entity_type in (EntityType.FUNCTION, EntityType.VTORDISP):
             # Thunks are excluded from comparison. They always match 100% because
             # they are paired up using the destination of their JMP instruction.
-            result = self.function_comparator.compare_function(match)
+            result = self.function_comparator.compare_function(
+                match,
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
             output_type = EntityType.FUNCTION
 
         elif match.entity_type == EntityType.VTABLE:
-            result = self._compare_vtable(match)
+            result = self._compare_vtable(match, include_diff=include_diff)
             output_type = EntityType.VTABLE
 
         else:
@@ -439,19 +680,47 @@ class Compare:
             accuracy=result.match_ratio,
             type=output_type,
             recomp_addr=match.recomp_addr,
-            is_effective_match=result.is_effective_match,
+            analysis=result.analysis,
             is_stub=match.get("stub", False),
             is_library=match.get("library", False),
             rdiff=result.diff,
+            display_similarity=result.display_similarity,
+            stack_permutation=result.stack_permutation,
+            accuracy_modulo_stack=result.accuracy_modulo_stack,
+            inline_expansions=result.inline_expansions,
+            accuracy_modulo_inline=result.accuracy_modulo_inline,
+            diagnostic_normalizations=result.diagnostic_normalizations,
         )
+
+    @property
+    def orig_source_digest(self) -> str | None:
+        return _image_digest(self.orig_bin)
 
     ## Public API
 
     def get_all(self) -> Iterator[ReccmpEntity]:
         return self._db.get_all()
 
+    def get_match(self, orig_addr: int) -> ReccmpMatch | None:
+        """Public lookup for a paired original address."""
+        return self._db.get_one_match(orig_addr)
+
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
+
+    def get_unmatched(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
+        """Raw unmatched inventory, including proven duplicate bodies."""
+        return self._db.unmatched(image_id)
+
+    def get_unexplained(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
+        """Unmatched inventory excluding proven duplicate bodies."""
+        return self._db.unexplained(image_id)
+
+    def get_aliases(
+        self, image_id: ImageId
+    ) -> Iterator[tuple[ReccmpEntity, ReccmpMatch]]:
+        """Proven side-local duplicates and their canonical pairs."""
+        return self._db.get_aliases(image_id)
 
     def get_vtables(self) -> Iterator[ReccmpMatch]:
         return self._db.get_matches_by_type(EntityType.VTABLE)
@@ -459,15 +728,61 @@ class Compare:
     def get_variables(self) -> Iterator[ReccmpMatch]:
         return self._db.get_matches_by_type(EntityType.DATA)
 
-    def compare_address(self, addr: int) -> ReccmpComparedEntity | None:
+    def compare_address(
+        self,
+        addr: int,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> ReccmpComparedEntity | None:
         match = self._db.get_one_match(addr)
         if match is None:
             return None
 
-        return self._compare_match(match)
+        return self._compare_match(
+            match,
+            include_diff=include_diff,
+            include_exact_diff=include_exact_diff,
+        )
+
+    def compare_addresses(
+        self,
+        orig_addrs: Iterable[int] = (),
+        recomp_addrs: Iterable[int] = (),
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+    ) -> Iterable[ReccmpComparedEntity]:
+        """Compare a selected set of matches from either address space.
+
+        A match requested through both address spaces is emitted once, ordered
+        by original address. Unknown and non-comparable addresses are omitted.
+        """
+        selected: dict[int, ReccmpMatch] = {}
+        for addr in orig_addrs:
+            match = self._db.get_one_match(addr)
+            if match is not None:
+                selected[match.orig_addr] = match
+        for addr in recomp_addrs:
+            entity = self._db.get(ImageId.RECOMP, addr)
+            if isinstance(entity, ReccmpMatch):
+                selected[entity.orig_addr] = entity
+
+        for orig_addr in sorted(selected):
+            diff = self._compare_match(
+                selected[orig_addr],
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
+            if diff is not None:
+                yield diff
 
     def compare_all(
-        self, filter_fn: Callable[[ReccmpEntity], bool] | None = None
+        self,
+        filter_fn: Callable[[ReccmpEntity], bool] | None = None,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
     ) -> Iterator[ReccmpComparedEntity]:
         for ent in self._db.all(ImageId.ORIG):
             if ent.entity_type not in (
@@ -477,33 +792,59 @@ class Compare:
             ):
                 continue
 
-            # Should filter matched and unmatched entities
-            # so our counts are accurate.
             if filter_fn and not filter_fn(ent):
                 continue
 
             if ent.recomp_addr is not None:
-                # mypy coercion.
                 assert isinstance(ent, ReccmpMatch)
-                diff = self._compare_match(ent)
+                diff = self._compare_match(
+                    ent,
+                    include_diff=include_diff,
+                    include_exact_diff=include_exact_diff,
+                )
             else:
                 diff = self._compare_non_match(ent)
 
             if diff is not None:
                 yield diff
 
-    def compare_vtables(self) -> Iterator[ReccmpComparedEntity]:
+    def compare_functions(
+        self, *, include_diff: bool = True, include_exact_diff: bool = True
+    ) -> Iterable[ReccmpComparedEntity]:
+        for match in self.get_functions():
+            diff = self._compare_match(
+                match,
+                include_diff=include_diff,
+                include_exact_diff=include_exact_diff,
+            )
+            if diff is not None:
+                yield diff
+
+    def compare_vtables(
+        self, *, include_diff: bool = True
+    ) -> Iterable[ReccmpComparedEntity]:
         for match in self.get_vtables():
-            diff = self._compare_match(match)
+            diff = self._compare_match(match, include_diff=include_diff)
             if diff is not None:
                 yield diff
 
     def to_report(
-        self, filename: str, filter_fn: Callable[[ReccmpEntity], bool] | None = None
+        self,
+        filename: str,
+        filter_fn: Callable[[ReccmpEntity], bool] | None = None,
+        *,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
     ) -> ReccmpStatusReport:
         """Creates a ReccmpStatusReport using the current reccmp state."""
-        report = ReccmpStatusReport(filename=filename)
-        for match in self.compare_all(filter_fn):
+        report = ReccmpStatusReport(
+            filename=filename, source_digest=_image_digest(self.orig_bin)
+        )
+        for match in self.compare_all(
+            filter_fn,
+            include_diff=include_diff,
+            include_exact_diff=include_exact_diff,
+        ):
             report.add_match(match)
 
         return report

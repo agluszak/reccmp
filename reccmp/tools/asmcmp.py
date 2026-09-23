@@ -2,7 +2,9 @@
 
 from datetime import datetime
 from pathlib import Path
+from dataclasses import asdict
 import argparse
+import json
 import logging
 import os
 
@@ -18,6 +20,13 @@ from reccmp.utils import (
 )
 
 from reccmp.compare import Compare
+from reccmp.compare.exact import compare_object_to_original
+from reccmp.formats.coff import parse_coff_object
+from reccmp.formats.detect import detect_image
+from reccmp.formats.pe import PEImage
+from reccmp.compare.diagnosis import (
+    ComparisonStatus,
+)
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.compare.report import (
@@ -38,6 +47,16 @@ from reccmp.project.detect import (
     RecCmpProjectException,
     argparse_add_project_target_args,
     argparse_parse_project_target,
+    RecCmpProject,
+)
+from reccmp.tools.asmcmp_text import (
+    diagnostic_normalizations_text,
+    inconclusive_diagnostic_text,
+    inline_layout_text,
+    mismatch_source_pin_text,
+    stack_layout_text,
+    strategy_attempts_text,
+    triage_status_note,
 )
 
 logger = logging.getLogger()
@@ -65,23 +84,54 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
     assert match.rdiff is not None
     udiff = raw_diff_to_udiff(match.rdiff, grouped=grouped_diff)
 
-    if match.effective_accuracy == 1.0:
+    note = triage_status_note(match.analysis)
+
+    if match.is_proven_match:
         ok_text = reccmp.color.Fore.GREEN + "✨ OK! ✨" + reccmp.color.Style.RESET_ALL
-        if match.accuracy == 1.0:
+        if match.analysis.status == ComparisonStatus.EXACT:
             print(f"{addrs}: {match.name} 100% match.\n\n{ok_text}\n\n")
         else:
             print_combined_diff(udiff, show_both_addrs)
 
             print(
-                f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior).\n\n{ok_text}\n\n"
+                f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior)."
+                f"\n{note}\n\n{ok_text}\n\n"
             )
+            stack = stack_layout_text(match)
+            if stack is not None:
+                print(stack)
+            inline = inline_layout_text(match)
+            if inline is not None:
+                print(inline)
+            level = diagnostic_normalizations_text(match)
+            if level is not None:
+                print(level)
 
     else:
         print_combined_diff(udiff, show_both_addrs)
-
         print(
             f"\n{match.name} is only {percenttext} similar to the original, diff above"
         )
+        stack = stack_layout_text(match)
+        if stack is not None:
+            print(stack)
+        inline = inline_layout_text(match)
+        if inline is not None:
+            print(inline)
+        level = diagnostic_normalizations_text(match)
+        if level is not None:
+            print(level)
+        source_pin = mismatch_source_pin_text(match)
+        if source_pin is not None:
+            print(source_pin)
+        diagnostic = inconclusive_diagnostic_text(match.analysis)
+        if diagnostic is not None:
+            print(diagnostic)
+        attempts = strategy_attempts_text(match.analysis)
+        if attempts is not None:
+            print(attempts)
+        if note is not None:
+            print(note)
 
 
 def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = False):
@@ -97,7 +147,27 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
     if match.is_stub:
         print(f"  {match.name} ({addrs}) is a stub.")
     else:
-        print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
+        if (
+            match.accuracy_modulo_inline is not None
+            and match.accuracy_modulo_inline > match.accuracy
+        ):
+            raw = percent_string(match.accuracy)
+            modulo = percent_string(match.accuracy_modulo_inline)
+            print(
+                f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo known inline"
+            )
+        elif (
+            match.accuracy_modulo_stack is not None
+            and match.accuracy_modulo_stack > match.accuracy
+        ):
+            raw = percent_string(match.accuracy)
+            modulo = percent_string(match.accuracy_modulo_stack)
+            print(f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack")
+        else:
+            print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
+        level = diagnostic_normalizations_text(match)
+        if level is not None and match.effective_accuracy < 1.0:
+            print(f"    {level}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +184,19 @@ def parse_args() -> argparse.Namespace:
     )
     argparse_add_project_target_args(parser)
     parser.add_argument(
+        "--object",
+        type=Path,
+        help="Compare a COFF contribution without a recompiled PE or PDB",
+    )
+    parser.add_argument(
+        "--symbol", help="Exact COFF linker symbol for --object (including decoration)"
+    )
+    parser.add_argument(
+        "--size",
+        type=lambda value: int(value, 0),
+        help="Independently known original extent for --object",
+    )
+    parser.add_argument(
         "--total",
         "-T",
         metavar="<count>",
@@ -125,6 +208,22 @@ def parse_args() -> argparse.Namespace:
         metavar="<offset>",
         type=virtual_address,
         help="Print assembly diff for specific function (original file's offset)",
+    )
+    parser.add_argument(
+        "--orig-address",
+        metavar="<offset>",
+        type=virtual_address,
+        action="append",
+        default=[],
+        help="Compare only this original address (repeatable).",
+    )
+    parser.add_argument(
+        "--recomp-address",
+        metavar="<offset>",
+        type=virtual_address,
+        action="append",
+        default=[],
+        help="Compare only this recompiled address (repeatable).",
     )
     parser.add_argument(
         "--json",
@@ -176,9 +275,37 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exclude LIBRARY annotations from the analysis",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Do not read or write the local parsed-analysis cache.",
+    )
     argparse_add_logging_args(parser)
 
     args = parser.parse_args()
+    if args.object is not None:
+        if (
+            not args.symbol
+            or args.size is None
+            or args.size <= 0
+            or len(args.orig_address) != 1
+        ):
+            parser.error(
+                "--object requires --symbol, positive --size and one --orig-address"
+            )
+        if any(
+            (
+                args.verbose is not None,
+                args.recomp_address,
+                args.html,
+                args.svg,
+                args.diff,
+                args.dump,
+            )
+        ):
+            parser.error("--object does not use executable diff/report options")
+    elif args.symbol is not None or args.size is not None:
+        parser.error("--symbol and --size require --object")
     argparse_parse_logging(args)
 
     return args
@@ -223,8 +350,46 @@ def dump_all_matched_functions(report: ReccmpStatusReport):
                         f.write(f"        : {line}\n")
 
 
+def compare_object(args: argparse.Namespace) -> int:
+    """Run the object view without requiring any recompiled linker output."""
+    original_path = (
+        RecCmpProject.from_directory(Path.cwd()).targets[args.target].original_path
+        if args.target
+        else args.paths_target.original_path
+    )
+    if original_path is None:
+        raise ValueError("The selected target has no original binary")
+    original = detect_image(original_path)
+    if not isinstance(original, PEImage):
+        raise ValueError("Object comparison currently supports i386 PE originals")
+    result = compare_object_to_original(
+        original,
+        parse_coff_object(args.object),
+        args.symbol,
+        args.orig_address[0],
+        args.size,
+    )
+    output = json.dumps(
+        {
+            "object": str(args.object),
+            "symbol": args.symbol,
+            "original_address": args.orig_address[0],
+            **asdict(result),
+        },
+        indent=2,
+    )
+    if args.json:
+        gen_json(args.json, output)
+    if not args.silent:
+        print(output)
+    return 0 if result.exact else 1
+
+
 def main() -> int:
     args = parse_args()
+
+    if args.object is not None:
+        return compare_object(args)
 
     try:
         target = argparse_parse_project_target(args)
@@ -234,7 +399,16 @@ def main() -> int:
 
     logging.basicConfig(level=args.loglevel, format="[%(levelname)s] %(message)s")
 
-    compare = Compare.from_target(target)
+    selected = bool(args.orig_address or args.recomp_address)
+    setup_orig_addresses = list(args.orig_address)
+    if args.verbose is not None:
+        setup_orig_addresses.append(args.verbose)
+    compare = Compare.from_target(
+        target,
+        orig_addrs=setup_orig_addresses,
+        recomp_addrs=args.recomp_address,
+        use_cache=not args.no_cache,
+    )
 
     print()
 
@@ -249,7 +423,7 @@ def main() -> int:
         print_match_verbose(match, show_both_addrs=args.print_rec_addr)
         return 0
 
-    ### Compare everything.
+    ### Compare selected entities or everything.
 
     def entity_filter(entity: ReccmpEntity) -> bool:
         if (
@@ -263,9 +437,31 @@ def main() -> int:
 
         return True
 
-    report = compare.to_report(
-        filename=target.original_path.name, filter_fn=entity_filter
+    include_diff = bool(
+        args.dump
+        or args.html is not None
+        or (args.json is not None and not args.json_diet)
     )
+    if selected:
+        report = ReccmpStatusReport(
+            filename=target.original_path.name,
+            source_digest=compare.orig_source_digest,
+        )
+        for entity in compare.compare_addresses(
+            args.orig_address,
+            args.recomp_address,
+            include_diff=include_diff,
+            include_exact_diff=bool(args.dump),
+        ):
+            report.add_match(entity)
+        report.asmcmp_filtering(args.nolib, target.report_config.ignore_functions)
+    else:
+        report = compare.to_report(
+            filename=target.original_path.name,
+            filter_fn=entity_filter,
+            include_diff=include_diff,
+            include_exact_diff=bool(args.dump),
+        )
 
     if args.dump:
         dump_all_matched_functions(report)
@@ -321,6 +517,9 @@ def main() -> int:
 
     if args.html is not None:
         write_html_report(args.html, report, target_icon)
+
+    if selected:
+        return 0
 
     report.update_function_count()
     function_count = report.function_count

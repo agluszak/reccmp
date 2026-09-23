@@ -20,7 +20,7 @@ from reccmp.compare.db import ReccmpEntity
 from reccmp.cvdump import Cvdump
 from reccmp.compare import Compare
 from reccmp.formats.exceptions import InvalidVirtualAddressError
-from reccmp.types import EntityType
+from reccmp.types import EntityType, ImageId
 from reccmp.project.detect import (
     argparse_add_project_target_args,
     argparse_parse_project_target,
@@ -111,15 +111,21 @@ def print_sections(sections):
     print()
 
 
-ALLOWED_TYPE_ABBREVIATIONS = ["fun", "dat", "poi", "str", "vta", "flo"]
+TYPE_ABBREVIATIONS = {
+    EntityType.IMPORT: "imp",
+    EntityType.IMPORT_THUNK: "ith",
+}
+
+ALLOWED_TYPE_ABBREVIATIONS = ["fun", "dat", "poi", "str", "vta", "flo", "ith"]
 
 
 def match_type_abbreviation(mtype: int | None) -> str:
-    """Return abbreviation of the given EntityType name"""
+    """Return the stable roadmap abbreviation for an entity type."""
     if mtype is None:
         return ""
 
-    return EntityType(mtype).name.lower()[:3]
+    entity_type = EntityType(mtype)
+    return TYPE_ABBREVIATIONS.get(entity_type, entity_type.name.lower()[:3])
 
 
 def get_cmakefiles_prefix(module: str) -> str:
@@ -168,6 +174,7 @@ class RoadmapRow(NamedTuple):
     size: int
     name: str | None
     module: str | None
+    pairing_state: str
 
 
 class DeltaCollector:
@@ -410,6 +417,12 @@ def main() -> int:
         raise ValueError("`roadmap` currently only supports 32-bit PE images")
 
     module_map = ModuleMap(target.recompiled_pdb, recomp_bin)
+    original_aliases = {
+        entity.orig_addr for entity, _ in engine.get_aliases(ImageId.ORIG)
+    }
+    recomp_duplicates = {
+        entity.recomp_addr for entity, _ in engine.get_aliases(ImageId.RECOMP)
+    }
 
     def is_same_section(orig: int, recomp: int) -> bool:
         """
@@ -463,6 +476,17 @@ def main() -> int:
             assert orig_ofs is not None
             displacement = recomp_ofs - orig_ofs
 
+        if orig_addr is not None and recomp_addr is not None:
+            pairing = "paired"
+        elif orig_addr in original_aliases:
+            pairing = "original_alias"
+        elif recomp_addr in recomp_duplicates:
+            pairing = "recomp_duplicate"
+        elif orig_addr is not None:
+            pairing = "unexplained"
+        else:
+            pairing = "recomp_only"
+
         return RoadmapRow(
             orig_sect_ofs,
             recomp_sect_ofs,
@@ -473,6 +497,7 @@ def main() -> int:
             match.any_size(),
             match.name,
             module_name,
+            pairing,
         )
 
     def roadmap_row_generator(matches):
