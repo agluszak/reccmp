@@ -32,6 +32,7 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         "struct W8Payload { int value; };\n"
         "struct W8Record { W8Payload payload; };\n"
         "struct SurrenderOnly { int unknown_04; };\n"
+        "template<class T> struct DependentRecord { T value; };\n"
         "inline int ReadW8Field(W8First& object, int index) {\n"
         "  int value = object.unknown_04;\n"
         "  object.values[index] = value;\n"
@@ -134,6 +135,12 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert {item.target for item in owners} == {"WIZ8", "SURRENDER"}
         assert all(item.asserted_size == 20 for item in owners)
         assert [field.pointer_depth for field in owners[0].fields] == [2, 1, 0, 0]
+        dependent_records = [
+            item for item in index.classes if item.qualified_name == "DependentRecord"
+        ]
+        assert len(dependent_records) == 2
+        assert all(item.size is None for item in dependent_records)
+        assert all(item.fields[0].offset is None for item in dependent_records)
         assert index.functions_by_address(target="WIZ8")[0x401000].name == "WIZ8"
         assert (
             index.functions_by_address(target="SURRENDER")[0x401000].name == "SURRENDER"

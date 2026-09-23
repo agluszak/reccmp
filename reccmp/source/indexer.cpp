@@ -225,7 +225,9 @@ class Indexer {
       QualType element = array->getElementType();
       entry["storage_kind"] = "array";
       entry["array_element_type"] = typeName(element);
-      entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      if (!element->isDependentType() && element->isConstantSizeType()) {
+        entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      }
       if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
         entry["array_count"] = static_cast<int64_t>(constant->getSize().getZExtValue());
       }
@@ -878,7 +880,8 @@ class Indexer {
               dyn_cast<CXXRecordDecl>(owner->getDefinition());
           owner = definition ? definition : owner;
         }
-        if (owner && owner->isCompleteDefinition() && !field->isInvalidDecl()) {
+        if (owner && !owner->isDependentType() && owner->isCompleteDefinition() &&
+            !field->isInvalidDecl()) {
           const ASTRecordLayout& layout = indexer_.context_.getASTRecordLayout(owner);
           offsetBits = static_cast<int64_t>(layout.getFieldOffset(field->getFieldIndex()));
           if (field->isBitField()) {
@@ -955,7 +958,9 @@ class Indexer {
     for (const CXXBaseSpecifier& base : record->bases()) bases.push_back(typeName(base.getType()));
 
     const ASTRecordLayout* layout = nullptr;
-    if (record->isCompleteDefinition()) layout = &context_.getASTRecordLayout(record);
+    if (record->isCompleteDefinition() && !record->isDependentType()) {
+      layout = &context_.getASTRecordLayout(record);
+    }
 
     llvm::json::Array fields;
     for (const FieldDecl* field : record->fields()) {
