@@ -2,6 +2,7 @@ from textwrap import dedent
 import pytest
 from reccmp.parser.parser import (
     DecompParser,
+    ReaderState,
 )
 from reccmp.parser.error import AlertCode
 
@@ -250,6 +251,21 @@ def test_implicit_lookup_by_name(parser):
     assert parser.functions[0].name == "TestClass::TestMethod()"
 
 
+def test_function_skips_clang_format_directive_after_marker(parser):
+    parser.read("""\
+        // FUNCTION: TEST 0x1234
+        // clang-format off
+        int test_function()
+        {
+            return 1;
+        }
+        """)
+    assert parser.state == ReaderState.SEARCH
+    assert len(parser.functions) == 1
+    assert parser.functions[0].lookup_by_name is False
+    assert parser.functions[0].name.startswith("int test_function")
+
+
 def test_function_with_spaces(parser):
     """There should not be any spaces between the end of FUNCTION markers
     and the start or name of the function. If it's a blank line, we can safely
@@ -262,6 +278,36 @@ def test_function_with_spaces(parser):
     assert len(parser.functions) == 1
     assert len(parser.alerts) == 1
     assert parser.alerts[0].code == AlertCode.UNEXPECTED_BLANK_LINE
+
+
+def test_multiline_function_signature(parser):
+    parser.read("""\
+        // FUNCTION: TEST 0x1234
+        void __fastcall VeryLongFunctionNameWithManyArgs(
+            void* self, int a, int b, int c, int d, int e)
+        {
+            return;
+        }
+        """)
+    assert parser.state == ReaderState.SEARCH
+    assert len(parser.functions) == 1
+    assert parser.functions[0].lookup_by_name is False
+    assert "VeryLongFunctionNameWithManyArgs" in parser.functions[0].name
+    assert "void* self" in parser.functions[0].name
+
+
+def test_wrapped_signature_with_one_line_body(parser):
+    parser.read("""\
+        // FUNCTION: TEST 0x1234
+        TestClass::TestClass()
+            : value(0) {}
+        // FUNCTION: TEST 0x5678
+        void next_function() {}
+        """)
+
+    assert parser.state == ReaderState.SEARCH
+    assert len(parser.functions) == 2
+    assert not parser.alerts
 
 
 def test_function_with_spaces_implicit(parser):
