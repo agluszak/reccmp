@@ -1,5 +1,6 @@
 import logging
-from typing import Callable, Iterator, NamedTuple, TypeVar, cast
+from collections import Counter
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar, cast
 
 # Disable spurious warnings in vscode / pylance
 # pyright: reportMissingModuleSource=false
@@ -15,10 +16,14 @@ from ghidra.program.model.data import (
     DataTypeConflictHandler,
     Enum,
     EnumDataType,
+    FunctionDefinition,
+    FunctionDefinitionDataType,
+    ParameterDefinitionImpl,
     StructureDataType,
     StructureInternal,
     TypedefDataType,
-    ComponentOffsetSettingsDefinition,
+    Union,
+    UnionDataType,
 )
 
 from reccmp.cvdump.types import CvdumpKeyError
@@ -48,6 +53,13 @@ from .type_conversion import get_scalar_ghidra_type
 
 logger = logging.getLogger(__name__)
 
+_CALL_TYPE_TO_GHIDRA = {
+    "C Near": "__cdecl",
+    "ThisCall": "__thiscall",
+    "STD Near": "__stdcall",
+    "Fast Near": "__fastcall",
+}
+
 
 class GhidraFieldListItem(NamedTuple):
     """Using a Ghidra DataType instead of the Cvdump type key from FieldListItem"""
@@ -58,6 +70,7 @@ class GhidraFieldListItem(NamedTuple):
 
 
 class PdbTypeImporter:
+    # pylint: disable=too-many-instance-attributes
     """Allows PDB types to be imported into Ghidra."""
 
     def __init__(
@@ -74,6 +87,9 @@ class PdbTypeImporter:
 
         # tracks the enums we have already handled for the sake of efficiency
         self.handled_enums: dict[SanitizedEntityName, Enum] = {}
+        self.handled_unions: set[SanitizedEntityName] = set()
+        self.handled_procedures: dict[CvdumpTypeKey, DataType] = {}
+        self.unimplemented_leaves: Counter[str] = Counter()
 
     @property
     def types(self):
@@ -125,15 +141,12 @@ class PdbTypeImporter:
             return self._import_array(type_pdb)
         elif type_category == "LF_ENUM":
             return self._import_enum(type_pdb)
-        elif type_category == "LF_PROCEDURE":
-            logger.warning(
-                "Not implemented: Function-valued type will be replaced by void: %s",
-                type_pdb,
-            )
-            return self._import_scalar_type(CVInfoTypeEnum.T_VOID)
+        elif type_category in ("LF_PROCEDURE", "LF_MFUNCTION"):
+            return self._import_procedure(type_index, type_pdb)
         elif type_category == "LF_UNION":
-            return self._import_union(type_pdb)
+            return self._import_union(type_index, type_pdb)
         else:
+            self.unimplemented_leaves[str(type_category)] += 1
             raise TypeNotImplementedError(type_pdb)
 
     def _import_scalar_type(self, type_key: CvdumpTypeKey) -> DataType:
@@ -187,23 +200,159 @@ class PdbTypeImporter:
 
         return ArrayDataType(inner_type, array_length, 0)
 
-    def _import_union(self, type_pdb: CvdumpParsedType) -> DataType:
-        raw_name: str = type_pdb["name"]
-        expected_size: int = type_pdb["size"]
-        type_name_with_namespace = sanitize_name(raw_name)
-
+    def _procedure_arguments(
+        self, type_pdb: CvdumpParsedType
+    ) -> tuple[list[DataType], bool]:
+        arg_list_key = type_pdb.get("arg_list_type")
+        if arg_list_key is None:
+            return [], False
         try:
-            logger.debug("Dereferencing union %s", type_pdb)
-            union_type = get_ghidra_type(self.api, type_name_with_namespace)
-            assert (
-                union_type.getLength() == expected_size
-            ), f"Wrong size of existing union type '{raw_name}': expected {expected_size}, got {union_type.getLength()}"
-            return union_type
-        except TypeNotFoundInGhidraError as e:
-            # We have so few instances, it is not worth implementing this
+            arg_leaf = self.extraction.compare.types.from_key(arg_list_key)
+        except CvdumpKeyError:
+            logger.warning(
+                "Missing arglist %s for procedure %s", arg_list_key, type_pdb
+            )
+            return [], False
+        raw_args = list(arg_leaf.get("args") or [])
+        varargs = False
+        if raw_args and raw_args[-1] == CVInfoTypeEnum.T_NOTYPE:
+            varargs = True
+            raw_args = raw_args[:-1]
+        elif CVInfoTypeEnum.T_NOTYPE in raw_args:
             raise TypeNotImplementedError(
-                f"Writing union types is not supported. Please add by hand: {type_pdb}"
-            ) from e
+                f"T_NOTYPE is not trailing in arglist {arg_list_key:#x}: {type_pdb}"
+            )
+        return [self.import_pdb_type_into_ghidra(key) for key in raw_args], varargs
+
+    def _import_procedure(
+        self, type_index: CvdumpTypeKey, type_pdb: CvdumpParsedType
+    ) -> DataType:
+        known = self.handled_procedures.get(type_index)
+        if known is not None:
+            return known
+
+        return_type = self.import_pdb_type_into_ghidra(type_pdb["return_type"])
+        arg_types, varargs = self._procedure_arguments(type_pdb)
+        params = [
+            ParameterDefinitionImpl(f"param{index}", arg_type, None)
+            for index, arg_type in enumerate(arg_types)
+        ]
+        this_type_key = type_pdb.get("this_type")
+        if (
+            type_pdb["type"] == "LF_MFUNCTION"
+            and this_type_key is not None
+            and this_type_key != CVInfoTypeEnum.T_VOID
+        ):
+            params.insert(
+                0,
+                ParameterDefinitionImpl(
+                    "this", self.import_pdb_type_into_ghidra(this_type_key), None
+                ),
+            )
+
+        definition = FunctionDefinitionDataType(
+            CategoryPath("/pdb/procedures"), f"PDB_{type_index:#06x}"
+        )
+        definition.setReturnType(return_type)
+        if params:
+            # Ghidra exposes a Java ParameterDefinition[] setter; its generated
+            # Python stub incorrectly models the array as one element.
+            cast(Any, definition).setArguments(params)
+        if hasattr(definition, "setVarArgs"):
+            definition.setVarArgs(varargs)
+        calling_convention = _CALL_TYPE_TO_GHIDRA.get(type_pdb.get("call_type") or "")
+        if calling_convention:
+            definition.setCallingConvention(calling_convention)
+        manager = self.api.getCurrentProgram().getDataTypeManager()
+        existing = manager.getDataType(definition.getPathName())
+        if existing is not None and isinstance(existing, FunctionDefinition):
+            existing.setReturnType(return_type)
+            cast(Any, existing).setArguments(params)
+            if hasattr(existing, "setVarArgs"):
+                existing.setVarArgs(varargs)
+            if calling_convention:
+                existing.setCallingConvention(calling_convention)
+            self.handled_procedures[type_index] = existing
+            return existing
+        imported = manager.addDataType(
+            definition, DataTypeConflictHandler.REPLACE_HANDLER
+        )
+        self.handled_procedures[type_index] = imported
+        return imported
+
+    def _import_union(
+        self, type_index: CvdumpTypeKey, type_pdb: CvdumpParsedType
+    ) -> DataType:
+        raw_name: str = type_pdb.get("name") or f"PDB_UNION_{type_index:#06x}"
+        expected_size: int = type_pdb["size"]
+        sanitized_name = sanitize_name(raw_name)
+        if not sanitized_name.base_name or sanitized_name.base_name in {
+            "[unnamed-tag]",
+            "unnamed-tag",
+            "<unnamed-tag>",
+        }:
+            sanitized_name = SanitizedEntityName(
+                sanitized_name.namespace_path, f"PDB_UNION_{type_index:#06x}"
+            )
+
+        existing: DataType | None = None
+        try:
+            existing = get_ghidra_type(self.api, sanitized_name)
+            if not isinstance(existing, Union):
+                sanitized_name = SanitizedEntityName(
+                    sanitized_name.namespace_path,
+                    f"{sanitized_name.base_name}_PDB_UNION",
+                )
+                existing = None
+        except TypeNotFoundInGhidraError:
+            existing = None
+
+        if sanitized_name in self.handled_unions:
+            return get_ghidra_type(self.api, sanitized_name)
+
+        self.handled_unions.add(sanitized_name)
+
+        union_type = existing or self._get_or_create_data_type(
+            sanitized_name,
+            "union",
+            Union,
+            UnionDataType,
+        )
+
+        field_list_type = type_pdb.get("field_list_type")
+        if field_list_type is not None:
+            try:
+                field_list = self.extraction.compare.types.from_key(field_list_type)
+            except CvdumpKeyError:
+                field_list = None
+            if field_list is not None:
+                self._overwrite_union(
+                    sanitized_name, union_type, field_list.get("members") or []
+                )
+
+        if union_type.getLength() != expected_size:
+            logger.warning(
+                "Imported union %s size %d differs from PDB size %d",
+                sanitized_name,
+                union_type.getLength(),
+                expected_size,
+            )
+        return union_type
+
+    def _overwrite_union(
+        self,
+        sanitized_name: SanitizedEntityName,
+        union_type: Union,
+        members: list[FieldListItem],
+    ) -> None:
+        for ordinal in reversed(range(union_type.getNumComponents())):
+            union_type.delete(ordinal)
+        for member in members:
+            member_type = self.import_pdb_type_into_ghidra(member.type)
+            try:
+                union_type.add(member_type, member.name, None)
+            except Exception as exc:
+                raise StructModificationError(sanitized_name) from exc
 
     def _import_enum(self, type_pdb: CvdumpParsedType) -> DataType:
         underlying_type = self.import_pdb_type_into_ghidra(type_pdb["underlying_type"])
@@ -404,12 +553,11 @@ class PdbTypeImporter:
                 f"{type_name}PtrOffset",
                 vbase_ghidra_pointer,
             )
-            # Set a default value of -4 for the pointer offset. While this appears to be correct in many cases,
-            # it does not always lead to the best decompile. It can be fine-tuned by hand; the next function call
-            # makes sure that we don't overwrite this value on re-running the import.
-            ComponentOffsetSettingsDefinition.DEF.setValue(
-                vbase_ghidra_pointer_typedef.getDefaultSettings(), -4
-            )
+            # Pointer offset is the displacement from the stored pointer to the
+            # typed object. PDB does not put that constant on the type leaf; a
+            # generic -4 is only correct for some primary vbptrs. Leave unset
+            # unless ComponentOffset is already present (do not overwrite a
+            # reviewer-tuned value on re-import).
 
             vbase_ghidra_pointer_typedef = add_data_type_or_reuse_existing(
                 self.api, vbase_ghidra_pointer_typedef
