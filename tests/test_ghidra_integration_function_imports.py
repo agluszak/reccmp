@@ -148,7 +148,7 @@ def test_import_variadic_function(
     assert function_helper.ghidra_function.hasVarArgs() is True
     assert importer.matches_ghidra_function(function_helper.ghidra_function) is True
     function_helper.assert_c_code("""
-void __cdecl MyVariadicFn(char *fmt, ...)
+void __cdecl MyVariadicFn(char *fmt,...)
 
 {
   return;
