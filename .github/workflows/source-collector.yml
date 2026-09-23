@@ -20,6 +20,5 @@ jobs:
           --volume /tmp/reccmp-uv-cache:/root/.cache/uv \
           --workdir /work \
           --env RECCMP_SOURCE_INDEXER=/usr/local/bin/reccmp-source-indexer \
-          --env UV_PROJECT_ENVIRONMENT=/tmp/reccmp-venv \
           reccmp-source-test \
-          bash -lc 'uv sync --locked --group test && uv run pytest tests/test_source_index.py tests/test_source_records.py tests/test_source_batch.py -q --tb=short'
+          bash -lc 'uv venv -q /tmp/reccmp-venv && uv pip install -q --python /tmp/reccmp-venv -e . -r requirements-tests.txt && /tmp/reccmp-venv/bin/python -m pytest tests/test_source_index.py tests/test_source_records.py tests/test_source_batch.py -q --tb=short'

@@ -14,34 +14,32 @@ jobs:
       with:
         python-version: '3.14'
 
-    - uses: astral-sh/setup-uv@v5
-
     - name: Install python libraries
       shell: bash
       id: install
       run: |
-        uv sync --locked --group test
+        pip install -r requirements.txt -r requirements-tests.txt
 
     - name: Run black
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: uv run black --check .
+      run: black --check .
 
     - name: Run pylint
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: uv run pylint reccmp tests
+      run: pylint reccmp tests
 
     - name: Run mypy
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: uv run mypy ./reccmp ./tests
+      run: mypy ./reccmp ./tests
 
     - name: Run codespell
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
       run: |
-        uv run codespell \
+        codespell \
           --ignore-multiline-regex \
             '# codespell:ignore-begin.*?codespell:ignore-end *\n' \
           --ignore-regex remote-checkin-comment \

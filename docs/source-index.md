@@ -52,5 +52,5 @@ Run the collector integration test inside the pinned image:
 docker run --rm -v "$PWD:/work" -w /work \
   -e RECCMP_SOURCE_INDEXER=/usr/local/bin/reccmp-source-indexer \
   reccmp-source-test \
-  uv run --group test pytest tests/test_source_batch.py
+  bash -lc 'uv venv -q /tmp/venv && uv pip install -q --python /tmp/venv -e . -r requirements-tests.txt && /tmp/venv/bin/python -m pytest tests/test_source_batch.py'
 ```
