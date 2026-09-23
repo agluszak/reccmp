@@ -1,4 +1,4 @@
-"""Shape of symbolic memory addresses: flattening, stack roots, disjointness."""
+"""Shape of symbolic memory addresses: flattening, stack roots, and whether two accesses overlap."""
 
 from __future__ import annotations
 

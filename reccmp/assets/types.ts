@@ -14,7 +14,9 @@ export interface ReccmpComparedEntity {
   matching: number;
   name: string;
   recomp: string;
+  /** Legacy reports only; current reports use comparison.status. */
   effective?: boolean;
+  comparison?: { status: 'exact' | 'effective' | 'mismatch' | 'inconclusive' };
   stub?: boolean;
   diff?: UnifiedDiffGroup[];
   /* dynamic property access */

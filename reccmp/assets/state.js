@@ -9,6 +9,8 @@
  * } from "./types"
  */
 
+import { isEffectiveMatch } from './globals';
+
 // reccmp-pack-begin
 /**
  * Special internal values to ensure this sort order for matching column:
@@ -27,7 +29,7 @@ function getRowSortValue(row) {
 
   // An effective match sorts near the top
   // but under a non-effective match.
-  if ('effective' in row) {
+  if (isEffectiveMatch(row)) {
     return 1.0;
   }
 
@@ -82,9 +84,9 @@ function createFilterFunction({ hidePerfect, hideStub, query, filterType }) {
    */
   return (row) => {
     // Destructuring sets defaults for optional values from this object.
-    const { effective = false, stub = false, diff = '', name, address, matching } = row;
+    const { stub = false, diff = '', name, address, matching } = row;
 
-    if (hidePerfect && (effective || matching >= 1)) {
+    if (hidePerfect && (isEffectiveMatch(row) || matching >= 1)) {
       return false;
     }
 
