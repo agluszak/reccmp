@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -19,13 +20,17 @@
 
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/ASTTypeTraits.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/RecordLayout.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Type.h"
+#include "clang/AST/ParentMapContext.h"
+#include "clang/Index/USRGeneration.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -85,6 +90,8 @@ struct Location {
   std::string file;
   unsigned line = 0;
   unsigned endLine = 0;
+  unsigned column = 0;
+  int64_t offset = -1;
 };
 
 struct CachedFile {
@@ -131,16 +138,34 @@ class Indexer {
   // A declaration's own file decides whether it is indexed at all, so the cost
   // of a toolchain header is one FileID lookup rather than a serialised node.
   Location locate(const Decl* declaration) const {
-    Location location;
     SourceRange range = declaration->getSourceRange();
-    SourceLocation beginLoc = sources_.getExpansionLoc(range.getBegin());
-    const CachedFile& file = fileInfo(beginLoc);
-    location.file = file.absolute;
-    PresumedLoc begin = sources_.getPresumedLoc(beginLoc);
-    if (begin.isValid()) location.line = begin.getLine();
+    Location location = locate(sources_.getExpansionLoc(range.getBegin()));
     PresumedLoc end = sources_.getPresumedLoc(sources_.getExpansionLoc(range.getEnd()));
     location.endLine = end.isValid() ? end.getLine() : location.line;
     return location;
+  }
+
+  Location locate(SourceLocation sourceLocation) const {
+    Location location;
+    SourceLocation beginLoc = sources_.getExpansionLoc(sourceLocation);
+    const CachedFile& file = fileInfo(beginLoc);
+    location.file = file.absolute;
+    PresumedLoc begin = sources_.getPresumedLoc(beginLoc);
+    if (begin.isValid()) {
+      location.line = begin.getLine();
+      location.column = begin.getColumn();
+    }
+    if (beginLoc.isValid() && beginLoc.isFileID()) {
+      location.offset = static_cast<int64_t>(sources_.getFileOffset(beginLoc));
+    }
+    location.endLine = location.line;
+    return location;
+  }
+
+  std::string declarationUsr(const Decl* declaration) const {
+    llvm::SmallString<128> buffer;
+    if (index::generateUSRForDecl(declaration->getCanonicalDecl(), buffer)) return "";
+    return buffer.str().str();
   }
 
   // Clang's JSON dump records a type's spelling and, when the top level of that
@@ -200,7 +225,9 @@ class Indexer {
       QualType element = array->getElementType();
       entry["storage_kind"] = "array";
       entry["array_element_type"] = typeName(element);
-      entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      if (!element->isDependentType() && element->isConstantSizeType()) {
+        entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      }
       if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
         entry["array_count"] = static_cast<int64_t>(constant->getSize().getZExtValue());
       }
@@ -451,6 +478,7 @@ class Indexer {
     bool isMember = isa<CXXRecordDecl>(context);
     std::string scope = scopeOf(context);
     std::string qualifiedName = qualify(scope, function->getNameAsString());
+    std::string functionIdentity = semanticId(function, qualifiedName);
 
     std::string semanticKind;
     if (isa<CXXConstructorDecl>(function)) {
@@ -508,7 +536,7 @@ class Indexer {
     std::string convention = callingConvention(functionType, semanticKind);
     llvm::json::Object record{
         {"record", "declaration"},
-        {"semantic_id", semanticId(function, qualifiedName)},
+        {"semantic_id", functionIdentity},
         {"qualified_name", qualifiedName},
         {"semantic_kind", semanticKind},
         {"calling_convention", convention},
@@ -527,14 +555,16 @@ class Indexer {
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-        // clang-cl delays template body parsing, so a pattern in a unit that
-        // never instantiated it has no body and no closing brace to report. Such
-        // a unit does not own the definition; the unit that instantiated it does,
-        // and only that one carries the real source extent.
+        // A primary template body is source for its dependent member uses, but
+        // its definition is not a concrete emitted function that owns a reccmp
+        // FUNCTION marker. Keep its marker-join row declaration-only; an emitted
+        // specialization carries the concrete function identity and extent.
         {"is_definition",
-         function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed()},
+         function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed() &&
+             !function->getDescribedFunctionTemplate()},
     };
     emit(std::move(record));
+    emitMemberUses(function, functionIdentity, qualifiedName, location);
   }
 
   // One variable definition or declaration. Parameters are VarDecls too,
@@ -575,13 +605,362 @@ class Indexer {
     return method && method->isVirtual();
   }
 
+  class MemberUseVisitor : public RecursiveASTVisitor<MemberUseVisitor> {
+   public:
+    MemberUseVisitor(Indexer& indexer, llvm::StringRef functionIdentity,
+                     llvm::StringRef functionName,
+                     const Location& functionLocation)
+        : indexer_(indexer),
+          functionIdentity_(functionIdentity),
+          functionName_(functionName),
+          functionLocation_(functionLocation) {}
+
+    bool VisitMemberExpr(MemberExpr* expression) {
+      const auto* field = dyn_cast<FieldDecl>(expression->getMemberDecl());
+      if (field) emitResolved(expression, field);
+      return true;
+    }
+
+    bool VisitCXXDependentScopeMemberExpr(CXXDependentScopeMemberExpr* expression) {
+      Location useLocation = indexer_.locate(expression->getMemberLoc());
+      std::string owner = indexer_.typeName(expression->getBaseType());
+      std::string name = expression->getMember().getAsString();
+      emit(nullptr, expression, useLocation, owner, name, "", "", nullptr);
+      return true;
+    }
+
+   private:
+    static bool contains(const Stmt* root, const Stmt* sought) {
+      if (!root) return false;
+      if (root == sought) return true;
+      for (const Stmt* child : root->children()) {
+        if (contains(child, sought)) return true;
+      }
+      return false;
+    }
+
+    static bool transparent(const Stmt* statement) {
+      return isa<CastExpr>(statement) || isa<ParenExpr>(statement) ||
+             isa<ExprWithCleanups>(statement) ||
+             isa<MaterializeTemporaryExpr>(statement) ||
+             isa<CXXBindTemporaryExpr>(statement) || isa<ConstantExpr>(statement) ||
+             isa<CXXDefaultArgExpr>(statement) || isa<CXXDefaultInitExpr>(statement);
+    }
+
+    std::vector<const Stmt*> parents(const Stmt* statement) const {
+      std::vector<const Stmt*> result;
+      DynTypedNode current = DynTypedNode::create(*statement);
+      for (unsigned depth = 0; depth < 128; ++depth) {
+        DynTypedNodeList found = indexer_.context_.getParents(current);
+        if (found.empty()) break;
+        const Stmt* parent = nullptr;
+        for (const DynTypedNode& candidate : found) {
+          if ((parent = candidate.get<Stmt>())) break;
+        }
+        if (!parent) break;
+        result.push_back(parent);
+        current = DynTypedNode::create(*parent);
+      }
+      return result;
+    }
+
+    static bool isNonEvaluated(const std::vector<const Stmt*>& ancestors) {
+      for (const Stmt* ancestor : ancestors) {
+        if (const auto* unary = dyn_cast<UnaryExprOrTypeTraitExpr>(ancestor)) {
+          if (unary->getKind() == UETT_SizeOf || unary->getKind() == UETT_AlignOf)
+            return true;
+        }
+        if (isa<CXXNoexceptExpr>(ancestor) || isa<TypeTraitExpr>(ancestor)) return true;
+      }
+      return false;
+    }
+
+    static std::string integerValue(const Expr* expression) {
+      expression = expression->IgnoreParenImpCasts();
+      bool negative = false;
+      if (const auto* unary = dyn_cast<UnaryOperator>(expression)) {
+        if (unary->getOpcode() == UO_Minus) {
+          negative = true;
+          expression = unary->getSubExpr()->IgnoreParenImpCasts();
+        }
+      }
+      const auto* integer = dyn_cast<IntegerLiteral>(expression);
+      if (!integer) return "";
+      std::string value = llvm::toString(integer->getValue(), 10, true);
+      return negative ? "-" + value : value;
+    }
+
+    void addArrayIndex(const ArraySubscriptExpr* subscript,
+                       llvm::json::Array& indices) const {
+      std::string value = integerValue(subscript->getIdx());
+      llvm::json::Object index{{"constant", !value.empty()}};
+      if (!value.empty()) index["value"] = value;
+      indices.push_back(std::move(index));
+    }
+
+    static bool isAssignmentOperatorOverload(const CXXOperatorCallExpr* call) {
+      OverloadedOperatorKind kind = call->getOperator();
+      return kind == OO_Equal || kind == OO_PlusEqual || kind == OO_MinusEqual ||
+             kind == OO_StarEqual || kind == OO_SlashEqual || kind == OO_PercentEqual ||
+             kind == OO_AmpEqual || kind == OO_PipeEqual || kind == OO_CaretEqual ||
+             kind == OO_LessLessEqual || kind == OO_GreaterGreaterEqual;
+    }
+
+    static bool isCompoundAssignment(OverloadedOperatorKind kind) {
+      return kind != OO_Equal;
+    }
+
+    void classifyMemoryCall(const CallExpr* call, const Expr* member,
+                            std::set<std::string>& operations) const {
+      const FunctionDecl* callee = call->getDirectCallee();
+      if (!callee) return;
+      std::string name = callee->getQualifiedNameAsString();
+      std::string lowered = llvm::StringRef(name).lower();
+      int destination = -1;
+      int source = -1;
+      if (lowered == "memcpy" || lowered == "std::memcpy" || lowered == "memmove" ||
+          lowered == "std::memmove" || lowered == "strcpy" || lowered == "strncpy") {
+        destination = 0;
+        source = 1;
+      } else if (lowered == "memcpy_s" || lowered == "memmove_s") {
+        destination = 0;
+        source = 2;
+      } else if (lowered == "memset" || lowered == "std::memset") {
+        destination = 0;
+      } else if (lowered == "std::copy" || lowered == "copy" ||
+                 lowered == "std::copy_n" || lowered == "copy_n") {
+        source = 0;
+        destination = 2;
+      } else if (lowered == "std::copy_backward" || lowered == "copy_backward") {
+        source = 0;
+        destination = 2;
+      }
+      if (destination >= 0 && static_cast<unsigned>(destination) < call->getNumArgs() &&
+          contains(call->getArg(destination), member)) {
+        operations.insert("copy-memory-destination");
+      }
+      if (source >= 0 && static_cast<unsigned>(source) < call->getNumArgs() &&
+          contains(call->getArg(source), member)) {
+        operations.insert("copy-memory-source");
+      }
+    }
+
+    void emitResolved(const MemberExpr* expression, const FieldDecl* field) {
+      const CXXRecordDecl* owner = dyn_cast<CXXRecordDecl>(field->getParent());
+      if (owner) {
+        const CXXRecordDecl* definition =
+            dyn_cast<CXXRecordDecl>(owner->getDefinition());
+        owner = definition ? definition : owner->getCanonicalDecl();
+      }
+      std::string ownerName;
+      if (owner) {
+        llvm::raw_string_ostream stream(ownerName);
+        owner->printQualifiedName(stream, indexer_.policy_);
+        stream.flush();
+      }
+      Location declarationLocation = indexer_.locate(field);
+      Location useLocation = indexer_.locate(expression->getMemberLoc());
+      const std::string ownerIdentity = owner ? indexer_.declarationUsr(owner) : "";
+      const std::string fieldUsr = indexer_.declarationUsr(field);
+      const std::string identityOwner = ownerIdentity.empty() ? "unknown-owner" : ownerIdentity;
+      const std::string fieldIdentity =
+          identityOwner + "::field@" + relative(declarationLocation.file) + ":" +
+          std::to_string(declarationLocation.line) + ":" +
+          std::to_string(declarationLocation.column) + ":" +
+          std::to_string(field->getFieldIndex());
+      emit(field, expression, useLocation, ownerName, field->getNameAsString(),
+           ownerIdentity, fieldUsr, &declarationLocation, fieldIdentity);
+    }
+
+    void emit(const FieldDecl* field, const Expr* expression,
+              const Location& useLocation, llvm::StringRef ownerName,
+              llvm::StringRef fieldName, llvm::StringRef ownerIdentity,
+              llvm::StringRef fieldUsr, const Location* declarationLocation,
+              llvm::StringRef fieldIdentity = "") {
+      std::vector<const Stmt*> ancestors = parents(expression);
+      std::set<std::string> operations;
+      llvm::json::Array arrayIndices;
+      llvm::json::Array conversions;
+      std::string conversionSource = field ? indexer_.canonicalName(expression->getType()) :
+                                             indexer_.canonicalName(expression->getType());
+      for (const Stmt* ancestor : ancestors) {
+        if (const auto* cast = dyn_cast<CastExpr>(ancestor)) {
+          std::string destination = indexer_.canonicalName(cast->getType());
+          if (destination != conversionSource) {
+            conversions.push_back(llvm::json::Object{
+                {"kind", cast->getCastKindName()},
+                {"source_type", conversionSource},
+                {"destination_type", destination},
+            });
+          }
+          conversionSource = destination;
+        }
+        if (const auto* subscript = dyn_cast<ArraySubscriptExpr>(ancestor)) {
+          if (contains(subscript->getBase(), expression)) {
+            operations.insert("array-index");
+            addArrayIndex(subscript, arrayIndices);
+          }
+        }
+        if (const auto* unary = dyn_cast<UnaryOperator>(ancestor)) {
+          if (!contains(unary->getSubExpr(), expression)) continue;
+          if (unary->getOpcode() == UO_AddrOf) operations.insert("address-taken");
+          if (unary->isIncrementDecrementOp()) {
+            operations.insert("read");
+            operations.insert("write");
+          }
+        }
+        if (const auto* binary = dyn_cast<BinaryOperator>(ancestor)) {
+          if (!binary->isAssignmentOp()) continue;
+          if (contains(binary->getLHS(), expression)) {
+            operations.insert("write");
+            if (binary->isCompoundAssignmentOp()) operations.insert("read");
+            if (binary->getLHS()->IgnoreParenImpCasts() == expression &&
+                (expression->getType()->isRecordType() || expression->getType()->isArrayType())) {
+              operations.insert("copy-memory-destination");
+            }
+          }
+          if (contains(binary->getRHS(), expression)) {
+            operations.insert("read");
+            if (binary->getRHS()->IgnoreParenImpCasts() == expression &&
+                (expression->getType()->isRecordType() || expression->getType()->isArrayType())) {
+              operations.insert("copy-memory-source");
+            }
+          }
+        }
+        if (const auto* overload = dyn_cast<CXXOperatorCallExpr>(ancestor)) {
+          if (isAssignmentOperatorOverload(overload) && overload->getNumArgs() > 1) {
+            if (contains(overload->getArg(0), expression)) {
+              operations.insert("write");
+              if (isCompoundAssignment(overload->getOperator())) operations.insert("read");
+              if (overload->getOperator() == OO_Equal &&
+                  overload->getArg(0)->IgnoreParenImpCasts() == expression &&
+                  expression->getType()->isRecordType()) {
+                operations.insert("copy-memory-destination");
+              }
+            }
+            if (contains(overload->getArg(1), expression)) {
+              operations.insert("read");
+              if (overload->getOperator() == OO_Equal &&
+                  overload->getArg(1)->IgnoreParenImpCasts() == expression &&
+                  expression->getType()->isRecordType()) {
+                operations.insert("copy-memory-source");
+              }
+            }
+          }
+        }
+        if (const auto* call = dyn_cast<CallExpr>(ancestor)) {
+          classifyMemoryCall(call, expression, operations);
+        }
+        if (const auto* outerMember = dyn_cast<MemberExpr>(ancestor)) {
+          if (contains(outerMember->getBase(), expression)) operations.insert("member-base");
+        }
+      }
+
+      if (isNonEvaluated(ancestors)) operations.insert("unevaluated");
+      const bool hasArrayUse = operations.find("array-index") != operations.end();
+      const bool hasWrite = operations.find("write") != operations.end();
+      const bool hasAddress = operations.find("address-taken") != operations.end();
+      const bool memberBase = operations.find("member-base") != operations.end();
+      if (hasArrayUse && !hasWrite) operations.insert("read");
+      if (!hasWrite && !hasAddress && !memberBase &&
+          operations.find("read") == operations.end() &&
+          operations.find("unevaluated") == operations.end()) {
+        operations.insert("read");
+      }
+
+      llvm::json::Array operationList;
+      for (const std::string& operation : operations) operationList.push_back(operation);
+
+      int64_t offsetBits = -1;
+      int64_t extentBits = -1;
+      if (field) {
+        const CXXRecordDecl* owner = dyn_cast<CXXRecordDecl>(field->getParent());
+        if (owner) {
+          const CXXRecordDecl* definition =
+              dyn_cast<CXXRecordDecl>(owner->getDefinition());
+          owner = definition ? definition : owner;
+        }
+        if (owner && !owner->isDependentType() && owner->isCompleteDefinition() &&
+            !field->isInvalidDecl()) {
+          const ASTRecordLayout& layout = indexer_.context_.getASTRecordLayout(owner);
+          offsetBits = static_cast<int64_t>(layout.getFieldOffset(field->getFieldIndex()));
+          if (field->isBitField()) {
+            extentBits = static_cast<int64_t>(field->getBitWidthValue(indexer_.context_));
+          } else if (!field->getType()->isIncompleteType() &&
+                     field->getType()->isConstantSizeType()) {
+            extentBits = static_cast<int64_t>(indexer_.context_.getTypeSize(field->getType()));
+          }
+        }
+      }
+      llvm::json::Object record{
+          {"record", "member-use"},
+          {"owner_identity", ownerIdentity.empty() ? llvm::json::Value(nullptr)
+                                                   : llvm::json::Value(ownerIdentity.str())},
+          {"owner_status", ownerIdentity.empty() ? "unknown" : "resolved"},
+          {"owner", ownerName.str()},
+          {"field_identity", fieldIdentity.empty()
+                                 ? ("unknown-owner::field@" + relative(useLocation.file) + ":" +
+                                    std::to_string(useLocation.line) + ":" +
+                                    std::to_string(useLocation.column) + ":" + fieldName.str())
+                                 : fieldIdentity.str()},
+          {"field_usr", fieldUsr.empty() ? llvm::json::Value(nullptr)
+                                         : llvm::json::Value(fieldUsr.str())},
+          {"name", fieldName.str()},
+          {"declaration_file", declarationLocation ? relative(declarationLocation->file) : ""},
+          {"declaration_line", declarationLocation ? declarationLocation->line : 0},
+          {"declaration_column", declarationLocation ? declarationLocation->column : 0},
+          {"declaration_offset", declarationLocation ? llvm::json::Value(declarationLocation->offset)
+                                                       : llvm::json::Value(nullptr)},
+          {"offset_bits", offsetBits >= 0 ? llvm::json::Value(offsetBits)
+                                          : llvm::json::Value(nullptr)},
+          {"extent_bits", extentBits >= 0 ? llvm::json::Value(extentBits)
+                                          : llvm::json::Value(nullptr)},
+          {"offset_bytes", offsetBits >= 0 && offsetBits % 8 == 0
+                               ? llvm::json::Value(offsetBits / 8)
+                               : llvm::json::Value(nullptr)},
+          {"extent_bytes", extentBits >= 0 && extentBits % 8 == 0
+                               ? llvm::json::Value(extentBits / 8)
+                               : llvm::json::Value(nullptr)},
+          {"declared_type", field ? indexer_.canonicalName(field->getType())
+                                    : indexer_.canonicalName(expression->getType())},
+          {"function_identity", functionIdentity_.str()},
+          {"function", functionName_.str()},
+          {"function_file", relative(functionLocation_.file)},
+          {"function_line", functionLocation_.line},
+          {"use_file", relative(useLocation.file)},
+          {"use_line", useLocation.line},
+          {"use_column", useLocation.column},
+          {"use_offset", useLocation.offset >= 0 ? llvm::json::Value(useLocation.offset)
+                                                 : llvm::json::Value(nullptr)},
+          {"operations", std::move(operationList)},
+          {"array_indices", std::move(arrayIndices)},
+          {"conversions", std::move(conversions)},
+      };
+      indexer_.emit(std::move(record));
+    }
+
+    Indexer& indexer_;
+    llvm::StringRef functionIdentity_;
+    llvm::StringRef functionName_;
+    Location functionLocation_;
+  };
+
+  void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
+                      llvm::StringRef functionName, const Location& functionLocation) {
+    if (!function->doesThisDeclarationHaveABody()) return;
+    MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
+    visitor.TraverseStmt(function->getBody());
+  }
+
   void emitClass(const CXXRecordDecl* record, llvm::StringRef qualifiedName,
                  const Location& location) {
     llvm::json::Array bases;
     for (const CXXBaseSpecifier& base : record->bases()) bases.push_back(typeName(base.getType()));
 
     const ASTRecordLayout* layout = nullptr;
-    if (record->isCompleteDefinition()) layout = &context_.getASTRecordLayout(record);
+    if (record->isCompleteDefinition() && !record->isDependentType()) {
+      layout = &context_.getASTRecordLayout(record);
+    }
 
     llvm::json::Array fields;
     for (const FieldDecl* field : record->fields()) {

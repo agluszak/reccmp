@@ -28,15 +28,6 @@ from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
 _SCHEMA = "reccmp-source-index-v6"
-_SUPPORTED_SCHEMAS = frozenset(
-    {
-        _SCHEMA,
-        "reccmp-source-index-v5",
-        "reccmp-source-index-v4",
-        "reccmp-source-index-v3",
-        "reccmp-source-index-v2",
-    }
-)
 
 
 class SourceIndexError(ValueError):
@@ -128,6 +119,58 @@ class SourceField:
     # Physical storage of one array element: scalar, pointer, reference,
     # embedded_record, array.
     array_element_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceArrayIndex:
+    """One source array selector observed at a member use."""
+
+    constant: bool
+    value: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceConversion:
+    """One Clang conversion surrounding a member expression."""
+
+    kind: str
+    source_type: str
+    destination_type: str
+
+
+@dataclass(frozen=True)
+# pylint: disable=too-many-instance-attributes
+class SourceMemberUse:
+    """One compiler-resolved field use in a source function body."""
+
+    owner_identity: str | None
+    owner_status: str
+    owner: str
+    field_identity: str
+    field_usr: str | None
+    name: str
+    declaration_file: str
+    declaration_line: int
+    declaration_column: int
+    declaration_offset: int | None
+    offset_bits: int | None
+    extent_bits: int | None
+    offset_bytes: int | None
+    extent_bytes: int | None
+    declared_type: str
+    function_identity: str
+    function: str
+    function_file: str
+    function_line: int
+    use_file: str
+    use_line: int
+    use_column: int
+    use_offset: int | None
+    operations: tuple[str, ...]
+    array_indices: tuple[SourceArrayIndex, ...]
+    conversions: tuple[SourceConversion, ...]
+    unit_id: str = ""
+    target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +273,7 @@ class _NamespaceRecords:
     declarations: tuple[SourceDeclaration, ...]
     variables: tuple[SourceVariable, ...]
     classes: tuple[SourceClass, ...]
+    member_uses: tuple[SourceMemberUse, ...]
     conflicts: tuple[SourceConflict, ...]
     size_assertions: dict[str, int]
     abi: SourceAbi | None = None
@@ -247,6 +291,7 @@ class TranslationUnitRecords:
     declarations: list[SourceDeclaration] = field(default_factory=list)
     variables: list[SourceVariable] = field(default_factory=list)
     classes: list[SourceClass] = field(default_factory=list)
+    member_uses: list[SourceMemberUse] = field(default_factory=list)
     size_assertions: list[_SizeAssertion] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     abi: SourceAbi | None = None
@@ -275,6 +320,10 @@ class TranslationUnitRecords:
                 self.variables.append(variable)
         elif kind == "class":
             self.classes.append(_class_from_dict({**values, "unit_id": self.unit_id}))
+        elif kind == "member-use":
+            self.member_uses.append(
+                _member_use_from_dict({**values, "unit_id": self.unit_id})
+            )
         elif kind == "size-assertion":
             self.size_assertions.append(
                 _SizeAssertion(
@@ -333,6 +382,7 @@ def derive_namespace(
     declarations = [item for unit in selected for item in unit.declarations]
     variables = [item for unit in selected for item in unit.variables]
     classes = [item for unit in selected for item in unit.classes]
+    member_uses = [item for unit in selected for item in unit.member_uses]
     assertions = [item for unit in selected for item in unit.size_assertions]
 
     derived_declarations, declaration_conflicts = _derive_entities(
@@ -350,6 +400,7 @@ def derive_namespace(
         target=target,
     )
     derived_classes, class_conflicts = _derive_classes(classes, target=target)
+    derived_member_uses = _derive_member_uses(member_uses, target=target)
     size_assertions = _derive_size_assertions(assertions)
     abi = _derive_abi(selected)
     return _NamespaceRecords(
@@ -359,10 +410,42 @@ def derive_namespace(
             _apply_asserted_size(item, size_assertions.get(item.qualified_name))
             for item in derived_classes
         ),
+        member_uses=derived_member_uses,
         conflicts=declaration_conflicts + variable_conflicts + class_conflicts,
         size_assertions=size_assertions,
         abi=abi,
     )
+
+
+def _member_use_key(item: SourceMemberUse) -> tuple[Any, ...]:
+    """Deduplicate a repeated header observation without collapsing functions."""
+    return (
+        item.target or "",
+        item.owner_identity or "",
+        item.field_identity,
+        item.function_identity,
+        item.use_file,
+        item.use_line,
+        item.use_column,
+        item.use_offset if item.use_offset is not None else -1,
+        item.operations,
+        tuple((index.constant, index.value or "") for index in item.array_indices),
+        tuple(
+            (conversion.kind, conversion.source_type, conversion.destination_type)
+            for conversion in item.conversions
+        ),
+    )
+
+
+def _derive_member_uses(
+    observations: Sequence[SourceMemberUse], *, target: str | None
+) -> tuple[SourceMemberUse, ...]:
+    """Attach the target namespace and collapse identical repeated-TU rows."""
+    unique: dict[tuple[Any, ...], SourceMemberUse] = {}
+    for item in observations:
+        projected = replace(item, target=target) if target is not None else item
+        unique.setdefault(_member_use_key(projected), projected)
+    return tuple(unique[key] for key in sorted(unique))
 
 
 # Test/fixture helper: accumulate observations across units without merging.
@@ -388,6 +471,10 @@ class SourceCollector:
     @property
     def variables(self) -> list[SourceVariable]:
         return [item for unit in self.units.values() for item in unit.variables]
+
+    @property
+    def member_uses(self) -> list[SourceMemberUse]:
+        return [item for unit in self.units.values() for item in unit.member_uses]
 
     def derive(
         self, *, target: str | None = None, unit_ids: set[str] | None = None
@@ -612,6 +699,11 @@ def record_command(
         indexer,
         compiler,
         *filtered[:separator],
+        # clang-cl defers primary template bodies until instantiation by
+        # default. The source-use index needs the original dependent
+        # expressions too, so collect from Clang's eager AST while keeping
+        # function ownership rules separate from body availability.
+        "-fno-delayed-template-parsing",
         "-fsyntax-only",
         *filtered[separator:],
     ]
@@ -627,6 +719,44 @@ def _declaration_from_dict(values: Mapping[str, Any]) -> SourceDeclaration:
 
 def _variable_from_dict(values: Mapping[str, Any]) -> SourceVariable:
     return SourceVariable(**dict(values))
+
+
+def _member_use_from_dict(values: Mapping[str, Any]) -> SourceMemberUse:
+    data = dict(values)
+    data["operations"] = tuple(data.get("operations") or ())
+    data["array_indices"] = tuple(
+        SourceArrayIndex(
+            constant=bool(item.get("constant")),
+            value=(str(item["value"]) if item.get("value") is not None else None),
+        )
+        for item in data.get("array_indices") or ()
+    )
+    data["conversions"] = tuple(
+        SourceConversion(
+            kind=str(item.get("kind") or ""),
+            source_type=str(item.get("source_type") or ""),
+            destination_type=str(item.get("destination_type") or ""),
+        )
+        for item in data.get("conversions") or ()
+    )
+    for key in (
+        "owner_identity",
+        "field_usr",
+        "declaration_offset",
+        "offset_bits",
+        "extent_bits",
+        "offset_bytes",
+        "extent_bytes",
+        "use_offset",
+    ):
+        if (
+            key in data
+            and data[key] is not None
+            and key not in ("owner_identity", "field_usr")
+        ):
+            data[key] = int(data[key])
+    data.pop("record", None)
+    return SourceMemberUse(**data)
 
 
 def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:
@@ -925,6 +1055,7 @@ class SourceIndex:
         classes: Iterable[SourceClass],
         markers: Iterable[SourceMarker],
         variables: Iterable[SourceVariable] = (),
+        member_uses: Iterable[SourceMemberUse] = (),
         conflicts: Iterable[SourceConflict] = (),
         abi: SourceAbi | None = None,
         target_abis: Mapping[str, SourceAbi] | None = None,
@@ -937,6 +1068,7 @@ class SourceIndex:
             sorted(markers, key=lambda item: (item.address, item.source_file))
         )
         self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
+        self.member_uses = tuple(sorted(member_uses, key=_member_use_key))
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
         self.abi = abi
         self.target_abis: dict[str, SourceAbi] = dict(target_abis or {})
@@ -972,6 +1104,9 @@ class SourceIndex:
             targets_present.update(
                 item.target for item in self.declarations if item.target is not None
             )
+            targets_present.update(
+                item.target for item in self.member_uses if item.target is not None
+            )
             if not targets_present or targets_present == {target}:
                 abi = self.abi
         return SourceIndex(
@@ -979,6 +1114,7 @@ class SourceIndex:
             classes=(item for item in self.classes if item.target == target),
             markers=(item for item in self.markers if item.target == target),
             variables=(item for item in self.variables if item.target == target),
+            member_uses=(item for item in self.member_uses if item.target == target),
             conflicts=(item for item in self.conflicts if item.target == target),
             abi=abi,
             target_abis={target: abi} if abi is not None else {},
@@ -1190,6 +1326,7 @@ class SourceIndex:
             classes=classes,
             markers=markers,
             variables=namespace.variables,
+            member_uses=namespace.member_uses,
             conflicts=namespace.conflicts,
             abi=namespace.abi,
         )
@@ -1218,9 +1355,6 @@ class SourceIndex:
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records."""
-        schema = document.get("schema")
-        if schema not in _SUPPORTED_SCHEMAS:
-            raise SourceIndexError("unsupported source-index schema")
         declarations = tuple(
             _declaration_from_dict(item) for item in document["declarations"]
         )
@@ -1242,12 +1376,11 @@ class SourceIndex:
             declarations=declarations,
             classes=(_class_from_dict(item) for item in document["classes"]),
             markers=markers,
-            variables=(
-                _variable_from_dict(item) for item in document.get("variables", ())
+            variables=(_variable_from_dict(item) for item in document["variables"]),
+            member_uses=(
+                _member_use_from_dict(item) for item in document["member_uses"]
             ),
-            conflicts=(
-                _conflict_from_dict(item) for item in document.get("conflicts", ())
-            ),
+            conflicts=(_conflict_from_dict(item) for item in document["conflicts"]),
             abi=(
                 SourceAbi(**document["abi"])
                 if isinstance(document.get("abi"), Mapping)
@@ -1324,6 +1457,7 @@ class SourceIndex:
             "declarations": [asdict(item) for item in self.declarations],
             "classes": [asdict(item) for item in self.classes],
             "variables": [asdict(item) for item in self.variables],
+            "member_uses": [asdict(item) for item in self.member_uses],
             "conflicts": [asdict(item) for item in self.conflicts],
         }
         if self.abi is not None:

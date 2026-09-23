@@ -136,6 +136,7 @@ def test_the_index_command_keeps_the_build_arguments_and_drops_the_ast_dump() ->
 
     assert command[:2] == ["/indexer/indexer", "/usr/bin/clang-cl"]
     assert "-ast-dump=json" not in command
+    assert "-fno-delayed-template-parsing" in command
     # The build's own -Xclang option and its argument both survive, and the
     # source file stays behind the driver's end-of-options separator.
     assert command.count("-Xclang") == 1

@@ -21,6 +21,7 @@ from .index import (
     SourceDeclaration,
     SourceIndex,
     SourceIndexError,
+    _member_use_key,
     TranslationUnitRecords,
     record_command,
     relative_unit_id,
@@ -386,12 +387,16 @@ def collect_compile_database(
                 declarations.setdefault(
                     (declaration.target, declaration.merge_key), declaration
                 )
+        member_uses = {
+            _member_use_key(item): item for part in indexes for item in part.member_uses
+        }
 
         result = SourceIndex(
             declarations=declarations.values(),
             classes=classes.values(),
             markers=(item for part in indexes for item in part.markers),
             variables=variables.values(),
+            member_uses=member_uses.values(),
             conflicts=conflicts.values(),
             abi=_merged_abi(indexes),
             target_abis={

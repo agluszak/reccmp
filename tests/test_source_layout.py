@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
@@ -407,36 +409,12 @@ def test_asserted_size_mismatch_untrusts_layout():
     assert namespace.classes[0].layout_trusted is False
 
 
-def test_v3_schema_loads_without_layout_fields():
-    document = {
-        "schema": "reccmp-source-index-v3",
-        "declarations": [],
-        "markers": [],
-        "classes": [
-            {
-                "semantic_id": "record:Foo",
-                "qualified_name": "Foo",
-                "bases": [],
-                "fields": [
-                    {
-                        "name": "x",
-                        "type": "int",
-                        "source_file": "a.h",
-                        "line": 1,
-                    }
-                ],
-                "virtual_declarations": [],
-                "source_file": "a.h",
-                "line": 1,
-                "end_line": 2,
-            }
-        ],
-    }
-    index = SourceIndex.from_dict(document)
-    assert index.classes[0].size is None
-    assert index.classes[0].fields[0].offset is None
-    assert index.classes[0].layout_trusted is None
-    assert index.to_dict()["schema"] == "reccmp-source-index-v6"
+def test_source_index_reader_fails_when_a_field_is_missing():
+    document = SourceIndex(declarations=(), classes=(), markers=()).to_dict()
+    del document["member_uses"]
+
+    with pytest.raises(KeyError, match="member_uses"):
+        SourceIndex.from_dict(document)
 
 
 def test_unit_abi_round_trips_in_index_projection():
