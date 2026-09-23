@@ -1,5 +1,6 @@
 import difflib
 from reccmp.compare.asm.fixes import analyze_effective_match
+from reccmp.compare.diagnosis import ComparisonStatus
 
 
 def is_effective_match(*args, **kwargs) -> bool:
@@ -7,8 +8,8 @@ def is_effective_match(*args, **kwargs) -> bool:
     return analyze_effective_match(*args, **kwargs).is_effective
 
 
-def test_semantic_similarity_can_be_lower_than_raw_similarity():
-    """Unreachable textual matches must not raise the reachable semantic score."""
+def test_unreachable_textual_matches_do_not_hide_a_mismatch():
+    """A near-perfect display ratio from unreachable code is still a mismatch."""
     orig_asm = ["mov eax, 1", "ret"] + ["mov ecx, ecx"] * 100
     recomp_asm = ["mov eax, 2", "ret"] + ["mov ecx, ecx"] * 100
     diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
@@ -24,7 +25,7 @@ def test_semantic_similarity_can_be_lower_than_raw_similarity():
     )
 
     assert diff.ratio() > 0.99
-    assert analysis.semantic_similarity == 0.5
+    assert analysis.status == ComparisonStatus.MISMATCH
 
 
 def test_fix_cmp_jmp():

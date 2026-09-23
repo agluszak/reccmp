@@ -208,7 +208,7 @@ def test_immediate_value_difference():
     assert result.difference.orig.facts["value"] == 4
 
 
-def test_mismatch_analysis_carries_diagnostic_semantic_similarity():
+def test_register_renamed_constant_difference_is_a_mismatch():
     orig = [
         "mov eax, dword ptr [ebp - 4]",
         "add eax, 5",
@@ -232,7 +232,6 @@ def test_mismatch_analysis_carries_diagnostic_semantic_similarity():
     )
     assert result.status == ComparisonStatus.MISMATCH
     assert result.difference.kind == "immediate_value"
-    assert result.semantic_similarity == 0.75
 
 
 def test_branch_condition_difference():

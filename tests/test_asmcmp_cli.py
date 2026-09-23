@@ -7,11 +7,9 @@ from reccmp.compare.diagnosis import (
     ComparisonDifference,
     DifferenceSide,
 )
-from reccmp.compare.report import ReccmpComparedEntity
 from reccmp.tools.asmcmp import (
     inconclusive_diagnostic_text,
     parse_args,
-    semantic_similarity_text,
     triage_status_note,
 )
 
@@ -61,29 +59,6 @@ def test_triage_note_exact_and_mismatch_have_no_gloss():
         DifferenceSide(0, 0x501000, {}),
     )
     assert triage_status_note(ComparisonAnalysis.mismatch(difference)) is None
-
-
-def test_semantic_similarity_text_keeps_raw_score_visible():
-    difference = ComparisonDifference(
-        "memory_value",
-        DifferenceSide(1, 0x401002, {}),
-        DifferenceSide(1, 0x501002, {}),
-    )
-    match = ReccmpComparedEntity(
-        0x401000,
-        "Example",
-        0.25,
-        analysis=ComparisonAnalysis.mismatch(
-            difference,
-            semantic_similarity=0.75,
-        ),
-    )
-    text = semantic_similarity_text(match)
-    assert text is not None
-    assert "75.00%" in text
-    assert "semantic similarity (diagnostic" in text
-    assert "25.00%" in text
-    assert "raw" in text
 
 
 def test_inconclusive_diagnostic_renders_reason_location_and_facts():

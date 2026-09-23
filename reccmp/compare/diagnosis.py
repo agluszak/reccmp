@@ -173,9 +173,6 @@ class ComparisonAnalysis:
     difference: ComparisonDifference | None = None
     inconclusive_reason: str | None = None
     inconclusive_location: DifferenceSide | None = None
-    # Diagnostic repair-distance estimate.  This is deliberately separate
-    # from status: only EXACT/EFFECTIVE are proofs of semantic equivalence.
-    semantic_similarity: float | None = None
 
     def __post_init__(self) -> None:
         normalized = normalize_effective_reasons(self.effective_reasons)
@@ -198,18 +195,6 @@ class ComparisonAnalysis:
             and self.inconclusive_location is not None
         ):
             raise ValueError("Only inconclusive results carry an analysis location")
-        if self.semantic_similarity is not None:
-            if not 0.0 <= self.semantic_similarity <= 1.0:
-                raise ValueError("Semantic similarity must be between zero and one")
-            if self.status == ComparisonStatus.INCONCLUSIVE:
-                raise ValueError(
-                    "Inconclusive results cannot carry semantic similarity"
-                )
-            if (
-                self.status == ComparisonStatus.MISMATCH
-                and self.semantic_similarity == 1.0
-            ):
-                raise ValueError("A mismatch cannot have 100% semantic similarity")
 
     @property
     def is_effective(self) -> bool:
@@ -217,27 +202,15 @@ class ComparisonAnalysis:
 
     @classmethod
     def exact(cls) -> "ComparisonAnalysis":
-        return cls(ComparisonStatus.EXACT, semantic_similarity=1.0)
+        return cls(ComparisonStatus.EXACT)
 
     @classmethod
     def effective(cls, reasons) -> "ComparisonAnalysis":
-        return cls(
-            ComparisonStatus.EFFECTIVE,
-            tuple(reasons),
-            semantic_similarity=1.0,
-        )
+        return cls(ComparisonStatus.EFFECTIVE, tuple(reasons))
 
     @classmethod
-    def mismatch(
-        cls,
-        difference: ComparisonDifference,
-        semantic_similarity: float | None = None,
-    ) -> "ComparisonAnalysis":
-        return cls(
-            ComparisonStatus.MISMATCH,
-            difference=difference,
-            semantic_similarity=semantic_similarity,
-        )
+    def mismatch(cls, difference: ComparisonDifference) -> "ComparisonAnalysis":
+        return cls(ComparisonStatus.MISMATCH, difference=difference)
 
     @classmethod
     def inconclusive(

@@ -396,9 +396,7 @@ class FunctionComparator:
                         {**recomp_side.facts, **recomp_layout},
                     )
             enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
-            return ComparisonAnalysis.mismatch(
-                enriched, semantic_similarity=analysis.semantic_similarity
-            )
+            return ComparisonAnalysis.mismatch(enriched)
         if (
             analysis.status == ComparisonStatus.INCONCLUSIVE
             and analysis.inconclusive_location is not None

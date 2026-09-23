@@ -6,7 +6,6 @@ from reccmp.compare.asm.effective import (
     FunctionMetadata,
     LineEffects,
     effects_conflict,
-    estimate_isomorphic_cfg_semantic_similarity,
     flags_dead_at,
     sequence_effects,
     verify_cfg_effective_match,
@@ -252,38 +251,14 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
 
-    def failure(recorder: AnalysisRecorder) -> ComparisonAnalysis:
-        analysis = recorder.failure_analysis()
-        if (
-            analysis.status == ComparisonStatus.MISMATCH
-            and analysis.difference is not None
-            and full_orig_targets is not None
-            and full_recomp_targets is not None
-        ):
-            similarity = estimate_isomorphic_cfg_semantic_similarity(
-                orig.displays,
-                recomp.displays,
-                full_orig_targets,
-                full_recomp_targets,
-                metadata=metadata,
-                orig_meta=orig_meta,
-                recomp_meta=recomp_meta,
-            )
-            if similarity is not None:
-                return ComparisonAnalysis.mismatch(
-                    analysis.difference,
-                    semantic_similarity=similarity,
-                )
-        return analysis
-
     # Only positional lockstep and the two CFG strategies establish trusted
     # program points. Diff alignment and relocation are proof-only.
     if cfg_attempted and cfg.best_difference is not None:
-        return failure(cfg)
+        return cfg.failure_analysis()
     if lockstep.best_difference is not None:
-        return failure(lockstep)
+        return lockstep.failure_analysis()
     if iso_attempted and iso.best_difference is not None:
-        return failure(iso)
+        return iso.failure_analysis()
     if not cfg_attempted:
         cfg.mark_inconclusive("missing_metadata")
     for candidate in (iso, cfg, lockstep):

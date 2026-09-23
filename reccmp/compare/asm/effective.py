@@ -1871,8 +1871,6 @@ def _discharge_run_obligations(
     recorder: AnalysisRecorder | None,
     last_index_o: int | None = None,
     last_index_r: int | None = None,
-    *,
-    require_dead_registers: bool = True,
 ) -> bool:
     """Shared end-of-run admission checklist for every verifier strategy.
 
@@ -1880,51 +1878,46 @@ def _discharge_run_obligations(
     scratch); callee-saved and SP must match; callee-save swaps must balance;
     load-folding obligations and frame-slot layouts must hold; x87 depth and
     live slots must agree.
-
-    ``require_dead_registers`` is True for every strategy: CFG/iso now
-    propagate matched nodes and other relational obligations across
-    blocks, so callee-saved and dead-register discharge can run at ``ret``.
     """
     # pylint: disable=too-many-return-statements,too-many-branches,too-many-arguments
     # pylint: disable=too-many-positional-arguments
-    if require_dead_registers:
-        for family in FAMILIES:
-            if orig.regs[family] == recomp.regs[family]:
-                ctx.add_matched(orig.regs[family])
-        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-            if slot_o == slot_r:
-                ctx.add_matched(slot_o)
+    for family in FAMILIES:
+        if orig.regs[family] == recomp.regs[family]:
+            ctx.add_matched(orig.regs[family])
+    for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
+        if slot_o == slot_r:
+            ctx.add_matched(slot_o)
 
-        dead_register_difference = False
-        for family in FAMILIES:
-            value_o, value_r = orig.regs[family], recomp.regs[family]
-            if value_o == value_r:
+    dead_register_difference = False
+    for family in FAMILIES:
+        value_o, value_r = orig.regs[family], recomp.regs[family]
+        if value_o == value_r:
+            continue
+        if family not in CALLER_SAVED:
+            if recorder is not None:
+                summary_o, summary_r = _diagnostic_summaries(value_o, value_r)
+                recorder.record_difference(
+                    "preserved_state",
+                    last_index_o,
+                    last_index_r,
+                    {"register": family, "value": summary_o},
+                    {"register": family, "value": summary_r},
+                )
+            return False
+        if _ins_split_ok(value_o, value_r, ctx):
+            dead_register_difference = True
+            continue
+        for value in (value_o, value_r):
+            if _is_scratch(value):
+                dead_register_difference = True
                 continue
-            if family not in CALLER_SAVED:
+            if not _contained(value, ctx):
                 if recorder is not None:
-                    summary_o, summary_r = _diagnostic_summaries(value_o, value_r)
-                    recorder.record_difference(
-                        "preserved_state",
-                        last_index_o,
-                        last_index_r,
-                        {"register": family, "value": summary_o},
-                        {"register": family, "value": summary_r},
-                    )
+                    recorder.mark_inconclusive("analysis_limit")
                 return False
-            if _ins_split_ok(value_o, value_r, ctx):
-                dead_register_difference = True
-                continue
-            for value in (value_o, value_r):
-                if _is_scratch(value):
-                    dead_register_difference = True
-                    continue
-                if not _contained(value, ctx):
-                    if recorder is not None:
-                        recorder.mark_inconclusive("analysis_limit")
-                    return False
-                dead_register_difference = True
-        if dead_register_difference and "register_allocation" not in ctx.categories:
-            ctx.categories.add("dead_operation")
+            dead_register_difference = True
+    if dead_register_difference and "register_allocation" not in ctx.categories:
+        ctx.categories.add("dead_operation")
 
     if ctx.save_stack:
         if recorder is not None:
@@ -1945,13 +1938,10 @@ def _discharge_run_obligations(
         return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
-    if require_dead_registers:
-        for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-            if slot_o != slot_r:
-                if not (_contained(slot_o, ctx) and _contained(slot_r, ctx)):
-                    return False
-    elif orig.x87.known != recomp.x87.known:
-        return False
+    for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
+        if slot_o != slot_r:
+            if not (_contained(slot_o, ctx) and _contained(slot_r, ctx)):
+                return False
     return True
 
 
@@ -3535,7 +3525,6 @@ def verify_cfg_effective_match(
                 recorder,
                 ends[block] - 1,
                 ends[block] - 1,
-                require_dead_registers=True,
             ):
                 return False
         if last_kind == "code" and ends[block] == total:
@@ -4433,142 +4422,6 @@ def _align_block_lines(
     return result
 
 
-@dataclass
-class _SemanticSimilarityRecorder:
-    """Unique aligned units collected by the diagnostic recovery pass.
-
-    CFG blocks may execute more than once while their entry phis converge, so
-    units are keyed by instruction indices instead of counted per visit.  An
-    edit always wins over an earlier tentative match for the same unit.
-    """
-
-    matched: set[tuple[int, int]] = field(default_factory=set)
-    edits: set[tuple[int, int]] = field(default_factory=set)
-    completed: bool = False
-
-    def match(self, index_o: int, index_r: int) -> None:
-        key = (index_o, index_r)
-        if key not in self.edits:
-            self.matched.add(key)
-
-    def edit(self, index_o: int, index_r: int) -> None:
-        key = (index_o, index_r)
-        self.matched.discard(key)
-        self.edits.add(key)
-
-    def score(self) -> float | None:
-        total = len(self.matched) + len(self.edits)
-        if not self.completed or not self.edits or total == 0:
-            return None
-        return len(self.matched) / total
-
-
-def _changed_registers(before: SideState, after: SideState) -> list[str]:
-    return [family for family in FAMILIES if before.regs[family] != after.regs[family]]
-
-
-def _local_outputs_equivalent(
-    before_o: SideState,
-    before_r: SideState,
-    orig: SideState,
-    recomp: SideState,
-) -> bool:
-    """Whether a paired instruction produced the same canonical outputs.
-
-    Physical destination registers are ignored: only the multiset of newly
-    written symbolic values matters.  This is the local counterpart of the
-    full verifier's register-allocation proof.
-    """
-
-    changed_o = _changed_registers(before_o, orig)
-    changed_r = _changed_registers(before_r, recomp)
-    if sorted((orig.regs[f] for f in changed_o), key=repr) != sorted(
-        (recomp.regs[f] for f in changed_r), key=repr
-    ):
-        return False
-
-    for attr in ("flags", "carry", "fpu_flags"):
-        changed = getattr(before_o, attr) != getattr(orig, attr) or getattr(
-            before_r, attr
-        ) != getattr(recomp, attr)
-        if changed and getattr(orig, attr) != getattr(recomp, attr):
-            return False
-
-    changed_x87 = (
-        before_o.x87.state_key() != orig.x87.state_key()
-        or before_r.x87.state_key() != recomp.x87.state_key()
-    )
-    return not changed_x87 or orig.x87.state_key() == recomp.x87.state_key()
-
-
-def _recover_local_outputs(
-    before_o: SideState,
-    before_r: SideState,
-    orig: SideState,
-    recomp: SideState,
-    key: tuple[int, int],
-) -> bool:
-    """Resume after one diagnostic edit without resetting unrelated state.
-
-    Only locations written by the aligned pair are assigned shared opaque
-    values.  If output roles or x87 shapes cannot be paired, the diagnostic
-    score is unavailable rather than widened with whole-machine havoc.
-    """
-
-    changed_o = _changed_registers(before_o, orig)
-    changed_r = _changed_registers(before_r, recomp)
-    if len(changed_o) != len(changed_r):
-        return False
-    for role, (family_o, family_r) in enumerate(zip(changed_o, changed_r)):
-        reg_value: Value = ("semantic_edit", *key, "reg", role)
-        orig.regs[family_o] = reg_value
-        recomp.regs[family_r] = reg_value
-
-    for attr in ("flags", "carry", "fpu_flags"):
-        changed = getattr(before_o, attr) != getattr(orig, attr) or getattr(
-            before_r, attr
-        ) != getattr(recomp, attr)
-        if changed:
-            attr_value: Value = ("semantic_edit", *key, attr)
-            setattr(orig, attr, attr_value)
-            setattr(recomp, attr, attr_value)
-
-    changed_x87 = (
-        before_o.x87.state_key() != orig.x87.state_key()
-        or before_r.x87.state_key() != recomp.x87.state_key()
-    )
-    if changed_x87:
-        if (
-            len(orig.x87.known) != len(recomp.x87.known)
-            or orig.x87.deep_pops != recomp.x87.deep_pops
-            or orig.x87.epoch != recomp.x87.epoch
-        ):
-            return False
-        values = [
-            ("semantic_edit", *key, "x87", slot) for slot in range(len(orig.x87.known))
-        ]
-        orig.x87.known = list(values)
-        recomp.x87.known = list(values)
-
-    # A differing load is already charged to this edit, but it must not
-    # discharge an obligation created by an earlier one-sided load. Preserve
-    # each side's history from immediately before the edited pair and discard
-    # only the pair's own memory-read effects.
-    orig.load_log = set(before_o.load_log)
-    recomp.load_log = set(before_r.load_log)
-    return True
-
-
-def _observations_touch_memory(observations: list) -> bool:
-    for entry in observations:
-        kind = entry[0]
-        if kind in ("store", "call"):
-            return True
-        if isinstance(kind, tuple) and STRING_OPS.get(kind[0], ("", "", False))[2]:
-            return True
-    return False
-
-
 def verify_isomorphic_cfg_effective_match(
     orig_asm: AsmStream,
     recomp_asm: AsmStream,
@@ -4578,7 +4431,6 @@ def verify_isomorphic_cfg_effective_match(
     orig_meta: list[InstructionMeta | None] | None = None,
     recomp_meta: list[InstructionMeta | None] | None = None,
     recorder: AnalysisRecorder | None = None,
-    similarity: _SemanticSimilarityRecorder | None = None,
     orig_addrs: list[int | None] | None = None,
     recomp_addrs: list[int | None] | None = None,
     orig_roles: list[AsmRole] | None = None,
@@ -4779,8 +4631,6 @@ def verify_isomorphic_cfg_effective_match(
                 if admit_unsupported_identical(
                     orig_state, recomp_state, ctx, index_o, meta_o, meta_r
                 ):
-                    if similarity is not None:
-                        similarity.match(index_o, index_r)
                     continue
                 if recorder is not None:
                     recorder.mark_inconclusive(
@@ -4800,8 +4650,6 @@ def verify_isomorphic_cfg_effective_match(
                 orig_state,
                 recomp_state,
             ):
-                if similarity is not None:
-                    similarity.match(index_o, index_r)
                 _commit_memory(ctx, obs_o, index_o)
                 continue
 
@@ -4842,42 +4690,8 @@ def verify_isomorphic_cfg_effective_match(
                     meta_o,
                     meta_r,
                 )
-                if similarity is None:
-                    return False
-                similarity.edit(index_o, index_r)
-                if not _recover_local_outputs(
-                    state_before_o,
-                    state_before_r,
-                    orig_state,
-                    recomp_state,
-                    (index_o, index_r),
-                ):
-                    return False
-                if _observations_touch_memory(obs_o) or _observations_touch_memory(
-                    obs_r
-                ):
-                    _commit_clobber(ctx, ("semantic_edit", index_o, index_r))
-                    ctx.receiver_values.clear()
-                continue
+                return False
 
-            if similarity is not None:
-                if not _local_outputs_equivalent(
-                    state_before_o,
-                    state_before_r,
-                    orig_state,
-                    recomp_state,
-                ):
-                    similarity.edit(index_o, index_r)
-                    if not _recover_local_outputs(
-                        state_before_o,
-                        state_before_r,
-                        orig_state,
-                        recomp_state,
-                        (index_o, index_r),
-                    ):
-                        return False
-                else:
-                    similarity.match(index_o, index_r)
             _invalidate_save_slots(ctx, obs_o)
             for obs_entry in obs_o:
                 ctx.add_matched(obs_entry)
@@ -4946,7 +4760,6 @@ def verify_isomorphic_cfg_effective_match(
                 recorder,
                 last_o,
                 last_r,
-                require_dead_registers=similarity is None,
             ):
                 return False
         if "fallout" in edges_o:
@@ -5003,38 +4816,4 @@ def verify_isomorphic_cfg_effective_match(
         return False
     if any_shifted and recorder is not None:
         recorder.reasons.add("instruction_reorder")
-    if similarity is not None:
-        similarity.completed = True
-        return not similarity.edits
     return True
-
-
-def estimate_isomorphic_cfg_semantic_similarity(
-    orig_asm: list[str],
-    recomp_asm: list[str],
-    orig_targets: list[int | None],
-    recomp_targets: list[int | None],
-    metadata: FunctionMetadata | None = None,
-    orig_meta: list[InstructionMeta | None] | None = None,
-    recomp_meta: list[InstructionMeta | None] | None = None,
-) -> float | None:
-    """Estimate normalized repair similarity for a concrete mismatch.
-
-    The ordinary verifier remains the proof authority.  This pass reuses its
-    CFG alignment and symbolic execution but may recover after a local edit;
-    any recovery that would require whole-state havoc leaves the score absent.
-    """
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
-
-    similarity = _SemanticSimilarityRecorder()
-    verify_isomorphic_cfg_effective_match(
-        orig_asm,
-        recomp_asm,
-        orig_targets,
-        recomp_targets,
-        metadata=metadata,
-        orig_meta=orig_meta,
-        recomp_meta=recomp_meta,
-        similarity=similarity,
-    )
-    return similarity.score()

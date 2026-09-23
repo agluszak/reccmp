@@ -201,7 +201,6 @@ def test_structured_comparison_schema_round_trip():
                     },
                 ),
             ),
-            semantic_similarity=0.875,
         ),
         ComparisonAnalysis.inconclusive(
             "non_isomorphic_cfg",
@@ -233,18 +232,9 @@ def test_structured_comparison_schema_round_trip():
     assert value["data"][1]["comparison"] == {
         "status": "effective",
         "effective_reasons": ["register_allocation", "padding"],
-        "semantic_similarity": 1.0,
     }
-    assert value["data"][0]["comparison"] == {
-        "status": "exact",
-        "semantic_similarity": 1.0,
-    }
-    assert set(value["data"][2]["comparison"]) == {
-        "status",
-        "difference",
-        "semantic_similarity",
-    }
-    assert value["data"][2]["comparison"]["semantic_similarity"] == 0.875
+    assert value["data"][0]["comparison"] == {"status": "exact"}
+    assert set(value["data"][2]["comparison"]) == {"status", "difference"}
     assert value["data"][3]["comparison"] == {
         "status": "inconclusive",
         "inconclusive_reason": "non_isomorphic_cfg",
@@ -263,7 +253,6 @@ def test_structured_comparison_schema_round_trip():
     restored_analyses = [entity.analysis for entity in restored.entities.values()]
     assert [analysis.status for analysis in restored_analyses] == list(ComparisonStatus)
     assert restored_analyses[2].difference == analyses[2].difference
-    assert restored_analyses[2].semantic_similarity == 0.875
 
 
 def test_old_effective_boolean_schema_is_accepted():

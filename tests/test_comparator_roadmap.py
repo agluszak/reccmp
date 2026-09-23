@@ -94,7 +94,7 @@ def test_rewrite_stack_displacements():
 
 
 def test_derive_diagnostic_normalizations():
-    assert derive_diagnostic_normalizations(ComparisonAnalysis.exact()) == ()
+    assert not derive_diagnostic_normalizations(ComparisonAnalysis.exact())
     assert derive_diagnostic_normalizations(
         ComparisonAnalysis.effective({"register_allocation"})
     ) == (DiagnosticNormalization.REGISTER_ALLOCATION,)

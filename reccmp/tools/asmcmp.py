@@ -27,7 +27,6 @@ from reccmp.formats.pe import PEImage
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
-    DiagnosticNormalization,
 )
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
@@ -76,18 +75,6 @@ def triage_status_note(analysis: ComparisonAnalysis) -> str | None:
             "NOT evidence of a source defect; investigate verifier/metadata/alignment"
         )
     return None
-
-
-def semantic_similarity_text(match: ReccmpComparedEntity) -> str | None:
-    """Render the optional repair-oriented score without implying proof."""
-    if (
-        match.analysis.status != ComparisonStatus.MISMATCH
-        or match.semantic_similarity is None
-    ):
-        return None
-    semantic = percent_string(match.semantic_similarity)
-    raw = percent_string(match.accuracy)
-    return f"{semantic} semantic similarity (diagnostic; {raw} raw)"
 
 
 def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
@@ -214,13 +201,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
 
     else:
         print_combined_diff(udiff, show_both_addrs)
-        semantic = semantic_similarity_text(match)
-        if semantic is not None:
-            print(f"\n{match.name} has {semantic}; diff above")
-        else:
-            print(
-                f"\n{match.name} is only {percenttext} similar to the original, diff above"
-            )
+        print(
+            f"\n{match.name} is only {percenttext} similar to the original, diff above"
+        )
         stack = stack_layout_text(match)
         if stack is not None:
             print(stack)
@@ -253,10 +236,7 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
     if match.is_stub:
         print(f"  {match.name} ({addrs}) is a stub.")
     else:
-        semantic = semantic_similarity_text(match)
-        if semantic is not None:
-            print(f"  {match.name} ({addrs}) has {semantic}")
-        elif (
+        if (
             match.accuracy_modulo_inline is not None
             and match.accuracy_modulo_inline > match.accuracy
         ):
