@@ -11,6 +11,7 @@ import pytest
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.cvinfo import CVInfoTypeEnum, CvdumpTypeKey
 from reccmp.compare.db import ReccmpMatch
+from reccmp.types import ImageId
 from reccmp.ghidra.importer.pdb_extraction import (
     CppRegisterSymbol,
     CppStackSymbol,
@@ -23,6 +24,52 @@ from .ghidra_integration_test_setup import (
 
 if TYPE_CHECKING:
     from ghidra.program.flatapi import FlatProgramAPI
+
+
+def test_import_function_into_recompiled_image(
+    ghidra: "FlatProgramAPI",
+    function_helper: GhidraFunctionTestHelper,
+    type_helper: GhidraTypeTestHelper,
+):
+    from reccmp.ghidra.importer.importer import _import_function_into_ghidra
+    from reccmp.ghidra.importer.pdb_extraction import PdbFunction
+
+    recomp_address = function_helper.ORIG_FN_TO_OVERWRITE_SECONDARY
+    original_function = ghidra.getFunctionAt(
+        ghidra.getAddressFactory().getAddress(hex(function_helper.orig_address))
+    )
+    assert original_function is not None
+    original_name = original_function.getName()
+
+    pdb_function = PdbFunction(
+        ReccmpMatch(
+            function_helper.orig_address,
+            recomp_address,
+            {
+                "name": "RecompiledImageFunction",
+                "orig_size": 20,
+                "recomp_size": 1,
+            },
+        ),
+        signature=None,
+        is_stub=False,
+    )
+
+    _import_function_into_ghidra(
+        ghidra,
+        pdb_function,
+        type_helper.type_importer,
+        [],
+        image_id=ImageId.RECOMP,
+    )
+
+    imported = ghidra.getFunctionAt(
+        ghidra.getAddressFactory().getAddress(hex(recomp_address))
+    )
+    assert imported is not None
+    assert imported.getName() == "RecompiledImageFunction"
+    assert imported.getBody().getNumAddresses() == 1
+    assert original_function.getName() == original_name
 
 
 def test_import_trivial_function(
@@ -58,6 +105,50 @@ def test_import_trivial_function(
     assert importer.matches_ghidra_function(function_helper.ghidra_function) is True
     function_helper.assert_c_code("""
 void MyTestFn(void)
+
+{
+  return;
+}
+
+""")
+
+
+def test_import_variadic_function(
+    ghidra: "FlatProgramAPI",
+    function_helper: GhidraFunctionTestHelper,
+    type_helper: GhidraTypeTestHelper,
+):
+    from reccmp.ghidra.importer.function_importer import (
+        PdbFunctionImporter,
+        PdbFunction,
+    )
+
+    function_helper.overwrite_example_function(b"\xc3")
+
+    func_signature = FunctionSignature(
+        call_type="__cdecl",
+        arglist=[CVInfoTypeEnum.T_32PRCHAR, CVInfoTypeEnum.T_NOTYPE],
+        return_type=CVInfoTypeEnum.T_VOID,
+        class_type=None,
+        symbols=[
+            CppStackSymbol("fmt", CVInfoTypeEnum.T_32PRCHAR, 4),
+        ],
+        this_adjust=0,
+    )
+    pdb_function = PdbFunction(
+        ReccmpMatch(function_helper.orig_address, 1234, {"name": "MyVariadicFn"}),
+        func_signature,
+        is_stub=False,
+    )
+    importer = PdbFunctionImporter.build(
+        ghidra, pdb_function, type_helper.type_importer, []
+    )
+    importer.overwrite_ghidra_function(function_helper.ghidra_function)
+
+    assert function_helper.ghidra_function.hasVarArgs() is True
+    assert importer.matches_ghidra_function(function_helper.ghidra_function) is True
+    function_helper.assert_c_code("""
+void __cdecl MyVariadicFn(char *fmt,...)
 
 {
   return;
