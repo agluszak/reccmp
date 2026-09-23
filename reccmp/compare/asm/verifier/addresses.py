@@ -14,7 +14,7 @@ def _foldable_address_value(value: Value, scale: int, segment: str) -> bool:
     return len(value) == 2 and value[0] == "addr" and value[1][1] in ("", segment)
 
 
-def _flatten_mem(addr: Value) -> Value:
+def flatten_mem(addr: Value) -> Value:
     """Fold scale-1 base registers that hold a computed address (from lea)
     into the memory expression itself, so `[esi]` with esi = &[ebx + 0x1c6]
     compares as `[ebx + 0x1c6]`."""
@@ -45,7 +45,7 @@ def _flatten_mem(addr: Value) -> Value:
     return ("mem", seg, tuple(sorted(terms, key=repr)), disp, syms)
 
 
-def _stack_rooted(value: Value) -> bool:
+def stack_rooted(value: Value) -> bool:
     """Is the value derived from the stack pointer or frame pointer?"""
     if not isinstance(value, tuple) or not value:
         return False
@@ -59,31 +59,31 @@ def _stack_rooted(value: Value) -> bool:
         children = tuple(child for child, _ in value[1][2])
     elif tag in ("add", "ins_r16"):
         children = value[1:]
-    return any(_stack_rooted(child) for child in children)
+    return any(stack_rooted(child) for child in children)
 
 
 def _is_pure_global(mem: Value) -> bool:
     return not mem[2] and bool(mem[4])
 
 
-def _unwind_spadd(value: Value, offset: int = 0) -> tuple[Value, int]:
+def unwind_spadd(value: Value, offset: int = 0) -> tuple[Value, int]:
     while isinstance(value, tuple) and value and value[0] == "spadd":
         offset += value[2]
         value = value[1]
     return (value, offset)
 
 
-def _abs_stack_offset(addr: Value, is_slot) -> tuple[Value, int] | None:
+def abs_stack_offset(addr: Value, is_slot) -> tuple[Value, int] | None:
     """Resolve an access to (root value, byte offset) when its address is a
     plain chain of constant adjustments over one root — a push/pop slot, or
     a single-register memory operand like [ebp - 8] or [esp + 4]."""
     if is_slot:
-        return _unwind_spadd(addr)
-    mem = _flatten_mem(addr)
+        return unwind_spadd(addr)
+    mem = flatten_mem(addr)
     if len(mem[2]) == 1 and not mem[4] and isinstance(mem[3], int):
         value, scale = mem[2][0]
         if scale == 1:
-            root, offset = _unwind_spadd(value)
+            root, offset = unwind_spadd(value)
             return (root, offset + mem[3])
     return None
 
@@ -104,7 +104,7 @@ def _ranges_disjoint(a_disp, a_width, b_disp, b_width) -> bool:
     )
 
 
-def _mem_disjoint(a: tuple, b: tuple) -> bool:
+def mem_disjoint(a: tuple, b: tuple) -> bool:
     """Can the two memory accesses be proven non-overlapping?
     Accesses are (address value, width, stack_kind) where stack_kind is
     False for ordinary operands, "push" for a fresh slot below the stack
@@ -114,8 +114,8 @@ def _mem_disjoint(a: tuple, b: tuple) -> bool:
     b_addr, b_width, b_stack = b
 
     if a_stack or b_stack:
-        a_res = _abs_stack_offset(a_addr, a_stack)
-        b_res = _abs_stack_offset(b_addr, b_stack)
+        a_res = abs_stack_offset(a_addr, a_stack)
+        b_res = abs_stack_offset(b_addr, b_stack)
         if (
             a_res is not None
             and b_res is not None
@@ -125,14 +125,14 @@ def _mem_disjoint(a: tuple, b: tuple) -> bool:
             return True
         if a_stack and b_stack:
             return False
-        other = _flatten_mem(b_addr if a_stack else a_addr)
+        other = flatten_mem(b_addr if a_stack else a_addr)
         # A stack slot never overlaps a named global. An access through an
         # unknown pointer, however, must be assumed to alias the stack:
         # nothing proves an incoming pointer cannot equal the slot address.
         return _is_pure_global(other)
 
-    a_mem = _flatten_mem(a_addr)
-    b_mem = _flatten_mem(b_addr)
+    a_mem = flatten_mem(a_addr)
+    b_mem = flatten_mem(b_addr)
 
     if a_mem[1] != b_mem[1]:
         # Different segment prefixes: assume they can alias.
@@ -151,8 +151,8 @@ def _mem_disjoint(a: tuple, b: tuple) -> bool:
         return True
 
     # Stack/frame memory never overlaps a named global.
-    stack_a = any(_stack_rooted(v) for v, _ in a_mem[2])
-    stack_b = any(_stack_rooted(v) for v, _ in b_mem[2])
+    stack_a = any(stack_rooted(v) for v, _ in a_mem[2])
+    stack_b = any(stack_rooted(v) for v, _ in b_mem[2])
     if (global_a and stack_b) or (global_b and stack_a):
         return True
 

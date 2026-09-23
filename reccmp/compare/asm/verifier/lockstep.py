@@ -11,20 +11,20 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.evidence import (
-    _record_observable_difference,
-    _record_operand_candidate,
+    record_observable_difference,
+    record_operand_candidate,
 )
 from reccmp.compare.asm.verifier.obligations import (
-    _addrs_from_meta,
-    _aligned_indices,
-    _callee_save_swap,
-    _discharge_run_obligations,
-    _divergences_justified,
-    _invalidate_save_slots,
-    _one_sided_ok,
-    _record_pair_categories,
-    _rewrite_control_observables,
+    addrs_from_meta,
     admit_unsupported_identical,
+    aligned_indices,
+    callee_save_swap,
+    discharge_run_obligations,
+    divergences_justified,
+    invalidate_save_slots,
+    one_sided_ok,
+    record_pair_categories,
+    rewrite_control_observables,
 )
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
@@ -32,8 +32,8 @@ from reccmp.compare.asm.verifier.state import (
     Context,
     FunctionMetadata,
     SideState,
-    _clone_state,
-    _commit_memory,
+    clone_state,
+    commit_memory,
     guard_state_size,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
@@ -63,7 +63,7 @@ def verify_effective_match(
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     orig_stream = resolve_asm_stream(orig_asm)
     recomp_stream = resolve_asm_stream(recomp_asm)
-    aligned = _aligned_indices(codes, len(orig_stream), len(recomp_stream))
+    aligned = aligned_indices(codes, len(orig_stream), len(recomp_stream))
     if aligned is None:
         if recorder is not None:
             recorder.mark_inconclusive(
@@ -84,12 +84,12 @@ def verify_effective_match(
     orig_cf_addrs = (
         recorder.orig_addrs
         if recorder is not None and recorder.orig_addrs is not None
-        else _addrs_from_meta(orig_meta)
+        else addrs_from_meta(orig_meta)
     )
     recomp_cf_addrs = (
         recorder.recomp_addrs
         if recorder is not None and recorder.recomp_addrs is not None
-        else _addrs_from_meta(recomp_meta)
+        else addrs_from_meta(recomp_meta)
     )
 
     try:
@@ -111,7 +111,7 @@ def verify_effective_match(
                         side_ins = instruction_at(side_stream, side_index)
                     except (Reject, IndexError, KeyError, ValueError, TypeError):
                         side_ins = None
-                if not _one_sided_ok(
+                if not one_sided_ok(
                     side,
                     other_side,
                     ctx,
@@ -139,13 +139,13 @@ def verify_effective_match(
             try:
                 ins_o = instruction_at(orig_stream, index_o)
                 ins_r = instruction_at(recomp_stream, index_r)
-                _record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
+                record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
                 obs_o: list = []
                 obs_r: list = []
                 before_o = dict(orig.regs)
                 before_r = dict(recomp.regs)
-                state_before_o = _clone_state(orig)
-                state_before_r = _clone_state(recomp)
+                state_before_o = clone_state(orig)
+                state_before_r = clone_state(recomp)
                 execute(orig, ctx, idx, ins_o, obs_o)
                 execute(recomp, ctx, idx, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
@@ -182,13 +182,13 @@ def verify_effective_match(
 
             meta_o = orig_meta[index_o] if orig_meta is not None else None
             meta_r = recomp_meta[index_r] if recomp_meta is not None else None
-            _rewrite_control_observables(obs_o, meta_o, orig_cf_addrs)
-            _rewrite_control_observables(obs_r, meta_r, recomp_cf_addrs)
+            rewrite_control_observables(obs_o, meta_o, orig_cf_addrs)
+            rewrite_control_observables(obs_r, meta_r, recomp_cf_addrs)
 
-            if _callee_save_swap(ctx, ins_o, ins_r, obs_o, obs_r, orig, recomp):
+            if callee_save_swap(ctx, ins_o, ins_r, obs_o, obs_r, orig, recomp):
                 # The pushed values differ (that is the point of the swap),
                 # but the slot and width agree: commit from the orig side.
-                _commit_memory(ctx, obs_o, idx)
+                commit_memory(ctx, obs_o, idx)
                 continue
 
             if obs_o != obs_r:
@@ -202,7 +202,7 @@ def verify_effective_match(
                     if recomp_meta is not None and index_r is not None
                     else None
                 )
-                _record_observable_difference(
+                record_observable_difference(
                     ctx,
                     index_o,
                     index_r,
@@ -214,7 +214,7 @@ def verify_effective_match(
                     meta_r,
                 )
                 return False
-            _invalidate_save_slots(ctx, obs_o)
+            invalidate_save_slots(ctx, obs_o)
             for entry in obs_o:
                 ctx.add_matched(entry)
 
@@ -235,7 +235,7 @@ def verify_effective_match(
             for value in written_o:
                 if value in written_r:
                     ctx.add_matched(value)
-            _record_pair_categories(
+            record_pair_categories(
                 ctx,
                 state_before_o,
                 state_before_r,
@@ -258,12 +258,12 @@ def verify_effective_match(
                 )
                 if conditional and orig.regs != recomp.regs:
                     return False
-                if not _divergences_justified(ctx, orig, recomp):
+                if not divergences_justified(ctx, orig, recomp):
                     return False
 
-            _commit_memory(ctx, obs_o, idx)
+            commit_memory(ctx, obs_o, idx)
 
-        if not _discharge_run_obligations(
+        if not discharge_run_obligations(
             ctx, orig, recomp, recorder, last_index_o, last_index_r
         ):
             return False

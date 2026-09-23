@@ -14,11 +14,11 @@ from reccmp.compare.asm.model import (
 )
 from reccmp.compare.asm.verifier.addresses import (
     Value,
-    _abs_stack_offset,
-    _flatten_mem,
-    _mem_disjoint,
-    _stack_rooted,
-    _unwind_spadd,
+    abs_stack_offset,
+    flatten_mem,
+    mem_disjoint,
+    stack_rooted,
+    unwind_spadd,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
 
@@ -52,12 +52,12 @@ X87_CONSTANTS = {"fld1", "fldz", "fldpi", "fldl2e", "fldl2t", "fldlg2", "fldln2"
 X87_UNARY = {"fchs", "fabs", "fsqrt", "frndint", "fcos", "fsin", "ftan", "f2xm1"}
 
 
-def _vsort(a: Value, b: Value) -> tuple[Value, Value]:
+def vsort(a: Value, b: Value) -> tuple[Value, Value]:
     """Canonical order for the operands of a commutative operation."""
     return (a, b) if repr(a) <= repr(b) else (b, a)
 
 
-def _commutative_result(mnemonic: str, a: Value, b: Value) -> Value:
+def commutative_result(mnemonic: str, a: Value, b: Value) -> Value:
     """Canonicalize a commutative integer result.
 
     Integer addition is associative modulo the destination width, so flatten
@@ -66,7 +66,7 @@ def _commutative_result(mnemonic: str, a: Value, b: Value) -> Value:
     the final physical add even when the destination value is equal.
     """
     if mnemonic not in ASSOCIATIVE_COMMUTATIVE_BINOPS:
-        return (mnemonic, *_vsort(a, b))
+        return (mnemonic, *vsort(a, b))
 
     terms: list[Value] = []
     pending = [a, b]
@@ -148,7 +148,7 @@ class SideState:
         only when its first access is a write (a proper lifetime start);
         a slot that is read first would let two different uninitialized
         locals appear equal, so it keeps its raw displacement."""
-        self.slot_accesses.append((disp, _WIDTHS.get(size)))
+        self.slot_accesses.append((disp, WIDTHS.get(size)))
         if disp not in self.slot_map:
             if write:
                 self.slot_map[disp] = sum(
@@ -181,7 +181,7 @@ class SideState:
         self.regs[family] = ("ins_" + part, old, value)
 
 
-_WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10}
+WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10}
 
 
 @dataclass(frozen=True)
@@ -294,7 +294,7 @@ class Context:
 _ALIAS_SCAN_LIMIT = 128
 
 
-def _load_tag(ctx: Context, address: Value, width, stack) -> int | Value:
+def memory_load_tag(ctx: Context, address: Value, width, stack) -> int | Value:
     """Tag identifying which memory state a load reads: the tag of the
     newest committed store that may alias it (or of any clobber), else the
     scope's initial memory tag. Two loads of the same address with the same
@@ -312,56 +312,56 @@ def _load_tag(ctx: Context, address: Value, width, stack) -> int | Value:
     return ctx.initial_gen
 
 
-def _frame_pointer_value(value: Value) -> bool:
+def frame_pointer_value(value: Value) -> bool:
     """Does this value hold a pointer into the current function's own
     frame (strictly below the entry stack pointer)? Such a value reaching
     memory or a callee makes the frame externally reachable."""
     if not isinstance(value, tuple) or not value:
         return False
     if value[0] == "addr":
-        resolved = _abs_stack_offset(value[1], False)
+        resolved = abs_stack_offset(value[1], False)
         if resolved is None:
             # An escaping address we cannot resolve: assume the worst
             # when it is stack-rooted at all.
-            return any(_stack_rooted(term) for term, _ in value[1][2])
+            return any(stack_rooted(term) for term, _ in value[1][2])
         root, offset = resolved
         return root == ("init", "sp") and offset < 0
     if value[0] == "spadd":
-        root, offset = _unwind_spadd(value)
+        root, offset = unwind_spadd(value)
         return root == ("init", "sp") and offset < 0
     return False
 
 
 def _store_may_alias_load(store: tuple, load: tuple, stack_escaped: bool) -> bool:
-    """May this committed store affect this load? Refines _mem_disjoint
+    """May this committed store affect this load? Refines mem_disjoint
     with an ABI fact: while no frame pointer has escaped, memory strictly
     below the entry stack pointer is the function's private scratch, which
     no incoming (unknown) pointer can alias."""
-    if _mem_disjoint(store, load):
+    if mem_disjoint(store, load):
         return False
     if not stack_escaped:
         for scratch, other in ((store, load), (load, store)):
-            resolved = _abs_stack_offset(scratch[0], scratch[2])
+            resolved = abs_stack_offset(scratch[0], scratch[2])
             if (
                 resolved is not None
                 and resolved[0] == ("init", "sp")
                 and resolved[1] < 0
                 and not other[2]
             ):
-                other_mem = _flatten_mem(other[0])
-                if not any(_stack_rooted(term) for term, _ in other_mem[2]):
+                other_mem = flatten_mem(other[0])
+                if not any(stack_rooted(term) for term, _ in other_mem[2]):
                     return False
     return True
 
 
-def _commit_clobber(ctx: Context, marker) -> None:
+def commit_clobber(ctx: Context, marker) -> None:
     """Record a write to unknown locations: every later load re-reads."""
     tag = ("mem", marker, "clobber")
     ctx.mem_events.append((tag, None))
     ctx.gen = tag
 
 
-def _commit_memory(ctx: Context, obs: list, marker) -> None:
+def commit_memory(ctx: Context, obs: list, marker) -> None:
     """Commit the memory effects of one verified instruction pair. Deferred
     until after both sides executed so that loads within the pair observe
     the same pre-instruction memory."""
@@ -369,13 +369,13 @@ def _commit_memory(ctx: Context, obs: list, marker) -> None:
         kind = entry[0]
         if kind == "store":
             _, address, size, value = entry
-            width = 4 if size == "stack" else _WIDTHS.get(size)
+            width = 4 if size == "stack" else WIDTHS.get(size)
             stack = "push" if size == "stack" else False
             tag = ("mem", marker, k)
             ctx.mem_events.append((tag, (address, width, stack)))
             ctx.receiver_values[(address, width)] = (tag, value)
             ctx.gen = tag
-            if _frame_pointer_value(value):
+            if frame_pointer_value(value):
                 ctx.stack_escaped = True
         elif kind == "call":
             if ctx.scratch_pushes:
@@ -383,14 +383,14 @@ def _commit_memory(ctx: Context, obs: list, marker) -> None:
                 # an extra argument: not provably equivalent.
                 raise Reject
             for argument in entry[2:]:
-                if _frame_pointer_value(argument):
+                if frame_pointer_value(argument):
                     ctx.stack_escaped = True
-            _commit_clobber(ctx, (marker, k))
+            commit_clobber(ctx, (marker, k))
         elif isinstance(kind, tuple):
             # String instruction: (mnemonic, prefix). Writers clobber; the
             # data they copy was already committed by its original store.
             if STRING_OPS.get(kind[0], ("", "", False))[2]:
-                _commit_clobber(ctx, (marker, k))
+                commit_clobber(ctx, (marker, k))
 
 
 # Symbolic values are DAGs (a register value can feed several later values),
@@ -458,7 +458,7 @@ CONTROL_TAGS = frozenset(
 )
 
 
-def _clone_state(state: SideState) -> SideState:
+def clone_state(state: SideState) -> SideState:
     clone = SideState(rename_slots=state.rename_slots)
     clone.regs = dict(state.regs)
     clone.flags = state.flags

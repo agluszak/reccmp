@@ -9,7 +9,7 @@ from reccmp.compare.asm.verifier import (
     FunctionMetadata,
 )
 from reccmp.compare.asm.verifier.evidence import (
-    _diagnostic_summaries,
+    diagnostic_summaries,
 )
 from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructionMeta
@@ -357,7 +357,7 @@ def test_reason_order_is_deterministic():
 
 
 def test_colliding_symbolic_summaries_are_disambiguated():
-    orig, recomp = _diagnostic_summaries(("poison", 1), ("poison", 2))
+    orig, recomp = diagnostic_summaries(("poison", 1), ("poison", 2))
     assert orig.startswith("poison#")
     assert recomp.startswith("poison#")
     assert orig != recomp

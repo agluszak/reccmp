@@ -109,7 +109,7 @@ def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> b
     return bool(syms) or disp != 0
 
 
-def _extract_switch_tables(
+def extract_switch_tables(
     stream: ResolvedAsm,
     kinds: list[str],
     addrs: list[int | None] | None,
@@ -258,7 +258,7 @@ def _mark_side_inconclusive(
         recorder.mark_inconclusive(reason, recomp_index=index, facts=facts)
 
 
-def _block_terminator(
+def block_terminator(
     start: int, end: int, kinds: list[str], owned_data: set[int] | frozenset[int]
 ) -> int:
     """Last non-owned instruction in ``[start, end)``, preferring a control op."""
@@ -273,7 +273,7 @@ def _block_terminator(
     return last_code
 
 
-def _build_side_cfg(
+def build_side_cfg(
     asm: AsmStream,
     targets: list[int | None],
     *,
@@ -327,7 +327,7 @@ def _build_side_cfg(
         )
         return None
     kinds = [_control_kind_at(stream, i) for i in range(total)]
-    extracted = _extract_switch_tables(stream, kinds, addrs)
+    extracted = extract_switch_tables(stream, kinds, addrs)
     if extracted is None:
         first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
         _mark_side_inconclusive(
@@ -392,7 +392,7 @@ def _build_side_cfg(
     ends = [order[n + 1] if n + 1 < len(order) else total for n in range(len(order))]
     succ: list[dict[str, int | str]] = []
     for n, start in enumerate(order):
-        last = _block_terminator(start, ends[n], kinds, owned_data)
+        last = block_terminator(start, ends[n], kinds, owned_data)
         kind = kinds[last]
         edges: dict[str, int | str] = {}
         if kind == "jcc":
@@ -564,7 +564,7 @@ def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
             continue
         if _is_empty_jump_block(cfg, block_b):
             continue
-        last_b = _block_terminator(
+        last_b = block_terminator(
             cfg.starts[block_b], cfg.ends[block_b], cfg.kinds, cfg.owned_data
         )
         if last_b in cfg.table_dests:
@@ -637,7 +637,7 @@ def _collapse_duplicate_ret_blocks(
     return _rebuild_cfg_keeping(cfg, keep, redirect=redirect), True
 
 
-def _canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
+def canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
     """Conservative CFG cleanup before isomorphic block pairing.
 
     Removes empty jump-only trampolines, merges trivial fallthrough splits,
@@ -654,7 +654,7 @@ def _canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
     return current
 
 
-def _pair_cfg_blocks(
+def pair_cfg_blocks(
     cfg_o: _SideCfg,
     cfg_r: _SideCfg,
     recorder: AnalysisRecorder | None = None,

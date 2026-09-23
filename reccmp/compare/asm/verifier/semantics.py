@@ -11,27 +11,27 @@ from reccmp.compare.asm.model import (
 )
 from reccmp.compare.asm.verifier.addresses import (
     Value,
-    _flatten_mem,
-    _stack_rooted,
-    _unwind_spadd,
+    flatten_mem,
+    stack_rooted,
+    unwind_spadd,
 )
 from reccmp.compare.asm.verifier.state import (
-    _WIDTHS,
     CARRY_BINOPS,
     CC_CANON,
     COMMUTATIVE_BINOPS,
     JCC_MNEMONICS,
     ORDERED_BINOPS,
     STRING_OPS,
+    WIDTHS,
     X87_CONSTANTS,
     X87_UNARY,
     ZERO_FLAGS,
     Context,
     SideState,
     X87Stack,
-    _commutative_result,
-    _load_tag,
-    _vsort,
+    commutative_result,
+    memory_load_tag,
+    vsort,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ def mem_address(
         and not syms
         and disp < 0
         and any(reg == "ebp" for reg, _ in reg_terms)
-        and _stack_rooted(state.regs["bp"])
+        and stack_rooted(state.regs["bp"])
     ):
         if not escape and reg_terms == [("ebp", 1)]:
             # A plain frame-local slot: alpha-renamable across the sides.
@@ -67,14 +67,14 @@ def mem_address(
         # key is the slot id rather than an offset.
         folded = []
         for value, scale in pairs:
-            base, offset = _unwind_spadd(value)
+            base, offset = unwind_spadd(value)
             if offset:
                 disp_key += scale * offset
                 value = base
             folded.append((value, scale))
         pairs = folded
     terms = tuple(sorted(pairs, key=repr))
-    if escape and any(_stack_rooted(value) for value, _ in terms):
+    if escape and any(stack_rooted(value) for value, _ in terms):
         # A stack address escapes into a register: pointers derived from it
         # could reach frame slots or saved registers on the stack.
         state.slots_escaped = True
@@ -93,10 +93,10 @@ def read_operand(state: SideState, ctx: Context, op) -> Value:
         return state.x87.read(op[1])
     if kind == "mem":
         address = mem_address(state, op)
-        width = _WIDTHS.get(op[1])
+        width = WIDTHS.get(op[1])
         if ctx.trace is not None:
             ctx.trace.append(("r", address, width, False))
-        tag = _load_tag(ctx, address, width, False)
+        tag = memory_load_tag(ctx, address, width, False)
         state.load_log.add((address, tag))
         return ("load", address, op[1], tag)
     raise Reject
@@ -111,11 +111,11 @@ def _canonical_address_value(address: Value) -> Value:
     scale-one pointer arithmetic through the same associative-add builder used
     by ADD itself.
     """
-    mem = _flatten_mem(address)
+    mem = flatten_mem(address)
     _, seg, terms, disp, syms = mem
     if seg or syms or not isinstance(disp, int):
         return ("addr", mem)
-    if any(scale != 1 or _stack_rooted(value) for value, scale in terms):
+    if any(scale != 1 or stack_rooted(value) for value, scale in terms):
         return ("addr", mem)
 
     values = [value for value, _ in terms]
@@ -126,11 +126,11 @@ def _canonical_address_value(address: Value) -> Value:
 
     result = values[0]
     for value in values[1:]:
-        result = _commutative_result("add", result, value)
+        result = commutative_result("add", result, value)
     return result
 
 
-def _receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
+def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
     """Canonical receiver identity independent of reload generation tags."""
     seen: set[int] = set()
     while (
@@ -140,7 +140,7 @@ def _receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
         and id(receiver) not in seen
     ):
         seen.add(id(receiver))
-        address, size = receiver[1], _WIDTHS.get(receiver[2])
+        address, size = receiver[1], WIDTHS.get(receiver[2])
         forwarded = ctx.receiver_values.get((address, size))
         if forwarded is None:
             return ("receiver_load", address, receiver[2])
@@ -170,7 +170,7 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     if not (isinstance(target, tuple) and len(target) == 4 and target[0] == "load"):
         return None
 
-    call_mem = _flatten_mem(target[1])
+    call_mem = flatten_mem(target[1])
     _, call_seg, call_terms, slot, call_syms = call_mem
     if call_seg or call_syms or not isinstance(slot, int) or len(call_terms) != 1:
         return None
@@ -180,7 +180,7 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     ):
         return None
 
-    receiver_mem = _flatten_mem(vtable[1])
+    receiver_mem = flatten_mem(vtable[1])
     _, receiver_seg, receiver_terms, receiver_disp, receiver_syms = receiver_mem
     if (
         receiver_seg
@@ -190,7 +190,7 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
         or receiver_terms[0][1] != 1
     ):
         return None
-    receiver = _receiver_equivalence_class(receiver_terms[0][0], ctx)
+    receiver = receiver_equivalence_class(receiver_terms[0][0], ctx)
     return ("vcall", receiver, slot)
 
 
@@ -201,7 +201,7 @@ def write_operand(state: SideState, ctx: Context, op, value: Value, obs: list) -
     elif kind == "mem":
         address = mem_address(state, op, write=True)
         if ctx.trace is not None:
-            ctx.trace.append(("w", address, _WIDTHS.get(op[1]), False))
+            ctx.trace.append(("w", address, WIDTHS.get(op[1]), False))
         obs.append(("store", address, op[1], value))
     elif kind == "st":
         state.x87.write(op[1], value)
@@ -242,7 +242,7 @@ def canon_condition(cc: str, state: SideState) -> Value:
         width = flags[3] if len(flags) > 3 else None
         base: tuple
         if pred in ("eq", "ne"):
-            base = (pred, _vsort(a, b))
+            base = (pred, vsort(a, b))
         else:
             base = (pred, b, a) if swap else (pred, a, b)
         return base if width is None else (*base, width)
@@ -275,8 +275,8 @@ def _compare_width(op_a, op_b) -> int | str:
                 return _PART_BYTES[part]
         if op[0] == "mem":
             size = op[1]
-            if size in _WIDTHS:
-                return _WIDTHS[size]
+            if size in WIDTHS:
+                return WIDTHS[size]
             if isinstance(size, str) and size.startswith("size"):
                 try:
                     return int(size[4:])
@@ -321,14 +321,14 @@ def execute(
     elif mnemonic in COMMUTATIVE_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        pair = _vsort(a, b)
+        pair = vsort(a, b)
         if mnemonic == "xor" and a == b:
             value = ("imm", 0)
         elif mnemonic in ("and", "or") and a == b:
             # and/or of a value with itself leaves it unchanged.
             value = a
         else:
-            value = _commutative_result(mnemonic, a, b)
+            value = commutative_result(mnemonic, a, b)
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic == "xor" and a == b:
             # Zero idiom: the flags are those of comparing zero with zero.
@@ -406,11 +406,11 @@ def execute(
             # exactly the flag state of `cmp r, 0`.
             state.flags = ("cmp", a, ("imm", 0), width)
         else:
-            state.flags = ("test", *_vsort(a, b), width)
+            state.flags = ("test", *vsort(a, b), width)
         state.carry = ("cf0",)
     elif mnemonic in ("mul", "imul") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
-        pair = _vsort(state.read_reg(acc), read_operand(state, ctx, ops[0]))
+        pair = vsort(state.read_reg(acc), read_operand(state, ctx, ops[0]))
         state.write_reg(acc, (mnemonic, "lo", *pair))
         state.write_reg(hi, (mnemonic, "hi", *pair))
         state.flags = ("flags", mnemonic, *pair)
@@ -446,7 +446,7 @@ def execute(
             state,
             ctx,
             ops[0],
-            ("load", esp, "stack", _load_tag(ctx, esp, 4, "pop")),
+            ("load", esp, "stack", memory_load_tag(ctx, esp, 4, "pop")),
             obs,
         )
         state.write_reg("esp", esp_add(esp, 4))
@@ -454,7 +454,9 @@ def execute(
         ebp = state.read_reg("ebp")
         if ctx.trace is not None:
             ctx.trace.append(("r", ebp, 4, "pop"))
-        state.write_reg("ebp", ("load", ebp, "stack", _load_tag(ctx, ebp, 4, "pop")))
+        state.write_reg(
+            "ebp", ("load", ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
+        )
         state.write_reg("esp", esp_add(ebp, 4))
     elif mnemonic == "call" and len(ops) == 1:
         # The callee may take arguments in ecx (thiscall) or ecx+edx
@@ -473,7 +475,7 @@ def execute(
         # ABI says it is an argument — never merely because the call looked
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
-            entry.append(_receiver_equivalence_class(state.read_reg("ecx"), ctx))
+            entry.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
             if abi is not None and abi.uses_edx:
                 entry.append(state.read_reg("edx"))
         else:
@@ -591,16 +593,16 @@ def execute_x87(state: SideState, ctx: Context, ins: Instruction, obs: list) -> 
         op = "f" + ("add" if "add" in mnemonic else "mul")
         if mnemonic in ("faddp", "fmulp"):
             dest = ops[0][1] if ops else 1
-            value = (op, *_vsort(x87.read(dest), x87.read(0)))
+            value = (op, *vsort(x87.read(dest), x87.read(0)))
             x87.write(dest, value)
             x87.pop()
         elif len(ops) == 2 and ops[0] == ("st", 0):
-            x87.write(0, (op, *_vsort(x87.read(0), x87.read(ops[1][1]))))
+            x87.write(0, (op, *vsort(x87.read(0), x87.read(ops[1][1]))))
         elif len(ops) == 2 and ops[1] == ("st", 0):
             dest = ops[0][1]
-            x87.write(dest, (op, *_vsort(x87.read(dest), x87.read(0))))
+            x87.write(dest, (op, *vsort(x87.read(dest), x87.read(0))))
         elif len(ops) == 1:
-            x87.write(0, (op, *_vsort(x87.read(0), read_operand(state, ctx, ops[0]))))
+            x87.write(0, (op, *vsort(x87.read(0), read_operand(state, ctx, ops[0]))))
         else:
             raise Reject
     elif (

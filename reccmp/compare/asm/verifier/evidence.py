@@ -72,7 +72,7 @@ def _symbolic_fingerprint(value) -> str:
     return digest.hexdigest()
 
 
-def _diagnostic_summaries(value_o, value_r) -> tuple[str, str]:
+def diagnostic_summaries(value_o, value_r) -> tuple[str, str]:
     """Readable summaries, disambiguated when shortening hides a difference."""
     summary_o = _symbolic_summary(value_o)
     summary_r = _symbolic_summary(value_r)
@@ -112,7 +112,7 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
     }
 
 
-def _target_facts(
+def target_facts(
     ins: Instruction, meta: InstructionMeta | None, target_index: int | None = None
 ) -> dict[str, str | int | bool | None]:
     target_name = None
@@ -156,7 +156,7 @@ def _checked_call_registers(ctx: Context, ins: Instruction) -> list[str]:
     return registers
 
 
-def _record_operand_candidate(
+def record_operand_candidate(
     ctx: Context,
     index_o: int,
     index_r: int,
@@ -211,7 +211,7 @@ def _record_operand_candidate(
             return
 
 
-def _record_observable_difference(
+def record_observable_difference(
     ctx: Context,
     index_o: int,
     index_r: int,
@@ -239,14 +239,14 @@ def _record_observable_difference(
                 "call_target",
                 index_o,
                 index_r,
-                _target_facts(ins_o, meta_o),
-                _target_facts(ins_r, meta_r),
+                target_facts(ins_o, meta_o),
+                target_facts(ins_r, meta_r),
             )
             return
         registers = _checked_call_registers(ctx, ins_o)
         for position, register in enumerate(registers, start=2):
             if first_o[position] != first_r[position]:
-                value_o, value_r = _diagnostic_summaries(
+                value_o, value_r = diagnostic_summaries(
                     first_o[position], first_r[position]
                 )
                 recorder.record_difference(
@@ -273,7 +273,7 @@ def _record_observable_difference(
             )
             return
         if first_o[3] != first_r[3]:
-            value_o, value_r = _diagnostic_summaries(first_o[3], first_r[3])
+            value_o, value_r = diagnostic_summaries(first_o[3], first_r[3])
             recorder.record_difference(
                 "memory_value",
                 index_o,
@@ -288,7 +288,7 @@ def _record_observable_difference(
         predicate_o = first_o[1] if tag_o == "branch" else None
         predicate_r = first_r[1] if tag_r == "branch" else None
         if predicate_o != predicate_r:
-            value_o, value_r = _diagnostic_summaries(predicate_o, predicate_r)
+            value_o, value_r = diagnostic_summaries(predicate_o, predicate_r)
             recorder.record_difference(
                 "branch_condition",
                 index_o,
@@ -303,8 +303,8 @@ def _record_observable_difference(
             "branch_target",
             index_o,
             index_r,
-            _target_facts(ins_o, meta_o, target_o),
-            _target_facts(ins_r, meta_r, target_r),
+            target_facts(ins_o, meta_o, target_o),
+            target_facts(ins_r, meta_r, target_r),
         )
         return
 
@@ -313,7 +313,7 @@ def _record_observable_difference(
             continue
         if entry_o and entry_r and entry_o[0] == entry_r[0]:
             if entry_o[0] in ("retval", "retfpu"):
-                value_o, value_r = _diagnostic_summaries(entry_o[1], entry_r[1])
+                value_o, value_r = diagnostic_summaries(entry_o[1], entry_r[1])
                 recorder.record_difference(
                     "return_value",
                     index_o,
@@ -323,7 +323,7 @@ def _record_observable_difference(
                 )
                 return
             if entry_o[0] in ("retsaved", "retstack"):
-                value_o, value_r = _diagnostic_summaries(entry_o, entry_r)
+                value_o, value_r = diagnostic_summaries(entry_o, entry_r)
                 recorder.record_difference(
                     "preserved_state",
                     index_o,

@@ -18,7 +18,7 @@ from reccmp.compare.asm.model import (
     Instruction,
     Reject,
 )
-from reccmp.compare.asm.verifier.addresses import _mem_disjoint
+from reccmp.compare.asm.verifier.addresses import mem_disjoint
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     CC_CANON,
@@ -266,11 +266,11 @@ def effects_conflict(moved: LineEffects, other: LineEffects) -> bool:
         return True
     for access in moved.mem_writes:
         for against in other.mem_reads + other.mem_writes:
-            if not _mem_disjoint(access, against):
+            if not mem_disjoint(access, against):
                 return True
     for access in moved.mem_reads:
         for against in other.mem_writes:
-            if not _mem_disjoint(access, against):
+            if not mem_disjoint(access, against):
                 return True
     return False
 

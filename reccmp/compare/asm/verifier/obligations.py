@@ -15,12 +15,12 @@ from reccmp.compare.asm.model import (
 )
 from reccmp.compare.asm.verifier.addresses import (
     Value,
-    _mem_disjoint,
-    _unwind_spadd,
+    mem_disjoint,
+    unwind_spadd,
 )
 from reccmp.compare.asm.verifier.evidence import (
-    _diagnostic_summaries,
-    _record_observable_difference,
+    diagnostic_summaries,
+    record_observable_difference,
 )
 from reccmp.compare.asm.verifier.semantics import (
     esp_add,
@@ -29,21 +29,21 @@ from reccmp.compare.asm.verifier.semantics import (
     read_operand,
 )
 from reccmp.compare.asm.verifier.state import (
-    _WIDTHS,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
     CONTROL_TAGS,
     FAMILIES,
     JCC_MNEMONICS,
     STRING_OPS,
+    WIDTHS,
     Context,
     SideState,
-    _commit_clobber,
-    _commutative_result,
-    _frame_pointer_value,
-    _load_tag,
-    _vsort,
+    commit_clobber,
+    commutative_result,
+    frame_pointer_value,
     guard_state_size,
+    memory_load_tag,
+    vsort,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
 
@@ -56,7 +56,7 @@ DATA_LINE_RE = re.compile(r"^(Jump table:|Data table:|start \+ |0x[0-9a-f]+$)")
 JUMP_TABLE_ENTRY_RE = re.compile(r"^start \+ (0x[0-9a-f]+)$")
 
 
-def _switch_index_observation(state: SideState, ins: Instruction) -> tuple:
+def switch_index_observation(state: SideState, ins: Instruction) -> tuple:
     """Index register values that select a recognized switch-table case."""
     op = ins.operands[0]
     assert isinstance(op, tuple) and op[0] == "mem"
@@ -93,7 +93,7 @@ def resync(states: tuple[SideState, SideState], idx: int, ctx: Context) -> None:
         state.carry = ("resync_cf", idx)
         state.fpu_flags = ("resync_fpuflags", idx)
         state.x87.known = [("resync_st", idx, i) for i in range(len(state.x87.known))]
-    _commit_clobber(ctx, ("resync", idx))
+    commit_clobber(ctx, ("resync", idx))
 
 
 def _contained(value: Value, ctx: Context) -> bool:
@@ -126,7 +126,7 @@ def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
 CALLER_SAVED = ("a", "c", "d")
 
 
-def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> bool:
+def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> bool:
     # pylint: disable=too-many-boolean-expressions
     """At a control transfer, refuse unjustified live divergent register state.
 
@@ -166,7 +166,7 @@ def _divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> 
     return True
 
 
-def _addrs_from_meta(
+def addrs_from_meta(
     metas: list[InstructionMeta | None] | None,
 ) -> list[int | None] | None:
     if metas is None:
@@ -194,7 +194,7 @@ def _control_destination(
     return raw_operand
 
 
-def _rewrite_control_observables(
+def rewrite_control_observables(
     obs: list,
     meta: InstructionMeta | None,
     addrs: list[int | None] | None,
@@ -230,7 +230,7 @@ def _is_scratch(value: Value) -> bool:
 CALLEE_SAVED = ("b", "si", "di")
 
 
-def _aligned_indices(
+def aligned_indices(
     codes, orig_len: int, recomp_len: int
 ) -> list[tuple[int | None, int | None]] | None:
     """Pair up the two sequences (by index) for lockstep verification.
@@ -366,10 +366,10 @@ def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     reads of the slot alias correctly."""
     value = read_operand(state, ctx, ins.operands[0])
     new_esp = esp_add(state.read_reg("esp"), -4)
-    root, offset = _unwind_spadd(new_esp)
+    root, offset = unwind_spadd(new_esp)
     if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
         return False
-    if _frame_pointer_value(value):
+    if frame_pointer_value(value):
         return False
     obs = [("store", new_esp, "stack", value)]
     state.write_reg("esp", new_esp)
@@ -377,7 +377,7 @@ def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     ctx.mem_events.append((tag, (new_esp, 4, "push")))
     ctx.gen = tag
     ctx.scratch_pushes.append([state, offset, value, tag])
-    _invalidate_save_slots(ctx, obs)
+    invalidate_save_slots(ctx, obs)
     ctx.categories.add("callee_save_substitution")
     return True
 
@@ -390,10 +390,10 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
     if ins.operands[0][0] != "reg":
         return False
     esp = state.read_reg("esp")
-    root, offset = _unwind_spadd(esp)
+    root, offset = unwind_spadd(esp)
     if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
         return False
-    tag = _load_tag(ctx, esp, 4, "pop")
+    tag = memory_load_tag(ctx, esp, 4, "pop")
     value: Value = ("load", esp, "stack", tag)
     for k, record in enumerate(ctx.scratch_pushes):
         if record[0] is state and record[1] == offset:
@@ -407,7 +407,7 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
     return True
 
 
-def _one_sided_ok(
+def one_sided_ok(
     state: SideState,
     other: SideState,
     ctx: Context,
@@ -476,7 +476,7 @@ def _load_obligations_met(ctx: Context) -> bool:
     )
 
 
-def _discharge_run_obligations(
+def discharge_run_obligations(
     ctx: Context,
     orig: SideState,
     recomp: SideState,
@@ -507,7 +507,7 @@ def _discharge_run_obligations(
             continue
         if family not in CALLER_SAVED:
             if recorder is not None:
-                summary_o, summary_r = _diagnostic_summaries(value_o, value_r)
+                summary_o, summary_r = diagnostic_summaries(value_o, value_r)
                 recorder.record_difference(
                     "preserved_state",
                     last_index_o,
@@ -580,7 +580,7 @@ def admit_unsupported_identical(
     return True
 
 
-def _callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> bool:
+def callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> bool:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-boolean-expressions
     """Detect a balanced callee-save substitution: one side saves and
@@ -639,7 +639,7 @@ def _callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) ->
     return False
 
 
-def _invalidate_save_slots(ctx: Context, obs: list) -> None:
+def invalidate_save_slots(ctx: Context, obs: list) -> None:
     """Any store that cannot be proven disjoint from a pending callee-save
     slot invalidates that record: the pop can no longer be trusted to
     restore the pushed value."""
@@ -652,9 +652,9 @@ def _invalidate_save_slots(ctx: Context, obs: list) -> None:
         if size == "stack":
             access: tuple = (address, 4, "push")
         else:
-            access = (address, _WIDTHS.get(size), False)
+            access = (address, WIDTHS.get(size), False)
         for record in ctx.save_stack:
-            if record[3] and not _mem_disjoint((record[2], 4, "pop"), access):
+            if record[3] and not mem_disjoint((record[2], 4, "pop"), access):
                 record[3] = False
 
 
@@ -741,11 +741,11 @@ def _commutative_order_used(
             if a_o == b_r and b_o == a_r and (a_o != a_r or b_o != b_r):
                 return True
             if ins_o.mnemonic in ASSOCIATIVE_COMMUTATIVE_BINOPS:
-                pair_o = _vsort(a_o, b_o)
-                pair_r = _vsort(a_r, b_r)
-                return pair_o != pair_r and _commutative_result(
+                pair_o = vsort(a_o, b_o)
+                pair_r = vsort(a_r, b_r)
+                return pair_o != pair_r and commutative_result(
                     ins_o.mnemonic, a_o, b_o
-                ) == _commutative_result(ins_r.mnemonic, a_r, b_r)
+                ) == commutative_result(ins_r.mnemonic, a_r, b_r)
             return False
         if ins_o.mnemonic in ("fadd", "fmul", "fiadd", "fimul"):
             if len(ins_o.operands) != 1 or len(ins_r.operands) != 1:
@@ -792,7 +792,7 @@ def _same_meta_effects(
     return all(getattr(orig, field) == getattr(recomp, field) for field in fields)
 
 
-def _record_pair_categories(
+def record_pair_categories(
     ctx: Context,
     before_o: SideState,
     before_r: SideState,
@@ -823,7 +823,7 @@ def _record_pair_categories(
         ctx.categories.add("condition_inversion")
 
 
-def _accept_agreeing_pair(
+def accept_agreeing_pair(
     ctx: Context,
     index_o: int,
     index_r: int,
@@ -839,12 +839,12 @@ def _accept_agreeing_pair(
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     obs_o, obs_r = obs
     if obs_o != obs_r:
-        _record_observable_difference(
+        record_observable_difference(
             ctx, index_o, index_r, ins[0], ins[1], obs_o, obs_r, meta[0], meta[1]
         )
         return False
-    _invalidate_save_slots(ctx, obs_o)
+    invalidate_save_slots(ctx, obs_o)
     for obs_entry in obs_o:
         ctx.add_matched(obs_entry)
-    _record_pair_categories(ctx, *before, *after, *ins, obs_o, obs_r)
+    record_pair_categories(ctx, *before, *after, *ins, obs_o, obs_r)
     return True

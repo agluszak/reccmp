@@ -11,7 +11,7 @@ from reccmp.compare.asm.verifier import (
     verify_effective_match,
 )
 from reccmp.compare.asm.verifier.semantics import (
-    _receiver_equivalence_class,
+    receiver_equivalence_class,
 )
 from reccmp.compare.asm.verifier.state import (
     Context,
@@ -198,7 +198,7 @@ def test_virtual_call_receiver_reload_ignores_unrelated_pointee_store():
     before = ("load", address, "dword", 0)
     after_unrelated_store = ("load", address, "dword", ("mem", 4, 0))
     ctx = Context()
-    assert _receiver_equivalence_class(before, ctx) == _receiver_equivalence_class(
+    assert receiver_equivalence_class(before, ctx) == receiver_equivalence_class(
         after_unrelated_store, ctx
     )
 
@@ -243,9 +243,9 @@ def test_reject_virtual_receiver_reload_after_exact_pointer_store():
     ctx.receiver_values[(address, 4)] = (store_tag, ("init", "di"))
     before_store = ("load", address, "dword", 0)
     after_store = ("load", address, "dword", store_tag)
-    assert _receiver_equivalence_class(
-        before_store, ctx
-    ) != _receiver_equivalence_class(after_store, ctx)
+    assert receiver_equivalence_class(before_store, ctx) != receiver_equivalence_class(
+        after_store, ctx
+    )
 
 
 def test_reject_virtual_call_with_different_receiver():

@@ -13,7 +13,7 @@ import pytest
 
 from reccmp.compare import Compare
 from reccmp.compare.asm.verifier.cfg_build import (
-    _extract_switch_tables,
+    extract_switch_tables,
 )
 from reccmp.compare.asm.ir import (
     AsmRole,
@@ -407,7 +407,7 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         index_register="eax",
     )
     stream = resolve_asm_stream(excerpt, jump_tables=(table,))
-    extracted = _extract_switch_tables(
+    extracted = extract_switch_tables(
         stream,
         ["jmp", "data", "data", "ret", "ret"],
         [0x1000, 0x1004, 0x1008, 0x1010, 0x1020],
@@ -446,7 +446,7 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         index_register="eax",
     )
     stream = resolve_asm_stream(excerpt, jump_tables=(table,))
-    extracted = _extract_switch_tables(
+    extracted = extract_switch_tables(
         stream,
         ["jmp", "data", "data", "ret", "ret"],
         [0x1000, 0x1004, 0x1008, 0x1010, 0x1020],

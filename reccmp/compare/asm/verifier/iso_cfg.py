@@ -14,33 +14,33 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.block_align import (
-    _align_block_lines,
-    _dp_line,
-)
-from reccmp.compare.asm.verifier.cfg import (
-    _capture_cfg_state,
-    _CfgState,
-    _clone_cfg_state,
-    _converged,
-    _join_failure_facts,
-    _join_states,
-    _seed_context_from_cfg,
-    _states_equal,
+    align_block_lines,
+    dp_line,
 )
 from reccmp.compare.asm.verifier.cfg_build import (
-    _block_terminator,
-    _build_side_cfg,
-    _canonicalize_side_cfg,
-    _pair_cfg_blocks,
+    block_terminator,
+    build_side_cfg,
+    canonicalize_side_cfg,
+    pair_cfg_blocks,
 )
-from reccmp.compare.asm.verifier.evidence import _record_operand_candidate
+from reccmp.compare.asm.verifier.dataflow import (
+    CfgState,
+    capture_cfg_state,
+    clone_cfg_state,
+    converged,
+    join_failure_facts,
+    join_states,
+    seed_context_from_cfg,
+    states_equal,
+)
+from reccmp.compare.asm.verifier.evidence import record_operand_candidate
 from reccmp.compare.asm.verifier.obligations import (
-    _accept_agreeing_pair,
-    _callee_save_swap,
-    _discharge_run_obligations,
-    _one_sided_ok,
-    _switch_index_observation,
+    accept_agreeing_pair,
     admit_unsupported_identical,
+    callee_save_swap,
+    discharge_run_obligations,
+    one_sided_ok,
+    switch_index_observation,
 )
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
@@ -48,8 +48,8 @@ from reccmp.compare.asm.verifier.state import (
     Context,
     FunctionMetadata,
     SideState,
-    _clone_state,
-    _commit_memory,
+    clone_state,
+    commit_memory,
     guard_state_size,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
@@ -103,14 +103,14 @@ def verify_isomorphic_cfg_effective_match(
         )
     orig_asm = orig_stream.displays
     recomp_asm = recomp_stream.displays
-    cfg_o = _build_side_cfg(
+    cfg_o = build_side_cfg(
         orig_stream,
         orig_targets,
         recorder=recorder,
         side="orig",
         addrs=orig_addrs,
     )
-    cfg_r = _build_side_cfg(
+    cfg_r = build_side_cfg(
         recomp_stream,
         recomp_targets,
         recorder=recorder,
@@ -119,9 +119,9 @@ def verify_isomorphic_cfg_effective_match(
     )
     if cfg_o is None or cfg_r is None:
         return False
-    cfg_o = _canonicalize_side_cfg(cfg_o, orig_asm)
-    cfg_r = _canonicalize_side_cfg(cfg_r, recomp_asm)
-    pairs = _pair_cfg_blocks(cfg_o, cfg_r, recorder)
+    cfg_o = canonicalize_side_cfg(cfg_o, orig_asm)
+    cfg_r = canonicalize_side_cfg(cfg_r, recomp_asm)
+    pairs = pair_cfg_blocks(cfg_o, cfg_r, recorder)
     if pairs is None:
         return False
     pair_ids = {pair: n for n, pair in enumerate(pairs)}
@@ -134,9 +134,9 @@ def verify_isomorphic_cfg_effective_match(
         start_r, end_r = cfg_r.starts[block_r], cfg_r.ends[block_r]
         indices_o = [i for i in range(start_o, end_o) if i not in cfg_o.owned_data]
         indices_r = [i for i in range(start_r, end_r) if i not in cfg_r.owned_data]
-        aligned = _align_block_lines(
-            [_dp_line(orig_stream, i) for i in indices_o],
-            [_dp_line(recomp_stream, i) for i in indices_r],
+        aligned = align_block_lines(
+            [dp_line(orig_stream, i) for i in indices_o],
+            [dp_line(recomp_stream, i) for i in indices_r],
         )
         if aligned is None:
             if recorder is not None:
@@ -181,8 +181,8 @@ def verify_isomorphic_cfg_effective_match(
             for local_o, local_r in aligned
         ]
 
-    entry: dict[tuple[int, int], _CfgState] = {
-        (0, 0): _CfgState(
+    entry: dict[tuple[int, int], CfgState] = {
+        (0, 0): CfgState(
             SideState(rename_slots=False),
             SideState(rename_slots=False),
             ("cfg_mem_init",),
@@ -195,10 +195,10 @@ def verify_isomorphic_cfg_effective_match(
         # pylint: disable=too-many-branches,too-many-statements
         # pylint: disable=too-many-return-statements,too-many-locals
         block_o, block_r = pair
-        flow = _clone_cfg_state(entry[pair])
+        flow = clone_cfg_state(entry[pair])
         orig_state, recomp_state = flow.orig, flow.recomp
         ctx = Context(gen=flow.memory, metadata=metadata, recorder=recorder)
-        _seed_context_from_cfg(ctx, flow)
+        seed_context_from_cfg(ctx, flow)
         edges_o = cfg_o.succ[block_o]
         edges_r = cfg_r.succ[block_r]
         for index_o, index_r in alignments[pair]:
@@ -221,7 +221,7 @@ def verify_isomorphic_cfg_effective_match(
                         side_ins = instruction_at(side_stream, position)
                     except (Reject, IndexError, KeyError, ValueError, TypeError):
                         side_ins = None
-                if not _one_sided_ok(
+                if not one_sided_ok(
                     side,
                     other_side,
                     ctx,
@@ -243,11 +243,11 @@ def verify_isomorphic_cfg_effective_match(
             try:
                 ins_o = instruction_at(orig_stream, index_o)
                 ins_r = instruction_at(recomp_stream, index_r)
-                _record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
+                record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
                 obs_o: list = []
                 obs_r: list = []
-                state_before_o = _clone_state(orig_state)
-                state_before_r = _clone_state(recomp_state)
+                state_before_o = clone_state(orig_state)
+                state_before_r = clone_state(recomp_state)
                 execute(orig_state, ctx, index_o, ins_o, obs_o)
                 execute(recomp_state, ctx, index_o, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
@@ -272,7 +272,7 @@ def verify_isomorphic_cfg_effective_match(
             guard_state_size(orig_state, ctx)
             guard_state_size(recomp_state, ctx)
 
-            if _callee_save_swap(
+            if callee_save_swap(
                 ctx,
                 ins_o,
                 ins_r,
@@ -281,7 +281,7 @@ def verify_isomorphic_cfg_effective_match(
                 orig_state,
                 recomp_state,
             ):
-                _commit_memory(ctx, obs_o, index_o)
+                commit_memory(ctx, obs_o, index_o)
                 continue
 
             # Canonicalize local control-flow targets: the block pairing
@@ -300,14 +300,14 @@ def verify_isomorphic_cfg_effective_match(
                         if obs_entry[0] in CONTROL_TAGS - {"jmpind"}:
                             entries[k] = (*obs_entry[:-1], ("L", kind))
             if any(role.startswith("case") for role in edges_o):
-                idx_o = _switch_index_observation(state_before_o, ins_o)
-                idx_r = _switch_index_observation(state_before_r, ins_r)
+                idx_o = switch_index_observation(state_before_o, ins_o)
+                idx_r = switch_index_observation(state_before_r, ins_r)
                 for entries, idx in ((obs_o, idx_o), (obs_r, idx_r)):
                     for k, obs_entry in enumerate(entries):
                         if obs_entry[0] == "jmpind":
                             entries[k] = ("jmpind", ("L", "switch"), idx)
 
-            if not _accept_agreeing_pair(
+            if not accept_agreeing_pair(
                 ctx,
                 index_o,
                 index_r,
@@ -333,7 +333,7 @@ def verify_isomorphic_cfg_effective_match(
             if kind in ("jmp", "jcc") and (
                 edges_o.get("taken" if kind == "jcc" else "jmp") == "external"
             ):
-                if not _converged(orig_state, recomp_state):
+                if not converged(orig_state, recomp_state):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "external_control_flow_state",
@@ -342,15 +342,15 @@ def verify_isomorphic_cfg_effective_match(
                             {"edge_kind": kind},
                         )
                     return False
-            _commit_memory(ctx, obs_o, index_o)
+            commit_memory(ctx, obs_o, index_o)
 
-        last_o = _block_terminator(
+        last_o = block_terminator(
             cfg_o.starts[block_o],
             cfg_o.ends[block_o],
             cfg_o.kinds,
             cfg_o.owned_data,
         )
-        last_r = _block_terminator(
+        last_r = block_terminator(
             cfg_r.starts[block_r],
             cfg_r.ends[block_r],
             cfg_r.kinds,
@@ -358,7 +358,7 @@ def verify_isomorphic_cfg_effective_match(
         )
         last_kind = cfg_o.kinds[last_o]
         if last_kind == "ret":
-            if not _discharge_run_obligations(
+            if not discharge_run_obligations(
                 ctx,
                 orig_state,
                 recomp_state,
@@ -377,7 +377,7 @@ def verify_isomorphic_cfg_effective_match(
                 )
             return False
 
-        outgoing = _capture_cfg_state(orig_state, recomp_state, ctx)
+        outgoing = capture_cfg_state(orig_state, recomp_state, ctx)
         if recorder is not None:
             recorder.reasons.update(ctx.categories)
         for role, to_o in edges_o.items():
@@ -387,20 +387,20 @@ def verify_isomorphic_cfg_effective_match(
             assert isinstance(to_o, int) and isinstance(to_r, int)
             successor = (to_o, to_r)
             if successor not in entry:
-                entry[successor] = _clone_cfg_state(outgoing)
+                entry[successor] = clone_cfg_state(outgoing)
                 pending.append(successor)
             else:
-                joined = _join_states(entry[successor], outgoing, pair_ids[successor])
+                joined = join_states(entry[successor], outgoing, pair_ids[successor])
                 if joined is None:
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "state_join_failure",
                             cfg_o.starts[to_o],
                             cfg_r.starts[to_r],
-                            _join_failure_facts(entry[successor], outgoing),
+                            join_failure_facts(entry[successor], outgoing),
                         )
                     return False
-                if not _states_equal(joined, entry[successor]):
+                if not states_equal(joined, entry[successor]):
                     entry[successor] = joined
                     pending.append(successor)
         return True

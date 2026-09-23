@@ -17,21 +17,19 @@ from pathlib import Path
 
 import pytest
 
+from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
+    analyze_effective_match,
     verify_cfg_effective_match,
     verify_effective_match,
     verify_isomorphic_cfg_effective_match,
 )
-from reccmp.compare.asm.verifier.cfg import (
-    _CfgState,
-    _join_states,
+from reccmp.compare.asm.verifier.dataflow import (
+    CfgState,
+    join_states,
 )
-from reccmp.compare.asm.verifier.state import (
-    SideState,
-)
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.verifier.state import SideState
 from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
@@ -1030,6 +1028,6 @@ def test_cfg_join_rejects_uncorrelated_trap_parity():
     fall_o.load_log.add((addr, gen))
     taken_o, taken_r = SideState(), SideState()
     taken_r.load_log.add((addr, gen))
-    fall = _CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
-    taken = _CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
-    assert _join_states(fall, taken, 0) is None
+    fall = CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
+    taken = CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
+    assert join_states(fall, taken, 0) is None

@@ -92,7 +92,7 @@ def _dp_skeleton(ins: Instruction) -> tuple:
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 
-def _dp_line(stream: ResolvedAsm, index: int) -> _DpLine:
+def dp_line(stream: ResolvedAsm, index: int) -> _DpLine:
     display = stream.displays[index]
     try:
         ins = instruction_at(stream, index)
@@ -126,7 +126,7 @@ def _dp_sub_cost(line_o: _DpLine, line_r: _DpLine) -> float | None:
     return _SUB_CLASS
 
 
-def _align_block_lines(
+def align_block_lines(
     lines_o: list[_DpLine], lines_r: list[_DpLine]
 ) -> list[tuple[int | None, int | None]] | None:
     """Pair up two blocks' instructions with a cost-minimizing alignment.
