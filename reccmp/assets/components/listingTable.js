@@ -1,4 +1,5 @@
 import { ReccmpRegisterEvent, ReccmpSortColEvent, ReccmpTableEvent, ReccmpToggleExpandedEvent } from '../events';
+import { isEffectiveMatch } from '../globals';
 
 /** @import { ColumnNames, ReccmpComparedEntity, ReccmpInternalState } from '../types' */
 
@@ -25,7 +26,7 @@ function getMatchPercentText(row) {
     return 'stub';
   }
 
-  if ('effective' in row) {
+  if (isEffectiveMatch(row)) {
     return '100.00%*';
   }
 

@@ -2,11 +2,16 @@ import re
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from struct import unpack, error as StructError
 from typing_extensions import Self
 from reccmp.formats import Image
-from reccmp.formats.exceptions import InvalidVirtualReadError
+from reccmp.analysis.string_const import is_likely_latin1, is_likely_widechar
+from reccmp.formats.exceptions import (
+    InvalidVirtualReadError,
+    InvalidVirtualAddressError,
+    InvalidStringError,
+)
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.cvdump.cvinfo import CvdumpTypeKey
 from reccmp.cvdump.types import (
@@ -15,6 +20,10 @@ from reccmp.cvdump.types import (
     CvdumpIntegrityError,
 )
 from reccmp.types import ImageId
+from reccmp.source.index import strip_type_qualifiers, variable_type_is_indirection
+
+if TYPE_CHECKING:
+    from reccmp.source import SourceIndex
 
 logger = logging.getLogger(__name__)
 
@@ -233,15 +242,194 @@ class VariableComparator:
     types: CvdumpTypesParser
     orig_bin: Image
     recomp_bin: Image
+    source_index: "SourceIndex | None" = None
+
+    def _source_type_name(self, var: ReccmpMatch) -> str | None:
+        """Resolve a Clang layout type name for this variable, when indexed.
+
+        Pointer/reference variables store an address; do not treat their
+        pointee ``record_semantic_id`` as the variable's physical layout.
+        """
+        if self.source_index is None or not var.name:
+            return None
+
+        for item in self.source_index.variables:
+            if item.qualified_name != var.name and not item.qualified_name.endswith(
+                f"::{var.name}"
+            ):
+                continue
+            if variable_type_is_indirection(item.type):
+                return None
+            if item.record_semantic_id:
+                nested = self.source_index.class_for_semantic_id(
+                    item.record_semantic_id
+                )
+                if nested is not None and self.source_index.has_layout(
+                    nested.qualified_name
+                ):
+                    return nested.qualified_name
+            name = strip_type_qualifiers(item.type)
+            if self.source_index.has_layout(name):
+                return name
+        # Fall back: variable name may itself be a typed aggregate in the index.
+        if self.source_index.has_layout(var.name):
+            return var.name
+        return None
+
+    def _source_layout_members(
+        self, type_name: str, data_size: int
+    ) -> list[tuple[DataOffset, int]] | None:
+        """Build ``(DataOffset, size)`` rows from trusted Clang layout.
+
+        Used when PDB cannot provide a typed format string (``raw_only``).
+        Returns ``None`` when layout is missing or untrusted so callers fall
+        back to byte-wise raw comparison.
+        """
+        if self.source_index is None or not self.source_index.has_layout(type_name):
+            return None
+        members: list[tuple[DataOffset, int]] = []
+        offset = 0
+        while offset < data_size:
+            resolved = self.source_index.resolve_field(type_name, offset)
+            if resolved is None or resolved.relative_offset != 0:
+                members.append((DataOffset(offset=offset, name="", pointer=False), 1))
+                offset += 1
+                continue
+            leaf = resolved.leaf
+            size = leaf.size
+            is_pointer = (leaf.pointer_depth or 0) > 0
+            if (
+                leaf.storage_kind == "array"
+                and leaf.array_stride
+                and leaf.array_stride > 0
+            ):
+                size = leaf.array_stride
+                is_pointer = leaf.array_element_kind in ("pointer", "reference")
+            if size is None or size <= 0:
+                members.append((DataOffset(offset=offset, name="", pointer=False), 1))
+                offset += 1
+                continue
+            if is_pointer:
+                pointer_width = 4
+                if self.source_index is not None and self.source_index.abi is not None:
+                    pointer_width = max(1, self.source_index.abi.pointer_width // 8)
+                size = pointer_width
+            # Do not overrun the variable extent.
+            if resolved.absolute_offset + size > data_size:
+                size = data_size - resolved.absolute_offset
+            if size <= 0:
+                break
+            path = ".".join(resolved.path) if resolved.path else leaf.name
+            members.append(
+                (
+                    DataOffset(
+                        offset=resolved.absolute_offset,
+                        name=path,
+                        pointer=is_pointer,
+                    ),
+                    size,
+                )
+            )
+            offset = resolved.absolute_offset + size
+        return members or None
+
+    @staticmethod
+    def _unpack_layout_members(
+        data: bytes, members: list[tuple[DataOffset, int]]
+    ) -> tuple:
+        values: list[int] = []
+        for item, size in members:
+            chunk = data[item.offset : item.offset + size]
+            if len(chunk) < size:
+                raise StructError(
+                    f"short read at offset {item.offset:#x} need {size} got {len(chunk)}"
+                )
+            values.append(int.from_bytes(chunk, "little"))
+        return tuple(values)
+
+    def _member_display_name(
+        self, member: DataOffset, type_name: str | None
+    ) -> str | None:
+        """Prefer SourceIndex field paths when layout is known; else PDB name."""
+        if type_name is not None and self.source_index is not None:
+            path = self.source_index.field_path_at(type_name, member.offset)
+            if path:
+                return path
+        if member.name:
+            return member.name
+        if type_name is None:
+            return None
+        return f"+{member.offset:#x}" if member.offset else None
 
     def is_pointer_match(self, orig_addr: int, recomp_addr: int) -> bool:
         """Check whether these pointers point at the same thing"""
 
-        # Null pointers considered matching
-        if orig_addr == 0 and recomp_addr == 0:
+        # Identical absolute values match: NULL, INVALID_HANDLE_VALUE (-1), and
+        # same-base matching builds where the pointed-to VA is unchanged.
+        if orig_addr == recomp_addr:
             return True
 
-        return self.db.is_match(orig_addr, recomp_addr)
+        if self.db.is_match(orig_addr, recomp_addr):
+            return True
+
+        # MSVC string pooling can leave orig pointing at another string's NUL
+        # while recomp has a distinct "". Wide strings are also easy to mis-
+        # identify as short Latin1 fragments during PE analysis; compare the
+        # decoded contents as a last resort.
+        return self.is_string_content_match(orig_addr, recomp_addr)
+
+    def _decode_string_at(self, img: Image, addr: int) -> tuple[str, bool] | None:
+        """Return (text, is_wide) for the best string decode at addr, or None."""
+        wide_text: str | None = None
+        try:
+            wide_text = img.read_widechar(addr).decode("utf-16-le")
+        except (InvalidStringError, UnicodeDecodeError, InvalidVirtualAddressError):
+            pass
+
+        narrow_text: str | None = None
+        try:
+            narrow_text = img.read_string(addr).decode("latin1")
+        except (InvalidStringError, UnicodeDecodeError, InvalidVirtualAddressError):
+            pass
+
+        if wide_text is None and narrow_text is None:
+            return None
+
+        # Prefer wide when it continues past a Latin1 truncation (embedded NUL).
+        if wide_text is not None and (
+            narrow_text is None
+            or len(wide_text) > len(narrow_text)
+            or wide_text == narrow_text
+        ):
+            return wide_text, True
+
+        assert narrow_text is not None
+        return narrow_text, False
+
+    def is_string_content_match(self, orig_addr: int, recomp_addr: int) -> bool:
+        """True when both addresses decode to the same C or wide string text."""
+        orig = self._decode_string_at(self.orig_bin, orig_addr)
+        recomp = self._decode_string_at(self.recomp_bin, recomp_addr)
+        if orig is None or recomp is None:
+            return False
+
+        orig_text, orig_wide = orig
+        recomp_text, recomp_wide = recomp
+
+        # Empty narrow and empty wide both mean "".
+        if orig_text == "" and recomp_text == "":
+            return True
+
+        if orig_wide != recomp_wide:
+            return False
+
+        if orig_text != recomp_text:
+            return False
+
+        # Reject binary blobs that merely share a decode (e.g. int payloads).
+        if orig_wide:
+            return is_likely_widechar(orig_text)
+        return is_likely_latin1(orig_text)
 
     def is_pointer_match_to_offset(self, orig_addr: int, recomp_addr: int) -> bool:
         """Check whether these pointers point at the same offset of the same matched entity."""
@@ -306,6 +494,7 @@ class VariableComparator:
                 )
 
         assert data_size is not None
+        source_type_name = self._source_type_name(var)
 
         try:
             orig_block = DataBlock.read(var.orig_addr, data_size, self.orig_bin)
@@ -316,15 +505,39 @@ class VariableComparator:
         # Reading from recomp should never fail, so if it does, raising an exception is correct
         recomp_block = DataBlock.read(var.recomp_addr, data_size, self.recomp_bin)
 
+        used_source_layout = False
         if raw_only:
-            # If there is no specific type information available
-            # (i.e. if this is a static or non-public variable)
-            # then we can only compare the raw bytes.
-            compare_items = [
-                DataOffset(offset=i, name="", pointer=False) for i in range(data_size)
-            ]
-            orig_data = tuple(orig_block.data)
-            recomp_data = tuple(recomp_block.data)
+            source_members = (
+                self._source_layout_members(source_type_name, data_size)
+                if source_type_name
+                else None
+            )
+            if source_members is not None:
+                # Trusted Clang layout as an alternate type provider when PDB
+                # cannot materialize a format string.
+                used_source_layout = True
+                compare_items = [item for item, _size in source_members]
+                try:
+                    orig_data = self._unpack_layout_members(
+                        orig_block.data, source_members
+                    )
+                    recomp_data = self._unpack_layout_members(
+                        recomp_block.data, source_members
+                    )
+                except StructError as e:
+                    return create_comparison_item(
+                        var, error=f"Failed to unpack data: {e}"
+                    )
+            else:
+                # If there is no specific type information available
+                # (i.e. if this is a static or non-public variable)
+                # then we can only compare the raw bytes.
+                compare_items = [
+                    DataOffset(offset=i, name="", pointer=False)
+                    for i in range(data_size)
+                ]
+                orig_data = tuple(orig_block.data)
+                recomp_data = tuple(recomp_block.data)
         else:
             assert type_key is not None
             compare_items = [
@@ -372,7 +585,11 @@ class VariableComparator:
             compared.append(
                 ComparedOffset(
                     offset=member.offset,
-                    name=member.name,
+                    name=(
+                        member.name
+                        if used_source_layout and member.name
+                        else self._member_display_name(member, source_type_name)
+                    ),
                     match=match,
                     values=(value_a, value_b),
                 )
@@ -381,5 +598,6 @@ class VariableComparator:
         return create_comparison_item(
             var,
             compared=compared,
-            raw_only=raw_only,
+            # Source-layout typed compare is not "raw only" for reporting.
+            raw_only=raw_only and not used_source_layout,
         )
