@@ -142,7 +142,8 @@ def test_the_index_command_keeps_the_build_arguments_and_drops_the_ast_dump() ->
     assert command[command.index("-Xclang") + 1] == "-fno-wchar"
     assert command[-2:] == ["--", "/repo/src/wiz8/vector.cpp"]
     assert not any(
-        argument.startswith("/Fo") or argument == "/c" for argument in command
+        argument.startswith("/Fo") or argument == "/c"  # codespell:ignore
+        for argument in command  # codespell:ignore
     )
 
 

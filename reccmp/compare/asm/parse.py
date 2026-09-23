@@ -125,7 +125,9 @@ class ParseAsm:
         ident_fn = getattr(lookup, "identity", None)
         if callable(ident_fn):
             return ident_fn(addr, exact=exact, indirect=indirect)
-        result = lookup(addr, exact=exact, indirect=indirect) if callable(lookup) else None
+        result = (
+            lookup(addr, exact=exact, indirect=indirect) if callable(lookup) else None
+        )
         if isinstance(result, Reference):
             return result.identity
         return None
@@ -162,9 +164,7 @@ class ParseAsm:
 
     def indirect_reference(self, addr: int) -> Reference:
         display = self.indirect_replace(addr)
-        return Reference(
-            display, self._reference_identity(addr, display, exact=True)
-        )
+        return Reference(display, self._reference_identity(addr, display, exact=True))
 
     def _reference_identity(self, addr: int, display: str, *, exact: bool = False):
         resolved = self.lookup_identity(addr, exact=exact)
@@ -373,9 +373,7 @@ class ParseAsm:
                 if potential_name is not None:
                     ref = Reference(
                         potential_name,
-                        self._reference_identity(
-                            addr_val, potential_name, exact=True
-                        ),
+                        self._reference_identity(addr_val, potential_name, exact=True),
                     )
                     operands[0] = ("sym", ref)
                     control_target = ref.identity

@@ -1032,9 +1032,12 @@ def test_meta_step_over_unmodeled_instruction():
     bswap_meta = meta("bswap", ("ecx",), ("ecx",), 4)
     orig_meta = [None, None, bswap_meta, None]
     recomp_meta = [None, None, bswap_meta, None]
-    assert verify_effective_match(
-        orig, recomp, orig_meta=orig_meta, recomp_meta=recomp_meta
-    ) is True
+    assert (
+        verify_effective_match(
+            orig, recomp, orig_meta=orig_meta, recomp_meta=recomp_meta
+        )
+        is True
+    )
     # If the bswap reads a diverged register, it must still reject.
     bad_meta = meta("bswap", ("eax",), ("eax",), 4)
     orig_meta = [None, None, bad_meta, None]

@@ -129,9 +129,7 @@ def entity_proof_identity(
                 configured_orig if configured_orig is not None else canonical_orig
             )
         symbol = entity.get("symbol")
-        if canonical_orig is not None and (
-            configured_alias or entity.matched
-        ):
+        if canonical_orig is not None and (configured_alias or entity.matched):
             return ("entity", canonical_orig, offset)
         if entity.entity_type == EntityType.IMPORT:
             return ("import", entity.best_name() or entity.get("symbol"))
@@ -404,9 +402,7 @@ def create_name_lookup(
         return entity, addr - base_addr
 
     @cache
-    def lookup_cached(
-        _gen: int, addr: int, exact: bool, indirect: bool
-    ) -> str | None:
+    def lookup_cached(_gen: int, addr: int, exact: bool, indirect: bool) -> str | None:
         del _gen
         resolved = resolve_entity(addr, exact=exact, indirect=indirect)
         if resolved is None:
@@ -435,9 +431,7 @@ def create_name_lookup(
         entity, offset = resolved
         if offset == 0:
             entity = follow_thunk(entity)
-        return entity_proof_identity(
-            db, image_id, entity, offset, equivalence_groups
-        )
+        return entity_proof_identity(db, image_id, entity, offset, equivalence_groups)
 
     def identity(
         addr: int, exact: bool = False, indirect: bool = False

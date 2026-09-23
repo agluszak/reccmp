@@ -644,10 +644,7 @@ def test_test_self_equals_cmp_zero():
     metadata = FunctionMetadata(return_kind="void")
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
     targets = [None, None, 4, None, None]
-    assert (
-        verify_cfg_effective_match(orig, recomp, targets, targets, metadata)
-        is True
-    )
+    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
 
 
 def test_test_self_equals_cmp_zeroed_register():

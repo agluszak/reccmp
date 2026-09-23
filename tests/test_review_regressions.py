@@ -21,7 +21,6 @@ from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
 
-
 # --- A1: reachable code after jmp-over-int3 must not vanish -----------------
 
 _A1_ORIG = bytes.fromhex("EB01CCB801000000C3")  # jmp +1; int3; mov eax,1; ret

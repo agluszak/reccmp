@@ -238,7 +238,8 @@ class InstructGen:
                 pending = sorted(
                     addr
                     for addr, kind in self.confirmed_addrs.items()
-                    if addr >= self.cur_addr and kind == SectionType.CODE
+                    if addr >= self.cur_addr
+                    and kind == SectionType.CODE
                     and addr not in visited_code
                 )
                 if not pending:
@@ -326,6 +327,7 @@ class InstructGen:
                 ):
                     self.coverage_incomplete = True
                     break
+
 
 @cache
 def get_detail_disassembler(is_32: bool = True) -> Cs:

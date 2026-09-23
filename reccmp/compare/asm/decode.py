@@ -171,9 +171,7 @@ def from_capstone(insn) -> DecodedInstruction:
             for op in operands
         ):
             control_flow_known = False
-        elif any(
-            isinstance(op, tuple) and op and op[0] == "mem" for op in operands
-        ):
+        elif any(isinstance(op, tuple) and op and op[0] == "mem" for op in operands):
             control_flow_known = False
     raw_operands = tuple(format_operand(op) for op in operands)
 

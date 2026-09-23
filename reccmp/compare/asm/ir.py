@@ -86,9 +86,7 @@ def rebind_local_identities(
     stays side-local.
     """
     insn_ids = {
-        row.address: (
-            row.instruction_id if row.instruction_id is not None else index
-        )
+        row.address: (row.instruction_id if row.instruction_id is not None else index)
         for index, row in enumerate(excerpt)
         if row.address is not None and row.is_code
     }
@@ -175,9 +173,7 @@ class FunctionImage:
             for index, row in enumerate(self.excerpt)
         )
 
-    def with_excerpt(
-        self, excerpt: Sequence[DecodedInstruction]
-    ) -> "FunctionImage":
+    def with_excerpt(self, excerpt: Sequence[DecodedInstruction]) -> "FunctionImage":
         """Return a copy whose excerpt (and ids) come from ``excerpt``."""
         return replace(self, excerpt=tuple(excerpt))
 
@@ -456,9 +452,7 @@ def control_flow_topology_keys(
     tuple of case destination ids.
     """
     addr_to_id = {
-        row.address: (
-            row.instruction_id if row.instruction_id is not None else index
-        )
+        row.address: (row.instruction_id if row.instruction_id is not None else index)
         for index, row in enumerate(excerpt)
         if row.address is not None
     }

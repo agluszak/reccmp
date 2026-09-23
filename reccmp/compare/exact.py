@@ -63,7 +63,7 @@ def _source_name(name: str) -> str:
 
 
 def parse_coff_functions(path: Path) -> list[CoffFunction]:
-    """Compatibility function view of the complete object, including statics.
+    """Compatibility function view of the complete object, including static functions.
 
     Do not strip bytes which could be code or data. Callers supply an original
     extent when comparing; section alignment is not a function-size oracle.

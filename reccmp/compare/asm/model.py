@@ -201,7 +201,9 @@ def format_operand(operand) -> str:
             parts.append(f"+ {token}")
     for sign, name in syms:
         if not parts:
-            parts.append(operand_display(name) if sign > 0 else f"-{operand_display(name)}")
+            parts.append(
+                operand_display(name) if sign > 0 else f"-{operand_display(name)}"
+            )
         else:
             shown = operand_display(name)
             parts.append(f"+ {shown}" if sign > 0 else f"- {shown}")

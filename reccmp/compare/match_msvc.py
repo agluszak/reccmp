@@ -1,12 +1,15 @@
 from reccmp.types import EntityType
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.event import (
     ReccmpEvent,
     ReccmpReportProtocol,
     reccmp_report_nop,
 )
+from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.compare.queries import get_referencing_entity_matches
+from reccmp.parser.codebase import DecompCodebase
+from reccmp.parser.node import ParserFunction
 from reccmp.types import ImageId
 
 
@@ -103,13 +106,122 @@ def _match_name(name: str) -> str:
     return name.replace(" *", "*").replace(" &", "&")
 
 
+def match_folded_function_aliases(
+    db: EntityDb,
+    codebase: DecompCodebase,
+    lines_db: LinesDb,
+    report: ReccmpReportProtocol = reccmp_report_nop,
+    *,
+    truncate: bool = False,
+) -> None:
+    """Bind FOLDED annotations to the canonical pair as recomp-side aliases.
+
+    Retail ICF may keep one body at an address that several recomp symbols still
+    emit under ``/OPT:NOICF``. Each FOLDED annotation names one of those recomp
+    symbols; once the canonical (non-folded) annotation owns the orig address,
+    the extras become ``set_alias`` edges so vtable slots and operand compare
+    treat them as the shared original identity.
+    """
+
+    recomp_by_name: dict[str, list[int]] = {}
+    for ent in db.get_all():
+        if ent.recomp_addr is None:
+            continue
+        if ent.get("type") not in (EntityType.FUNCTION, None):
+            continue
+        name = ent.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        key = _match_name(name[:255] if truncate else name)
+        recomp_by_name.setdefault(key, []).append(ent.recomp_addr)
+
+    folded: list[ParserFunction] = [
+        symbol
+        for symbol in (
+            *codebase.iter_line_functions(),
+            *codebase.iter_name_functions(),
+        )
+        if symbol.is_folded
+    ]
+    for symbol in folded:
+        if db.get_one_match(symbol.offset) is None:
+            report(
+                ReccmpEvent.NO_MATCH,
+                symbol.offset,
+                msg=(
+                    f"FOLDED annotation at 0x{symbol.offset:x} has no canonical "
+                    f"owner to alias ({symbol.name})"
+                ),
+            )
+            continue
+
+        recomp_addr: int | None = None
+        if symbol.is_nameref():
+            key = _match_name(symbol.name[:255] if truncate else symbol.name)
+            candidates = [
+                addr
+                for addr in recomp_by_name.get(key, [])
+                if db.alias_canonical_orig(ImageId.RECOMP, addr) is None
+            ]
+            if len(candidates) == 1:
+                recomp_addr = candidates[0]
+            elif not candidates:
+                report(
+                    ReccmpEvent.NO_MATCH,
+                    symbol.offset,
+                    msg=f"Failed to alias FOLDED name '{symbol.name}' at 0x{symbol.offset:x}",
+                )
+                continue
+            else:
+                report(
+                    ReccmpEvent.AMBIGUOUS_MATCH,
+                    symbol.offset,
+                    msg=(
+                        f"Ambiguous FOLDED name '{symbol.name}' has "
+                        f"{len(candidates)} recomp candidates"
+                    ),
+                )
+                continue
+        else:
+            assert symbol.filename is not None
+            recomp_addr = lines_db.find_function(
+                symbol.filename,
+                symbol.line_number,
+                symbol.end_line,
+                folded=True,
+            )
+            if recomp_addr is None:
+                continue
+
+        if not db.set_alias(ImageId.RECOMP, recomp_addr, symbol.offset):
+            report(
+                ReccmpEvent.NO_MATCH,
+                symbol.offset,
+                msg=(
+                    f"Could not alias FOLDED recomp 0x{recomp_addr:x} to "
+                    f"0x{symbol.offset:x} ({symbol.name})"
+                ),
+            )
+
+
 def match_functions(
     db: EntityDb,
     report: ReccmpReportProtocol = reccmp_report_nop,
     *,
     truncate: bool = False,
+    equivalence_groups: dict[int, int] | None = None,
 ):
-    """Match functions by name only when the identity is unique on both sides."""
+    """Match functions by name only when the identity is unique on both sides.
+
+    Multiple original addresses may carry the same name when the original
+    binary emitted the same body more than once (e.g. a per-TU COMDAT copy).
+    If the project declares those addresses equivalent in an
+    ``equivalence-groups`` file, they count as a single identity here: the
+    canonical member takes the real match and the other members become
+    original-side aliases of it. Distinct (non-equivalent) bodies that merely
+    share a name are still reported as ambiguous."""
+    groups = equivalence_groups or {}
+
     recomp_symbols: dict[int, str] = {}
     name_index = EntityIndex()
 
@@ -133,7 +245,8 @@ def match_functions(
         for ent in db.unmatched(ImageId.ORIG)
         if ent.get("type") == EntityType.FUNCTION and ent.get("name")
     ]
-    orig_name_counts: dict[str, int] = {}
+    orig_by_addr: dict[int, ReccmpEntity] = {}
+    orig_name_identities: dict[str, set[int]] = {}
     normalized_names: dict[int, str] = {}
     for ent in orig_entities:
         assert ent.orig_addr is not None
@@ -143,12 +256,50 @@ def match_functions(
             name = name[:255]
         name = _match_name(name)
         normalized_names[ent.orig_addr] = name
-        orig_name_counts[name] = orig_name_counts.get(name, 0) + 1
+        orig_by_addr[ent.orig_addr] = ent
+        orig_name_identities.setdefault(name, set()).add(
+            canonical_orig_addr(groups, ent.orig_addr)
+        )
+
+    # For names that resolve to a single original identity, decide which
+    # entity owns the real match. Normally that is the entity itself; for an
+    # equivalence group it is the canonical member. If the canonical is not
+    # an unmatched entity under this name (already matched elsewhere or not
+    # an entity at all), the lowest-addressed member takes the match instead.
+    name_owners: dict[str, int] = {}
+    for name, identities in orig_name_identities.items():
+        if len(identities) != 1:
+            continue
+        canonical = next(iter(identities))
+        if db.get_one_match(canonical) is not None:
+            name_owners[name] = canonical
+            continue
+        owner = orig_by_addr.get(canonical)
+        if owner is None or normalized_names.get(canonical) != name:
+            owner = min(
+                (
+                    e
+                    for e in orig_entities
+                    if normalized_names.get(e.orig_addr or 0) == name
+                ),
+                key=lambda e: e.orig_addr or 0,
+            )
+        name_owners[name] = owner.orig_addr or 0
+
+    pending_aliases: list[tuple[int, int]] = []
 
     with db.batch() as batch:
         for ent in orig_entities:
             assert ent.orig_addr is not None
             name = normalized_names[ent.orig_addr]
+            identities = orig_name_identities[name]
+
+            if len(identities) == 1 and ent.orig_addr != name_owners[name]:
+                # Equivalent duplicate: the owner takes the real match and
+                # this address becomes an original-side alias of it.
+                pending_aliases.append((ent.orig_addr, name_owners[name]))
+                continue
+
             candidates = name_index.get(name)
             if not candidates:
                 report(
@@ -158,18 +309,33 @@ def match_functions(
                 )
                 continue
 
-            if orig_name_counts[name] != 1 or len(candidates) != 1:
+            if len(identities) != 1 or len(candidates) != 1:
                 symbols = [recomp_symbols.get(addr, "None") for addr in candidates]
                 report(
                     ReccmpEvent.AMBIGUOUS_MATCH,
                     ent.orig_addr,
                     msg=f"Ambiguous function name '{name}' has "
-                    f"{orig_name_counts[name]} original and {len(candidates)} recomp candidates:\n"
+                    f"{len(identities)} original and {len(candidates)} recomp candidates:\n"
                     + ",\n".join(f"'{symbol}'" for symbol in symbols),
                 )
                 continue
 
             batch.match(ent.orig_addr, name_index.pop(name))
+
+    for member_addr, owner_addr in pending_aliases:
+        # Aliases require a real canonical match. If the owner could not be
+        # matched its own report already covers the group.
+        if db.get_one_match(owner_addr) is None:
+            continue
+        if not db.set_alias(ImageId.ORIG, member_addr, owner_addr):
+            report(
+                ReccmpEvent.NO_MATCH,
+                member_addr,
+                msg=(
+                    f"Could not alias equivalent original 0x{member_addr:x} to "
+                    f"0x{owner_addr:x}"
+                ),
+            )
 
 
 def _find_vtable_match(

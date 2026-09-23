@@ -16,6 +16,9 @@ from typing import Mapping, Sequence
 
 from reccmp.parser.marker import ProjectAliases
 from .index import (
+    SourceAbi,
+    SourceClass,
+    SourceDeclaration,
     SourceIndex,
     SourceIndexError,
     TranslationUnitRecords,
@@ -358,22 +361,31 @@ def collect_compile_database(
 
         variables: dict[tuple[str | None, str], SourceVariable] = {}
         for part in indexes:
-            for item in part.variables:
-                variables.setdefault((item.target, item.semantic_id), item)
+            for variable in part.variables:
+                variables.setdefault((variable.target, variable.semantic_id), variable)
         conflicts: dict[tuple[str | None, str, str], SourceConflict] = {}
         for part in indexes:
-            for item in part.conflicts:
+            for conflict in part.conflicts:
                 conflicts.setdefault(
-                    (item.target, item.record_kind, item.semantic_id), item
+                    (
+                        conflict.target,
+                        conflict.record_kind,
+                        conflict.semantic_id,
+                    ),
+                    conflict,
                 )
-        classes: dict[tuple[str | None, str], object] = {}
+        classes: dict[tuple[str | None, str], SourceClass] = {}
         for part in indexes:
-            for item in part.classes:
-                classes.setdefault((item.target, item.semantic_id), item)
-        declarations: dict[tuple[str | None, tuple[str, ...]], object] = {}
+            for source_class in part.classes:
+                classes.setdefault(
+                    (source_class.target, source_class.semantic_id), source_class
+                )
+        declarations: dict[tuple[str | None, tuple[str, ...]], SourceDeclaration] = {}
         for part in indexes:
-            for item in part.declarations:
-                declarations.setdefault((item.target, item.merge_key), item)
+            for declaration in part.declarations:
+                declarations.setdefault(
+                    (declaration.target, declaration.merge_key), declaration
+                )
 
         result = SourceIndex(
             declarations=declarations.values(),

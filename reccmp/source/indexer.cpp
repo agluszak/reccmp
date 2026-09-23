@@ -250,7 +250,7 @@ class Indexer {
     std::string qualified;
     llvm::raw_string_ostream stream(qualified);
     record->printQualifiedName(stream, policy_);
-    return ("record:" + stream.str()).str();
+    return "record:" + stream.str();
   }
 
   std::string templateArguments(const ClassTemplateSpecializationDecl* specialization) const {
@@ -783,7 +783,7 @@ class IndexConsumer : public ASTConsumer {
     out_ << llvm::json::Value(llvm::json::Object{
                 {"record", "unit-abi"},
                 {"target_triple", target.getTriple().str()},
-                {"pointer_width", static_cast<int64_t>(target.getPointerWidth(0) / 8)},
+                {"pointer_width", static_cast<int64_t>(target.getPointerWidth(LangAS::Default) / 8)},
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";

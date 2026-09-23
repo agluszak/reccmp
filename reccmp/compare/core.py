@@ -31,6 +31,7 @@ from .match_msvc import (
     match_lines,
     match_symbols,
     match_functions,
+    match_folded_function_aliases,
     match_vtables,
     match_static_variables,
     match_variables,
@@ -51,6 +52,7 @@ from .analyze import (
     create_thunks,
     create_analysis_floats,
     create_analysis_strings,
+    create_analysis_widechars,
     create_analysis_vtordisps,
     create_crt_functions,
     create_seh_entities,
@@ -263,7 +265,19 @@ class Compare:
         # Match using PDB and annotation data
         truncate = self.cvdump_analysis.truncate_symbols
         match_symbols(self._db, self.report, truncate=truncate)
-        match_functions(self._db, self.report, truncate=truncate)
+        match_functions(
+            self._db,
+            self.report,
+            truncate=truncate,
+            equivalence_groups=self.equivalence_groups,
+        )
+        match_folded_function_aliases(
+            self._db,
+            self.codebase,
+            self._lines_db,
+            self.report,
+            truncate=truncate,
+        )
         match_vtables(self._db, self.report)
         classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         match_static_variables(self._db, self.report)
@@ -313,6 +327,8 @@ class Compare:
             # Detect floats first because we can identify them with more confidence
             # and this eliminates them from consideration as strings.
             create_analysis_floats(self._db, img_id, binfile)
+            # Wide before Latin1: otherwise L"F1" is misread as the short string "F".
+            create_analysis_widechars(self._db, img_id, binfile)
             create_analysis_strings(self._db, img_id, binfile, self.bin_encoding)
             complete_partial_floats(self._db, img_id, binfile)
             complete_partial_strings(self._db, img_id, binfile, self.bin_encoding)
@@ -397,7 +413,17 @@ class Compare:
         """
         if recomp is None or recomp.recomp_addr is None:
             return False
-        if recomp.get("type") not in (EntityType.FUNCTION, None):
+        # VTORDISP/THUNK slot entities are bare adjustor/jump stubs: their
+        # transfer target is a code address, so body equivalence still proves
+        # the slot. IMPORT_THUNK slots are excluded on purpose - the thunk body
+        # is just `jmp dword ptr [iat]` and sanitization would erase the only
+        # byte that distinguishes one import from another.
+        if recomp.get("type") not in (
+            EntityType.FUNCTION,
+            EntityType.VTORDISP,
+            EntityType.THUNK,
+            None,
+        ):
             return False
         size = recomp.size(ImageId.RECOMP)
         if size is None or size <= 0:
@@ -532,6 +558,13 @@ class Compare:
                 and (
                     orig.recomp_addr == recomp.recomp_addr
                     or self._orig_addrs_equivalent(orig.orig_addr, recomp.orig_addr)
+                    or (
+                        recomp.recomp_addr is not None
+                        and self._db.alias_canonical_orig(
+                            ImageId.RECOMP, recomp.recomp_addr
+                        )
+                        == raw_orig
+                    )
                 )
             )
             if not slot_matches and raw_orig is not None:

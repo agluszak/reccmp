@@ -92,9 +92,7 @@ def load_source_index_for_target(
     scoped = index.for_target(target.target_id)
     if _scoped_is_empty(scoped):
         if _records_have_targets(index):
-            logger.debug(
-                "source index has no records for target %s", target.target_id
-            )
+            logger.debug("source index has no records for target %s", target.target_id)
             return None
         scoped = index
     abi = scoped.abi

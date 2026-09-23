@@ -49,9 +49,7 @@ def test_function_image_captures_excerpt_tables_and_coverage():
         tuple(replace(row, instruction_id=i) for i, row in enumerate(image.excerpt))
     )
     assert stamped.instruction_ids == tuple(range(len(stamped.excerpt)))
-    assert all(
-        row.instruction_id == i for i, row in enumerate(stamped.excerpt)
-    )
+    assert all(row.instruction_id == i for i, row in enumerate(stamped.excerpt))
 
 
 def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(

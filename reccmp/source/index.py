@@ -800,7 +800,18 @@ def _join_markers(
         )
         candidates = by_location.get((relative, method_symbol.line_number), [])
         marker_declaration: SourceDeclaration | None = None
-        if method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}:
+        # Name-reference markers (TEMPLATE/SYNTHETIC/LIBRARY, and FUNCTION with a
+        # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
+        # point at their name line, not a definition, so they cannot bind by
+        # location.
+        if (
+            method_symbol.type
+            in {
+                MarkerType.FUNCTION,
+                MarkerType.STUB,
+            }
+            and not method_symbol.is_nameref()
+        ):
             if len(candidates) != 1:
                 raise SourceIndexError(
                     f"{relative}:{method_symbol.line_number}: {method_symbol.type.name} "
@@ -950,21 +961,21 @@ class SourceIndex:
         if abi is None and self.abi is not None:
             # Single-ABI indexes (and legacy JSON) may only carry ``abi``.
             targets_present = {
-                item.target
-                for item in (
-                    *self.classes,
-                    *self.markers,
-                    *self.variables,
-                    *self.declarations,
-                )
-                if item.target is not None
+                item.target for item in self.classes if item.target is not None
             }
+            targets_present.update(
+                item.target for item in self.markers if item.target is not None
+            )
+            targets_present.update(
+                item.target for item in self.variables if item.target is not None
+            )
+            targets_present.update(
+                item.target for item in self.declarations if item.target is not None
+            )
             if not targets_present or targets_present == {target}:
                 abi = self.abi
         return SourceIndex(
-            declarations=(
-                item for item in self.declarations if item.target == target
-            ),
+            declarations=(item for item in self.declarations if item.target == target),
             classes=(item for item in self.classes if item.target == target),
             markers=(item for item in self.markers if item.target == target),
             variables=(item for item in self.variables if item.target == target),
@@ -989,7 +1000,9 @@ class SourceIndex:
             return self._classes_by_target_semantic_id.get((target, semantic_id))
         return self._classes_by_semantic_id.get(semantic_id)
 
-    def _lookup_nested_class(self, field: SourceField, type_spelling: str) -> str | None:
+    def _lookup_nested_class(
+        self, field: SourceField, type_spelling: str
+    ) -> str | None:
         """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping.
 
         Only for *embedded* record storage. Pointer/reference fields keep the
