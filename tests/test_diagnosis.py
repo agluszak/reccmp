@@ -2,14 +2,22 @@
 
 from difflib import SequenceMatcher
 
-from reccmp.compare.asm.effective import (
+import pytest
+
+from reccmp.compare.asm.verifier import (
     CallAbi,
     FunctionMetadata,
+)
+from reccmp.compare.asm.verifier.evidence import (
     _diagnostic_summaries,
 )
 from reccmp.compare.asm.fixes import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructionMeta
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    StrategyAttempt,
+)
 
 
 def analyze(orig, recomp, **kwargs):
@@ -208,7 +216,7 @@ def test_immediate_value_difference():
     assert result.difference.orig.facts["value"] == 4
 
 
-def test_mismatch_analysis_carries_diagnostic_semantic_similarity():
+def test_register_renamed_constant_difference_is_a_mismatch():
     orig = [
         "mov eax, dword ptr [ebp - 4]",
         "add eax, 5",
@@ -232,7 +240,6 @@ def test_mismatch_analysis_carries_diagnostic_semantic_similarity():
     )
     assert result.status == ComparisonStatus.MISMATCH
     assert result.difference.kind == "immediate_value"
-    assert result.semantic_similarity == 0.75
 
 
 def test_branch_condition_difference():
@@ -307,6 +314,41 @@ def test_unsupported_instruction_is_inconclusive():
     result = analyze(["bswap eax", "ret"], ["bswap ecx", "ret"])
     assert result.status == ComparisonStatus.INCONCLUSIVE
     assert result.inconclusive_reason == "missing_metadata"
+    by_strategy = {attempt.strategy: attempt for attempt in result.attempts}
+    assert by_strategy["lockstep"].blocker == "unsupported_instruction"
+    assert by_strategy["lockstep"].location.instruction_index == 0
+    assert by_strategy["cfg"].blocker == "missing_metadata"
+
+
+def test_mismatch_keeps_every_strategy_attempt():
+    result = analyze(["mov eax, 1", "ret"], ["mov eax, 2", "ret"])
+    assert result.status == ComparisonStatus.MISMATCH
+    assert [attempt.strategy for attempt in result.attempts] == [
+        "lockstep",
+        "diff_aligned",
+        "cfg",
+        "isomorphic_cfg",
+    ]
+    lockstep = result.attempts[0]
+    assert lockstep.trusted_alignment
+    assert lockstep.difference == result.difference
+    assert not result.attempts[1].trusted_alignment
+
+
+def test_proven_results_carry_no_attempts():
+    assert not analyze(["mov eax, 1", "ret"], ["mov eax, 1", "ret"]).attempts
+    with pytest.raises(ValueError):
+        ComparisonAnalysis(
+            ComparisonStatus.EXACT,
+            attempts=(StrategyAttempt("cfg", blocker="missing_metadata"),),
+        )
+
+
+def test_attempt_has_exactly_one_outcome():
+    with pytest.raises(ValueError):
+        StrategyAttempt("cfg")
+    with pytest.raises(ValueError):
+        StrategyAttempt("unknown", blocker="analysis_limit")
 
 
 def test_reason_order_is_deterministic():

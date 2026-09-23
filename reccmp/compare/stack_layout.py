@@ -21,6 +21,8 @@ from reccmp.compare.diff import (
 from reccmp.compare.diff import raw_diff_to_udiff
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpTypeKey
+from reccmp.compare.asm.ir import rewrite_stack_displacements
+from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 StackRefKind = Literal["argument", "local", "spill", "saved", "unknown"]
 
@@ -57,6 +59,7 @@ def canonical_stack_ref(
     known_spills: set[int] | frozenset[int] | None = None,
     pdb_slots: Sequence[tuple[int, int, str, StackRefKind]] | None = None,
 ) -> CanonicalStackRef:
+    # pylint: disable=too-many-return-statements
     """Map a physical (reg, offset) pair to a canonical stack reference.
 
     When ``pdb_slots`` is provided (``(start, size, name, kind)`` covering
@@ -347,7 +350,14 @@ def permutation_entries(
         entries: list[StackPermutationEntry] = []
         seen: set[tuple[str, str]] = set()
         for orig, recomp in sorted(
-            stack_pairs, key=lambda p: (p.orig.offset, p.recomp.offset)
+            stack_pairs,
+            key=lambda p: (
+                p.orig.offset,
+                p.recomp.offset,
+                p.orig.label(),
+                p.recomp.label(),
+                p.recomp.symbol.name if p.recomp.symbol else "",
+            ),
         ):
             key = (orig.label(), recomp.label())
             if key in seen:
@@ -363,17 +373,21 @@ def permutation_entries(
         return tuple(entries)
 
     entries = []
-    for orig_key, recomp_key in sorted(mapping.items(), key=lambda kv: kv[0][1]):
+    # Offset first, then the full slot identity so equal offsets on
+    # different base registers have a stable order across processes.
+    for orig_key, recomp_key in sorted(
+        mapping.items(), key=lambda kv: (kv[0][1], repr(kv[0]), repr(kv[1]))
+    ):
         orig = StackRegisterOffset(*orig_key)
         recomp = StackRegisterOffset(*recomp_key)
         # Recover symbol from any matching pair.
-        symbol = next(
+        symbol = min(
             (
                 p.recomp.symbol.name
                 for p in stack_pairs
                 if p.orig == orig and p.recomp == recomp and p.recomp.symbol
             ),
-            None,
+            default=None,
         )
         entries.append(StackPermutationEntry(orig.label(), recomp.label(), symbol))
     return tuple(entries)
@@ -385,9 +399,6 @@ def accuracy_after_stack_map(
     mapping: dict[tuple[str, int], tuple[str, int]],
 ) -> float:
     """SequenceMatcher ratio after rewriting orig stack offsets toward recomp."""
-    from reccmp.compare.asm.ir import rewrite_stack_displacements
-    from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
-
     if not mapping:
         return SequenceMatcherWithPins(list(orig_asm), list(recomp_asm), []).ratio()
 

@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 import dataclasses
 from dataclasses import dataclass, field
 from functools import cache
@@ -8,7 +9,10 @@ from typing import Callable, Iterator
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
-from reccmp.compare.asm.effective import CallAbi, FunctionMetadata
+from reccmp.compare.asm.verifier import (
+    CallAbi,
+    FunctionMetadata,
+)
 from reccmp.compare.asm.fixes import analyze_effective_match, assert_fixup
 from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.instgen import (
@@ -22,6 +26,7 @@ from reccmp.compare.asm.ir import (
     FunctionImage,
     compute_extent_closed,
     control_flow_topology_keys,
+    local_destination_keys,
     excerpt_addrs,
     excerpt_displays,
     instruction_match_key,
@@ -42,6 +47,7 @@ from reccmp.compare.diagnosis import (
     ComparisonStatus,
     DifferenceSide,
     FactValue,
+    StrategyAttempt,
 )
 from reccmp.compare.verification import (
     admit_effective,
@@ -77,6 +83,7 @@ from reccmp.formats.exceptions import (
 )
 from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
+from reccmp.compare.inlines import find_call_sites
 
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
 
@@ -298,13 +305,25 @@ class FunctionComparator:
             "source_line": path_line_pair[1],
         }
 
-    def _enrich_side_with_source(self, side: DifferenceSide) -> DifferenceSide:
-        """Attach PDB line info when the side address is a recomp VA."""
-        extra = self._source_facts_of_recomp_addr(side.address)
+    def _enrich_side_with_source(
+        self, side: DifferenceSide, *, recomp: bool = False
+    ) -> DifferenceSide:
+        """Attach PDB line info for the recomp address of this location.
+
+        Orig-side locations are pinned through their recorded recomp
+        counterpart; an orig address is never looked up in the recomp PDB.
+        """
+        recomp_address = (
+            side.address
+            if recomp or side.image == "recomp"
+            else side.facts.get("recomp_address")
+        )
+        if not isinstance(recomp_address, int) or isinstance(recomp_address, bool):
+            return side
+        extra = self._source_facts_of_recomp_addr(recomp_address)
         if not extra:
             return side
-        facts = {**side.facts, **extra}
-        return DifferenceSide(side.instruction_index, side.address, facts)
+        return dataclasses.replace(side, facts={**side.facts, **extra})
 
     def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
         """Resolve the class that owns ``this`` for layout enrichment."""
@@ -374,7 +393,7 @@ class FunctionComparator:
         ):
             diff = analysis.difference
             orig_side = diff.orig
-            recomp_side = self._enrich_side_with_source(diff.recomp)
+            recomp_side = self._enrich_side_with_source(diff.recomp, recomp=True)
             if diff.kind == "memory_address":
                 class_name = self._owning_class_for_match(match)
                 orig_layout = self._layout_facts_for_displacement(
@@ -384,30 +403,53 @@ class FunctionComparator:
                     class_name, recomp_side.facts
                 )
                 if orig_layout:
-                    orig_side = DifferenceSide(
-                        orig_side.instruction_index,
-                        orig_side.address,
-                        {**orig_side.facts, **orig_layout},
+                    orig_side = dataclasses.replace(
+                        orig_side, facts={**orig_side.facts, **orig_layout}
                     )
                 if recomp_layout:
-                    recomp_side = DifferenceSide(
-                        recomp_side.instruction_index,
-                        recomp_side.address,
-                        {**recomp_side.facts, **recomp_layout},
+                    recomp_side = dataclasses.replace(
+                        recomp_side, facts={**recomp_side.facts, **recomp_layout}
                     )
             enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
-            return ComparisonAnalysis.mismatch(
-                enriched, semantic_similarity=analysis.semantic_similarity
+            return dataclasses.replace(
+                analysis,
+                difference=enriched,
+                attempts=self._enrich_attempts_with_source(analysis.attempts),
             )
-        if (
-            analysis.status == ComparisonStatus.INCONCLUSIVE
-            and analysis.inconclusive_location is not None
-        ):
-            return ComparisonAnalysis.inconclusive(
-                analysis.inconclusive_reason or "analysis_limit",
-                self._enrich_side_with_source(analysis.inconclusive_location),
+        if analysis.status == ComparisonStatus.INCONCLUSIVE:
+            location = analysis.inconclusive_location
+            return dataclasses.replace(
+                analysis,
+                inconclusive_location=(
+                    self._enrich_side_with_source(location)
+                    if location is not None
+                    else None
+                ),
+                attempts=self._enrich_attempts_with_source(analysis.attempts),
             )
         return analysis
+
+    def _enrich_attempts_with_source(
+        self, attempts: tuple[StrategyAttempt, ...]
+    ) -> tuple[StrategyAttempt, ...]:
+        enriched: list[StrategyAttempt] = []
+        for attempt in attempts:
+            if attempt.difference is not None:
+                diff = attempt.difference
+                attempt = dataclasses.replace(
+                    attempt,
+                    difference=ComparisonDifference(
+                        diff.kind,
+                        diff.orig,
+                        self._enrich_side_with_source(diff.recomp, recomp=True),
+                    ),
+                )
+            elif attempt.location is not None:
+                attempt = dataclasses.replace(
+                    attempt, location=self._enrich_side_with_source(attempt.location)
+                )
+            enriched.append(attempt)
+        return tuple(enriched)
 
     def _load_function_image(
         self,
@@ -593,22 +635,22 @@ class FunctionComparator:
         shape remain part of the key.
         """
         cache_key = (image_id, addr, size)
-        cache = getattr(self, "_fp_cache", None)
-        if cache is not None and cache_key in cache:
-            return cache[cache_key]
+        memo = getattr(self, "_fp_cache", None)
+        if memo is not None and cache_key in memo:
+            return memo[cache_key]
 
         image = self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin
         valid_addr = create_valid_addr_lookup(self.db, image_id, image)
         try:
             raw = image.read(addr, size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
-            if cache is not None:
-                cache[cache_key] = None
+            if memo is not None:
+                memo[cache_key] = None
             return None
         instructions = _code_instructions(raw, addr, self.is_32bit)
         if instructions is None:
-            if cache is not None:
-                cache[cache_key] = None
+            if memo is not None:
+                memo[cache_key] = None
             return None
 
         def normalize_operand(operand: str) -> str:
@@ -622,33 +664,33 @@ class FunctionComparator:
             (mnemonic, normalize_operand(operand))
             for _, _, mnemonic, operand in instructions
         )
-        if cache is not None:
-            cache[cache_key] = fingerprint
+        if memo is not None:
+            memo[cache_key] = fingerprint
         return fingerprint
 
     def _helper_entry_for_match(self, entity: ReccmpMatch) -> HelperCatalogEntry | None:
         """Lazily fingerprint one paired helper (memoized in the catalog map)."""
-        cache = getattr(self, "_helper_by_orig", None)
-        if cache is None:
+        memo = getattr(self, "_helper_by_orig", None)
+        if memo is None:
             self._helper_by_orig = {}
-            cache = self._helper_by_orig
-        if entity.orig_addr in cache:
-            return cache[entity.orig_addr]
+            memo = self._helper_by_orig
+        if entity.orig_addr in memo:
+            return memo[entity.orig_addr]
 
         recomp_size = entity.size(ImageId.RECOMP)
         if recomp_size is None or recomp_size <= 0:
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         try:
             raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
         fingerprint = asm_fingerprint_from_ir(excerpt)
         needle = strip_helper_epilog(fingerprint)
         if len(needle) < 3:
-            cache[entity.orig_addr] = None
+            memo[entity.orig_addr] = None
             return None
         name = entity.best_name() or f"sub_{entity.orig_addr:x}"
         entry = HelperCatalogEntry(
@@ -659,7 +701,7 @@ class FunctionComparator:
             byte_size=recomp_size,
             effect_summary=summarize_helper_effects(needle),
         )
-        cache[entity.orig_addr] = entry
+        memo[entity.orig_addr] = entry
         return entry
 
     def _ensure_helper_identity_index(self) -> None:
@@ -754,8 +796,6 @@ class FunctionComparator:
         recomp_asm: AsmExcerpt,
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
-        from reccmp.compare.inlines import find_call_sites
-
         orig_fp = fingerprint_from_asm(orig_asm)
         recomp_fp = fingerprint_from_asm(recomp_asm)
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}
@@ -1061,6 +1101,7 @@ class FunctionComparator:
         active: set[tuple[int, int]],
         proved: dict[tuple[int, int], bool],
     ) -> bool:
+        # pylint: disable=too-many-positional-arguments,too-many-return-statements
         try:
             orig_raw = self.orig_bin.read(orig_addr, size)
             recomp_raw = self.recomp_bin.read(recomp_addr, size)
@@ -1101,8 +1142,22 @@ class FunctionComparator:
                 _proved=proved,
             )
         orig_asm = self.orig_sanitize.parse_asm(orig_raw, orig_addr)
+        orig_topology = local_destination_keys(
+            orig_asm,
+            self.orig_sanitize.jump_tables,
+            start_addr=orig_addr,
+            extent=size,
+        )
         recomp_asm = self.recomp_sanitize.parse_asm(recomp_raw, recomp_addr)
+        recomp_topology = local_destination_keys(
+            recomp_asm,
+            self.recomp_sanitize.jump_tables,
+            start_addr=recomp_addr,
+            extent=size,
+        )
         if not orig_asm or len(orig_asm) != len(recomp_asm):
+            return False
+        if orig_topology is None or recomp_topology is None:
             return False
         orig_insts = _code_instructions(orig_raw, orig_addr, self.is_32bit)
         recomp_insts = _code_instructions(recomp_raw, recomp_addr, self.is_32bit)
@@ -1116,7 +1171,13 @@ class FunctionComparator:
         for index, (orig_row, recomp_row) in enumerate(zip(orig_asm, recomp_asm)):
             orig_line = orig_row.display
             recomp_line = recomp_row.display
-            if orig_line == recomp_line and "<OFFSET" not in orig_line:
+            # Local branches must reach the same instruction id: equal
+            # displacement text does not imply that when encodings differ.
+            if (
+                orig_line == recomp_line
+                and "<OFFSET" not in orig_line
+                and orig_topology[index] == recomp_topology[index]
+            ):
                 continue
             if not self._transfer_targets_alias_equivalent(
                 orig_insts[index], recomp_insts[index], depth, active, proved
@@ -1488,6 +1549,7 @@ class FunctionComparator:
         recomp_meta: list[InstructionMeta | None] | None = None,
         coverage_incomplete: bool = False,
     ) -> EntityCompareResult:
+        # pylint: disable=too-many-arguments
         """Test/legacy wrapper that lifts excerpts into ephemeral function images."""
         orig_image = FunctionImage(
             start_addr=0,

@@ -7,6 +7,7 @@ from reccmp.cvdump.types import (
     TypeInfo,
 )
 from reccmp.compare.db import EntityDb, ReccmpMatch
+from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
 from reccmp.types import EntityType, ImageId
 from .mock_types_db import MockTypesDb
 from .raw_image import RawImage
@@ -513,7 +514,6 @@ def test_display_signed_unsigned(
 
 def test_compare_uses_source_layout_field_paths(db: EntityDb):
     """When SourceIndex has layout, differing members report dotted field paths."""
-    from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
 
     key = CvdumpTypeKey(0x1000)
     type_info = [
@@ -598,7 +598,6 @@ def test_compare_raw_only_uses_trusted_source_layout(
     db: EntityDb, types: CvdumpTypesParser
 ):
     """Without PDB type format, trusted Clang layout still types the compare."""
-    from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
 
     create_matched_variable(db, 0, size=8)
     with db.batch() as batch:

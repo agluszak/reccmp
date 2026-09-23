@@ -1,12 +1,12 @@
+import dataclasses
 import logging
 from typing import Sequence
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     JCC_MNEMONICS,
     FunctionMetadata,
     LineEffects,
     effects_conflict,
-    estimate_isomorphic_cfg_semantic_similarity,
     flags_dead_at,
     sequence_effects,
     verify_cfg_effective_match,
@@ -28,11 +28,11 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
+    StrategyAttempt,
 )
 from reccmp.compare.verification import (
     admit_effective,
     admit_exact_analysis,
-    admit_proof,
 )
 from reccmp.compare.pinned_sequences import DiffOpcode
 
@@ -82,7 +82,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     Prefer ``DecodedInstruction`` excerpts so the verifier uses Capstone
     operands directly. Legacy ``list[str]`` still works via text parse.
 
-    The relational verifier (see effective.py) proves equivalence modulo
+    The relational verifier (see the verifier package) proves equivalence modulo
     register allocation, commutative-operand order and inverted compare/jump
     conditions. Instruction-scheduling differences are handled by undoing
     relocations that are proven independent of everything they cross, then
@@ -139,15 +139,6 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
                 "incomplete_coverage" if coverage_incomplete else "open_extent"
             )
         return admitted.analysis
-
-    def finish(analysis: ComparisonAnalysis) -> ComparisonAnalysis:
-        if analysis.status == ComparisonStatus.EFFECTIVE:
-            return finish_effective(analysis.effective_reasons)
-        return admit_proof(
-            analysis,
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        )
 
     def new_recorder() -> AnalysisRecorder:
         return AnalysisRecorder(orig_addr_list, recomp_addr_list)
@@ -252,48 +243,38 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
 
-    def failure(recorder: AnalysisRecorder) -> ComparisonAnalysis:
-        analysis = recorder.failure_analysis()
-        if (
-            analysis.status == ComparisonStatus.MISMATCH
-            and analysis.difference is not None
-            and full_orig_targets is not None
-            and full_recomp_targets is not None
-        ):
-            similarity = estimate_isomorphic_cfg_semantic_similarity(
-                orig.displays,
-                recomp.displays,
-                full_orig_targets,
-                full_recomp_targets,
-                metadata=metadata,
-                orig_meta=orig_meta,
-                recomp_meta=recomp_meta,
-            )
-            if similarity is not None:
-                return ComparisonAnalysis.mismatch(
-                    analysis.difference,
-                    semantic_similarity=similarity,
-                )
-        return analysis
+    if not cfg_attempted:
+        cfg.mark_inconclusive("missing_metadata")
+    attempts = [lockstep.attempt("lockstep"), diff_aligned.attempt("diff_aligned")]
+    if relocation_normalized is not None:
+        attempts.append(relocation.attempt("relocation"))
+    attempts.append(cfg.attempt("cfg"))
+    attempts.append(
+        iso.attempt("isomorphic_cfg")
+        if iso_attempted
+        else StrategyAttempt("isomorphic_cfg", blocker="missing_metadata")
+    )
+
+    def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
+        return dataclasses.replace(
+            recorder.failure_analysis(), attempts=tuple(attempts)
+        )
 
     # Only positional lockstep and the two CFG strategies establish trusted
     # program points. Diff alignment and relocation are proof-only.
     if cfg_attempted and cfg.best_difference is not None:
-        return failure(cfg)
+        return failed(cfg)
     if lockstep.best_difference is not None:
-        return failure(lockstep)
+        return failed(lockstep)
     if iso_attempted and iso.best_difference is not None:
-        return failure(iso)
-    if not cfg_attempted:
-        cfg.mark_inconclusive("missing_metadata")
+        return failed(iso)
     for candidate in (iso, cfg, lockstep):
         if candidate.inconclusive_reason is not None:
             inconclusive = candidate
             break
     else:
         inconclusive = cfg
-        inconclusive.mark_inconclusive("analysis_limit")
-    analysis = inconclusive.failure_analysis()
+    analysis = failed(inconclusive)
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
     return analysis
 
@@ -312,6 +293,7 @@ def _display_topology_equal(
     recomp_addrs: Sequence[int | None] | None,
     recomp_meta: Sequence[InstructionMeta | None] | None,
 ) -> bool:
+    # pylint: disable=too-many-positional-arguments
     """True when local branch destinations (instruction ids) are known and agree.
 
     Jump-free streams are vacuously equal. Jump-bearing streams without
@@ -380,7 +362,7 @@ def undo_relocations(
     if not inserts or len(inserts) != len(deletes):
         return None
 
-    effects = sequence_effects(orig.displays)
+    effects = sequence_effects(orig)
     if effects is None:
         return None
 

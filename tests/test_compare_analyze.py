@@ -597,17 +597,21 @@ def test_normalize_original_zero_size_data(db: EntityDb):
 
     normalize_original_zero_size_data(db, binfile)
 
-    assert db.get(ImageId.ORIG, 0x1050).get("type") == EntityType.LABEL
+    label = db.get(ImageId.ORIG, 0x1050)
+    assert label is not None and label.get("type") == EntityType.LABEL
     thunk = db.get(ImageId.ORIG, 0x2000)
+    assert thunk is not None
     assert thunk.get("type") == EntityType.THUNK
     assert thunk.size(ImageId.ORIG) == 5
     assert get_ref_addr(db, ImageId.ORIG, 0x2000) == 0x1100
     vtable = db.get(ImageId.ORIG, 0x4000)
+    assert vtable is not None
     assert vtable.get("type") == EntityType.VTABLE
     assert vtable.get("name") == "Sample"
     assert vtable.get("inferred_vtable") is True
     assert vtable.size(ImageId.ORIG) == 12
-    assert db.get(ImageId.ORIG, 0x4020).get("type") == EntityType.DATA
+    data = db.get(ImageId.ORIG, 0x4020)
+    assert data is not None and data.get("type") == EntityType.DATA
 
 
 def test_classify_exact_vtable_aliases(db: EntityDb):

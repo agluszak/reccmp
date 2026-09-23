@@ -10,7 +10,9 @@ import difflib
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.effective import verify_effective_match
+from reccmp.compare.asm.verifier import (
+    verify_effective_match,
+)
 from reccmp.compare.asm.fixes import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
 from reccmp.compare.asm.parse import ParseAsm
@@ -259,26 +261,43 @@ def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> InstructionM
     )
 
 
+_BSWAP_ORIG = [
+    "mov eax, dword ptr [esi]",
+    "mov ecx, dword ptr [edi]",
+    "bswap ecx",
+    "mov dword ptr [ebx], ecx",
+]
+_BSWAP_RECOMP = [
+    "mov edx, dword ptr [esi]",
+    "mov ecx, dword ptr [edi]",
+    "bswap ecx",
+    "mov dword ptr [ebx], ecx",
+]
+
+
 def test_a6_one_sided_meta_cannot_step_divergent_unsupported_instruction():
     """``meta_o or meta_r`` must not invent agreement when only one side has meta."""
-    orig = [
-        "mov eax, dword ptr [esi]",
-        "mov ecx, dword ptr [edi]",
-        "bswap ecx",
-        "mov dword ptr [ebx], ecx",
-    ]
-    recomp = [
-        "mov edx, dword ptr [esi]",
-        "mov ecx, dword ptr [edi]",
-        "bswap ecx",
-        "mov dword ptr [ebx], ecx",
-    ]
+    orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
     one_sided = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
     assert verify_effective_match(orig, recomp, orig_meta=one_sided) is False
     assert verify_effective_match(orig, recomp, recomp_meta=one_sided) is False
 
-    both = one_sided
-    # Matching meta on both sides remains the supported step path.
+
+def test_meta_step_over_unmodeled_instruction():
+    """With capstone metadata, an unmodeled register-only instruction
+    (bswap) can be stepped over even while a rename is in flight — its
+    reads must agree, its writes become fresh paired values."""
+    orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
+    # Without metadata: bswap requires full sync, but eax/edx diverge.
+    assert verify_effective_match(orig, recomp) is False
+    both = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
     assert (
         verify_effective_match(orig, recomp, orig_meta=both, recomp_meta=both) is True
+    )
+    # If the bswap reads a diverged register, it must still reject.
+    bad = [None, None, _bswap_meta(("eax",), ("eax",)), None]
+    orig2 = [orig[0], orig[1], "bswap eax", "mov dword ptr [ebx], ecx"]
+    recomp2 = [recomp[0], recomp[1], "bswap eax", "mov dword ptr [ebx], ecx"]
+    assert (
+        verify_effective_match(orig2, recomp2, orig_meta=bad, recomp_meta=bad) is False
     )

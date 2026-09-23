@@ -11,7 +11,10 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from reccmp.compare.asm.effective import _extract_switch_tables
+from reccmp.compare import Compare
+from reccmp.compare.asm.verifier.cfg_build import (
+    _extract_switch_tables,
+)
 from reccmp.compare.asm.ir import (
     AsmRole,
     DecodedInstruction,
@@ -46,7 +49,7 @@ from reccmp.compare.verification import (
     admit_exact_analysis,
     admit_proof,
 )
-from reccmp.cvdump import Cvdump, CvdumpError
+from reccmp.cvdump import Cvdump, CvdumpAnalysis, CvdumpError
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.source import (
     SourceAbi,
@@ -372,7 +375,6 @@ def test_entity_compare_result_derives_normalizations_at_construction():
         analysis=ComparisonAnalysis.effective(("register_allocation",))
     )
     assert result.analysis.status == ComparisonStatus.EFFECTIVE
-    assert result.equivalence_level is not None
     assert result.diagnostic_normalizations
 
 
@@ -503,7 +505,9 @@ def test_alias_equivalent_reuses_proved_results_not_active_frames():
             return first and again
         return True
 
-    comparator._raw_pair_alias_equivalent_body = body  # type: ignore[method-assign]
+    comparator._raw_pair_alias_equivalent_body = (  # type: ignore[method-assign]  # pylint: disable=protected-access
+        body
+    )
     assert comparator.raw_pair_alias_equivalent(1, 10, 4)
     assert calls == [(1, 10), (2, 20)]
 
@@ -512,6 +516,7 @@ def test_alias_cycle_is_not_treated_as_proved():
     comparator = object.__new__(FunctionComparator)
 
     def body(orig_addr, recomp_addr, size, depth, active, proved):
+        # pylint: disable=too-many-positional-arguments
         return comparator.raw_pair_alias_equivalent(
             orig_addr,
             recomp_addr,
@@ -521,7 +526,9 @@ def test_alias_cycle_is_not_treated_as_proved():
             _proved=proved,
         )
 
-    comparator._raw_pair_alias_equivalent_body = body  # type: ignore[method-assign]
+    comparator._raw_pair_alias_equivalent_body = (  # type: ignore[method-assign]  # pylint: disable=protected-access
+        body
+    )
     assert not comparator.raw_pair_alias_equivalent(1, 10, 4)
 
 
@@ -764,8 +771,6 @@ def test_report_identity_prefers_source_digest():
 
 
 def test_to_report_records_orig_image_digest():
-    from reccmp.compare import Compare
-    from reccmp.cvdump import CvdumpAnalysis
 
     payload = b"orig-bytes"
     compare = Compare(

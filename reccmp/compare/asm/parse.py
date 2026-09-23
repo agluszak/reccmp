@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from functools import cache
-from typing import Hashable
+from collections.abc import Hashable
 from typing_extensions import Buffer
 
 from reccmp.types import ImageId
@@ -124,7 +124,9 @@ class ParseAsm:
             return None
         ident_fn = getattr(lookup, "identity", None)
         if callable(ident_fn):
-            return ident_fn(addr, exact=exact, indirect=indirect)
+            return ident_fn(  # pylint: disable=not-callable
+                addr, exact=exact, indirect=indirect
+            )
         result = (
             lookup(addr, exact=exact, indirect=indirect) if callable(lookup) else None
         )

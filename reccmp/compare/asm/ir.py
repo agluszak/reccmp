@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Hashable, Sequence, Union
+from collections.abc import Hashable, Sequence
+from typing import Union
 
 from .model import (
     STACK_ENTRY_REGEX,
@@ -149,6 +150,7 @@ def rebind_local_identities(
 
 @dataclass(frozen=True)
 class FunctionImage:
+    # pylint: disable=too-many-instance-attributes
     """Lossless view of one decoded function for comparison.
 
     Owns the extent evidence, decoded excerpt, jump tables, and coverage
@@ -489,7 +491,7 @@ def control_flow_topology_keys(
             keys.append(("ret",))
             continue
         proof = _branch_proof_identity(row, addr_to_id)
-        if proof is not None and proof[0] == "local":
+        if isinstance(proof, tuple) and proof[0] == "local":
             keys.append(proof)
             continue
         if proof is not None and row.branch_target is not None:
@@ -500,6 +502,52 @@ def control_flow_topology_keys(
             keys.append(switch_key)
             continue
         return None
+    return tuple(keys)
+
+
+def local_destination_keys(
+    excerpt: Sequence[DecodedInstruction],
+    jump_tables: Sequence[JumpTable] = (),
+    *,
+    start_addr: int,
+    extent: int,
+) -> tuple[Hashable, ...] | None:
+    """Per-row instruction ids of local branch and switch-case destinations.
+
+    Rows without a local destination contribute ``()``. Displays show local
+    branches as byte displacements, which identify the same instruction on
+    both sides only if every crossed instruction has the same encoding
+    length; these keys make the destination explicit. Returns None when a
+    destination falls inside the extent but not on an instruction boundary.
+    """
+    addr_to_id = {
+        row.address: (row.instruction_id if row.instruction_id is not None else index)
+        for index, row in enumerate(excerpt)
+        if row.address is not None
+    }
+    case_targets = {
+        entry_addr: target
+        for table in jump_tables
+        for entry_addr, target in table.entries
+    }
+
+    def key(target: int | None, tag: str) -> Hashable | None:
+        if target is None or not start_addr <= target < start_addr + extent:
+            return ()
+        local_id = addr_to_id.get(target)
+        return None if local_id is None else (tag, local_id)
+
+    keys: list[Hashable] = []
+    for row in excerpt:
+        if row.role == AsmRole.JUMP_TABLE_ENTRY and row.address is not None:
+            item = key(case_targets.get(row.address), "case")
+        elif row.is_jump:
+            item = key(row.branch_target, "local")
+        else:
+            item = ()
+        if item is None:
+            return None
+        keys.append(item)
     return tuple(keys)
 
 
@@ -550,6 +598,7 @@ def compute_extent_closed(
     jump_tables: Sequence[JumpTable] = (),
     extent_kind: ExtentKind = ExtentKind.KNOWN,
 ) -> bool:
+    # pylint: disable=too-many-nested-blocks,too-many-return-statements
     """True when every reachable path ends inside a modeled terminal.
 
     A coverage walk can only prove the supplied byte window. Implicit
@@ -565,9 +614,9 @@ def compute_extent_closed(
     code = [row for row in excerpt if row.is_code and row.address is not None]
     if not code:
         return False
-    addr_to_row = {row.address: row for row in code}
+    addr_to_row = {row.address: row for row in code if row.address is not None}
     window = range(start_addr, start_addr + extent)
-    pending = [code[0].address]
+    pending = list(addr_to_row)[:1]
     seen: set[int] = set()
     while pending:
         addr = pending.pop()

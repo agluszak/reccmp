@@ -1,6 +1,7 @@
 from itertools import pairwise
 import itertools
-from typing import Hashable, Iterable, Iterator, Sequence
+from collections.abc import Hashable
+from typing import Iterable, Iterator, Sequence
 from reccmp.difflib import DiffOpcode, SequenceMatcher, get_grouped_opcodes
 
 

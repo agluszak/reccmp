@@ -70,6 +70,7 @@ class GhidraFieldListItem(NamedTuple):
 
 
 class PdbTypeImporter:
+    # pylint: disable=too-many-instance-attributes
     """Allows PDB types to be imported into Ghidra."""
 
     def __init__(
@@ -310,7 +311,7 @@ class PdbTypeImporter:
             sanitized_name,
             "union",
             Union,
-            lambda category_path, name: UnionDataType(category_path, name),
+            UnionDataType,
         )
 
         field_list_type = type_pdb.get("field_list_type")

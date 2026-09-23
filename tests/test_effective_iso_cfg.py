@@ -1,5 +1,5 @@
 """Tests for the isomorphic-CFG effective-match verifier
-(reccmp.compare.asm.effective.verify_isomorphic_cfg_effective_match) and the
+(reccmp.compare.asm.verifier.verify_isomorphic_cfg_effective_match) and the
 flag/one-sided generalizations that support it.
 
 The centerpiece sample is a real MSVC 5.0 register-allocation wobble:
@@ -10,20 +10,25 @@ copy and mirrored one compare region — shifting the length of the function
 and every crossing branch displacement.
 """
 
+# pylint: disable=too-many-lines
+
 import difflib
 from pathlib import Path
 
 import pytest
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     FunctionMetadata,
-    SideState,
-    _CfgState,
-    _join_states,
-    estimate_isomorphic_cfg_semantic_similarity,
     verify_cfg_effective_match,
     verify_effective_match,
     verify_isomorphic_cfg_effective_match,
+)
+from reccmp.compare.asm.verifier.cfg import (
+    _CfgState,
+    _join_states,
+)
+from reccmp.compare.asm.verifier.state import (
+    SideState,
 )
 from reccmp.compare.asm.fixes import analyze_effective_match
 from reccmp.compare.asm.parse import ParseAsm
@@ -299,95 +304,6 @@ def test_reject_different_store_value_after_join():
     assert (
         verify_isomorphic_cfg_effective_match(orig, recomp, targets, list(targets))
         is False
-    )
-
-
-def test_semantic_similarity_counts_one_local_edit_without_cascade():
-    """One wrong constant is one repair unit even though register allocation
-    makes every raw line in the computation look different."""
-    orig = [
-        "mov eax, dword ptr [ebp - 4]",
-        "add eax, 5",
-        "mov dword ptr [esi], eax",
-        "ret",
-    ]
-    recomp = [
-        "mov ecx, dword ptr [ebp - 4]",
-        "add ecx, 6",
-        "mov dword ptr [esi], ecx",
-        "ret",
-    ]
-    targets: list[int | None] = [None] * 4
-    score = estimate_isomorphic_cfg_semantic_similarity(
-        orig,
-        recomp,
-        targets,
-        list(targets),
-        metadata=FunctionMetadata(return_kind="void"),
-    )
-    assert score == pytest.approx(0.75)
-
-
-def test_semantic_similarity_decreases_for_an_independent_edit():
-    orig = [
-        "mov eax, dword ptr [ebp - 4]",
-        "add eax, 5",
-        "mov dword ptr [esi], eax",
-        "ret",
-    ]
-    recomp = [
-        "mov ecx, dword ptr [ebp - 4]",
-        "add ecx, 6",
-        "mov dword ptr [edi], ecx",
-        "ret",
-    ]
-    targets: list[int | None] = [None] * 4
-    score = estimate_isomorphic_cfg_semantic_similarity(
-        orig,
-        recomp,
-        targets,
-        list(targets),
-        metadata=FunctionMetadata(return_kind="void"),
-    )
-    assert score == pytest.approx(0.5)
-
-
-def test_semantic_similarity_is_unavailable_for_different_cfgs():
-    orig = ["test eax, eax", "je 0x2", "inc ebx", "ret"]
-    recomp = ["test eax, eax", "inc ebx", "je 0x1", "ret"]
-    assert (
-        estimate_isomorphic_cfg_semantic_similarity(
-            orig,
-            recomp,
-            [None, 3, None, None],
-            [None, None, 3, None],
-        )
-        is None
-    )
-
-
-def test_semantic_similarity_preserves_one_sided_load_obligations():
-    """Recovering an unrelated edit must not invent the load needed to prove
-    that an earlier one-sided potentially faulting read is harmless."""
-    orig = [
-        "mov eax, dword ptr [ebp - 4]",
-        "mov ecx, 1",
-        "mov edx, 10",
-        "ret",
-    ]
-    recomp = [
-        "mov ecx, 2",
-        "mov edx, 10",
-        "ret",
-    ]
-    assert (
-        estimate_isomorphic_cfg_semantic_similarity(
-            orig,
-            recomp,
-            [None] * len(orig),
-            [None] * len(recomp),
-        )
-        is None
     )
 
 

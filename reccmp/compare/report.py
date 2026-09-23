@@ -13,11 +13,9 @@ from .diagnosis import (
     ComparisonStatus,
     DiagnosticNormalization,
     DifferenceSide,
-    EquivalenceLevel,
     StackPermutationEntry,
-    _LEGACY_LEVEL_TO_NORMALIZATION,
+    StrategyAttempt,
     derive_diagnostic_normalizations,
-    derive_equivalence_level,
 )
 from .diff import (
     CombinedDiffOutput,
@@ -74,7 +72,6 @@ class ReccmpComparedEntity:
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
     accuracy_modulo_inline: float | None = None
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
-    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies
@@ -99,18 +96,8 @@ class ReccmpComparedEntity:
     def effective_accuracy(self) -> float:
         return 1.0 if self.is_effective_match else self.accuracy
 
-    @property
-    def semantic_similarity(self) -> float | None:
-        """Per-function diagnostic similarity, never an aggregate score."""
-        return self.analysis.semantic_similarity
-
-    def refresh_equivalence_level(self) -> None:
+    def refresh_diagnostic_normalizations(self) -> None:
         self.diagnostic_normalizations = derive_diagnostic_normalizations(
-            self.analysis,
-            accuracy_modulo_stack=self.accuracy_modulo_stack,
-            accuracy_modulo_inline=self.accuracy_modulo_inline,
-        )
-        self.equivalence_level = derive_equivalence_level(
             self.analysis,
             accuracy_modulo_stack=self.accuracy_modulo_stack,
             accuracy_modulo_inline=self.accuracy_modulo_inline,
@@ -373,7 +360,6 @@ class JSONEntityVersion1:
     accuracy_modulo_inline: float | None = None
     inline_expansions: list[dict[str, object]] | None = None
     diagnostic_normalizations: list[str] | None = None
-    equivalence_level: str | None = None
 
 
 class JSONReportVersion1(BaseModel):
@@ -386,29 +372,47 @@ class JSONReportVersion1(BaseModel):
 
 
 def _side_json(side: DifferenceSide) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "instruction_index": side.instruction_index,
         "address": side.address,
         "facts": side.facts,
     }
+    if side.image is not None:
+        value["image"] = side.image
+    return value
+
+
+def _difference_json(difference: ComparisonDifference) -> dict[str, object]:
+    return {
+        "kind": difference.kind,
+        "orig": _side_json(difference.orig),
+        "recomp": _side_json(difference.recomp),
+    }
+
+
+def _attempt_json(attempt: StrategyAttempt) -> dict[str, object]:
+    value: dict[str, object] = {"strategy": attempt.strategy}
+    if attempt.difference is not None:
+        value["difference"] = _difference_json(attempt.difference)
+    if attempt.blocker is not None:
+        value["blocker"] = attempt.blocker
+    if attempt.location is not None:
+        value["location"] = _side_json(attempt.location)
+    return value
 
 
 def _analysis_json(analysis: ComparisonAnalysis) -> dict[str, object]:
     value: dict[str, object] = {"status": analysis.status.value}
-    if analysis.semantic_similarity is not None:
-        value["semantic_similarity"] = analysis.semantic_similarity
     if analysis.effective_reasons:
         value["effective_reasons"] = list(analysis.effective_reasons)
     if analysis.difference is not None:
-        value["difference"] = {
-            "kind": analysis.difference.kind,
-            "orig": _side_json(analysis.difference.orig),
-            "recomp": _side_json(analysis.difference.recomp),
-        }
+        value["difference"] = _difference_json(analysis.difference)
     if analysis.inconclusive_reason is not None:
         value["inconclusive_reason"] = analysis.inconclusive_reason
     if analysis.inconclusive_location is not None:
         value["inconclusive_location"] = _side_json(analysis.inconclusive_location)
+    if analysis.attempts:
+        value["attempts"] = [_attempt_json(attempt) for attempt in analysis.attempts]
     return value
 
 
@@ -433,7 +437,37 @@ def _parse_side(value: object) -> DifferenceSide:
         for key, fact in facts.items()
     ):
         raise ReccmpReportDeserializeError
-    return DifferenceSide(instruction_index, address, facts)
+    image = value.get("image")
+    if image not in (None, "orig", "recomp"):
+        raise ReccmpReportDeserializeError
+    return DifferenceSide(instruction_index, address, facts, image)
+
+
+def _parse_difference(value: dict) -> ComparisonDifference:
+    return ComparisonDifference(
+        kind=value["kind"],
+        orig=_parse_side(value["orig"]),
+        recomp=_parse_side(value["recomp"]),
+    )
+
+
+def _parse_attempt(value: object) -> StrategyAttempt:
+    if not isinstance(value, dict):
+        raise ReccmpReportDeserializeError
+    return StrategyAttempt(
+        strategy=value["strategy"],
+        difference=(
+            _parse_difference(value["difference"])
+            if value.get("difference") is not None
+            else None
+        ),
+        blocker=value.get("blocker"),
+        location=(
+            _parse_side(value["location"])
+            if value.get("location") is not None
+            else None
+        ),
+    )
 
 
 def _parse_analysis(value: object) -> ComparisonAnalysis:
@@ -441,20 +475,10 @@ def _parse_analysis(value: object) -> ComparisonAnalysis:
         raise ReccmpReportDeserializeError
     try:
         status = ComparisonStatus(value["status"])
-        semantic_similarity = value.get("semantic_similarity")
-        if semantic_similarity is not None and (
-            isinstance(semantic_similarity, bool)
-            or not isinstance(semantic_similarity, (int, float))
-        ):
-            raise ReccmpReportDeserializeError
         difference_value = value.get("difference")
         difference = None
         if difference_value is not None:
-            difference = ComparisonDifference(
-                kind=difference_value["kind"],
-                orig=_parse_side(difference_value["orig"]),
-                recomp=_parse_side(difference_value["recomp"]),
-            )
+            difference = _parse_difference(difference_value)
         return ComparisonAnalysis(
             status=status,
             effective_reasons=tuple(value.get("effective_reasons", ())),
@@ -465,9 +489,7 @@ def _parse_analysis(value: object) -> ComparisonAnalysis:
                 if value.get("inconclusive_location") is not None
                 else None
             ),
-            semantic_similarity=(
-                float(semantic_similarity) if semantic_similarity is not None else None
-            ),
+            attempts=tuple(_parse_attempt(item) for item in value.get("attempts", ())),
         )
     except (KeyError, TypeError, ValueError) as ex:
         raise ReccmpReportDeserializeError from ex
@@ -538,7 +560,6 @@ def _serialize_version_1(
                     if entity.diagnostic_normalizations
                     else None
                 ),
-                equivalence_level=entity.equivalence_level.value,
             )
         )
 
@@ -605,13 +626,6 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             inline_expansions=_parse_inline_expansions(e.inline_expansions),
             diagnostic_normalizations=_parse_diagnostic_normalizations(
                 e.diagnostic_normalizations,
-                e.equivalence_level,
-                analysis,
-                e.accuracy_modulo_stack,
-                e.accuracy_modulo_inline,
-            ),
-            equivalence_level=_parse_equivalence_level(
-                e.equivalence_level,
                 analysis,
                 e.accuracy_modulo_stack,
                 e.accuracy_modulo_inline,
@@ -696,67 +710,25 @@ def _parse_inline_expansions(
 
 def _parse_diagnostic_normalizations(
     value: list[str] | None,
-    legacy_level: str | None,
     analysis: ComparisonAnalysis,
     accuracy_modulo_stack: float | None,
     accuracy_modulo_inline: float | None,
 ) -> tuple[DiagnosticNormalization, ...]:
-    if value:
-        tags: list[DiagnosticNormalization] = []
-        for item in value:
-            if not isinstance(item, str):
-                raise ReccmpReportDeserializeError
-            try:
-                tags.append(DiagnosticNormalization(item))
-            except ValueError:
-                mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(item)
-                if mapped is None:
-                    raise ReccmpReportDeserializeError
-                tags.append(mapped)
-        # Stable order
-        order = list(DiagnosticNormalization)
-        return tuple(tag for tag in order if tag in set(tags))
-    if legacy_level is not None:
-        mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(legacy_level)
-        if mapped is not None:
-            return (mapped,)
-    return derive_diagnostic_normalizations(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
-
-
-def _parse_equivalence_level(
-    value: str | None,
-    analysis: ComparisonAnalysis,
-    accuracy_modulo_stack: float | None,
-    accuracy_modulo_inline: float | None = None,
-) -> EquivalenceLevel:
-    if value is not None:
-        # Accept both legacy "*_equivalent" strings and the shortened values.
-        try:
-            return EquivalenceLevel(value)
-        except ValueError:
-            aliases = {
-                "stack_layout_equivalent": EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
-                "register_allocation_equivalent": (
-                    EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
-                ),
-                "instruction_scheduling_equivalent": (
-                    EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
-                ),
-                "cfg_layout_equivalent": EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
-                "known_inline_equivalent": EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
-            }
-            if value in aliases:
-                return aliases[value]
+    if not value:
+        return derive_diagnostic_normalizations(
+            analysis,
+            accuracy_modulo_stack=accuracy_modulo_stack,
+            accuracy_modulo_inline=accuracy_modulo_inline,
+        )
+    tags: set[DiagnosticNormalization] = set()
+    for item in value:
+        if not isinstance(item, str):
             raise ReccmpReportDeserializeError
-    return derive_equivalence_level(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
+        try:
+            tags.add(DiagnosticNormalization(item.removesuffix("_equivalent")))
+        except ValueError as ex:
+            raise ReccmpReportDeserializeError from ex
+    return tuple(tag for tag in DiagnosticNormalization if tag in tags)
 
 
 def _parse_report_diff(value: object) -> CombinedDiffOutput | None:

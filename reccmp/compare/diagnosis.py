@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 FactValue: TypeAlias = str | int | bool | None
 
@@ -35,37 +35,6 @@ class DiagnosticNormalization(Enum):
     CFG_LAYOUT = "cfg_layout"
     KNOWN_INLINE = "known_inline"
     FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
-
-
-# Backward-compatible aliases for the previous single-valued lattice.
-# Kept so older reports/tests that still mention EquivalenceLevel compile;
-# new code should use DiagnosticNormalization + ComparisonStatus.
-class EquivalenceLevel(Enum):
-    """Deprecated single-valued view; prefer ComparisonStatus + normalizations."""
-
-    EXACT_INSTRUCTIONS = "exact_instructions"
-    STACK_LAYOUT_EQUIVALENT = "stack_layout"  # renamed: not a proof
-    REGISTER_ALLOCATION_EQUIVALENT = "register_allocation"
-    INSTRUCTION_SCHEDULING_EQUIVALENT = "instruction_scheduling"
-    CFG_LAYOUT_EQUIVALENT = "cfg_layout"
-    KNOWN_INLINE_EQUIVALENT = "known_inline"
-    FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
-    UNKNOWN_DIFFERENCE = "unknown_difference"
-
-
-_LEGACY_LEVEL_TO_NORMALIZATION = {
-    "stack_layout_equivalent": DiagnosticNormalization.STACK_LAYOUT,
-    "stack_layout": DiagnosticNormalization.STACK_LAYOUT,
-    "register_allocation_equivalent": DiagnosticNormalization.REGISTER_ALLOCATION,
-    "register_allocation": DiagnosticNormalization.REGISTER_ALLOCATION,
-    "instruction_scheduling_equivalent": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-    "instruction_scheduling": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-    "cfg_layout_equivalent": DiagnosticNormalization.CFG_LAYOUT,
-    "cfg_layout": DiagnosticNormalization.CFG_LAYOUT,
-    "known_inline_equivalent": DiagnosticNormalization.KNOWN_INLINE,
-    "known_inline": DiagnosticNormalization.KNOWN_INLINE,
-    "folded_symbol_alias": DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
-}
 
 
 def derive_diagnostic_normalizations(
@@ -107,53 +76,6 @@ def derive_diagnostic_normalizations(
     return tuple(tag for tag in order if tag in tags)
 
 
-def derive_equivalence_level(
-    analysis: "ComparisonAnalysis",
-    *,
-    accuracy_modulo_stack: float | None = None,
-    accuracy_modulo_inline: float | None = None,
-) -> EquivalenceLevel:
-    """Deprecated compatibility shim over proof status + normalizations."""
-    if analysis.status == ComparisonStatus.EXACT:
-        return EquivalenceLevel.EXACT_INSTRUCTIONS
-
-    norms = derive_diagnostic_normalizations(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
-    if not norms:
-        return EquivalenceLevel.UNKNOWN_DIFFERENCE
-
-    # Prefer a primary tag for legacy single-valued consumers.  folded_symbol
-    # is never reported as known_inline.
-    primary = norms[0]
-    mapping = {
-        DiagnosticNormalization.STACK_LAYOUT: EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
-        DiagnosticNormalization.REGISTER_ALLOCATION: (
-            EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
-        ),
-        DiagnosticNormalization.INSTRUCTION_SCHEDULING: (
-            EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
-        ),
-        DiagnosticNormalization.CFG_LAYOUT: EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
-        DiagnosticNormalization.KNOWN_INLINE: EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
-        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS: EquivalenceLevel.FOLDED_SYMBOL_ALIAS,
-    }
-    # Prefer known_inline / folded over stack when both present for legacy primary.
-    for preferred in (
-        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
-        DiagnosticNormalization.KNOWN_INLINE,
-        DiagnosticNormalization.CFG_LAYOUT,
-        DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-        DiagnosticNormalization.REGISTER_ALLOCATION,
-        DiagnosticNormalization.STACK_LAYOUT,
-    ):
-        if preferred in norms:
-            return mapping[preferred]
-    return mapping[primary]
-
-
 EFFECTIVE_REASON_ORDER = (
     "register_allocation",
     "frame_slot_layout",
@@ -190,9 +112,6 @@ MISMATCH_KINDS = frozenset(
 INCONCLUSIVE_REASONS = frozenset(
     {
         "unsupported_instruction",
-        # Legacy report compatibility. New analyses emit a specific control-flow
-        # reason below instead of this umbrella value.
-        "unsupported_control_flow",
         "empty_control_flow",
         "control_flow_metadata_mismatch",
         "invalid_control_flow_target",
@@ -234,6 +153,8 @@ class DifferenceSide:
     instruction_index: int | None = None
     address: int | None = None
     facts: dict[str, FactValue] = field(default_factory=dict)
+    # Which binary instruction_index/address refer to, when known.
+    image: Literal["orig", "recomp"] | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +168,39 @@ class ComparisonDifference:
             raise ValueError(f"Unknown mismatch kind: {self.kind}")
 
 
+STRATEGIES = ("lockstep", "diff_aligned", "relocation", "cfg", "isomorphic_cfg")
+
+# Strategies whose instruction pairing is anchored by position or by matched
+# CFG blocks. The others pair instructions heuristically (diff opcodes,
+# undone relocations), so a difference they report may be an artifact of the
+# pairing rather than of the code.
+TRUSTED_ALIGNMENT_STRATEGIES = frozenset({"lockstep", "cfg", "isomorphic_cfg"})
+
+
+@dataclass(frozen=True)
+class StrategyAttempt:
+    """Where one verifier strategy stopped: a difference or a blocker."""
+
+    strategy: str
+    difference: ComparisonDifference | None = None
+    blocker: str | None = None
+    location: DifferenceSide | None = None
+
+    def __post_init__(self) -> None:
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"Unknown strategy: {self.strategy}")
+        if (self.difference is None) == (self.blocker is None):
+            raise ValueError("An attempt has exactly one of difference or blocker")
+        if self.blocker is not None and self.blocker not in INCONCLUSIVE_REASONS:
+            raise ValueError(f"Unknown inconclusive reason: {self.blocker}")
+        if self.location is not None and self.blocker is None:
+            raise ValueError("Only blocked attempts carry a location")
+
+    @property
+    def trusted_alignment(self) -> bool:
+        return self.strategy in TRUSTED_ALIGNMENT_STRATEGIES
+
+
 @dataclass(frozen=True)
 class ComparisonAnalysis:
     status: ComparisonStatus
@@ -254,9 +208,9 @@ class ComparisonAnalysis:
     difference: ComparisonDifference | None = None
     inconclusive_reason: str | None = None
     inconclusive_location: DifferenceSide | None = None
-    # Diagnostic repair-distance estimate.  This is deliberately separate
-    # from status: only EXACT/EFFECTIVE are proofs of semantic equivalence.
-    semantic_similarity: float | None = None
+    # Every strategy that ran, in execution order. The primary difference or
+    # reason above is chosen from these; the rest show what else blocked.
+    attempts: tuple[StrategyAttempt, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = normalize_effective_reasons(self.effective_reasons)
@@ -279,18 +233,8 @@ class ComparisonAnalysis:
             and self.inconclusive_location is not None
         ):
             raise ValueError("Only inconclusive results carry an analysis location")
-        if self.semantic_similarity is not None:
-            if not 0.0 <= self.semantic_similarity <= 1.0:
-                raise ValueError("Semantic similarity must be between zero and one")
-            if self.status == ComparisonStatus.INCONCLUSIVE:
-                raise ValueError(
-                    "Inconclusive results cannot carry semantic similarity"
-                )
-            if (
-                self.status == ComparisonStatus.MISMATCH
-                and self.semantic_similarity == 1.0
-            ):
-                raise ValueError("A mismatch cannot have 100% semantic similarity")
+        if self.is_effective and self.attempts:
+            raise ValueError("Proven results do not carry failed attempts")
 
     @property
     def is_effective(self) -> bool:
@@ -298,27 +242,15 @@ class ComparisonAnalysis:
 
     @classmethod
     def exact(cls) -> "ComparisonAnalysis":
-        return cls(ComparisonStatus.EXACT, semantic_similarity=1.0)
+        return cls(ComparisonStatus.EXACT)
 
     @classmethod
     def effective(cls, reasons) -> "ComparisonAnalysis":
-        return cls(
-            ComparisonStatus.EFFECTIVE,
-            tuple(reasons),
-            semantic_similarity=1.0,
-        )
+        return cls(ComparisonStatus.EFFECTIVE, tuple(reasons))
 
     @classmethod
-    def mismatch(
-        cls,
-        difference: ComparisonDifference,
-        semantic_similarity: float | None = None,
-    ) -> "ComparisonAnalysis":
-        return cls(
-            ComparisonStatus.MISMATCH,
-            difference=difference,
-            semantic_similarity=semantic_similarity,
-        )
+    def mismatch(cls, difference: ComparisonDifference) -> "ComparisonAnalysis":
+        return cls(ComparisonStatus.MISMATCH, difference=difference)
 
     @classmethod
     def inconclusive(
@@ -343,15 +275,24 @@ class AnalysisRecorder:
     inconclusive_reason: str | None = None
     inconclusive_location: DifferenceSide | None = None
 
-    def side(
-        self, which: str, instruction_index: int | None, facts: dict[str, FactValue]
-    ) -> DifferenceSide:
+    def address(
+        self, which: Literal["orig", "recomp"], instruction_index: int | None
+    ) -> int | None:
         addrs = self.orig_addrs if which == "orig" else self.recomp_addrs
-        address = None
         if addrs is not None and instruction_index is not None:
             if 0 <= instruction_index < len(addrs):
-                address = addrs[instruction_index]
-        return DifferenceSide(instruction_index, address, facts)
+                return addrs[instruction_index]
+        return None
+
+    def side(
+        self,
+        which: Literal["orig", "recomp"],
+        instruction_index: int | None,
+        facts: dict[str, FactValue],
+    ) -> DifferenceSide:
+        return DifferenceSide(
+            instruction_index, self.address(which, instruction_index), facts, which
+        )
 
     def record_difference(
         self,
@@ -387,6 +328,10 @@ class AnalysisRecorder:
             self.inconclusive_reason = reason
             detail = dict(facts or {})
             if orig_index is not None or (recomp_index is None and detail):
+                # Keep the counterpart so the location can be source-pinned.
+                recomp_address = self.address("recomp", recomp_index)
+                if recomp_address is not None:
+                    detail.setdefault("recomp_address", recomp_address)
                 self.inconclusive_location = self.side("orig", orig_index, detail)
             elif recomp_index is not None:
                 self.inconclusive_location = self.side("recomp", recomp_index, detail)
@@ -419,6 +364,16 @@ class AnalysisRecorder:
 
     def effective_reasons(self, extra_reasons=()) -> frozenset[str]:
         return frozenset(self.reasons | set(extra_reasons))
+
+    def attempt(self, strategy: str) -> StrategyAttempt:
+        """Summarize where this recorder's strategy stopped."""
+        if self.best_difference is not None:
+            return StrategyAttempt(strategy, difference=self.best_difference)
+        return StrategyAttempt(
+            strategy,
+            blocker=self.inconclusive_reason or "analysis_limit",
+            location=self.inconclusive_location,
+        )
 
     def failure_analysis(self) -> ComparisonAnalysis:
         if self.best_difference is not None:

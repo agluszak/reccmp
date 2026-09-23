@@ -1,5 +1,7 @@
 """Tests for CanonicalStackRef heuristics and helper effect summaries."""
 
+from typing import Literal
+
 from reccmp.compare.asm.ir import DecodedInstruction, AsmRole
 from reccmp.compare.inlines import (
     HelperCatalogEntry,
@@ -26,7 +28,7 @@ def test_canonical_stack_ref_heuristics():
 
 def test_canonical_stack_ref_pdb_multi_slot():
     """A double/struct spanning two dwords is one named argument."""
-    slots = [(8, 8, "x", "argument")]
+    slots: list[tuple[int, int, str, Literal["argument"]]] = [(8, 8, "x", "argument")]
     low = canonical_stack_ref("ebp", 8, pdb_slots=slots)
     high = canonical_stack_ref("ebp", 0xC, pdb_slots=slots)
     assert low.label() == "arg[x]"

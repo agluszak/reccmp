@@ -10,6 +10,7 @@ from reccmp.source import SourceIndex, SourceIndexError
 
 
 def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
+    # pylint: disable=too-many-statements
     if (
         not os.environ.get("RECCMP_SOURCE_INDEXER")
         and not Path("/usr/lib/llvm-19/include/clang/AST/ASTConsumer.h").is_file()

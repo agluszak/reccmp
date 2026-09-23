@@ -7,7 +7,8 @@ import struct
 from dataclasses import dataclass
 from functools import cache
 from enum import Enum, auto
-from typing import Hashable, Iterable, Literal, NamedTuple
+from collections.abc import Hashable
+from typing import Iterable, Literal, NamedTuple
 from capstone import (  # type: ignore
     CS_ARCH_X86,
     CS_MODE_16,
@@ -327,14 +328,6 @@ class InstructGen:
                 ):
                     self.coverage_incomplete = True
                     break
-
-
-@cache
-def get_detail_disassembler(is_32: bool = True) -> Cs:
-    """Backward-compatible alias; prefer ``decode.get_detail_disassembler``."""
-    from .decode import get_detail_disassembler as _impl
-
-    return _impl(is_32)
 
 
 @dataclass(frozen=True)

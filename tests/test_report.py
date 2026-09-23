@@ -1,5 +1,6 @@
 """Reccmp reports: files that contain the comparison result from asmcmp."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -10,7 +11,6 @@ from reccmp.compare.report import (
     combine_reports,
     deserialize_reccmp_report,
     serialize_reccmp_report,
-    ReccmpReportDeserializeError,
     ReccmpReportSameSourceError,
 )
 from reccmp.compare.diagnosis import (
@@ -18,6 +18,7 @@ from reccmp.compare.diagnosis import (
     ComparisonDifference,
     ComparisonStatus,
     DifferenceSide,
+    StrategyAttempt,
 )
 from reccmp.types import EntityType
 
@@ -201,18 +202,27 @@ def test_structured_comparison_schema_round_trip():
                     },
                 ),
             ),
-            semantic_similarity=0.875,
         ),
-        ComparisonAnalysis.inconclusive(
-            "non_isomorphic_cfg",
-            DifferenceSide(
-                7,
-                0x400123,
-                {
-                    "failure": "edge_roles",
-                    "orig_block_count": 8,
-                    "recomp_block_count": 9,
-                },
+        dataclasses.replace(
+            ComparisonAnalysis.inconclusive(
+                "non_isomorphic_cfg",
+                DifferenceSide(
+                    7,
+                    0x400123,
+                    {
+                        "failure": "edge_roles",
+                        "orig_block_count": 8,
+                        "recomp_block_count": 9,
+                    },
+                ),
+            ),
+            attempts=(
+                StrategyAttempt(
+                    "lockstep",
+                    blocker="unsupported_instruction",
+                    location=DifferenceSide(3, 0x400110, {}),
+                ),
+                StrategyAttempt("isomorphic_cfg", blocker="non_isomorphic_cfg"),
             ),
         ),
     ]
@@ -233,19 +243,22 @@ def test_structured_comparison_schema_round_trip():
     assert value["data"][1]["comparison"] == {
         "status": "effective",
         "effective_reasons": ["register_allocation", "padding"],
-        "semantic_similarity": 1.0,
     }
-    assert value["data"][0]["comparison"] == {
-        "status": "exact",
-        "semantic_similarity": 1.0,
-    }
-    assert set(value["data"][2]["comparison"]) == {
-        "status",
-        "difference",
-        "semantic_similarity",
-    }
-    assert value["data"][2]["comparison"]["semantic_similarity"] == 0.875
-    assert value["data"][3]["comparison"] == {
+    assert value["data"][0]["comparison"] == {"status": "exact"}
+    assert set(value["data"][2]["comparison"]) == {"status", "difference"}
+    assert value["data"][3]["comparison"]["attempts"] == [
+        {
+            "strategy": "lockstep",
+            "blocker": "unsupported_instruction",
+            "location": {"instruction_index": 3, "address": 0x400110, "facts": {}},
+        },
+        {"strategy": "isomorphic_cfg", "blocker": "non_isomorphic_cfg"},
+    ]
+    assert {
+        key: item
+        for key, item in value["data"][3]["comparison"].items()
+        if key != "attempts"
+    } == {
         "status": "inconclusive",
         "inconclusive_reason": "non_isomorphic_cfg",
         "inconclusive_location": {
@@ -263,7 +276,7 @@ def test_structured_comparison_schema_round_trip():
     restored_analyses = [entity.analysis for entity in restored.entities.values()]
     assert [analysis.status for analysis in restored_analyses] == list(ComparisonStatus)
     assert restored_analyses[2].difference == analyses[2].difference
-    assert restored_analyses[2].semantic_similarity == 0.875
+    assert restored_analyses[3] == analyses[3]
 
 
 def test_old_effective_boolean_schema_is_accepted():

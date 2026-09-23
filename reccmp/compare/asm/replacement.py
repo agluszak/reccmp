@@ -1,6 +1,7 @@
 import bisect
 from functools import cache
-from typing import Callable, Hashable, Protocol
+from collections.abc import Hashable
+from typing import Callable, Protocol
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.types import EntityType, ImageId
@@ -198,6 +199,7 @@ def create_name_lookup(
     *,
     jump_target: Callable[[int], int | None] | None = None,
 ) -> NameReplacementProtocol:
+    # pylint: disable=too-many-statements
     """Function generator for name replacement"""
     assert image_id in (ImageId.ORIG, ImageId.RECOMP), "Invalid image id"
 
@@ -326,38 +328,6 @@ def create_name_lookup(
 
         return entity.match_name(f"+{offset}")
 
-    def indirect_lookup(addr: int) -> str | None:
-        """Same as regular lookup but aware of the fact that the address is a pointer.
-        Indirect implies exact search, so we drop both parameters from the lookup entry point.
-        """
-        entity = db.get(image_id, addr, exact=True)
-        if entity is not None:
-            # If the indirect call points at a variable initialized to a function,
-            # prefer the variable name as this is more useful.
-            if entity.entity_type == EntityType.DATA:
-                return entity.match_name()
-
-            if entity.entity_type == EntityType.IMPORT:
-                import_name = canonical_callee_name(
-                    db, image_id, entity, equivalence_groups
-                )
-                if import_name is not None:
-                    return import_name
-
-                # If there's no name for the import, don't bother going further.
-                # The pointer is a dead end.
-                return None
-
-        # No suitable entity at the base address. Read the pointer and see what we get.
-        entity = follow_indirect(addr)
-
-        if entity is None:
-            return None
-
-        # Exact match only for indirect.
-        # The 'addr' variable still points at the indirect addr.
-        return get_name(entity, offset=0)
-
     def follow_thunk(entity: ReccmpEntity) -> ReccmpEntity:
         if entity.entity_type != EntityType.THUNK:
             return entity
@@ -371,6 +341,7 @@ def create_name_lookup(
     def resolve_entity(
         addr: int, exact: bool = False, indirect: bool = False
     ) -> tuple[ReccmpEntity, int] | None:
+        # pylint: disable=too-many-return-statements
         if indirect:
             entity = db.get(image_id, addr, exact=True)
             if entity is not None:

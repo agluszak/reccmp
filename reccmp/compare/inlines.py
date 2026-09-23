@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable, Hashable, Literal, Sequence, Union
+from collections.abc import Hashable
+from typing import Callable, Literal, Sequence, Union
 
 from reccmp.compare.asm.ir import AsmRole, DecodedInstruction
 from reccmp.compare.asm.model import (
@@ -89,6 +90,7 @@ class InlineHit:
 
 @dataclass(frozen=True)
 class InlineExpansionEvidence:
+    # pylint: disable=too-many-instance-attributes
     """One helper expansion observed while comparing a paired function."""
 
     helper_name: str
@@ -325,7 +327,7 @@ def collapse_indices(
     """Replace individual instruction indices with placeholders."""
     if not indices:
         return list(keys)
-    replace = {index: placeholder for index, placeholder in indices}
+    replace = dict(indices)
     return [replace.get(i, key) for i, key in enumerate(keys)]
 
 
@@ -712,6 +714,7 @@ def analyze_inline_layout(
     min_helper_ops: int = 3,
     exclude_orig_addrs: Sequence[int] = (),
 ) -> InlineLayoutResult:
+    # pylint: disable=too-many-locals,too-many-statements
     """Detect CALL↔inline asymmetries; handle every occurrence of each helper.
 
     Accepts sanitized display lines or ``DecodedInstruction`` excerpts; IR is

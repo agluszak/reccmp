@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Hashable
+from collections.abc import Hashable
 
 
 class Reject(Exception):
@@ -167,6 +167,7 @@ def format_imm(value: int) -> str:
 
 
 def format_operand(operand) -> str:
+    # pylint: disable=too-many-return-statements
     """Render a structured operand back to Capstone-like Intel text."""
     kind = operand[0]
     if kind == "reg":

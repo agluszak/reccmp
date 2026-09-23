@@ -27,8 +27,7 @@ from reccmp.formats.pe import PEImage
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
-    DiagnosticNormalization,
-    EquivalenceLevel,
+    DifferenceSide,
 )
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
@@ -79,18 +78,6 @@ def triage_status_note(analysis: ComparisonAnalysis) -> str | None:
     return None
 
 
-def semantic_similarity_text(match: ReccmpComparedEntity) -> str | None:
-    """Render the optional repair-oriented score without implying proof."""
-    if (
-        match.analysis.status != ComparisonStatus.MISMATCH
-        or match.semantic_similarity is None
-    ):
-        return None
-    semantic = percent_string(match.semantic_similarity)
-    raw = percent_string(match.accuracy)
-    return f"{semantic} semantic similarity (diagnostic; {raw} raw)"
-
-
 def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
     """Render the structured reason, location, and facts for an inconclusive result."""
     if analysis.status != ComparisonStatus.INCONCLUSIVE:
@@ -105,6 +92,43 @@ def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
             lines.append(f"  instruction index: {location.instruction_index}")
         for key, value in sorted(location.facts.items()):
             lines.append(f"  {key.replace('_', ' ')}: {value}")
+    return "\n".join(lines)
+
+
+def _side_text(side: DifferenceSide) -> str:
+    if side.address is not None:
+        text = format_address(side.address)
+    elif side.instruction_index is not None:
+        text = f"instruction {side.instruction_index}"
+    else:
+        text = "function exit"
+    path = side.facts.get("source_path")
+    line = side.facts.get("source_line")
+    if isinstance(path, str) and isinstance(line, int):
+        text += f" ({path}:{line})"
+    return text
+
+
+def strategy_attempts_text(analysis: ComparisonAnalysis) -> str | None:
+    """One line per verifier strategy: where it stopped and why."""
+    if not analysis.attempts:
+        return None
+    lines = ["verifier strategies:"]
+    for attempt in analysis.attempts:
+        name = attempt.strategy.replace("_", " ")
+        if attempt.difference is not None:
+            kind = attempt.difference.kind.replace("_", " ")
+            where = _side_text(attempt.difference.orig)
+            note = "" if attempt.trusted_alignment else " (heuristic pairing)"
+            lines.append(f"  {name}: {kind} difference at {where}{note}")
+        else:
+            reason = (attempt.blocker or "analysis_limit").replace("_", " ")
+            where = (
+                f" at {_side_text(attempt.location)}"
+                if attempt.location is not None
+                else ""
+            )
+            lines.append(f"  {name}: blocked by {reason}{where}")
     return "\n".join(lines)
 
 
@@ -166,25 +190,13 @@ def inline_layout_text(match: ReccmpComparedEntity) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-def equivalence_level_text(match: ReccmpComparedEntity) -> str | None:
-    """Deprecated: prefer diagnostic_normalizations_text."""
-    return diagnostic_normalizations_text(match)
-
-
 def diagnostic_normalizations_text(match: ReccmpComparedEntity) -> str | None:
     """Render non-proof diagnostic tags without claiming equivalence."""
-    tags = match.diagnostic_normalizations
-    if not tags and match.equivalence_level not in (
-        EquivalenceLevel.EXACT_INSTRUCTIONS,
-        EquivalenceLevel.UNKNOWN_DIFFERENCE,
-    ):
-        # Legacy reports may only have equivalence_level.
-        legacy = match.equivalence_level.value.replace("_equivalent", "")
-        if legacy in {tag.value for tag in DiagnosticNormalization}:
-            tags = (DiagnosticNormalization(legacy),)
-    if not tags:
+    if not match.diagnostic_normalizations:
         return None
-    joined = ", ".join(tag.value.replace("_", " ") for tag in tags)
+    joined = ", ".join(
+        tag.value.replace("_", " ") for tag in match.diagnostic_normalizations
+    )
     return f"diagnostic normalizations: {joined}"
 
 
@@ -221,26 +233,22 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             inline = inline_layout_text(match)
             if inline is not None:
                 print(inline)
-            level = equivalence_level_text(match)
+            level = diagnostic_normalizations_text(match)
             if level is not None:
                 print(level)
 
     else:
         print_combined_diff(udiff, show_both_addrs)
-        semantic = semantic_similarity_text(match)
-        if semantic is not None:
-            print(f"\n{match.name} has {semantic}; diff above")
-        else:
-            print(
-                f"\n{match.name} is only {percenttext} similar to the original, diff above"
-            )
+        print(
+            f"\n{match.name} is only {percenttext} similar to the original, diff above"
+        )
         stack = stack_layout_text(match)
         if stack is not None:
             print(stack)
         inline = inline_layout_text(match)
         if inline is not None:
             print(inline)
-        level = equivalence_level_text(match)
+        level = diagnostic_normalizations_text(match)
         if level is not None:
             print(level)
         source_pin = mismatch_source_pin_text(match)
@@ -249,6 +257,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         diagnostic = inconclusive_diagnostic_text(match.analysis)
         if diagnostic is not None:
             print(diagnostic)
+        attempts = strategy_attempts_text(match.analysis)
+        if attempts is not None:
+            print(attempts)
         if note is not None:
             print(note)
 
@@ -266,10 +277,7 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
     if match.is_stub:
         print(f"  {match.name} ({addrs}) is a stub.")
     else:
-        semantic = semantic_similarity_text(match)
-        if semantic is not None:
-            print(f"  {match.name} ({addrs}) has {semantic}")
-        elif (
+        if (
             match.accuracy_modulo_inline is not None
             and match.accuracy_modulo_inline > match.accuracy
         ):
@@ -287,7 +295,7 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             print(f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack")
         else:
             print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
-        level = equivalence_level_text(match)
+        level = diagnostic_normalizations_text(match)
         if level is not None and match.effective_accuracy < 1.0:
             print(f"    {level}")
 

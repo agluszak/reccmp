@@ -10,6 +10,8 @@ winner selection, and conflict derivation happen after collection — never by
 globally collapsing bare ``semantic_id`` values first.
 """
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 # The optional execution backend imports this record model when first used.
@@ -798,15 +800,15 @@ def type_spelling_is_indirection(type_name: str) -> bool:
     return name.endswith("*") or name.endswith("&")
 
 
-def field_is_indirection(field: SourceField) -> bool:
+def field_is_indirection(source_field: SourceField) -> bool:
     """Pointer/reference storage is a layout leaf; do not descend physically."""
-    if field.storage_kind in ("pointer", "reference"):
+    if source_field.storage_kind in ("pointer", "reference"):
         return True
-    if field.storage_kind == "array":
-        return field.array_element_kind in ("pointer", "reference")
-    if (field.pointer_depth or 0) > 0:
+    if source_field.storage_kind == "array":
+        return source_field.array_element_kind in ("pointer", "reference")
+    if (source_field.pointer_depth or 0) > 0:
         return True
-    return type_spelling_is_indirection(field.type)
+    return type_spelling_is_indirection(source_field.type)
 
 
 def variable_type_is_indirection(type_name: str) -> bool:
@@ -1060,6 +1062,7 @@ class SourceIndex:
         abi: SourceAbi | None = None,
         target_abis: Mapping[str, SourceAbi] | None = None,
     ) -> None:
+        # pylint: disable=too-many-arguments
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
         )
@@ -1137,22 +1140,26 @@ class SourceIndex:
         return self._classes_by_semantic_id.get(semantic_id)
 
     def _lookup_nested_class(
-        self, field: SourceField, type_spelling: str
+        self, source_field: SourceField, type_spelling: str
     ) -> str | None:
         """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping.
 
         Only for *embedded* record storage. Pointer/reference fields keep the
         pointee id for metadata but are not physical containment.
         """
-        if field.storage_kind == "array" and field.array_element_kind not in (
-            None,
-            "embedded_record",
+        if (
+            source_field.storage_kind == "array"
+            and source_field.array_element_kind
+            not in (
+                None,
+                "embedded_record",
+            )
         ):
             return None
-        if field_is_indirection(field):
+        if field_is_indirection(source_field):
             return None
-        if field.record_semantic_id:
-            nested = self._classes_by_semantic_id.get(field.record_semantic_id)
+        if source_field.record_semantic_id:
+            nested = self._classes_by_semantic_id.get(source_field.record_semantic_id)
             if nested is not None:
                 return nested.qualified_name
         stripped = strip_type_qualifiers(type_spelling)
@@ -1224,6 +1231,7 @@ class SourceIndex:
         path_prefix: tuple[str, ...],
         abs_base: int,
     ) -> ResolvedField | None:
+        # pylint: disable=too-many-return-statements
         source_class = self._classes_by_name.get(qualified_name)
         if source_class is None or not self._layout_usable(source_class):
             return None
@@ -1429,6 +1437,7 @@ class SourceIndex:
         force: bool = False,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
+        # pylint: disable=too-many-arguments
         """Collect direct AST records natively, once for all marker targets.
 
         Expects to run in the same filesystem as the compile database (typically

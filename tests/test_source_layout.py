@@ -20,6 +20,7 @@ from reccmp.source import (
     SourceField,
     SourceIndex,
 )
+from reccmp.source import SourceAbi
 
 
 def _index_with_layout() -> SourceIndex:
@@ -418,7 +419,6 @@ def test_source_index_reader_fails_when_a_field_is_missing():
 
 
 def test_unit_abi_round_trips_in_index_projection():
-    from reccmp.source import SourceAbi
 
     index = SourceIndex(
         declarations=(),
@@ -438,7 +438,6 @@ def test_unit_abi_round_trips_in_index_projection():
 
 
 def test_record_semantic_id_preferred_for_nested_lookup():
-    from reccmp.source import SourceClass, SourceField
 
     index = SourceIndex(
         declarations=(),
@@ -708,24 +707,25 @@ def test_cross_target_class_name_is_not_last_wins():
     assert index.class_named("Foo") is None
     exe = index.for_target("EXE")
     dll = index.for_target("DLL")
-    assert exe.class_named("Foo") is not None
-    assert exe.class_named("Foo").size == 8
-    assert dll.class_named("Foo") is not None
-    assert dll.class_named("Foo").size == 4
+    exe_foo = exe.class_named("Foo")
+    dll_foo = dll.class_named("Foo")
+    assert exe_foo is not None and exe_foo.size == 8
+    assert dll_foo is not None and dll_foo.size == 4
 
 
 def test_enrich_memory_address_with_layout_facts():
     index = _index_with_layout()
+    lines_db = MagicMock()
+    lines_db.find_line_of_recomp_address.return_value = None
     comparator = FunctionComparator(
         db=MagicMock(),
-        lines_db=MagicMock(),
+        lines_db=lines_db,
         orig_bin=MagicMock(),
         recomp_bin=MagicMock(),
         report=MagicMock(),
         types=MagicMock(),
         source_index=index,
     )
-    comparator.lines_db.find_line_of_recomp_address.return_value = None
 
     match = MagicMock()
     match.orig_addr = 0x401000
@@ -739,7 +739,11 @@ def test_enrich_memory_address_with_layout_facts():
             DifferenceSide(1, 0x501010, {"displacement": 12, "base_register": "ecx"}),
         )
     )
-    enriched = comparator._enrich_analysis_with_source(analysis, match=match)
+    enriched = (
+        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
+            analysis, match=match
+        )
+    )
     assert enriched.difference is not None
     assert enriched.difference.orig.facts["class_name"] == "Foo"
     assert enriched.difference.orig.facts["field_name"] == "flag"

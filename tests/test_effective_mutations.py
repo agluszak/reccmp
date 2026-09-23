@@ -13,7 +13,7 @@ import re
 
 import pytest
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     CallAbi,
     FunctionMetadata,
     verify_effective_match,
