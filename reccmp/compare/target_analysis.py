@@ -210,6 +210,15 @@ def _load_cvdump(
 
     cvdump = _load_base_cvdump(target.recompiled_pdb, cache, pdb_fingerprint)
     symbols_by_address = codebase.symbols_for_offsets(orig_addrs)
+    if any(not symbols_by_address.get(addr) for addr in orig_addrs):
+        # An address without an annotation can only be paired by discovery
+        # (body equivalence, unique call sites), which needs every symbol.
+        logger.debug("Targeted address has no annotation; using full symbols")
+        return (
+            _load_full_cvdump(target.recompiled_pdb, cache, pdb_fingerprint),
+            pdb_fingerprint,
+            "full",
+        )
     symbol_hints = {
         SymbolModuleHint(
             source_file=symbol.filename,

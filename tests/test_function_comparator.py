@@ -5,7 +5,7 @@ import pytest
 from reccmp.call_facts import CallFacts
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.types import CvdumpTypesParser
-from reccmp.source import SourceIndex
+from reccmp.source import DeclarationKey, SourceIndex, SourceMarker, keyed
 from reccmp.source.index import SourceDeclaration
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
@@ -365,10 +365,21 @@ def test_line_annotation_wrong_order(db: EntityDb, lines_db: LinesDb, report):
 
     compare_functions(db, lines_db, code, code, report)
 
-    report.assert_called_with(
-        ReccmpEvent.WRONG_ORDER,
+    # LIS keeps the largest monotonic subset; with two crossing pins that is
+    # one annotation, and the other is reported as out of order.
+    wrong_order = [
+        call
+        for call in report.call_args_list
+        if call.args[0] == ReccmpEvent.WRONG_ORDER
+    ]
+    assert len(wrong_order) == 1
+    assert wrong_order[0].args[1] in (
+        ORIG_GLOBAL_OFFSET + 0,
         ORIG_GLOBAL_OFFSET + 3,
-        "Line annotation 'cppfile.cpp:384' is out of order relative to other line annotations.",
+    )
+    assert (
+        wrong_order[0].args[2]
+        == "Line annotation 'cppfile.cpp:384' is out of order relative to other line annotations."
     )
 
 
@@ -692,25 +703,27 @@ def test_call_facts_take_each_field_from_the_strongest_producer(
     class's size."""
     symbol = "?g@@YGXVValue@@@Z"
     index = SourceIndex(
-        declarations=(
-            SourceDeclaration(
-                semantic_id=symbol,
-                qualified_name="g",
-                semantic_kind="free_function",
-                calling_convention="__stdcall",
-                return_type="void",
-                parameter_types=("class Value",),
-                owning_class=None,
-                has_this=False,
-                is_virtual=False,
-                source_file="g.cpp",
-                line=1,
-                end_line=1,
-                is_definition=True,
-                call=CallFacts(False, False, 12, "void"),
-            ),
+        declarations=keyed(
+            (
+                SourceDeclaration(
+                    semantic_id=symbol,
+                    qualified_name="g",
+                    semantic_kind="free_function",
+                    calling_convention="__stdcall",
+                    return_type="void",
+                    parameter_types=("class Value",),
+                    owning_class=None,
+                    has_this=False,
+                    is_virtual=False,
+                    source_file="g.cpp",
+                    line=1,
+                    end_line=1,
+                    is_definition=True,
+                    call=CallFacts(False, False, 12, "void"),
+                ),
+            )
         ),
-        classes=(),
+        classes={},
         markers=(),
     )
     comp = FunctionComparator(
@@ -728,4 +741,70 @@ def test_call_facts_take_each_field_from_the_strongest_producer(
     assert comp._call_facts_of_node(node) == CallFacts(False, False, 12, "void")
     comp.source_index = None
     # pylint: disable-next=protected-access
+    assert comp._call_facts_of_node(node).stack_cleanup is None
+
+
+def test_clang_call_facts_come_from_the_marked_declaration(
+    db: EntityDb, lines_db: LinesDb, report: ReccmpReportProtocol
+):
+    """Two TU-local functions share a mangled name but not their facts: the
+    marker at the original address says which one is being compared; the
+    name alone says nothing."""
+    # stdcall taking a class by value: the name states no argument bytes
+    symbol = "?copyMemory@@YGXVValue@@@Z"
+
+    def declaration(source_file: str, cleanup: int) -> SourceDeclaration:
+        return SourceDeclaration(
+            semantic_id=symbol,
+            qualified_name="copyMemory",
+            semantic_kind="free_function",
+            calling_convention="__stdcall",
+            return_type="void *",
+            parameter_types=(),
+            owning_class=None,
+            has_this=False,
+            is_virtual=False,
+            source_file=source_file,
+            line=1,
+            end_line=2,
+            is_definition=True,
+            linkage="internal",
+            call=CallFacts(False, False, cleanup, "i32"),
+        )
+
+    huffman = DeclarationKey("TEST", symbol, "huffman.cpp")
+    renderer = DeclarationKey("TEST", symbol, "renderer.cpp")
+    index = SourceIndex(
+        declarations={
+            huffman: declaration("huffman.cpp", 12),
+            renderer: declaration("renderer.cpp", 8),
+        },
+        classes={},
+        markers=(
+            SourceMarker(
+                address=0x1000,
+                marker_kind="FUNCTION",
+                source_file="renderer.cpp",
+                line=1,
+                declaration=declaration("renderer.cpp", 8),
+                target="TEST",
+                declaration_key=renderer,
+            ),
+        ),
+    )
+    comp = FunctionComparator(
+        db,
+        lines_db,
+        RawImage.from_memory(b""),
+        RawImage.from_memory(b""),
+        report,
+        CvdumpTypesParser(),
+        source_index=index,
+    )
+    node = CvdumpNode(0, 0)
+    node.decorated_name = symbol
+    # pylint: disable=protected-access
+    assert comp._call_facts_of_node(node, 0x1000).stack_cleanup == 8
+    assert index.call_facts_named(symbol) is None
+    # By name alone only the decorated name's own facts remain.
     assert comp._call_facts_of_node(node).stack_cleanup is None

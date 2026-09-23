@@ -1,4 +1,5 @@
 from unittest.mock import Mock, patch
+import struct
 import pytest
 from reccmp.compare.db import EntityDb
 from reccmp.formats.image import ImageImport, ImageRegion
@@ -10,6 +11,7 @@ from reccmp.formats.exceptions import (
     InvalidStringError,
 )
 from reccmp.compare.analyze import (
+    match_entry,
     create_analysis_floats,
     create_analysis_strings,
     create_thunks,
@@ -18,8 +20,15 @@ from reccmp.compare.analyze import (
     create_imports,
     create_import_thunks,
     create_seh_entities,
+    normalize_original_zero_size_data,
+    classify_exact_vtable_aliases,
+    match_inferred_vtables_by_slots,
 )
-from reccmp.analysis.funcinfo import FuncInfo, UnwindMapEntry
+from reccmp.analysis.funcinfo import (
+    ExceptionRegistration,
+    FuncInfo,
+    UnwindMapEntry,
+)
 
 
 @pytest.fixture(name="db")
@@ -464,6 +473,32 @@ def test_create_import_thunks(db: EntityDb):
     assert get_ref_addr(db, ImageId.ORIG, 0x2000) == 0x1000
 
 
+def test_create_fixed_base_import_thunk_from_six_byte_function(db: EntityDb):
+    """A six-byte PDB function entity supplies boundary evidence without relocations."""
+    with db.batch() as batch:
+        batch.set(ImageId.RECOMP, 0x2000, type=EntityType.FUNCTION, size=6)
+        batch.set(ImageId.RECOMP, 0x3000, type=EntityType.FUNCTION, size=7)
+
+    binfile = Mock(spec=PEImage)
+    binfile.imports = (ImageImport(addr=0x1000, module="TEST", name="Hello"),)
+    binfile.get_code_regions.return_value = (
+        ImageRegion(0x2000, b"\xff\x25\x00\x10\x00\x00"),
+        ImageRegion(0x3000, b"\xff\x25\x00\x10\x00\x00"),
+    )
+    binfile.relocations = set()
+
+    create_import_thunks(db, ImageId.RECOMP, binfile)
+
+    thunk = db.get(ImageId.RECOMP, 0x2000)
+    assert thunk is not None
+    assert thunk.get("type") == EntityType.IMPORT_THUNK
+    assert get_ref_addr(db, ImageId.RECOMP, 0x2000) == 0x1000
+
+    non_thunk = db.get(ImageId.RECOMP, 0x3000)
+    assert non_thunk is not None
+    assert non_thunk.get("type") == EntityType.FUNCTION
+
+
 def test_create_import_thunks_pe_only(db: EntityDb):
     """At the moment, we have seen import thunks on PE images only.
     create_import_thunks should be a no-op if the image is not PE."""
@@ -487,15 +522,28 @@ def test_create_seh_entities(db: EntityDb, image_id: ImageId):
     mock_funcinfo_data = [
         (handler_addr, FuncInfo(funcinfo_addr, (UnwindMapEntry(-1, unwind_addr),)))
     ]
-    with patch(
-        "reccmp.compare.analyze.find_eh_handlers", return_value=iter(mock_funcinfo_data)
-    ) as find_fn:
+    registration = ExceptionRegistration(0x100, handler_addr, mock_funcinfo_data[0][1])
+    with db.batch() as batch:
+        batch.set(image_id, 0x100, type=EntityType.FUNCTION)
+    with (
+        patch(
+            "reccmp.compare.analyze.find_eh_handlers",
+            return_value=iter(mock_funcinfo_data),
+        ) as find_fn,
+        patch(
+            "reccmp.compare.analyze.find_exception_registrations",
+            return_value=iter([registration]),
+        ),
+    ):
         create_seh_entities(db, image_id, pe_image)
         find_fn.assert_called()
 
     e = db.get(image_id, handler_addr)
     assert e is not None
     assert e.get("type") == EntityType.LABEL
+    side = "orig" if image_id == ImageId.ORIG else "recomp"
+    assert e.get(f"seh_owner_{side}") == 0x100
+    assert e.get(f"seh_funcinfo_{side}") == funcinfo_addr
 
     e = db.get(image_id, unwind_addr)
     assert e is not None
@@ -504,3 +552,174 @@ def test_create_seh_entities(db: EntityDb, image_id: ImageId):
     e = db.get(image_id, funcinfo_addr)
     assert e is not None
     assert e.get("type") == EntityType.DATA
+
+
+def test_normalize_original_zero_size_data(db: EntityDb):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            0x1000,
+            type=EntityType.FUNCTION,
+            size=0x100,
+            name="Owner",
+        )
+        batch.set(ImageId.ORIG, 0x1050, type=EntityType.DATA, name="inside")
+        batch.set(ImageId.ORIG, 0x2000, type=EntityType.DATA, name="jump")
+        batch.set(
+            ImageId.ORIG,
+            0x4000,
+            type=EntityType.DATA,
+            name="Sample::'vftable'",
+        )
+        batch.set(
+            ImageId.ORIG,
+            0x4020,
+            type=EntityType.DATA,
+            name="g_apfnDispatch",
+        )
+
+    code = ImageRegion(0x1000, b"\x90" * 0x2000)
+    jump = b"\xe9" + (0x1100 - 0x2005).to_bytes(4, "little", signed=True)
+    table = struct.pack("<IIII", 0x1100, 0x1200, 0x1300, 0)
+
+    def read(addr: int, size: int) -> bytes:
+        if 0x4000 <= addr < 0x4000 + len(table):
+            return table[addr - 0x4000 : addr - 0x4000 + size]
+        if 0x4020 <= addr < 0x4020 + len(table):
+            return table[addr - 0x4020 : addr - 0x4020 + size]
+        if addr == 0x2000:
+            return jump[:size]
+        return b"\0" * size
+
+    binfile = Mock(spec=PEImage)
+    binfile.get_code_regions.return_value = (code,)
+    binfile.read.side_effect = read
+
+    normalize_original_zero_size_data(db, binfile)
+
+    label = db.get(ImageId.ORIG, 0x1050)
+    assert label is not None and label.get("type") == EntityType.LABEL
+    thunk = db.get(ImageId.ORIG, 0x2000)
+    assert thunk is not None
+    assert thunk.get("type") == EntityType.THUNK
+    assert thunk.size(ImageId.ORIG) == 5
+    assert get_ref_addr(db, ImageId.ORIG, 0x2000) == 0x1100
+    vtable = db.get(ImageId.ORIG, 0x4000)
+    assert vtable is not None
+    assert vtable.get("type") == EntityType.VTABLE
+    assert vtable.get("name") == "Sample"
+    assert vtable.get("inferred_vtable") is True
+    assert vtable.size(ImageId.ORIG) == 12
+    data = db.get(ImageId.ORIG, 0x4020)
+    assert data is not None and data.get("type") == EntityType.DATA
+
+
+def test_classify_exact_vtable_aliases(db: EntityDb):
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x1000, type=EntityType.VTABLE, name="Base", size=12)
+        batch.set(ImageId.RECOMP, 0x2000, type=EntityType.VTABLE, name="Base", size=12)
+        batch.match(0x1000, 0x2000)
+        batch.set(ImageId.ORIG, 0x1100, type=EntityType.VTABLE, name="Base", size=12)
+
+    raw = b"one two three"
+    orig_bin = Mock(spec=PEImage)
+    recomp_bin = Mock(spec=PEImage)
+    orig_bin.read.return_value = raw
+    recomp_bin.read.return_value = raw
+
+    classify_exact_vtable_aliases(db, orig_bin, recomp_bin)
+
+    assert db.alias_canonical_orig(ImageId.ORIG, 0x1100) == 0x1000
+
+
+def test_match_inferred_vtables_requires_exact_slot_identities(db: EntityDb):
+    with db.batch() as batch:
+        for orig_addr, recomp_addr in zip(
+            (0x1000, 0x1010, 0x1020), (0x2000, 0x2010, 0x2020)
+        ):
+            batch.set(ImageId.ORIG, orig_addr, type=EntityType.FUNCTION, size=1)
+            batch.set(ImageId.RECOMP, recomp_addr, type=EntityType.FUNCTION, size=1)
+            batch.match(orig_addr, recomp_addr)
+        batch.set(
+            ImageId.ORIG,
+            0x3000,
+            type=EntityType.VTABLE,
+            name="Exact",
+            size=12,
+            inferred_vtable=True,
+        )
+        batch.set(
+            ImageId.RECOMP,
+            0x4000,
+            type=EntityType.VTABLE,
+            name="Exact::`vftable'",
+            size=12,
+        )
+        batch.set(
+            ImageId.ORIG,
+            0x3100,
+            type=EntityType.VTABLE,
+            name="Mismatch",
+            size=12,
+            inferred_vtable=True,
+        )
+        batch.set(
+            ImageId.RECOMP,
+            0x4100,
+            type=EntityType.VTABLE,
+            name="Mismatch::`vftable'",
+            size=12,
+        )
+
+    orig_tables = {
+        0x3000: struct.pack("<III", 0x1000, 0x1010, 0x1020),
+        0x3100: struct.pack("<III", 0x1000, 0x1010, 0x1020),
+    }
+    recomp_tables = {
+        0x4000: struct.pack("<III", 0x2000, 0x2010, 0x2020),
+        0x4100: struct.pack("<III", 0x2000, 0x2010, 0x9999),
+    }
+    orig_bin = Mock(spec=PEImage)
+    recomp_bin = Mock(spec=PEImage)
+    orig_bin.read.side_effect = lambda addr, size: orig_tables[addr][:size]
+    recomp_bin.read.side_effect = lambda addr, size: recomp_tables[addr][:size]
+
+    match_inferred_vtables_by_slots(db, orig_bin, recomp_bin)
+
+    assert db.is_match(0x3000, 0x4000)
+    assert not db.is_match(0x3100, 0x4100)
+
+
+#### match_entry ####
+
+
+def test_match_entry(db: EntityDb):
+    """The entry points of both binaries should match."""
+    orig_bin = Mock()
+    orig_bin.optional_header.address_of_entry_point = 0x1000
+    orig_bin.entry = 0x401000
+    recomp_bin = Mock()
+    recomp_bin.optional_header.address_of_entry_point = 0x2000
+    recomp_bin.entry = 0x602000
+
+    match_entry(db, orig_bin, recomp_bin)
+
+    assert db.is_match(0x401000, 0x602000)
+    entity = db.get(ImageId.RECOMP, 0x602000)
+    assert entity is not None
+    assert entity.get("type") == EntityType.FUNCTION
+
+
+def test_match_entry_no_entry_point(db: EntityDb):
+    """AddressOfEntryPoint == 0 means "no entry point" (common for DLLs).
+    The image base must not be staged as a function."""
+    orig_bin = Mock()
+    orig_bin.optional_header.address_of_entry_point = 0x1000
+    orig_bin.entry = 0x401000
+    recomp_bin = Mock()
+    recomp_bin.optional_header.address_of_entry_point = 0
+    recomp_bin.entry = 0x600000  # image base
+
+    match_entry(db, orig_bin, recomp_bin)
+
+    assert db.count() == 0

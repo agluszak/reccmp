@@ -1,9 +1,6 @@
-from dataclasses import dataclass
-import re
 import logging
 import argparse
-import struct
-from typing import NamedTuple, Sequence
+from typing import Sequence
 
 import colorama
 import reccmp
@@ -14,13 +11,24 @@ from reccmp.compare.diff import (
     MatchingOrMismatchingBlock,
     raw_diff_to_udiff,
 )
+from reccmp.compare.stack_layout import (
+    StackPair,
+    StackPairs,
+    StackRegisterOffset,
+    StackSymbol,
+    Warnings,
+    analyze_diff_block,
+    annotate_canonical_refs,
+    annotate_recomp_symbols,
+    collect_stack_pairs,
+    extract_stack_offset_from_instruction,
+)
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.project.detect import (
     argparse_add_project_target_args,
     argparse_parse_project_target,
     RecCmpProjectException,
 )
-from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.project.logging import (
     argparse_add_logging_args,
     argparse_parse_logging,
@@ -37,129 +45,22 @@ SWAP_ICON = f"{reccmp.color.Fore.YELLOW}⇄{reccmp.color.Style.RESET_ALL}"
 ERROR_ICON = f"{reccmp.color.Fore.RED}✗{reccmp.color.Style.RESET_ALL}"
 UNCLEAR_ICON = f"{reccmp.color.Fore.BLUE}?{reccmp.color.Style.RESET_ALL}"
 
-
-STACK_ENTRY_REGEX = re.compile(
-    r"(?P<register>e[sb]p)\s(?P<sign>[+-])\s(?P<offset>(0x)?[0-9a-f]+)(?![0-9a-f])"
-)
-
-
-@dataclass
-class StackSymbol:
-    name: str
-    data_type: CvdumpTypeKey
-
-
-@dataclass
-class StackRegisterOffset:
-    register: str
-    offset: int
-    symbol: StackSymbol | None = None
-
-    def __str__(self) -> str:
-        first_part = (
-            f"{self.register} + {self.offset:#04x}"
-            if self.offset > 0
-            else f"{self.register} - {-self.offset:#04x}"
-        )
-        second_part = f"  {self.symbol.name}" if self.symbol else ""
-        return first_part + second_part
-
-    def __hash__(self) -> int:
-        return hash(self.register) + self.offset
-
-    def copy(self) -> "StackRegisterOffset":
-        return StackRegisterOffset(self.register, self.offset, self.symbol)
-
-    def __eq__(self, other: object):
-        return (
-            isinstance(other, StackRegisterOffset)
-            and self.register == other.register
-            and self.offset == other.offset
-        )
-
-
-class StackPair(NamedTuple):
-    orig: StackRegisterOffset
-    recomp: StackRegisterOffset
-
-
-StackPairs = set[StackPair]
-
-
-@dataclass
-class Warnings:
-    structural_mismatches_present: bool = False
-    error_map_not_bijective: bool = False
-
-
-def extract_stack_offset_from_instruction(
-    instruction: str,
-) -> StackRegisterOffset | None:
-    match = STACK_ENTRY_REGEX.search(instruction)
-    if not match:
-        return None
-    offset = int(match.group("sign") + match.group("offset"), 16)
-    return StackRegisterOffset(match.group("register"), offset)
+# Re-exports for tests / callers that imported these from the tool module.
+__all__ = [
+    "StackSymbol",
+    "StackRegisterOffset",
+    "StackPair",
+    "StackPairs",
+    "Warnings",
+    "extract_stack_offset_from_instruction",
+    "analyze_diff",
+    "compare_function_stacks",
+    "main",
+]
 
 
 def analyze_diff(diff: MatchingOrMismatchingBlock, warnings: Warnings) -> StackPairs:
-    stack_pairs: StackPairs = set()
-    if "both" in diff:
-        # get the matching stack entries
-        for line in diff["both"]:
-            # 0 = orig addr, 1 = instruction, 2 = reccmp addr
-            instruction = line[1]
-
-            if match := extract_stack_offset_from_instruction(instruction):
-                logging.debug("stack match: %s", match)
-                # need a copy for recomp because we might add a debug symbol to it
-                stack_pairs.add(StackPair(match, match.copy()))
-            elif any(x in instruction for x in ["ebp", "esp"]):
-                logging.debug("not a stack offset: %s", instruction)
-
-    else:
-        assert "orig" in diff
-        assert "recomp" in diff
-        orig = diff["orig"]
-        recomp = diff["recomp"]
-        if len(orig) != len(recomp):
-            if orig:
-                mismatch_location = f"orig={orig[0][0]}"
-            else:
-                mismatch_location = f"recomp={recomp[0][0]}"
-            logging.error(
-                "Structural mismatch at %s:\n%s",
-                mismatch_location,
-                print_structural_mismatch(orig, recomp),
-            )
-            warnings.structural_mismatches_present = True
-            return set()
-
-        for orig_line, recomp_line in zip(orig, recomp):
-            if orig_match := extract_stack_offset_from_instruction(orig_line[1]):
-                recomp_match = extract_stack_offset_from_instruction(recomp_line[1])
-
-                if not recomp_match:
-                    logging.error(
-                        "Mismatching line structure at orig=%s:\n%s",
-                        orig_line[0],
-                        print_structural_mismatch(orig, recomp),
-                    )
-                    # not recoverable, whole block has a structural mismatch
-                    warnings.structural_mismatches_present = True
-                    return set()
-
-                stack_pair = StackPair(orig_match, recomp_match)
-
-                logging.debug(
-                    "stack match, wrong order: %s vs %s", stack_pair[0], stack_pair[1]
-                )
-                stack_pairs.add(stack_pair)
-
-            elif any(x in orig_line[1] for x in ["ebp", "esp"]):
-                logging.debug("not a stack offset: %s", orig_line[1])
-
-    return stack_pairs
+    return analyze_diff_block(diff, warnings)
 
 
 def print_bijective_match(left: str, right: str, exact: bool):
@@ -185,40 +86,32 @@ def format_list_of_offsets(offsets: list[StackRegisterOffset]) -> str:
 
 def compare_function_stacks(udiff: CombinedDiffOutput, fn_symbol: SymbolsEntry):
     warnings = Warnings()
+    stack_pairs, collected_warnings = collect_stack_pairs(udiff)
+    warnings.structural_mismatches_present = (
+        collected_warnings.structural_mismatches_present
+    )
 
-    # consists of pairs (orig, recomp)
-    # don't use a dict because we can have m:n relations
-    stack_pairs: StackPairs = set()
-
+    # Preserve prior logging for structural mismatches in mismatch blocks.
     for block in udiff:
-        # block[0] is e.g. "@@ -0x10071662,60 +0x10031368,60 @@"
         for diff in block[1]:
-            stack_pairs = stack_pairs.union(analyze_diff(diff, warnings))
+            if "both" in diff:
+                continue
+            assert "orig" in diff and "recomp" in diff
+            orig = diff["orig"]
+            recomp = diff["recomp"]
+            if len(orig) != len(recomp):
+                if orig:
+                    mismatch_location = f"orig={orig[0][0]}"
+                else:
+                    mismatch_location = f"recomp={recomp[0][0]}"
+                logging.error(
+                    "Structural mismatch at %s:\n%s",
+                    mismatch_location,
+                    print_structural_mismatch(orig, recomp),
+                )
 
-    # Note that the 'Frame Ptr Present' property is not relevant to the stack below `ebp`,
-    # but only to entries above (i.e. the function arguments on the stack).
-    # See also pdb_extraction.py.
-
-    stack_symbols: dict[int, StackSymbol] = {}
-
-    for symbol in fn_symbol.symbols:
-        if symbol.symbol_type == "S_BPREL32":
-            # convert hex to signed 32 bit integer
-            hex_bytes = bytes.fromhex(symbol.location[1:-1])
-            stack_offset = struct.unpack(">l", hex_bytes)[0]
-
-            stack_symbols[stack_offset] = StackSymbol(
-                symbol.name,
-                symbol.data_type,
-            )
-
-    for _, recomp in stack_pairs:
-        if recomp.register == "ebp":
-            recomp.symbol = stack_symbols.get(recomp.offset)
-        elif recomp.register == "esp":
-            logging.debug(
-                "Matching esp offsets to debug symbols is not implemented right now"
-            )
+    stack_symbols = annotate_recomp_symbols(stack_pairs, fn_symbol)
+    annotate_canonical_refs(stack_pairs)
 
     print_by_original_stack(stack_pairs, warnings)
     print_by_recomp_stack(stack_pairs, stack_symbols, warnings)
@@ -247,7 +140,6 @@ def print_by_recomp_stack(
     stack_symbols: dict[int, StackSymbol],
     warnings: Warnings,
 ):
-    # Show offsets from the debug symbols that we have not encountered in the diff
     all_recomp_offsets = set(x.recomp.offset for x in stack_pairs).union(
         stack_symbols.keys()
     )
@@ -259,8 +151,6 @@ def print_by_recomp_stack(
         )
 
         if recomp is None:
-            # The offset only appears in the debug symbols.
-            # The legend below explains why this can happen.
             stack_offset = StackRegisterOffset(
                 "ebp", recomp_offset, stack_symbols[recomp_offset]
             )
@@ -270,7 +160,6 @@ def print_by_recomp_stack(
         origs = [x.orig for x in stack_pairs if x.recomp == recomp]
 
         if len(origs) == 1:
-            # 1:1 clean match
             print_bijective_match(str(origs[0]), str(recomp), origs[0] == recomp)
         else:
             print_non_bijective_match(format_list_of_offsets(origs), str(recomp))
