@@ -1,10 +1,16 @@
 """Test our detection of SEH data for PE images"""
 
+import struct
+from unittest.mock import Mock
+
 from reccmp.formats import PEImage
+from reccmp.formats.image import ImageRegion
 from reccmp.analysis.funcinfo import (
+    FuncInfo,
     UnwindMapEntry,
     find_mov_eax_jmp_in_buffer,
     find_eh_handlers,
+    find_exception_registrations,
     find_funcinfo,
 )
 
@@ -44,4 +50,58 @@ def test_funcinfo_handlers(binfile: PEImage):
     assert sorted(funcinfo.unwinds) == [
         UnwindMapEntry(-1, 0x100013FF),
         UnwindMapEntry(0, 0x100013ED),
+    ]
+
+
+def test_find_exception_registrations_vc5_forms():
+    funcinfo = Mock()
+    handler_push = 0x12345678
+    handler_mov = 0x23456789
+    code = (
+        b"\x6a\xff\x68"
+        + handler_push.to_bytes(4, "little")
+        + b"\xb8"
+        + handler_mov.to_bytes(4, "little")
+        + b"\xe8\0\0\0\0"
+    )
+    image = Mock(spec=PEImage)
+    image.get_code_regions.return_value = [ImageRegion(0x1000, memoryview(code))]
+
+    registrations = list(
+        find_exception_registrations(
+            image,
+            iter(((handler_push, funcinfo), (handler_mov, funcinfo))),
+        )
+    )
+
+    assert [(item.addr, item.handler_addr) for item in registrations] == [
+        (0x1002, handler_push),
+        (0x1007, handler_mov),
+    ]
+
+
+def test_find_exception_registrations_requires_known_handler():
+    image = Mock(spec=PEImage)
+    image.get_code_regions.return_value = [
+        ImageRegion(0x1000, memoryview(b"\x68\x78\x56\x34\x12"))
+    ]
+    assert not list(find_exception_registrations(image, iter(())))
+
+
+def test_funcinfo_in_a_writable_data_section():
+    """The retail Wizardry 8 executable has a writable .rdata: FuncInfo is
+    found in any readable, non-executable section. A magic number whose
+    unwind map is not in the section is noise."""
+    base = 0x5EB000
+    funcinfo = struct.pack("<4I", 0x19930520, 1, base + 0x10, 0)
+    unwind_map = struct.pack("<iI", -1, 0x401234)
+    noise = struct.pack("<3I", 0x19930520, 3, 0x7FFF0000)
+    # LEGO1.DLL's .data has the magic followed by zeros: no states
+    empty = struct.pack("<3I", 0x19930520, 0, 0)
+    data = funcinfo + unwind_map + b"\0" * 8 + noise + empty
+    image = Mock(spec=PEImage)
+    image.get_data_regions.return_value = [ImageRegion(base, data, len(data))]
+
+    assert list(find_funcinfo(image)) == [
+        FuncInfo(base, (UnwindMapEntry(-1, 0x401234),))
     ]

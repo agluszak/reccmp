@@ -3,7 +3,7 @@ https://www.openrce.org/articles/full_view/21"""
 
 import re
 import struct
-from typing import Iterator, NamedTuple
+from typing import Iterable, Iterator, NamedTuple
 from typing_extensions import Buffer
 from reccmp.formats import PEImage
 
@@ -28,6 +28,14 @@ class FuncInfo(NamedTuple):
     unwinds: tuple[UnwindMapEntry, ...]
 
 
+class ExceptionRegistration(NamedTuple):
+    """Reference from a VC5 exception-registration prologue to its handler."""
+
+    addr: int
+    handler_addr: int
+    funcinfo: FuncInfo
+
+
 def find_funcinfo_offsets_in_buffer(buf: Buffer) -> Iterator[int]:
     """Return offsets of the FuncInfo magic number."""
     for match in FUNCINFO_MAGIC_RE.finditer(buf):
@@ -35,14 +43,22 @@ def find_funcinfo_offsets_in_buffer(buf: Buffer) -> Iterator[int]:
 
 
 def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
-    """Parse the FuncInfo struct and return its location."""
+    """Parse the FuncInfo struct and return its location. A magic number
+    without unwind states, or whose unwind map does not lie in the same
+    buffer, is not a FuncInfo."""
+    size = len(memoryview(buf))
     for ofs in find_funcinfo_offsets_in_buffer(buf):
+        if ofs + 12 > size:
+            continue
         # TODO: The structure may vary depending on the magic string.
         # We support format 19930520 to start.
         max_state, unwind_map_addr = struct.unpack_from("<4x2I", buf, offset=ofs)
 
         # Unwind offset is an absolute address.
         unwind_map_ofs = unwind_map_addr - base_addr
+        # A function with EH has at least one unwind state.
+        if not max_state or not 0 <= unwind_map_ofs <= size - 8 * max_state:
+            continue
         unwinds = tuple(
             UnwindMapEntry(
                 *struct.unpack_from("<iI", buf, offset=unwind_map_ofs + 8 * i)
@@ -54,8 +70,9 @@ def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
 
 
 def find_funcinfo(image: PEImage) -> Iterator[FuncInfo]:
-    """Find all FuncInfo structs in the image."""
-    for region in image.get_const_regions():
+    """Find all FuncInfo structs in the image: in any readable, non-executable
+    section, since not every linker (or later tool) leaves .rdata read-only."""
+    for region in image.get_data_regions():
         yield from find_funcinfo_in_buffer(region.data, region.addr)
 
 
@@ -86,3 +103,36 @@ def find_eh_handlers(image: PEImage) -> Iterator[tuple[int, FuncInfo]]:
             if (funcinfo := bytes_to_addr.get(funcinfo_bytes)) is not None:
                 # Return the EH handler address and the referenced FuncInfo struct
                 yield (handler_addr, funcinfo)
+
+
+def find_exception_registrations(
+    image: PEImage,
+    handlers: Iterable[tuple[int, FuncInfo]] | None = None,
+) -> Iterator[ExceptionRegistration]:
+    """Find VC5 function prologues that install a known EH handler.
+
+    VC5 emits the handler address either as ``push imm32`` in the inline
+    registration sequence or as ``mov eax, imm32`` before calling its shared
+    EH-prologue helper.  A handler address is accepted only after its body has
+    independently been related to a valid FuncInfo record.
+    """
+    if handlers is None:
+        handlers = find_eh_handlers(image)
+
+    handler_to_funcinfo = dict(handlers)
+    if not handler_to_funcinfo:
+        return
+
+    for region in image.get_code_regions():
+        buf = bytes(region.data)
+        # Both forms have a one-byte opcode followed by the handler address.
+        for offset in range(len(buf) - 4):
+            if buf[offset] not in (0x68, 0xB8):
+                continue
+
+            handler_addr = struct.unpack_from("<I", buf, offset + 1)[0]
+            funcinfo = handler_to_funcinfo.get(handler_addr)
+            if funcinfo is not None:
+                yield ExceptionRegistration(
+                    region.addr + offset, handler_addr, funcinfo
+                )

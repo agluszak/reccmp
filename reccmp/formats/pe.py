@@ -16,6 +16,7 @@ from typing import Iterable, Iterator, cast
 from .exceptions import (
     InvalidVirtualAddressError,
     SectionNotFoundError,
+    InvalidStringError,
 )
 from .image import Image, ImageRegion, ImageSection, ImageSectionFlags, ImageImport
 from .mz import ImageDosHeader
@@ -742,19 +743,21 @@ class PEImage(Image):
         instruction in the function is a jmp to the address in .idata.
         Search .text to find these functions."""
 
-        if not self.is_debug:
-            return []
-
-        thunks = []
-        # If this is a debug build, read the thunks at the start of .text
+        thunks: list[tuple[int, int]] = []
+        # Read the incremental-link thunk table at the start of .text.
+        # Entries are 5-byte jmps, optionally padded with int3 (0xCC) bytes.
         # Terminated by a big block of 0xcc padding bytes before the first
         # real function in the section.
         for sect in self.get_code_regions():
             ofs = 0
-            while True:
-                opcode, operand = struct.unpack("<Bi", sect.data[ofs : ofs + 5])
+            while ofs + 5 <= len(sect.data):
+                opcode = sect.data[ofs]
+                if opcode == 0xCC and thunks:
+                    ofs += 1
+                    continue
                 if opcode != 0xE9:
                     break
+                (operand,) = struct.unpack("<i", sect.data[ofs + 1 : ofs + 5])
 
                 thunk_ofs = sect.addr + ofs
                 jmp_ofs = thunk_ofs + 5 + operand
@@ -780,27 +783,57 @@ class PEImage(Image):
             *struct.unpack("<2L2H7L", self.read(export_start, 40))
         )
 
-        # TODO: if the number of functions doesn't match the number of names,
-        # are the remaining functions ordinals?
+        # The export name pointer table has NumberOfNames entries and each
+        # name is paired with a 16-bit index into the export address table.
+        # The EAT has NumberOfFunctions slots and may contain holes (zero RVA)
+        # for ordinals that have no exported address. Zipping the EAT with the
+        # name table 1:1 is incorrect on both counts.
         n_functions = export_table.address_table_entries
+        n_names = export_table.number_of_name_pointers
 
-        func_start = export_start + 40
-        func_addrs: list[int] = [
-            self.imagebase + rva
-            for rva, in struct.iter_unpack("<L", self.read(func_start, 4 * n_functions))
+        eat_rvas = [
+            rva
+            for rva, in struct.iter_unpack(
+                "<L",
+                self.read(
+                    self.imagebase + export_table.export_address_table_rva,
+                    4 * n_functions,
+                ),
+            )
         ]
 
-        name_start = func_start + 4 * n_functions
-        name_addrs: list[int] = [
-            self.imagebase + rva
-            for rva, in struct.iter_unpack("<L", self.read(name_start, 4 * n_functions))
+        name_rvas = [
+            rva
+            for rva, in struct.iter_unpack(
+                "<L",
+                self.read(self.imagebase + export_table.name_pointer_rva, 4 * n_names),
+            )
         ]
 
-        combined = zip(func_addrs, name_addrs)
-        return [
-            (func_addr, self.read_string(name_addr))
-            for (func_addr, name_addr) in combined
+        ordinal_indices = [
+            ordinal
+            for ordinal, in struct.iter_unpack(
+                "<H",
+                self.read(self.imagebase + export_table.ordinal_table_rva, 2 * n_names),
+            )
         ]
+
+        exports = []
+        for name_rva, ordinal_index in zip(name_rvas, ordinal_indices):
+            if ordinal_index >= len(eat_rvas):
+                continue
+            # A zero EAT RVA is a hole (e.g. a .def export whose symbol was
+            # not emitted), not a function at the image base.
+            if eat_rvas[ordinal_index] == 0:
+                continue
+            exports.append(
+                (
+                    self.imagebase + eat_rvas[ordinal_index],
+                    self.read_string(self.imagebase + name_rva),
+                )
+            )
+
+        return exports
 
     def iter_string(self, encoding: str = "ascii") -> Iterator[tuple[int, str]]:
         """Search for possible strings at each verified address in .data."""
@@ -813,6 +846,23 @@ class PEImage(Image):
 
                     try:
                         string = raw.decode(encoding)
+                    except UnicodeDecodeError:
+                        continue
+
+                    yield addr, string
+
+    def iter_widechar(self) -> Iterator[tuple[int, str]]:
+        """Search for possible UTF-16LE strings at each verified address in .data."""
+        for section in self.get_data_regions():
+            for addr in self._relocated_addrs:
+                if addr in section.range:
+                    try:
+                        raw = self.read_widechar(addr)
+                    except InvalidStringError:
+                        continue
+
+                    try:
+                        string = raw.decode("utf-16-le")
                     except UnicodeDecodeError:
                         continue
 
