@@ -1,5 +1,5 @@
 """Tests for the isomorphic-CFG effective-match verifier
-(reccmp.compare.asm.effective.verify_isomorphic_cfg_effective_match) and the
+(reccmp.compare.asm.verifier.verify_isomorphic_cfg_effective_match) and the
 flag/one-sided generalizations that support it.
 
 The centerpiece sample is a real MSVC 5.0 register-allocation wobble:
@@ -17,14 +17,18 @@ from pathlib import Path
 
 import pytest
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     FunctionMetadata,
-    SideState,
-    _CfgState,
-    _join_states,
     verify_cfg_effective_match,
     verify_effective_match,
     verify_isomorphic_cfg_effective_match,
+)
+from reccmp.compare.asm.verifier.cfg import (
+    _CfgState,
+    _join_states,
+)
+from reccmp.compare.asm.verifier.state import (
+    SideState,
 )
 from reccmp.compare.asm.fixes import analyze_effective_match
 from reccmp.compare.asm.parse import ParseAsm

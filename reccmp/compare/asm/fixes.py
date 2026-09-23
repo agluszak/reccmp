@@ -2,7 +2,7 @@ import dataclasses
 import logging
 from typing import Sequence
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     JCC_MNEMONICS,
     FunctionMetadata,
     LineEffects,
@@ -82,7 +82,7 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
     Prefer ``DecodedInstruction`` excerpts so the verifier uses Capstone
     operands directly. Legacy ``list[str]`` still works via text parse.
 
-    The relational verifier (see effective.py) proves equivalence modulo
+    The relational verifier (see the verifier package) proves equivalence modulo
     register allocation, commutative-operand order and inverted compare/jump
     conditions. Instruction-scheduling differences are handled by undoing
     relocations that are proven independent of everything they cross, then

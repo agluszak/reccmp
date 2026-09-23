@@ -5,7 +5,9 @@ from __future__ import annotations
 import struct
 from unittest.mock import Mock
 
-from reccmp.compare.asm.effective import verify_effective_match
+from reccmp.compare.asm.verifier import (
+    verify_effective_match,
+)
 from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb, ReccmpMatch

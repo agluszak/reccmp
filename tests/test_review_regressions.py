@@ -10,7 +10,9 @@ import difflib
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.effective import verify_effective_match
+from reccmp.compare.asm.verifier import (
+    verify_effective_match,
+)
 from reccmp.compare.asm.fixes import analyze_effective_match
 from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
 from reccmp.compare.asm.parse import ParseAsm

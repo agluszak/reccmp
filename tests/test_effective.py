@@ -1,16 +1,20 @@
 """Tests for the relational effective-match verifier
-(reccmp.compare.asm.effective.verify_effective_match)."""
+(reccmp.compare.asm.verifier.verify_effective_match)."""
 
 # pylint: disable=too-many-lines
 
 import difflib
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     CallAbi,
-    Context,
     FunctionMetadata,
-    _receiver_equivalence_class,
     verify_effective_match,
+)
+from reccmp.compare.asm.verifier.semantics import (
+    _receiver_equivalence_class,
+)
+from reccmp.compare.asm.verifier.state import (
+    Context,
 )
 from reccmp.compare.asm.instgen import InstructionMeta
 

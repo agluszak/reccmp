@@ -12,7 +12,9 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from reccmp.compare import Compare
-from reccmp.compare.asm.effective import _extract_switch_tables
+from reccmp.compare.asm.verifier.cfg_build import (
+    _extract_switch_tables,
+)
 from reccmp.compare.asm.ir import (
     AsmRole,
     DecodedInstruction,

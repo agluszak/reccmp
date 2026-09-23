@@ -2,7 +2,7 @@
 
 from difflib import SequenceMatcher
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     FunctionMetadata,
     verify_cfg_effective_match,
     verify_effective_match,

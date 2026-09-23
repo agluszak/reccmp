@@ -9,7 +9,10 @@ from typing import Callable, Iterator
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
-from reccmp.compare.asm.effective import CallAbi, FunctionMetadata
+from reccmp.compare.asm.verifier import (
+    CallAbi,
+    FunctionMetadata,
+)
 from reccmp.compare.asm.fixes import analyze_effective_match, assert_fixup
 from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.instgen import (

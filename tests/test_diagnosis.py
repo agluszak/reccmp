@@ -4,9 +4,11 @@ from difflib import SequenceMatcher
 
 import pytest
 
-from reccmp.compare.asm.effective import (
+from reccmp.compare.asm.verifier import (
     CallAbi,
     FunctionMetadata,
+)
+from reccmp.compare.asm.verifier.evidence import (
     _diagnostic_summaries,
 )
 from reccmp.compare.asm.fixes import analyze_effective_match
