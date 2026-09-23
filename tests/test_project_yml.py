@@ -158,3 +158,27 @@ def test_project_marker_aliases():
         """)
 
     assert p.targets["TEST"].marker_aliases == {"fun": "FUNCTION"}
+
+
+def test_project_verifier_configuration():
+    """Algebraic identities are on unless the project turns them off; the
+    choice is the project's, not the Python environment's."""
+    p = ProjectFile.from_str("""\
+        targets:
+            TEST:
+                hash:
+                    sha256: test
+                filename: test.exe
+        """)
+    assert p.targets["TEST"].verifier.algebraic_identities
+
+    p = ProjectFile.from_str("""\
+        targets:
+            TEST:
+                hash:
+                    sha256: test
+                filename: test.exe
+                verifier:
+                    algebraic-identities: false
+        """)
+    assert not p.targets["TEST"].verifier.algebraic_identities

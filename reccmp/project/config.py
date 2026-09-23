@@ -70,6 +70,17 @@ class YmlReportConfig(BaseModel):
         return cls(ignore_functions=[], ignore_variables=[])
 
 
+class YmlVerifierConfig(BaseModel):
+    """What the semantic verifier may use to prove equivalence."""
+
+    # Accept values proven equal as bit-vectors (z3) though computed
+    # differently: `and al, 1` against `and eax, 1` then reading al.
+    algebraic_identities: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("algebraic-identities", "algebraic_identities"),
+    )
+
+
 @dataclass
 class Hash:
     sha256: str
@@ -95,6 +106,7 @@ class ProjectFileTarget(BaseModel):
     encoding: str | None = Field(default=None)
     ghidra: YmlGhidraConfig = Field(default_factory=YmlGhidraConfig.default)
     report: YmlReportConfig = Field(default_factory=YmlReportConfig.default)
+    verifier: YmlVerifierConfig = Field(default_factory=YmlVerifierConfig)
     marker_aliases: dict[str, str] = Field(
         validation_alias=AliasChoices("marker-aliases", "marker_aliases"),
         default_factory=dict,
