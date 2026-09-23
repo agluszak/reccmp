@@ -186,10 +186,10 @@ wheels = [
 
 [[package]]
 name = "ghidra-stubs"
-version = "12.1.2"
+version = "12.1.4"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a2/04/e081d16bfa66d5117e5b1de49607fb57488fd9efad9fc89c7eb4ed5c5ae2/ghidra_stubs-12.1.2-py3-none-any.whl", hash = "sha256:52bfa4c5b194b3acc5d5a2213324a2f922c23f4a12e8d4b6a23e304310a53b18", size = 3784662, upload-time = "2026-06-08T11:07:49.662Z" },
+    { url = "https://files.pythonhosted.org/packages/61/3f/7d72e4ff099fba38cc22e13ade8abf676edc3550225bd2c048767aba3edb/ghidra_stubs-12.1.4-py3-none-any.whl", hash = "sha256:3d430b07b17250faba50d53b13c382c325b5399095cc2bdf57f6d65ffa7da71d", size = 3749924, upload-time = "2026-09-22T12:37:12.525Z" },
 ]
 
 [[package]]
@@ -766,7 +766,7 @@ requires-dist = [
 test = [
     { name = "black", specifier = "==26.5.1" },
     { name = "codespell", specifier = "==2.4.2" },
-    { name = "ghidra-stubs", specifier = "==12.1.2" },
+    { name = "ghidra-stubs", specifier = "==12.1.4" },
     { name = "mypy", specifier = "==2.2.0" },
     { name = "pylint", specifier = "==4.0.6" },
     { name = "pytest", specifier = "==9.1.1" },

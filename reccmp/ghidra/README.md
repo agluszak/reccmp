@@ -6,13 +6,13 @@
 
 - Runs in headless mode against a local project or a remote repository
   - If run on a local project, other Ghidra instances must be closed first
-- Requires Ghidra 12.0.2 or newer
+- Requires Ghidra 12.1.4 or newer
 
 ## Setup
 
 This assumes that you have already installed `reccmp`, e.g. in a virtual environment.
 
-- Install Ghidra 12.0.2 or newer.
+- Install Ghidra 12.1.4 or newer.
 - It may be necessary to configure the environment variable `GHIDRA_INSTALL_DIR` to point to
   your Ghidra installation. See also the
   [pyghidra documentation](https://pypi.org/project/pyghidra/).

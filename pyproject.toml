@@ -14,7 +14,7 @@ test = [
     "pylint==4.0.6",
     "mypy==2.2.0",
     "types-colorama>=0.4.15.20260508",
-    "ghidra-stubs==12.1.2",
+    "ghidra-stubs==12.1.4",
 ]
 
 [flake8]

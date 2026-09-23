@@ -9,7 +9,7 @@ jobs:
 
     container:
       # Note: This version should be kept in sync with ghidra-stubs in pyproject.toml
-      image: blacktop/ghidra:12.1.2
+      image: blacktop/ghidra:12.1.4
       env:
         # not set by default for some reason
         GHIDRA_INSTALL_DIR: '/ghidra'
