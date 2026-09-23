@@ -8,9 +8,7 @@ from reccmp.compare.asm.ir import (
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     DiagnosticNormalization,
-    EquivalenceLevel,
     derive_diagnostic_normalizations,
-    derive_equivalence_level,
 )
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.stack_layout import (
@@ -95,11 +93,8 @@ def test_rewrite_stack_displacements():
     )
 
 
-def test_derive_equivalence_level_lattice():
-    assert (
-        derive_equivalence_level(ComparisonAnalysis.exact())
-        == EquivalenceLevel.EXACT_INSTRUCTIONS
-    )
+def test_derive_diagnostic_normalizations():
+    assert derive_diagnostic_normalizations(ComparisonAnalysis.exact()) == ()
     assert derive_diagnostic_normalizations(
         ComparisonAnalysis.effective({"register_allocation"})
     ) == (DiagnosticNormalization.REGISTER_ALLOCATION,)
@@ -109,11 +104,6 @@ def test_derive_equivalence_level_lattice():
     assert derive_diagnostic_normalizations(
         ComparisonAnalysis.effective({"folded_symbol_alias"})
     ) == (DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,)
-    # folded_symbol must never be reported as known_inline
-    assert (
-        derive_equivalence_level(ComparisonAnalysis.effective({"folded_symbol_alias"}))
-        == EquivalenceLevel.FOLDED_SYMBOL_ALIAS
-    )
     assert derive_diagnostic_normalizations(
         ComparisonAnalysis.inconclusive("analysis_limit"),
         accuracy_modulo_stack=1.0,

@@ -372,7 +372,6 @@ def test_entity_compare_result_derives_normalizations_at_construction():
         analysis=ComparisonAnalysis.effective(("register_allocation",))
     )
     assert result.analysis.status == ComparisonStatus.EFFECTIVE
-    assert result.equivalence_level is not None
     assert result.diagnostic_normalizations
 
 

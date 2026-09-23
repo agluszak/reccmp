@@ -28,7 +28,6 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     DiagnosticNormalization,
-    EquivalenceLevel,
 )
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
@@ -166,25 +165,13 @@ def inline_layout_text(match: ReccmpComparedEntity) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-def equivalence_level_text(match: ReccmpComparedEntity) -> str | None:
-    """Deprecated: prefer diagnostic_normalizations_text."""
-    return diagnostic_normalizations_text(match)
-
-
 def diagnostic_normalizations_text(match: ReccmpComparedEntity) -> str | None:
     """Render non-proof diagnostic tags without claiming equivalence."""
-    tags = match.diagnostic_normalizations
-    if not tags and match.equivalence_level not in (
-        EquivalenceLevel.EXACT_INSTRUCTIONS,
-        EquivalenceLevel.UNKNOWN_DIFFERENCE,
-    ):
-        # Legacy reports may only have equivalence_level.
-        legacy = match.equivalence_level.value.replace("_equivalent", "")
-        if legacy in {tag.value for tag in DiagnosticNormalization}:
-            tags = (DiagnosticNormalization(legacy),)
-    if not tags:
+    if not match.diagnostic_normalizations:
         return None
-    joined = ", ".join(tag.value.replace("_", " ") for tag in tags)
+    joined = ", ".join(
+        tag.value.replace("_", " ") for tag in match.diagnostic_normalizations
+    )
     return f"diagnostic normalizations: {joined}"
 
 
@@ -221,7 +208,7 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             inline = inline_layout_text(match)
             if inline is not None:
                 print(inline)
-            level = equivalence_level_text(match)
+            level = diagnostic_normalizations_text(match)
             if level is not None:
                 print(level)
 
@@ -240,7 +227,7 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         inline = inline_layout_text(match)
         if inline is not None:
             print(inline)
-        level = equivalence_level_text(match)
+        level = diagnostic_normalizations_text(match)
         if level is not None:
             print(level)
         source_pin = mismatch_source_pin_text(match)
@@ -287,7 +274,7 @@ def print_match_oneline(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
             print(f"  {match.name} ({addrs}) is {raw} raw / {modulo} modulo stack")
         else:
             print(f"  {match.name} ({addrs}) is {percenttext} similar to the original")
-        level = equivalence_level_text(match)
+        level = diagnostic_normalizations_text(match)
         if level is not None and match.effective_accuracy < 1.0:
             print(f"    {level}")
 

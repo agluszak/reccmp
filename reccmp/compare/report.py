@@ -13,11 +13,8 @@ from .diagnosis import (
     ComparisonStatus,
     DiagnosticNormalization,
     DifferenceSide,
-    EquivalenceLevel,
     StackPermutationEntry,
-    _LEGACY_LEVEL_TO_NORMALIZATION,
     derive_diagnostic_normalizations,
-    derive_equivalence_level,
 )
 from .diff import (
     CombinedDiffOutput,
@@ -74,7 +71,6 @@ class ReccmpComparedEntity:
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
     accuracy_modulo_inline: float | None = None
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
-    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies
@@ -104,13 +100,8 @@ class ReccmpComparedEntity:
         """Per-function diagnostic similarity, never an aggregate score."""
         return self.analysis.semantic_similarity
 
-    def refresh_equivalence_level(self) -> None:
+    def refresh_diagnostic_normalizations(self) -> None:
         self.diagnostic_normalizations = derive_diagnostic_normalizations(
-            self.analysis,
-            accuracy_modulo_stack=self.accuracy_modulo_stack,
-            accuracy_modulo_inline=self.accuracy_modulo_inline,
-        )
-        self.equivalence_level = derive_equivalence_level(
             self.analysis,
             accuracy_modulo_stack=self.accuracy_modulo_stack,
             accuracy_modulo_inline=self.accuracy_modulo_inline,
@@ -373,7 +364,6 @@ class JSONEntityVersion1:
     accuracy_modulo_inline: float | None = None
     inline_expansions: list[dict[str, object]] | None = None
     diagnostic_normalizations: list[str] | None = None
-    equivalence_level: str | None = None
 
 
 class JSONReportVersion1(BaseModel):
@@ -538,7 +528,6 @@ def _serialize_version_1(
                     if entity.diagnostic_normalizations
                     else None
                 ),
-                equivalence_level=entity.equivalence_level.value,
             )
         )
 
@@ -605,13 +594,6 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             inline_expansions=_parse_inline_expansions(e.inline_expansions),
             diagnostic_normalizations=_parse_diagnostic_normalizations(
                 e.diagnostic_normalizations,
-                e.equivalence_level,
-                analysis,
-                e.accuracy_modulo_stack,
-                e.accuracy_modulo_inline,
-            ),
-            equivalence_level=_parse_equivalence_level(
-                e.equivalence_level,
                 analysis,
                 e.accuracy_modulo_stack,
                 e.accuracy_modulo_inline,
@@ -696,67 +678,25 @@ def _parse_inline_expansions(
 
 def _parse_diagnostic_normalizations(
     value: list[str] | None,
-    legacy_level: str | None,
     analysis: ComparisonAnalysis,
     accuracy_modulo_stack: float | None,
     accuracy_modulo_inline: float | None,
 ) -> tuple[DiagnosticNormalization, ...]:
-    if value:
-        tags: list[DiagnosticNormalization] = []
-        for item in value:
-            if not isinstance(item, str):
-                raise ReccmpReportDeserializeError
-            try:
-                tags.append(DiagnosticNormalization(item))
-            except ValueError:
-                mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(item)
-                if mapped is None:
-                    raise ReccmpReportDeserializeError
-                tags.append(mapped)
-        # Stable order
-        order = list(DiagnosticNormalization)
-        return tuple(tag for tag in order if tag in set(tags))
-    if legacy_level is not None:
-        mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(legacy_level)
-        if mapped is not None:
-            return (mapped,)
-    return derive_diagnostic_normalizations(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
-
-
-def _parse_equivalence_level(
-    value: str | None,
-    analysis: ComparisonAnalysis,
-    accuracy_modulo_stack: float | None,
-    accuracy_modulo_inline: float | None = None,
-) -> EquivalenceLevel:
-    if value is not None:
-        # Accept both legacy "*_equivalent" strings and the shortened values.
-        try:
-            return EquivalenceLevel(value)
-        except ValueError:
-            aliases = {
-                "stack_layout_equivalent": EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
-                "register_allocation_equivalent": (
-                    EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
-                ),
-                "instruction_scheduling_equivalent": (
-                    EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
-                ),
-                "cfg_layout_equivalent": EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
-                "known_inline_equivalent": EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
-            }
-            if value in aliases:
-                return aliases[value]
+    if not value:
+        return derive_diagnostic_normalizations(
+            analysis,
+            accuracy_modulo_stack=accuracy_modulo_stack,
+            accuracy_modulo_inline=accuracy_modulo_inline,
+        )
+    tags: set[DiagnosticNormalization] = set()
+    for item in value:
+        if not isinstance(item, str):
             raise ReccmpReportDeserializeError
-    return derive_equivalence_level(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
+        try:
+            tags.add(DiagnosticNormalization(item.removesuffix("_equivalent")))
+        except ValueError as ex:
+            raise ReccmpReportDeserializeError from ex
+    return tuple(tag for tag in DiagnosticNormalization if tag in tags)
 
 
 def _parse_report_diff(value: object) -> CombinedDiffOutput | None:

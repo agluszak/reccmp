@@ -37,37 +37,6 @@ class DiagnosticNormalization(Enum):
     FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
 
 
-# Backward-compatible aliases for the previous single-valued lattice.
-# Kept so older reports/tests that still mention EquivalenceLevel compile;
-# new code should use DiagnosticNormalization + ComparisonStatus.
-class EquivalenceLevel(Enum):
-    """Deprecated single-valued view; prefer ComparisonStatus + normalizations."""
-
-    EXACT_INSTRUCTIONS = "exact_instructions"
-    STACK_LAYOUT_EQUIVALENT = "stack_layout"  # renamed: not a proof
-    REGISTER_ALLOCATION_EQUIVALENT = "register_allocation"
-    INSTRUCTION_SCHEDULING_EQUIVALENT = "instruction_scheduling"
-    CFG_LAYOUT_EQUIVALENT = "cfg_layout"
-    KNOWN_INLINE_EQUIVALENT = "known_inline"
-    FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
-    UNKNOWN_DIFFERENCE = "unknown_difference"
-
-
-_LEGACY_LEVEL_TO_NORMALIZATION = {
-    "stack_layout_equivalent": DiagnosticNormalization.STACK_LAYOUT,
-    "stack_layout": DiagnosticNormalization.STACK_LAYOUT,
-    "register_allocation_equivalent": DiagnosticNormalization.REGISTER_ALLOCATION,
-    "register_allocation": DiagnosticNormalization.REGISTER_ALLOCATION,
-    "instruction_scheduling_equivalent": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-    "instruction_scheduling": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-    "cfg_layout_equivalent": DiagnosticNormalization.CFG_LAYOUT,
-    "cfg_layout": DiagnosticNormalization.CFG_LAYOUT,
-    "known_inline_equivalent": DiagnosticNormalization.KNOWN_INLINE,
-    "known_inline": DiagnosticNormalization.KNOWN_INLINE,
-    "folded_symbol_alias": DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
-}
-
-
 def derive_diagnostic_normalizations(
     analysis: "ComparisonAnalysis",
     *,
@@ -107,53 +76,6 @@ def derive_diagnostic_normalizations(
     return tuple(tag for tag in order if tag in tags)
 
 
-def derive_equivalence_level(
-    analysis: "ComparisonAnalysis",
-    *,
-    accuracy_modulo_stack: float | None = None,
-    accuracy_modulo_inline: float | None = None,
-) -> EquivalenceLevel:
-    """Deprecated compatibility shim over proof status + normalizations."""
-    if analysis.status == ComparisonStatus.EXACT:
-        return EquivalenceLevel.EXACT_INSTRUCTIONS
-
-    norms = derive_diagnostic_normalizations(
-        analysis,
-        accuracy_modulo_stack=accuracy_modulo_stack,
-        accuracy_modulo_inline=accuracy_modulo_inline,
-    )
-    if not norms:
-        return EquivalenceLevel.UNKNOWN_DIFFERENCE
-
-    # Prefer a primary tag for legacy single-valued consumers.  folded_symbol
-    # is never reported as known_inline.
-    primary = norms[0]
-    mapping = {
-        DiagnosticNormalization.STACK_LAYOUT: EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
-        DiagnosticNormalization.REGISTER_ALLOCATION: (
-            EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
-        ),
-        DiagnosticNormalization.INSTRUCTION_SCHEDULING: (
-            EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
-        ),
-        DiagnosticNormalization.CFG_LAYOUT: EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
-        DiagnosticNormalization.KNOWN_INLINE: EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
-        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS: EquivalenceLevel.FOLDED_SYMBOL_ALIAS,
-    }
-    # Prefer known_inline / folded over stack when both present for legacy primary.
-    for preferred in (
-        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
-        DiagnosticNormalization.KNOWN_INLINE,
-        DiagnosticNormalization.CFG_LAYOUT,
-        DiagnosticNormalization.INSTRUCTION_SCHEDULING,
-        DiagnosticNormalization.REGISTER_ALLOCATION,
-        DiagnosticNormalization.STACK_LAYOUT,
-    ):
-        if preferred in norms:
-            return mapping[preferred]
-    return mapping[primary]
-
-
 EFFECTIVE_REASON_ORDER = (
     "register_allocation",
     "frame_slot_layout",
@@ -190,9 +112,6 @@ MISMATCH_KINDS = frozenset(
 INCONCLUSIVE_REASONS = frozenset(
     {
         "unsupported_instruction",
-        # Legacy report compatibility. New analyses emit a specific control-flow
-        # reason below instead of this umbrella value.
-        "unsupported_control_flow",
         "empty_control_flow",
         "control_flow_metadata_mismatch",
         "invalid_control_flow_target",

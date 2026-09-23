@@ -6,10 +6,8 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     DiagnosticNormalization,
-    EquivalenceLevel,
     StackPermutationEntry,
     derive_diagnostic_normalizations,
-    derive_equivalence_level,
 )
 from reccmp.compare.inlines import InlineExpansionEvidence
 
@@ -37,22 +35,16 @@ class EntityCompareResult:
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
     accuracy_modulo_inline: float | None = None
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
-    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
 
     def __post_init__(self) -> None:
-        self.refresh_equivalence_level()
+        self.refresh_diagnostic_normalizations()
 
     @property
     def is_effective_match(self) -> bool:
         return self.analysis.status == ComparisonStatus.EFFECTIVE
 
-    def refresh_equivalence_level(self) -> None:
+    def refresh_diagnostic_normalizations(self) -> None:
         self.diagnostic_normalizations = derive_diagnostic_normalizations(
-            self.analysis,
-            accuracy_modulo_stack=self.accuracy_modulo_stack,
-            accuracy_modulo_inline=self.accuracy_modulo_inline,
-        )
-        self.equivalence_level = derive_equivalence_level(
             self.analysis,
             accuracy_modulo_stack=self.accuracy_modulo_stack,
             accuracy_modulo_inline=self.accuracy_modulo_inline,
