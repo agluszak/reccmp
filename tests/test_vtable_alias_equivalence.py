@@ -112,6 +112,44 @@ def test_truncated_read_is_not_alias_equivalent(db: EntityDb) -> None:
     assert not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
 
 
+def test_recomp_side_jmp_island_follows_landing_body(db: EntityDb) -> None:
+    _annotate_callee(db)
+    landing = 0x600
+    orig = _body(ORIG_BODY, ORIG_CALLEE)
+    recomp = _body(landing, RECOMP_CALLEE)
+    thunk = b"\xe9" + (landing - (RECOMP_BODY + 5)).to_bytes(4, "little", signed=True)
+
+    recomp_image = _image(recomp)
+
+    def read(addr: int, size: int) -> bytes:
+        if addr == RECOMP_BODY:
+            return thunk + b"\x90" * (size - len(thunk))
+        if addr == landing:
+            return recomp[:size]
+        return b""
+
+    recomp_image.read.side_effect = read
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP,
+            landing,
+            size=len(recomp),
+            name="operator_delete_body",
+            type=EntityType.FUNCTION,
+        )
+
+    comparator = FunctionComparator(
+        db,
+        LinesDb(),
+        _image(orig),
+        recomp_image,
+        Mock(spec=ReccmpReportProtocol),
+        CvdumpTypesParser(),
+    )
+
+    assert comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
+
+
 def test_vtable_slot_accepts_only_proven_alias_targets(db: EntityDb) -> None:
     # pylint: disable=protected-access
     _annotate_callee(db)

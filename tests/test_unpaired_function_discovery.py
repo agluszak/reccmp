@@ -10,6 +10,7 @@ def make_graph_comparator(db: EntityDb, fingerprints, edges):
     comparator = object.__new__(FunctionComparator)
     comparator.db = db
     comparator.equivalence_groups = {}
+    comparator.rebuild_lookups = Mock()  # type: ignore[method-assign]
     comparator._alias_fingerprint = Mock(  # type: ignore[method-assign]
         side_effect=lambda image, addr, size: fingerprints.get((image, addr))
     )
@@ -209,6 +210,7 @@ def test_paired_callsite_discovery_selects_only_mutually_unique_edges():
     add_functions(db, ImageId.RECOMP, 0x200, 0x210)
     comparator = object.__new__(FunctionComparator)
     comparator.db = db
+    comparator.rebuild_lookups = Mock()  # type: ignore[method-assign]
     comparator._paired_caller_identity_edges = Mock(  # type: ignore[method-assign]
         side_effect=[{(0x100, 0x200), (0x110, 0x210), (0x120, 0x210)}, set()]
     )

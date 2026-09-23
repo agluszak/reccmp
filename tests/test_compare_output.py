@@ -89,12 +89,13 @@ def test_compare_selected_addresses_from_both_images():
 
 
 def test_exact_comparison_skips_detailed_instruction_metadata():
-    orig_bin = RawImage.from_memory(b"\x90")
-    recomp_bin = RawImage.from_memory(b"\x90")
+    orig_bin = RawImage.from_memory(b"\xc3")
+    recomp_bin = RawImage.from_memory(b"\xc3")
     pdb = Mock(spec=CvdumpAnalysis)
     compare = Compare(orig_bin, recomp_bin, pdb, "HELLO")
 
     with get_db(compare).batch() as batch:
+        batch.set(ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.match(0, 0)
 
@@ -114,7 +115,8 @@ def test_exact_comparison_skips_detailed_instruction_metadata():
     recomp_meta.assert_not_called()
 
 
-def test_nonexact_comparison_collects_detailed_instruction_metadata():
+def test_nonexact_comparison_uses_detail_metadata_from_single_decode():
+    """Non-exact compares use Capstone detail facts without a second meta pass."""
     orig_bin = RawImage.from_memory(b"\x90")
     recomp_bin = RawImage.from_memory(b"\xc3")
     pdb = Mock(spec=CvdumpAnalysis)
@@ -143,8 +145,10 @@ def test_nonexact_comparison_collects_detailed_instruction_metadata():
         match = compare.compare_address(0, include_diff=False)
 
     assert match is not None
-    orig_meta.assert_called_once()
-    recomp_meta.assert_called_once()
+    # Meta is projected from the single InstructGen detail decode during
+    # parse_asm; collect_instruction_meta is no longer required on the hot path.
+    orig_meta.assert_not_called()
+    recomp_meta.assert_not_called()
 
 
 def test_not_matched():
@@ -321,13 +325,14 @@ def test_compare_function_diff():
 
 def test_compare_function_effective_match():
     """The diff is included for functions with an effective match."""
-    orig_bin = RawImage.from_memory(b"\x39\xc8\x74\x00\x90")
-    recomp_bin = RawImage.from_memory(b"\x39\xc1\x74\x00\x90")
+    orig_bin = RawImage.from_memory(b"\x39\xc8\x74\x00\xc3")
+    recomp_bin = RawImage.from_memory(b"\x39\xc1\x74\x00\xc3")
 
     pdb = Mock(spec=CvdumpAnalysis)
     compare = Compare(orig_bin, recomp_bin, pdb, "HELLO")
 
     with get_db(compare).batch() as batch:
+        batch.set(ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=5)
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=5)
         batch.match(0, 0)
 
@@ -351,7 +356,7 @@ def test_compare_function_effective_match():
                     "orig": [("0x0", "cmp eax, ecx")],
                     "recomp": [("0x0", "cmp ecx, eax")],
                 },
-                {"both": [("0x2", "je 4", "0x2"), ("0x4", "nop ", "0x4")]},
+                {"both": [("0x2", "je 4", "0x2"), ("0x4", "ret ", "0x4")]},
             ],
         )
     ]
@@ -367,8 +372,8 @@ def test_compare_function_diff_context():
     nop = b"\x90"  # nop
 
     # Different instructions at the beginning and end, separated by 30 NOP instructions.
-    orig_mem = inst0 + nop * 30 + inst1
-    recomp_mem = inst1 + nop * 30 + inst0
+    orig_mem = inst0 + nop * 30 + inst1 + b"\xc3"
+    recomp_mem = inst1 + nop * 30 + inst0 + b"\xc3"
 
     orig_bin = RawImage.from_memory(orig_mem)
     recomp_bin = RawImage.from_memory(recomp_mem)
@@ -378,6 +383,9 @@ def test_compare_function_diff_context():
 
     with get_db(compare).batch() as batch:
         # NAME, SIZE, and TYPE required for successful comparison.
+        batch.set(
+            ImageId.ORIG, 0, type=EntityType.FUNCTION, name="test", size=len(orig_mem)
+        )
         batch.set(
             ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=len(orig_mem)
         )
@@ -415,10 +423,13 @@ def test_compare_function_diff_context():
     # The second group begins with more matches
     assert len(group1[1][0]["both"]) == 10
 
-    # The second group ends with this diff:
-    assert group1[1][-1] == {
+    # The second group ends with the swapped instructions, then the shared ret.
+    assert group1[1][-2] == {
         "orig": [("0x20", "xor eax, eax")],
         "recomp": [("0x20", "lea ecx, [ecx]")],
+    }
+    assert group1[1][-1] == {
+        "both": [("0x22", "ret ", "0x22")],
     }
 
 

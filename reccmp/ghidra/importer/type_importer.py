@@ -1,6 +1,6 @@
 import logging
 from collections import Counter
-from typing import Callable, Iterator, NamedTuple, TypeVar, cast
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar, cast
 
 # Disable spurious warnings in vscode / pylance
 # pyright: reportMissingModuleSource=false
@@ -249,7 +249,9 @@ class PdbTypeImporter:
         )
         definition.setReturnType(return_type)
         if params:
-            definition.setArguments(params)
+            # Ghidra exposes a Java ParameterDefinition[] setter; its generated
+            # Python stub incorrectly models the array as one element.
+            cast(Any, definition).setArguments(params)
         if hasattr(definition, "setVarArgs"):
             definition.setVarArgs(varargs)
         calling_convention = _CALL_TYPE_TO_GHIDRA.get(type_pdb.get("call_type") or "")
@@ -259,7 +261,7 @@ class PdbTypeImporter:
         existing = manager.getDataType(definition.getPathName())
         if existing is not None and isinstance(existing, FunctionDefinition):
             existing.setReturnType(return_type)
-            existing.setArguments(params)
+            cast(Any, existing).setArguments(params)
             if hasattr(existing, "setVarArgs"):
                 existing.setVarArgs(varargs)
             if calling_convention:
@@ -287,6 +289,7 @@ class PdbTypeImporter:
                 sanitized_name.namespace_path, f"PDB_UNION_{type_index:#06x}"
             )
 
+        existing: DataType | None = None
         try:
             existing = get_ghidra_type(self.api, sanitized_name)
             if not isinstance(existing, Union):

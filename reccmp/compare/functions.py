@@ -11,7 +11,24 @@ from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.asm.effective import CallAbi, FunctionMetadata
 from reccmp.compare.asm.fixes import analyze_effective_match, assert_fixup
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
+from reccmp.compare.asm.instgen import (
+    InstructGen,
+    InstructionMeta,
+    SectionType,
+    meta_from_decoded,
+)
+from reccmp.compare.asm.ir import (
+    ExtentKind,
+    FunctionImage,
+    compute_extent_closed,
+    control_flow_topology_keys,
+    excerpt_addrs,
+    excerpt_displays,
+    instruction_match_key,
+    instruction_semantic_key,
+    rebind_local_identities,
+    resolve_asm_stream,
+)
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
 from reccmp.compare.asm.replacement import (
     canonical_callee_name,
@@ -19,12 +36,39 @@ from reccmp.compare.asm.replacement import (
 )
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
-from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonDifference,
+    ComparisonStatus,
+    DifferenceSide,
+    FactValue,
+)
+from reccmp.compare.verification import (
+    admit_effective,
+    admit_exact_analysis,
+    admit_proof,
+)
+from reccmp.compare.stack_layout import analyze_stack_layout
+from reccmp.compare.inlines import (
+    Fingerprint,
+    HelperCatalogEntry,
+    InlineHit,
+    InlineLayoutResult,
+    analyze_inline_layout,
+    asm_fingerprint_from_ir,
+    fingerprint_from_asm,
+    find_inline_expansions,
+    strip_helper_epilog,
+    summarize_helper_effects,
+)
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
+from reccmp.source import SourceIndex
+from reccmp.source.index import SourceIndexError
 from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.cvinfo import CvdumpTypeKey, CvdumpTypeMap
 from reccmp.cvdump.demangler import parse_function_signature
+from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpKeyError, CvdumpTypesParser
 from reccmp.types import EntityType
 from reccmp.formats.exceptions import (
@@ -35,6 +79,43 @@ from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
 
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
+
+
+def _longest_increasing_by_recomp(
+    annotations: list[ReccmpMatch],
+) -> list[ReccmpMatch]:
+    """Keep the longest subsequence with strictly increasing recomp addresses."""
+    n = len(annotations)
+    if n == 0:
+        return []
+
+    # tails[k] = index of the smallest-recomp-addr end of an IS of length k+1
+    tails: list[int] = []
+    predecessor: list[int | None] = [None] * n
+
+    for i, ann in enumerate(annotations):
+        addr = ann.recomp_addr
+        lo, hi = 0, len(tails)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if annotations[tails[mid]].recomp_addr < addr:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo > 0:
+            predecessor[i] = tails[lo - 1]
+        if lo == len(tails):
+            tails.append(i)
+        else:
+            tails[lo] = i
+
+    result: list[ReccmpMatch] = []
+    idx: int | None = tails[-1]
+    while idx is not None:
+        result.append(annotations[idx])
+        idx = predecessor[idx]
+    result.reverse()
+    return result
 
 
 def _code_instructions(
@@ -120,6 +201,17 @@ def create_bin_lookup(bin_file: Image) -> Callable[[int], int | None]:
     return lookup
 
 
+def _stamp_instruction_ids(excerpt: AsmExcerpt) -> tuple:
+    """Assign stable program-point ids when a test excerpt has none."""
+    rows = []
+    for index, row in enumerate(excerpt):
+        if row.instruction_id is None:
+            rows.append(dataclasses.replace(row, instruction_id=index))
+        else:
+            rows.append(row)
+    return tuple(rows)
+
+
 @dataclass
 class FunctionComparator:
     # pylint: disable=too-many-instance-attributes
@@ -137,9 +229,19 @@ class FunctionComparator:
     # Proven-equivalent original addresses (member -> canonical): references to
     # any group member sanitize to the canonical name on both sides.
     equivalence_groups: dict[int, int] = field(default_factory=dict)
+    # Optional Clang-backed layout/ownership index for mismatch enrichment.
+    source_index: SourceIndex | None = None
 
     def __post_init__(self):
         self._call_abi_cache: dict[str, CallAbi | None] | None = None
+        self._fp_cache: dict[
+            tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
+        ] = {}
+        self._helper_catalog: list[HelperCatalogEntry] | None = None
+        self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
+        # Exact call-identity → unique orig_addr (ambiguous keys omitted).
+        self._helper_identity_index: dict[str, int] | None = None
+        self._helper_identity_ambiguous: set[str] | None = None
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -152,6 +254,7 @@ class FunctionComparator:
             ),
             is_32bit=self.is_32bit,
             collect_meta=False,
+            image_id=ImageId.ORIG,
         )
         self.recomp_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(
@@ -167,7 +270,12 @@ class FunctionComparator:
             ),
             is_32bit=self.is_32bit,
             collect_meta=False,
+            image_id=ImageId.RECOMP,
         )
+
+    def rebuild_lookups(self) -> None:
+        """Rebuild name-lookup closures after the entity catalog is frozen."""
+        self.__post_init__()
 
     def _source_ref_of_recomp_addr(self, recomp_addr: int | None) -> str | None:
         if recomp_addr is None:
@@ -176,6 +284,182 @@ class FunctionComparator:
         if path_line_pair is None:
             return None
         return f"{path_line_pair[0].name}:{path_line_pair[1]}"
+
+    def _source_facts_of_recomp_addr(
+        self, recomp_addr: int | None
+    ) -> dict[str, FactValue]:
+        if recomp_addr is None:
+            return {}
+        path_line_pair = self.lines_db.find_line_of_recomp_address(recomp_addr)
+        if path_line_pair is None:
+            return {}
+        return {
+            "source_path": path_line_pair[0].name,
+            "source_line": path_line_pair[1],
+        }
+
+    def _enrich_side_with_source(self, side: DifferenceSide) -> DifferenceSide:
+        """Attach PDB line info when the side address is a recomp VA."""
+        extra = self._source_facts_of_recomp_addr(side.address)
+        if not extra:
+            return side
+        facts = {**side.facts, **extra}
+        return DifferenceSide(side.instruction_index, side.address, facts)
+
+    def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
+        """Resolve the class that owns ``this`` for layout enrichment."""
+        if match is None:
+            return None
+        if self.source_index is not None:
+            try:
+                owners = self.source_index.functions_by_address()
+            except SourceIndexError:
+                owners = {}
+            marker = owners.get(match.orig_addr)
+            if (
+                marker is not None
+                and marker.declaration is not None
+                and marker.declaration.owning_class
+            ):
+                return marker.declaration.owning_class
+            for declaration in self.source_index.declarations:
+                if declaration.owning_class and declaration.qualified_name in {
+                    match.name,
+                    match.best_name(),
+                }:
+                    return declaration.owning_class
+        name = match.best_name() or match.name or ""
+        if "::" in name:
+            return name.rsplit("::", 1)[0]
+        return None
+
+    def _layout_facts_for_displacement(
+        self, class_name: str | None, facts: dict[str, FactValue]
+    ) -> dict[str, FactValue]:
+        if (
+            self.source_index is None
+            or not class_name
+            or not isinstance(facts.get("displacement"), int)
+        ):
+            return {}
+        if not self.source_index.has_layout(class_name):
+            return {}
+        displacement = facts["displacement"]
+        assert isinstance(displacement, int)
+        resolved = self.source_index.resolve_field(class_name, displacement)
+        if resolved is None:
+            return {}
+        return {
+            "class_name": resolved.root_class,
+            "field_name": resolved.leaf.name,
+            "field_offset": resolved.absolute_offset,
+            "field_type": resolved.leaf.type,
+            "field_path": ".".join(resolved.path) or resolved.leaf.name,
+        }
+
+    def _enrich_analysis_with_source(
+        self,
+        analysis: ComparisonAnalysis,
+        *,
+        match: ReccmpMatch | None = None,
+    ) -> ComparisonAnalysis:
+        """Pin mismatch / inconclusive locations to recomp source lines.
+
+        When layout is available, also annotate ``memory_address`` diffs with
+        class/field facts for the owning class of the compared function.
+        """
+        if (
+            analysis.status == ComparisonStatus.MISMATCH
+            and analysis.difference is not None
+        ):
+            diff = analysis.difference
+            orig_side = diff.orig
+            recomp_side = self._enrich_side_with_source(diff.recomp)
+            if diff.kind == "memory_address":
+                class_name = self._owning_class_for_match(match)
+                orig_layout = self._layout_facts_for_displacement(
+                    class_name, orig_side.facts
+                )
+                recomp_layout = self._layout_facts_for_displacement(
+                    class_name, recomp_side.facts
+                )
+                if orig_layout:
+                    orig_side = DifferenceSide(
+                        orig_side.instruction_index,
+                        orig_side.address,
+                        {**orig_side.facts, **orig_layout},
+                    )
+                if recomp_layout:
+                    recomp_side = DifferenceSide(
+                        recomp_side.instruction_index,
+                        recomp_side.address,
+                        {**recomp_side.facts, **recomp_layout},
+                    )
+            enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
+            return ComparisonAnalysis.mismatch(
+                enriched, semantic_similarity=analysis.semantic_similarity
+            )
+        if (
+            analysis.status == ComparisonStatus.INCONCLUSIVE
+            and analysis.inconclusive_location is not None
+        ):
+            return ComparisonAnalysis.inconclusive(
+                analysis.inconclusive_reason or "analysis_limit",
+                self._enrich_side_with_source(analysis.inconclusive_location),
+            )
+        return analysis
+
+    def _load_function_image(
+        self,
+        sanitizer: ParseAsm,
+        raw: bytes,
+        start_addr: int,
+        extent: int,
+        extent_kind: ExtentKind,
+    ) -> FunctionImage:
+        """Decode one side into an owned function image (excerpt + tables)."""
+        excerpt = sanitizer.parse_asm(raw, start_addr)
+        stamped = tuple(
+            dataclasses.replace(row, instruction_id=index)
+            for index, row in enumerate(excerpt)
+        )
+        tables = tuple(sanitizer.jump_tables)
+        stamped = rebind_local_identities(
+            stamped,
+            start_addr=start_addr,
+            extent=extent,
+            jump_tables=tables,
+            image_id=(
+                sanitizer.image_id.name.lower()
+                if sanitizer.image_id is not None
+                else "unknown"
+            ),
+        )
+        return FunctionImage(
+            start_addr=start_addr,
+            extent=extent,
+            extent_kind=extent_kind,
+            excerpt=stamped,
+            jump_tables=tables,
+            coverage_incomplete=sanitizer.coverage_incomplete,
+            extent_closed=compute_extent_closed(
+                stamped,
+                start_addr=start_addr,
+                extent=extent,
+                coverage_incomplete=sanitizer.coverage_incomplete,
+                jump_tables=tables,
+                extent_kind=extent_kind,
+            ),
+            raw=raw,
+        )
+
+    def _fn_symbol_entry(self, match: ReccmpMatch | None) -> SymbolsEntry | None:
+        if match is None:
+            return None
+        node = self.func_nodes.get(match.recomp_addr)
+        if node is None:
+            return None
+        return node.symbol_entry
 
     def compare_function(
         self,
@@ -187,16 +471,20 @@ class FunctionComparator:
         # Detect when the recomp function size would cause us to read
         # enough bytes from the original function that we cross into
         # the next annotated function.
-        orig_size = match.size(ImageId.ORIG)
+        annotated_orig_size = match.size(ImageId.ORIG)
         recomp_size = match.size(ImageId.RECOMP)
 
-        if orig_size is None:
+        orig_extent_kind = ExtentKind.KNOWN
+        if annotated_orig_size is None:
+            orig_extent_kind = ExtentKind.ESTIMATED
             assert recomp_size is not None
             orig_max = match.max_size(ImageId.ORIG)
             if orig_max is not None:
                 orig_size = min(orig_max, recomp_size)
             else:
                 orig_size = recomp_size
+        else:
+            orig_size = annotated_orig_size
 
         assert orig_size is not None and recomp_size is not None
 
@@ -218,29 +506,43 @@ class FunctionComparator:
         except IndexError:
             pass
 
-        orig_combined = self.orig_sanitize.parse_asm(orig_raw, match.orig_addr)
-        recomp_combined = self.recomp_sanitize.parse_asm(recomp_raw, match.recomp_addr)
+        orig_image = self._load_function_image(
+            self.orig_sanitize,
+            orig_raw,
+            match.orig_addr,
+            orig_size,
+            orig_extent_kind,
+        )
+        recomp_image = self._load_function_image(
+            self.recomp_sanitize,
+            recomp_raw,
+            match.recomp_addr,
+            recomp_size,
+            ExtentKind.KNOWN,
+        )
+        orig_rows = list(orig_image.excerpt)
+        recomp_rows = list(recomp_image.excerpt)
 
         # Check for assert calls only if we expect to find them
         if has_asserts(self.orig_bin):
-            assert_fixup(orig_combined)
+            assert_fixup(orig_rows)
+            orig_image = orig_image.with_excerpt(orig_rows)
 
         if has_asserts(self.recomp_bin):
-            assert_fixup(recomp_combined)
+            assert_fixup(recomp_rows)
+            recomp_image = recomp_image.with_excerpt(recomp_rows)
 
-        line_annotations = self._collect_line_annotations(recomp_combined)
+        line_annotations = self._collect_line_annotations(list(recomp_image.excerpt))
 
         split_points = self._compute_split_points(
-            orig_combined, recomp_combined, line_annotations
+            list(orig_image.excerpt), list(recomp_image.excerpt), line_annotations
         )
 
-        result = self._compare_function_assembly(
-            orig_combined,
-            recomp_combined,
+        result = self.compare_function_images(
+            orig_image,
+            recomp_image,
             split_points,
             match=match,
-            orig_raw=orig_raw,
-            recomp_raw=recomp_raw,
             include_diff=include_diff,
             include_exact_diff=include_exact_diff,
         )
@@ -256,11 +558,27 @@ class FunctionComparator:
             and match.orig_addr in self.equivalence_groups
             and _is_bare_jmp_island(orig_raw)
         ):
-            result = dataclasses.replace(
-                result,
-                analysis=ComparisonAnalysis.effective(("folded_symbol_alias",)),
+            # The island is a modeled thunk to a grouped body; its guessed
+            # byte window is not the function extent this proof depends on.
+            alias = admit_effective(
+                ("folded_symbol_alias",),
+                coverage_incomplete=(
+                    orig_image.coverage_incomplete or recomp_image.coverage_incomplete
+                ),
+                extent_closed=True,
             )
+            if alias is not None:
+                return dataclasses.replace(result, analysis=alias.analysis)
 
+        analysis = admit_proof(
+            result.analysis,
+            coverage_incomplete=(
+                orig_image.coverage_incomplete or recomp_image.coverage_incomplete
+            ),
+            extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
+        )
+        if analysis is not result.analysis:
+            result = dataclasses.replace(result, analysis=analysis)
         return result
 
     def _alias_fingerprint(
@@ -274,14 +592,23 @@ class FunctionComparator:
         before the more expensive proof.  Relocation position and instruction
         shape remain part of the key.
         """
+        cache_key = (image_id, addr, size)
+        cache = getattr(self, "_fp_cache", None)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
         image = self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin
         valid_addr = create_valid_addr_lookup(self.db, image_id, image)
         try:
             raw = image.read(addr, size)
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
+            if cache is not None:
+                cache[cache_key] = None
             return None
         instructions = _code_instructions(raw, addr, self.is_32bit)
         if instructions is None:
+            if cache is not None:
+                cache[cache_key] = None
             return None
 
         def normalize_operand(operand: str) -> str:
@@ -291,10 +618,181 @@ class FunctionComparator:
 
             return re.sub(r"0x[0-9a-fA-F]+", replace, operand)
 
-        return tuple(
+        fingerprint = tuple(
             (mnemonic, normalize_operand(operand))
             for _, _, mnemonic, operand in instructions
         )
+        if cache is not None:
+            cache[cache_key] = fingerprint
+        return fingerprint
+
+    def _helper_entry_for_match(self, entity: ReccmpMatch) -> HelperCatalogEntry | None:
+        """Lazily fingerprint one paired helper (memoized in the catalog map)."""
+        cache = getattr(self, "_helper_by_orig", None)
+        if cache is None:
+            self._helper_by_orig = {}
+            cache = self._helper_by_orig
+        if entity.orig_addr in cache:
+            return cache[entity.orig_addr]
+
+        recomp_size = entity.size(ImageId.RECOMP)
+        if recomp_size is None or recomp_size <= 0:
+            cache[entity.orig_addr] = None
+            return None
+        try:
+            raw = self.recomp_bin.read(entity.recomp_addr, recomp_size)
+        except (InvalidVirtualAddressError, InvalidVirtualReadError):
+            cache[entity.orig_addr] = None
+            return None
+        excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
+        fingerprint = asm_fingerprint_from_ir(excerpt)
+        needle = strip_helper_epilog(fingerprint)
+        if len(needle) < 3:
+            cache[entity.orig_addr] = None
+            return None
+        name = entity.best_name() or f"sub_{entity.orig_addr:x}"
+        entry = HelperCatalogEntry(
+            orig_addr=entity.orig_addr,
+            recomp_addr=entity.recomp_addr,
+            name=name,
+            fingerprint=needle,
+            byte_size=recomp_size,
+            effect_summary=summarize_helper_effects(needle),
+        )
+        cache[entity.orig_addr] = entry
+        return entry
+
+    def _ensure_helper_identity_index(self) -> None:
+        """Build exact-identity maps for call-driven helper resolution.
+
+        Ambiguous names (overloads / collisions) are recorded but never chosen.
+        Substring matching is not used for modulo-inline accounting.
+        """
+        if self._helper_identity_index is not None:
+            return
+        index: dict[str, int] = {}
+        ambiguous: set[str] = set()
+
+        def add_key(key: str, orig_addr: int) -> None:
+            if not key or key in ambiguous:
+                return
+            existing = index.get(key)
+            if existing is None:
+                index[key] = orig_addr
+            elif existing != orig_addr:
+                del index[key]
+                ambiguous.add(key)
+
+        for entity in self.db.get_functions():
+            add_key(f"{entity.orig_addr:#x}", entity.orig_addr)
+            add_key(f"{entity.recomp_addr:#x}", entity.orig_addr)
+            add_key(f"{entity.orig_addr:x}", entity.orig_addr)
+            add_key(f"{entity.recomp_addr:x}", entity.orig_addr)
+            name = entity.best_name() or ""
+            if name:
+                add_key(name, entity.orig_addr)
+
+        self._helper_identity_index = index
+        self._helper_identity_ambiguous = ambiguous
+
+    def _resolve_helper_from_call_identities(
+        self, identities: set[str]
+    ) -> HelperCatalogEntry | None:
+        """Map sanitized call-operand identities to a paired helper."""
+        self._ensure_helper_identity_index()
+        assert self._helper_identity_index is not None
+        assert self._helper_identity_ambiguous is not None
+
+        matched_orig: set[int] = set()
+        for identity in identities:
+            if identity in self._helper_identity_ambiguous:
+                continue
+            orig_addr = self._helper_identity_index.get(identity)
+            if orig_addr is not None:
+                matched_orig.add(orig_addr)
+        if len(matched_orig) != 1:
+            return None
+        entity = self.db.get_one_match(next(iter(matched_orig)))
+        if entity is None:
+            return None
+        return self._helper_entry_for_match(entity)
+
+    def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
+        """Full catalog for ``find-inlines`` only — not used on the hot compare path."""
+        if self._helper_catalog is not None:
+            return self._helper_catalog
+
+        catalog: list[HelperCatalogEntry] = []
+        freq: dict[Fingerprint, int] = {}
+        for entity in self.db.get_functions():
+            entry = self._helper_entry_for_match(entity)
+            if entry is None:
+                continue
+            catalog.append(entry)
+            freq[entry.fingerprint] = freq.get(entry.fingerprint, 0) + 1
+        # Attach inverse-frequency uniqueness.
+        catalog = [
+            HelperCatalogEntry(
+                orig_addr=entry.orig_addr,
+                recomp_addr=entry.recomp_addr,
+                name=entry.name,
+                fingerprint=entry.fingerprint,
+                byte_size=entry.byte_size,
+                uniqueness=1.0 / freq[entry.fingerprint],
+                effect_summary=entry.effect_summary,
+            )
+            for entry in catalog
+        ]
+        catalog.sort(key=lambda entry: len(entry.fingerprint), reverse=True)
+        self._helper_catalog = catalog
+        return catalog
+
+    def _analyze_inline_expansions(
+        self,
+        match: ReccmpMatch,
+        orig_asm: AsmExcerpt,
+        recomp_asm: AsmExcerpt,
+    ) -> InlineLayoutResult | None:
+        """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
+        from reccmp.compare.inlines import find_call_sites
+
+        orig_fp = fingerprint_from_asm(orig_asm)
+        recomp_fp = fingerprint_from_asm(recomp_asm)
+        helpers_by_orig: dict[int, HelperCatalogEntry] = {}
+        for fingerprint in (orig_fp, recomp_fp):
+            for _index, identities in find_call_sites(fingerprint):
+                helper = self._resolve_helper_from_call_identities(identities)
+                if helper is None or helper.orig_addr == match.orig_addr:
+                    continue
+                helpers_by_orig[helper.orig_addr] = helper
+        if not helpers_by_orig:
+            return None
+
+        # Uniqueness among the call-referenced helpers only.
+        freq: dict[Fingerprint, int] = {}
+        for entry in helpers_by_orig.values():
+            freq[entry.fingerprint] = freq.get(entry.fingerprint, 0) + 1
+        helpers = [
+            HelperCatalogEntry(
+                orig_addr=entry.orig_addr,
+                recomp_addr=entry.recomp_addr,
+                name=entry.name,
+                fingerprint=entry.fingerprint,
+                byte_size=entry.byte_size,
+                uniqueness=1.0 / freq[entry.fingerprint],
+                effect_summary=entry.effect_summary,
+            )
+            for entry in helpers_by_orig.values()
+        ]
+        result = analyze_inline_layout(
+            orig_asm,
+            recomp_asm,
+            helpers,
+            exclude_orig_addrs=(match.orig_addr,),
+        )
+        if not result.expansions:
+            return None
+        return result
 
     def _unpaired_function_candidates(
         self, image_id: ImageId
@@ -421,6 +919,7 @@ class FunctionComparator:
                 return discovered
             self.db.bulk_match(pairs)
             discovered.extend(pairs)
+            self.rebuild_lookups()
 
     def discover_unpaired_function_bodies(self) -> list[tuple[int, int]]:
         """Discover differently named function pairs to a conservative fixed point.
@@ -485,6 +984,7 @@ class FunctionComparator:
             if pairs:
                 self.db.bulk_match(pairs)
                 discovered.extend(pairs)
+                self.rebuild_lookups()
                 continue
 
             # Alias identities can themselves unlock mutually unique callers,
@@ -498,6 +998,7 @@ class FunctionComparator:
             )
             if not orig_added and not recomp_added:
                 break
+            self.rebuild_lookups()
         return discovered
 
     def raw_pair_alias_equivalent(
@@ -507,7 +1008,8 @@ class FunctionComparator:
         size: int,
         *,
         _depth: int = 0,
-        _seen: set[tuple[int, int]] | None = None,
+        _active: set[tuple[int, int]] | None = None,
+        _proved: dict[tuple[int, int], bool] | None = None,
     ) -> bool:
         """Recomputed, conservative compiler-alias equivalence for one
         (orig, recomp) body pair that is not an annotated match.
@@ -531,10 +1033,34 @@ class FunctionComparator:
 
         if size <= 0 or _depth > 3:
             return False
-        seen = _seen if _seen is not None else set()
-        if (orig_addr, recomp_addr) in seen:
-            return True
-        seen.add((orig_addr, recomp_addr))
+        pair = (orig_addr, recomp_addr)
+        active = _active if _active is not None else set()
+        proved = _proved if _proved is not None else {}
+        cached = proved.get(pair)
+        if cached is not None:
+            return cached
+        if pair in active:
+            # Re-entering an unresolved pair is a cycle, not a completed proof.
+            return False
+        active.add(pair)
+        try:
+            result = self._raw_pair_alias_equivalent_body(
+                orig_addr, recomp_addr, size, _depth, active, proved
+            )
+        finally:
+            active.discard(pair)
+        proved[pair] = result
+        return result
+
+    def _raw_pair_alias_equivalent_body(
+        self,
+        orig_addr: int,
+        recomp_addr: int,
+        size: int,
+        depth: int,
+        active: set[tuple[int, int]],
+        proved: dict[tuple[int, int], bool],
+    ) -> bool:
         try:
             orig_raw = self.orig_bin.read(orig_addr, size)
             recomp_raw = self.recomp_bin.read(recomp_addr, size)
@@ -546,8 +1072,15 @@ class FunctionComparator:
             island_target = (
                 orig_addr + 5 + int.from_bytes(orig_raw[1:5], "little", signed=True)
             )
+            if island_target == orig_addr:
+                return False
             return self.raw_pair_alias_equivalent(
-                island_target, recomp_addr, size, _depth=_depth + 1, _seen=seen
+                island_target,
+                recomp_addr,
+                size,
+                _depth=depth + 1,
+                _active=active,
+                _proved=proved,
             )
         # Symmetric recomp-side forwarder: an incremental link records the
         # PDB symbol on the `jmp rel32` thunk, so the entity's own body is the
@@ -558,15 +1091,14 @@ class FunctionComparator:
                 recomp_addr + 5 + int.from_bytes(recomp_raw[1:5], "little", signed=True)
             )
             target = self.db.get(ImageId.RECOMP, island_target)
-            target_size = (
-                target.size(ImageId.RECOMP) if target is not None else None
-            )
+            target_size = target.size(ImageId.RECOMP) if target is not None else None
             return self.raw_pair_alias_equivalent(
                 orig_addr,
                 island_target,
                 target_size if target_size and target_size > 0 else size,
-                _depth=_depth + 1,
-                _seen=seen,
+                _depth=depth + 1,
+                _active=active,
+                _proved=proved,
             )
         orig_asm = self.orig_sanitize.parse_asm(orig_raw, orig_addr)
         recomp_asm = self.recomp_sanitize.parse_asm(recomp_raw, recomp_addr)
@@ -581,13 +1113,13 @@ class FunctionComparator:
             or len(recomp_insts) != len(orig_asm)
         ):
             return False
-        for index, ((_, orig_line), (_, recomp_line)) in enumerate(
-            zip(orig_asm, recomp_asm)
-        ):
+        for index, (orig_row, recomp_row) in enumerate(zip(orig_asm, recomp_asm)):
+            orig_line = orig_row.display
+            recomp_line = recomp_row.display
             if orig_line == recomp_line and "<OFFSET" not in orig_line:
                 continue
             if not self._transfer_targets_alias_equivalent(
-                orig_insts[index], recomp_insts[index], _depth, seen
+                orig_insts[index], recomp_insts[index], depth, active, proved
             ):
                 return False
         return True
@@ -597,7 +1129,8 @@ class FunctionComparator:
         orig_inst: tuple[int, int, str, str],
         recomp_inst: tuple[int, int, str, str],
         depth: int,
-        seen: set[tuple[int, int]],
+        active: set[tuple[int, int]],
+        proved: dict[tuple[int, int], bool],
     ) -> bool:
         """Whether a diverging instruction pair is a direct transfer whose
         two targets are themselves alias-equivalent bodies. The target size
@@ -620,7 +1153,12 @@ class FunctionComparator:
         if target_size is None or target_size <= 0:
             return False
         return self.raw_pair_alias_equivalent(
-            orig_target, recomp_target, target_size, _depth=depth + 1, _seen=seen
+            orig_target,
+            recomp_target,
+            target_size,
+            _depth=depth + 1,
+            _active=active,
+            _proved=proved,
         )
 
     # ------------------------------------------------------------------
@@ -743,6 +1281,199 @@ class FunctionComparator:
                 # Unreachable, but mypy doesn't understand
                 assert False
 
+    def compare_function_images(
+        self,
+        orig: FunctionImage,
+        recomp: FunctionImage,
+        split_points: list[tuple[int, int]],
+        *,
+        match: ReccmpMatch | None = None,
+        include_diff: bool = True,
+        include_exact_diff: bool = True,
+        metadata: FunctionMetadata | None = None,
+        orig_meta: list[InstructionMeta | None] | None = None,
+        recomp_meta: list[InstructionMeta | None] | None = None,
+    ) -> EntityCompareResult:
+        """Compare two owned function images; they are the source of excerpt,
+        tables, addresses, and coverage."""
+        # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+        orig_rows = list(orig.excerpt)
+        recomp_rows = list(recomp.excerpt)
+        coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
+        extent_closed = orig.extent_closed and recomp.extent_closed
+        orig_asm = excerpt_displays(orig_rows)
+        recomp_asm = excerpt_displays(recomp_rows)
+
+        orig_keys = [instruction_match_key(row) for row in orig_rows]
+        recomp_keys = [instruction_match_key(row) for row in recomp_rows]
+        orig_sem = [instruction_semantic_key(row) for row in orig_rows]
+        recomp_sem = [instruction_semantic_key(row) for row in recomp_rows]
+        display_diff = SequenceMatcherWithPins(orig_keys, recomp_keys, split_points)
+        semantic_diff = SequenceMatcherWithPins(orig_sem, recomp_sem, split_points)
+
+        ratio = semantic_diff.ratio()
+        display_similarity = display_diff.ratio()
+        opcodes = display_diff.get_opcodes()
+        operands_complete = all(
+            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
+        )
+        control_flow_complete = all(
+            (not row.is_code) or row.control_flow_known
+            for row in (*orig_rows, *recomp_rows)
+        )
+        displays_match = orig_asm == recomp_asm
+        orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
+        recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
+        exact = admit_exact_analysis(
+            displays_equal=displays_match,
+            topology_equal=(
+                orig_topology is not None and orig_topology == recomp_topology
+            ),
+            keys_equal=orig_sem == recomp_sem,
+            operands_complete=operands_complete,
+            control_flow_complete=control_flow_complete,
+            coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
+        )
+        if exact is not None:
+            analysis = exact
+        else:
+            if metadata is None and match is not None:
+                metadata = self._function_metadata(match)
+            if orig_meta is None:
+                orig_meta = [
+                    meta_from_decoded(row) if row.is_code else None for row in orig_rows
+                ]
+            if recomp_meta is None:
+                recomp_meta = [
+                    meta_from_decoded(row) if row.is_code else None
+                    for row in recomp_rows
+                ]
+            analysis = analyze_effective_match(
+                opcodes,
+                resolve_asm_stream(orig_rows, jump_tables=orig.jump_tables),
+                resolve_asm_stream(recomp_rows, jump_tables=recomp.jump_tables),
+                orig_addrs=excerpt_addrs(orig_rows),
+                metadata=metadata,
+                orig_meta=orig_meta,
+                recomp_addrs=excerpt_addrs(recomp_rows),
+                recomp_meta=recomp_meta,
+                coverage_incomplete=coverage_incomplete,
+                extent_closed=extent_closed,
+            )
+        analysis = admit_proof(
+            analysis,
+            coverage_incomplete=coverage_incomplete,
+            extent_closed=extent_closed,
+        )
+
+        analysis = self._enrich_analysis_with_source(analysis, match=match)
+
+        inline_layout = None
+        if ratio < 1.0 and match is not None and not analysis.is_effective:
+            inline_layout = self._analyze_inline_expansions(
+                match, orig_rows, recomp_rows
+            )
+
+        stack_layout = None
+        if ratio < 1.0:
+            stack_rdiff = RawDiffOutput(
+                codes=opcodes,
+                orig_inst=[
+                    (
+                        hex(row.address) if row.address is not None else "",
+                        row.display,
+                    )
+                    for row in orig_rows
+                ],
+                recomp_inst=[
+                    (
+                        hex(row.address) if row.address is not None else "",
+                        row.display,
+                    )
+                    for row in recomp_rows
+                ],
+            )
+            stack_layout = analyze_stack_layout(
+                stack_rdiff,
+                orig_asm,
+                recomp_asm,
+                fn_symbol=self._fn_symbol_entry(match),
+                types=self.types,
+            )
+
+        if not include_diff or (ratio == 1.0 and not include_exact_diff):
+            result = EntityCompareResult(
+                match_ratio=ratio,
+                display_similarity=display_similarity,
+                analysis=analysis,
+                stack_permutation=(
+                    stack_layout.permutation if stack_layout is not None else ()
+                ),
+                accuracy_modulo_stack=(
+                    stack_layout.accuracy_modulo_stack
+                    if stack_layout is not None
+                    else None
+                ),
+                inline_expansions=(
+                    inline_layout.expansions if inline_layout is not None else ()
+                ),
+                accuracy_modulo_inline=(
+                    inline_layout.accuracy_modulo_inline
+                    if inline_layout is not None
+                    else None
+                ),
+            )
+            return result
+
+        # Convert the addresses to hex string for the diff output
+        orig_for_printing = [
+            (hex(row.address) if row.address is not None else "", row.display)
+            for row in orig_rows
+        ]
+
+        recomp_for_printing = [
+            (
+                hex(row.address) if row.address is not None else "",
+                self._print_recomp_instruction(
+                    row.display,
+                    source_ref=self._source_ref_of_recomp_addr(row.address),
+                    is_pinned=any(
+                        recomp_addr == line_index for _, recomp_addr in split_points
+                    ),
+                ),
+            )
+            for line_index, row in enumerate(recomp_rows)
+        ]
+
+        rdiff = RawDiffOutput(
+            codes=opcodes,
+            orig_inst=orig_for_printing,
+            recomp_inst=recomp_for_printing,
+        )
+
+        result = EntityCompareResult(
+            diff=rdiff,
+            match_ratio=ratio,
+            display_similarity=display_similarity,
+            analysis=analysis,
+            stack_permutation=(
+                stack_layout.permutation if stack_layout is not None else ()
+            ),
+            accuracy_modulo_stack=(
+                stack_layout.accuracy_modulo_stack if stack_layout is not None else None
+            ),
+            inline_expansions=(
+                inline_layout.expansions if inline_layout is not None else ()
+            ),
+            accuracy_modulo_inline=(
+                inline_layout.accuracy_modulo_inline
+                if inline_layout is not None
+                else None
+            ),
+        )
+        return result
+
     def _compare_function_assembly(
         self,
         orig: AsmExcerpt,
@@ -750,97 +1481,65 @@ class FunctionComparator:
         split_points: list[tuple[int, int]],
         *,
         match: ReccmpMatch | None = None,
-        orig_raw: bytes | None = None,
-        recomp_raw: bytes | None = None,
         include_diff: bool = True,
         include_exact_diff: bool = True,
         metadata: FunctionMetadata | None = None,
         orig_meta: list[InstructionMeta | None] | None = None,
         recomp_meta: list[InstructionMeta | None] | None = None,
+        coverage_incomplete: bool = False,
     ) -> EntityCompareResult:
-        # pylint: disable=too-many-arguments,too-many-positional-arguments
-        # Detach addresses from asm lines for the text diff.
-        orig_asm = [x[1] for x in orig]
-        recomp_asm = [x[1] for x in recomp]
+        """Test/legacy wrapper that lifts excerpts into ephemeral function images."""
+        orig_image = FunctionImage(
+            start_addr=0,
+            extent=0,
+            extent_kind=ExtentKind.KNOWN,
+            excerpt=_stamp_instruction_ids(orig),
+            coverage_incomplete=coverage_incomplete,
+        )
+        recomp_image = FunctionImage(
+            start_addr=0,
+            extent=0,
+            extent_kind=ExtentKind.KNOWN,
+            excerpt=_stamp_instruction_ids(recomp),
+            coverage_incomplete=coverage_incomplete,
+        )
+        return self.compare_function_images(
+            orig_image,
+            recomp_image,
+            split_points,
+            match=match,
+            include_diff=include_diff,
+            include_exact_diff=include_exact_diff,
+            metadata=metadata,
+            orig_meta=orig_meta,
+            recomp_meta=recomp_meta,
+        )
 
-        diff = SequenceMatcherWithPins(orig_asm, recomp_asm, split_points)
+    def find_inlines(self, helper: ReccmpMatch) -> list[InlineHit]:
+        """Search original functions for probable expansions of ``helper``'s body."""
+        helper_size = helper.size(ImageId.RECOMP)
+        if helper_size is None or helper_size <= 0:
+            return []
+        helper_fp = self._alias_fingerprint(
+            ImageId.RECOMP, helper.recomp_addr, helper_size
+        )
+        if helper_fp is None:
+            return []
 
-        ratio = diff.ratio()
-        opcodes = diff.get_opcodes()
-        if ratio == 1.0:
-            analysis = ComparisonAnalysis.exact()
-        else:
-            if metadata is None and match is not None:
-                metadata = self._function_metadata(match)
-            if orig_meta is None and orig_raw is not None:
-                orig_meta_by_addr = self.orig_sanitize.collect_instruction_meta(
-                    orig_raw,
-                    (
-                        match.orig_addr
-                        if match is not None
-                        else (orig[0][0] if orig and orig[0][0] is not None else 0)
-                    ),
-                )
-                orig_meta = [
-                    orig_meta_by_addr.get(addr) if addr is not None else None
-                    for addr, _ in orig
-                ]
-            if recomp_meta is None and recomp_raw is not None:
-                recomp_meta_by_addr = self.recomp_sanitize.collect_instruction_meta(
-                    recomp_raw,
-                    (
-                        match.recomp_addr
-                        if match is not None
-                        else (
-                            recomp[0][0] if recomp and recomp[0][0] is not None else 0
-                        )
-                    ),
-                )
-                recomp_meta = [
-                    recomp_meta_by_addr.get(addr) if addr is not None else None
-                    for addr, _ in recomp
-                ]
-            analysis = analyze_effective_match(
-                opcodes,
-                orig_asm,
-                recomp_asm,
-                orig_addrs=[x[0] for x in orig],
-                metadata=metadata,
-                orig_meta=orig_meta,
-                recomp_addrs=[x[0] for x in recomp],
-                recomp_meta=recomp_meta,
-            )
+        hosts: list[tuple[int, str, int]] = []
+        for entity in self.db.get_functions():
+            if entity.orig_addr == helper.orig_addr:
+                continue
+            size = entity.size(ImageId.ORIG)
+            if size is None or size <= helper_size:
+                continue
+            name = entity.best_name() or f"sub_{entity.orig_addr:x}"
+            hosts.append((entity.orig_addr, name, size))
 
-        if not include_diff or (ratio == 1.0 and not include_exact_diff):
-            return EntityCompareResult(match_ratio=ratio, analysis=analysis)
-
-        # Convert the addresses to hex string for the diff output
-        orig_for_printing = [
-            (hex(addr) if addr is not None else "", instr) for addr, instr in orig
-        ]
-
-        recomp_for_printing = [
-            (
-                hex(addr) if addr is not None else "",
-                self._print_recomp_instruction(
-                    instruction,
-                    source_ref=self._source_ref_of_recomp_addr(addr),
-                    is_pinned=any(
-                        recomp_addr == line_index for _, recomp_addr in split_points
-                    ),
-                ),
-            )
-            for line_index, (addr, instruction) in enumerate(recomp)
-        ]
-
-        return EntityCompareResult(
-            diff=RawDiffOutput(
-                codes=opcodes,
-                orig_inst=orig_for_printing,
-                recomp_inst=recomp_for_printing,
-            ),
-            match_ratio=ratio,
-            analysis=analysis,
+        return find_inline_expansions(
+            helper_fp,
+            hosts,
+            lambda addr, size: self._alias_fingerprint(ImageId.ORIG, addr, size),
         )
 
     def _collect_line_annotations(self, recomp: AsmExcerpt) -> list[ReccmpMatch]:
@@ -851,23 +1550,22 @@ class FunctionComparator:
         if len(recomp) == 0:
             return []
 
-        recomp_start_addr = recomp[0][0]
-        recomp_end_addr = recomp[-1][0]
+        recomp_start_addr = recomp[0].address
+        recomp_end_addr = recomp[-1].address
         assert recomp_start_addr is not None and recomp_end_addr is not None
-        line_annotations = self.db.get_lines_in_recomp_range(
-            recomp_start_addr, recomp_end_addr
+        line_annotations = list(
+            self.db.get_lines_in_recomp_range(recomp_start_addr, recomp_end_addr)
         )
 
-        # This is a naive/greedy algorithm to remove the non-monotonous entries.
-        # There likely is a "better" way to do this, in the sense that the smallest number
-        # of entries is removed.
-        line_annotations_monotonous: list[ReccmpMatch] = []
-        last_address = 0
-        for sync_point in line_annotations:
-            if sync_point.recomp_addr > last_address:
-                line_annotations_monotonous.append(sync_point)
-                last_address = sync_point.recomp_addr
-            else:
+        # Longest increasing subsequence of recomp addresses keeps the maximum
+        # set of monotonic source pins (O(n log n)).
+        line_annotations_monotonous = _longest_increasing_by_recomp(line_annotations)
+        dropped = len(line_annotations) - len(line_annotations_monotonous)
+        if dropped:
+            kept = {id(ann) for ann in line_annotations_monotonous}
+            for sync_point in line_annotations:
+                if id(sync_point) in kept:
+                    continue
                 self.report(
                     ReccmpEvent.WRONG_ORDER,
                     sync_point.orig_addr,
@@ -912,7 +1610,7 @@ class FunctionComparator:
                 (
                     i
                     for i, entry in enumerate(orig)
-                    if entry[0] == line_annotation.orig_addr
+                    if entry.address == line_annotation.orig_addr
                 ),
                 None,
             )
@@ -928,7 +1626,7 @@ class FunctionComparator:
                 (
                     i
                     for i, entry in enumerate(recomp)
-                    if entry[0] == line_annotation.recomp_addr
+                    if entry.address == line_annotation.recomp_addr
                 ),
                 None,
             )

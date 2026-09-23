@@ -328,9 +328,7 @@ def test_procedure_import(
     assert second_import == imported
 
 
-def test_union(
-    type_helper: GhidraTypeTestHelper, cvdump_sample: CvdumpSample
-):
+def test_union(type_helper: GhidraTypeTestHelper, cvdump_sample: CvdumpSample):
     from ghidra.program.model.data import Union
 
     type_helper.set_up_cvdump_types(cvdump_sample.text)

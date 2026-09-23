@@ -1,16 +1,20 @@
 import logging
+import hashlib
 import difflib
 import struct
 from itertools import zip_longest
+from pathlib import Path
 from typing import Callable, Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
 from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.verification import admit_exact_analysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
 from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.functions import FunctionComparator
+from reccmp.compare.variables import VariableComparator
 from reccmp.formats import (
     Image,
     PEImage,
@@ -22,6 +26,7 @@ from reccmp.compare.event import (
     ReccmpReportProtocol,
     create_logging_wrapper,
 )
+from reccmp.source.index import SourceIndex
 from .match_msvc import (
     match_lines,
     match_symbols,
@@ -80,6 +85,20 @@ from .verify import (
 logger = logging.getLogger(__name__)
 
 
+def _image_digest(image: Image) -> str | None:
+    """SHA-256 of the original image bytes, used as report source identity."""
+    data = getattr(image, "data", None)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(data)).hexdigest()
+    path = getattr(image, "filepath", None)
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 class Compare:
     # pylint: disable=too-many-instance-attributes
     _db: EntityDb
@@ -94,9 +113,11 @@ class Compare:
     bin_encoding: str
     types: CvdumpTypesParser
     function_comparator: FunctionComparator
+    variable_comparator: VariableComparator
     data_sources: list[TextFile]
     project_aliases: ProjectAliases
     codebase: DecompCodebase | None
+    source_index: SourceIndex | None
 
     # pylint: disable=too-many-arguments
     # pylint: disable=too-many-positional-arguments
@@ -112,6 +133,7 @@ class Compare:
         project_aliases: ProjectAliases | None = None,
         codebase: DecompCodebase | None = None,
         equivalence_sources: list[TextFile] | None = None,
+        source_index: SourceIndex | None = None,
     ):
         self.orig_bin = orig_bin
         self.recomp_bin = recomp_bin
@@ -145,6 +167,7 @@ class Compare:
 
         self.types = CvdumpTypesParser()
 
+        self.source_index = source_index
         self.function_comparator = FunctionComparator(
             self._db,
             self._lines_db,
@@ -153,6 +176,14 @@ class Compare:
             self.report,
             self.types,
             equivalence_groups=self.equivalence_groups,
+            source_index=source_index,
+        )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=source_index,
         )
 
     def _configure_function_nodes(self) -> None:
@@ -182,8 +213,19 @@ class Compare:
             self.report,
             self.types,
             equivalence_groups=self.equivalence_groups,
+            source_index=self.source_index,
+        )
+        self.variable_comparator = VariableComparator(
+            db=self._db,
+            types=self.types,
+            orig_bin=self.orig_bin,
+            recomp_bin=self.recomp_bin,
+            source_index=self.source_index,
         )
         self._configure_function_nodes()
+        if not self._db.frozen:
+            self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     def run(self):
         if not isinstance(self.orig_bin, PEImage) or not isinstance(
@@ -293,6 +335,8 @@ class Compare:
 
         match_strings(self._db, self.report)
         classify_exact_string_aliases(self._db)
+        self._db.freeze()
+        self.function_comparator.rebuild_lookups()
 
     @classmethod
     def from_target(
@@ -302,13 +346,18 @@ class Compare:
         orig_addrs: Iterable[int] = (),
         recomp_addrs: Iterable[int] = (),
         use_cache: bool = True,
+        source_index: SourceIndex | None = None,
     ) -> Self:
+        from .source_capability import load_source_index_for_target
+
         loaded = load_target_analysis(
             target,
             orig_addrs=orig_addrs,
             recomp_addrs=recomp_addrs,
             use_cache=use_cache,
         )
+        if source_index is None:
+            source_index = load_source_index_for_target(target)
         compare = cls(
             loaded.orig_bin,
             loaded.recomp_bin,
@@ -320,6 +369,7 @@ class Compare:
             project_aliases=loaded.project_aliases,
             codebase=loaded.codebase,
             equivalence_sources=loaded.equivalence_sources,
+            source_index=source_index,
         )
         prepared = loaded.load_prepared()
         if prepared is not None:
@@ -415,7 +465,11 @@ class Compare:
         if orig_max is not None:
             orig_size = min(orig_size, orig_max)
         orig_size = effective_orig_vtable_size(
-            self.orig_bin, match.orig_addr, orig_size
+            self.orig_bin,
+            match.orig_addr,
+            orig_size,
+            db=self._db,
+            image_id=ImageId.ORIG,
         )
         orig_table = self.orig_bin.read(match.orig_addr, orig_size)
         recomp_table = self.recomp_bin.read(match.recomp_addr, recomp_size)
@@ -541,9 +595,13 @@ class Compare:
             ),
             match_ratio=ratio,
             analysis=(
-                ComparisonAnalysis.exact()
-                if ratio == 1.0
-                else ComparisonAnalysis.inconclusive("analysis_limit")
+                admit_exact_analysis(
+                    displays_equal=ratio == 1.0,
+                    topology_equal=True,
+                    keys_equal=ratio == 1.0,
+                    extent_closed=True,
+                )
+                or ComparisonAnalysis.inconclusive("analysis_limit")
             ),
         )
 
@@ -587,7 +645,7 @@ class Compare:
     ) -> ReccmpComparedEntity | None:
         """Router for comparison type"""
 
-        if match.size is None or match.any_size() == 0:
+        if match.any_size() == 0:
             return None
 
         if match.get("skip", False):
@@ -627,12 +685,27 @@ class Compare:
             is_stub=match.get("stub", False),
             is_library=match.get("library", False),
             rdiff=result.diff,
+            display_similarity=result.display_similarity,
+            stack_permutation=result.stack_permutation,
+            accuracy_modulo_stack=result.accuracy_modulo_stack,
+            inline_expansions=result.inline_expansions,
+            accuracy_modulo_inline=result.accuracy_modulo_inline,
+            diagnostic_normalizations=result.diagnostic_normalizations,
+            equivalence_level=result.equivalence_level,
         )
+
+    @property
+    def orig_source_digest(self) -> str | None:
+        return _image_digest(self.orig_bin)
 
     ## Public API
 
     def get_all(self) -> Iterator[ReccmpEntity]:
         return self._db.get_all()
+
+    def get_match(self, orig_addr: int) -> ReccmpMatch | None:
+        """Public lookup for a paired original address."""
+        return self._db.get_one_match(orig_addr)
 
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
@@ -766,7 +839,9 @@ class Compare:
         include_exact_diff: bool = True,
     ) -> ReccmpStatusReport:
         """Creates a ReccmpStatusReport using the current reccmp state."""
-        report = ReccmpStatusReport(filename=filename)
+        report = ReccmpStatusReport(
+            filename=filename, source_digest=_image_digest(self.orig_bin)
+        )
         for match in self.compare_all(
             filter_fn,
             include_diff=include_diff,

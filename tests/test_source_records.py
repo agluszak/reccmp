@@ -142,7 +142,8 @@ def test_the_index_command_keeps_the_build_arguments_and_drops_the_ast_dump() ->
     assert command[command.index("-Xclang") + 1] == "-fno-wchar"
     assert command[-2:] == ["--", "/repo/src/wiz8/vector.cpp"]
     assert not any(
-        argument.startswith("/Fo") or argument == "/c" for argument in command
+        argument.startswith("/Fo") or argument == "/c"  # codespell:ignore
+        for argument in command  # codespell:ignore
     )
 
 
@@ -212,7 +213,9 @@ def test_conflicting_global_spellings_are_retained() -> None:
 
     namespace = collector.derive()
     # The definition still wins the merged index, but the disagreement survives.
-    assert {item.semantic_id: item for item in namespace.variables}["_gThing"].type == "int"
+    assert {item.semantic_id: item for item in namespace.variables}[
+        "_gThing"
+    ].type == "int"
     (conflict,) = namespace.conflicts
     assert conflict.semantic_id == "_gThing"
     assert conflict.record_kind == "variable"

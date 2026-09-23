@@ -21,6 +21,139 @@ class ComparisonStatus(Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class DiagnosticNormalization(Enum):
+    """Non-proof accounting tags explaining residual compiler entropy.
+
+    These must never be read as semantic equivalence.  Only
+    ``ComparisonStatus.EXACT`` / ``EFFECTIVE`` are proofs.  Multiple tags may
+    apply at once (register allocation and scheduling are orthogonal).
+    """
+
+    STACK_LAYOUT = "stack_layout"
+    REGISTER_ALLOCATION = "register_allocation"
+    INSTRUCTION_SCHEDULING = "instruction_scheduling"
+    CFG_LAYOUT = "cfg_layout"
+    KNOWN_INLINE = "known_inline"
+    FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
+
+
+# Backward-compatible aliases for the previous single-valued lattice.
+# Kept so older reports/tests that still mention EquivalenceLevel compile;
+# new code should use DiagnosticNormalization + ComparisonStatus.
+class EquivalenceLevel(Enum):
+    """Deprecated single-valued view; prefer ComparisonStatus + normalizations."""
+
+    EXACT_INSTRUCTIONS = "exact_instructions"
+    STACK_LAYOUT_EQUIVALENT = "stack_layout"  # renamed: not a proof
+    REGISTER_ALLOCATION_EQUIVALENT = "register_allocation"
+    INSTRUCTION_SCHEDULING_EQUIVALENT = "instruction_scheduling"
+    CFG_LAYOUT_EQUIVALENT = "cfg_layout"
+    KNOWN_INLINE_EQUIVALENT = "known_inline"
+    FOLDED_SYMBOL_ALIAS = "folded_symbol_alias"
+    UNKNOWN_DIFFERENCE = "unknown_difference"
+
+
+_LEGACY_LEVEL_TO_NORMALIZATION = {
+    "stack_layout_equivalent": DiagnosticNormalization.STACK_LAYOUT,
+    "stack_layout": DiagnosticNormalization.STACK_LAYOUT,
+    "register_allocation_equivalent": DiagnosticNormalization.REGISTER_ALLOCATION,
+    "register_allocation": DiagnosticNormalization.REGISTER_ALLOCATION,
+    "instruction_scheduling_equivalent": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
+    "instruction_scheduling": DiagnosticNormalization.INSTRUCTION_SCHEDULING,
+    "cfg_layout_equivalent": DiagnosticNormalization.CFG_LAYOUT,
+    "cfg_layout": DiagnosticNormalization.CFG_LAYOUT,
+    "known_inline_equivalent": DiagnosticNormalization.KNOWN_INLINE,
+    "known_inline": DiagnosticNormalization.KNOWN_INLINE,
+    "folded_symbol_alias": DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
+}
+
+
+def derive_diagnostic_normalizations(
+    analysis: "ComparisonAnalysis",
+    *,
+    accuracy_modulo_stack: float | None = None,
+    accuracy_modulo_inline: float | None = None,
+) -> tuple[DiagnosticNormalization, ...]:
+    """Collect orthogonal diagnostic tags.  Never implies a proof."""
+    tags: set[DiagnosticNormalization] = set()
+
+    if analysis.status == ComparisonStatus.EFFECTIVE:
+        reasons = set(analysis.effective_reasons)
+        if "condition_inversion" in reasons:
+            tags.add(DiagnosticNormalization.CFG_LAYOUT)
+        if reasons & {"instruction_reorder", "commutative_order", "load_folding"}:
+            tags.add(DiagnosticNormalization.INSTRUCTION_SCHEDULING)
+        if reasons & {"register_allocation", "callee_save_substitution"}:
+            tags.add(DiagnosticNormalization.REGISTER_ALLOCATION)
+        if "frame_slot_layout" in reasons:
+            tags.add(DiagnosticNormalization.STACK_LAYOUT)
+        if "folded_symbol_alias" in reasons:
+            tags.add(DiagnosticNormalization.FOLDED_SYMBOL_ALIAS)
+
+    # Modulo scores are diagnostic collapses, not proofs of equivalence.
+    if accuracy_modulo_inline is not None and accuracy_modulo_inline >= 1.0:
+        tags.add(DiagnosticNormalization.KNOWN_INLINE)
+    if accuracy_modulo_stack is not None and accuracy_modulo_stack >= 1.0:
+        tags.add(DiagnosticNormalization.STACK_LAYOUT)
+
+    order = (
+        DiagnosticNormalization.STACK_LAYOUT,
+        DiagnosticNormalization.REGISTER_ALLOCATION,
+        DiagnosticNormalization.INSTRUCTION_SCHEDULING,
+        DiagnosticNormalization.CFG_LAYOUT,
+        DiagnosticNormalization.KNOWN_INLINE,
+        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
+    )
+    return tuple(tag for tag in order if tag in tags)
+
+
+def derive_equivalence_level(
+    analysis: "ComparisonAnalysis",
+    *,
+    accuracy_modulo_stack: float | None = None,
+    accuracy_modulo_inline: float | None = None,
+) -> EquivalenceLevel:
+    """Deprecated compatibility shim over proof status + normalizations."""
+    if analysis.status == ComparisonStatus.EXACT:
+        return EquivalenceLevel.EXACT_INSTRUCTIONS
+
+    norms = derive_diagnostic_normalizations(
+        analysis,
+        accuracy_modulo_stack=accuracy_modulo_stack,
+        accuracy_modulo_inline=accuracy_modulo_inline,
+    )
+    if not norms:
+        return EquivalenceLevel.UNKNOWN_DIFFERENCE
+
+    # Prefer a primary tag for legacy single-valued consumers.  folded_symbol
+    # is never reported as known_inline.
+    primary = norms[0]
+    mapping = {
+        DiagnosticNormalization.STACK_LAYOUT: EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
+        DiagnosticNormalization.REGISTER_ALLOCATION: (
+            EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
+        ),
+        DiagnosticNormalization.INSTRUCTION_SCHEDULING: (
+            EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
+        ),
+        DiagnosticNormalization.CFG_LAYOUT: EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
+        DiagnosticNormalization.KNOWN_INLINE: EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
+        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS: EquivalenceLevel.FOLDED_SYMBOL_ALIAS,
+    }
+    # Prefer known_inline / folded over stack when both present for legacy primary.
+    for preferred in (
+        DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,
+        DiagnosticNormalization.KNOWN_INLINE,
+        DiagnosticNormalization.CFG_LAYOUT,
+        DiagnosticNormalization.INSTRUCTION_SCHEDULING,
+        DiagnosticNormalization.REGISTER_ALLOCATION,
+        DiagnosticNormalization.STACK_LAYOUT,
+    ):
+        if preferred in norms:
+            return mapping[preferred]
+    return mapping[primary]
+
+
 EFFECTIVE_REASON_ORDER = (
     "register_allocation",
     "frame_slot_layout",
@@ -72,6 +205,8 @@ INCONCLUSIVE_REASONS = frozenset(
         "alignment_failure",
         "missing_metadata",
         "analysis_limit",
+        "incomplete_coverage",
+        "open_extent",
     }
 )
 
@@ -83,6 +218,15 @@ def normalize_effective_reasons(reasons) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"Unknown effective reasons: {sorted(unknown)}")
     return tuple(reason for reason in EFFECTIVE_REASON_ORDER if reason in values)
+
+
+@dataclass(frozen=True)
+class StackPermutationEntry:
+    """One orig → recomp local slot correspondence."""
+
+    orig: str
+    recomp: str
+    symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -273,8 +417,8 @@ class AnalysisRecorder:
             return self.candidate_difference
         return self.difference
 
-    def effective_analysis(self, extra_reasons=()) -> ComparisonAnalysis:
-        return ComparisonAnalysis.effective(self.reasons | set(extra_reasons))
+    def effective_reasons(self, extra_reasons=()) -> frozenset[str]:
+        return frozenset(self.reasons | set(extra_reasons))
 
     def failure_analysis(self) -> ComparisonAnalysis:
         if self.best_difference is not None:

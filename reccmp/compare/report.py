@@ -1,5 +1,5 @@
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Literal, cast
 
 from pydantic import BaseModel, ValidationError
@@ -11,7 +11,13 @@ from .diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
     ComparisonStatus,
+    DiagnosticNormalization,
     DifferenceSide,
+    EquivalenceLevel,
+    StackPermutationEntry,
+    _LEGACY_LEVEL_TO_NORMALIZATION,
+    derive_diagnostic_normalizations,
+    derive_equivalence_level,
 )
 from .diff import (
     CombinedDiffOutput,
@@ -19,6 +25,7 @@ from .diff import (
     RawDiffOutput,
     raw_diff_to_udiff,
 )
+from .inlines import InlineExpansionEvidence
 
 
 def format_address(addr: int) -> str:
@@ -61,6 +68,14 @@ class ReccmpComparedEntity:
     """True if this entity had no fixed recomp address across the
     samples combined by reccmp-aggregate."""
 
+    display_similarity: float | None = None
+    stack_permutation: tuple[StackPermutationEntry, ...] = ()
+    accuracy_modulo_stack: float | None = None
+    inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
+    accuracy_modulo_inline: float | None = None
+    diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
+    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
+
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies
 
@@ -74,6 +89,13 @@ class ReccmpComparedEntity:
         return self.analysis.status == ComparisonStatus.EFFECTIVE
 
     @property
+    def is_proven_match(self) -> bool:
+        return self.analysis.status in (
+            ComparisonStatus.EXACT,
+            ComparisonStatus.EFFECTIVE,
+        )
+
+    @property
     def effective_accuracy(self) -> float:
         return 1.0 if self.is_effective_match else self.accuracy
 
@@ -81,6 +103,18 @@ class ReccmpComparedEntity:
     def semantic_similarity(self) -> float | None:
         """Per-function diagnostic similarity, never an aggregate score."""
         return self.analysis.semantic_similarity
+
+    def refresh_equivalence_level(self) -> None:
+        self.diagnostic_normalizations = derive_diagnostic_normalizations(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
+        )
+        self.equivalence_level = derive_equivalence_level(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
+        )
 
 
 class ReccmpStatusReport:
@@ -98,6 +132,11 @@ class ReccmpStatusReport:
     from_version: int | None
     """Only set during deserialize. (Not used yet)"""
 
+    source_digest: str | None = None
+    """SHA-256 of the original binary, when known. Two reports with
+    different digests are not aggregate-compatible even if they share a
+    filename."""
+
     function_count: int = 0
     """Function count used to determine progress percentage and other statistics.
     We can compute this value from the report's entities or use a user-provided value.
@@ -108,9 +147,11 @@ class ReccmpStatusReport:
         filename: str,
         timestamp: datetime | None = None,
         from_version: int | None = None,
+        source_digest: str | None = None,
     ) -> None:
         self.filename = filename
         self.from_version = from_version
+        self.source_digest = source_digest
         self.function_count = 0
         if timestamp is not None:
             self.timestamp = timestamp
@@ -123,7 +164,12 @@ class ReccmpStatusReport:
         self.entities[match.orig_addr] = match
 
     def has_same_source(self, other: "ReccmpStatusReport") -> bool:
-        """Were both reports derived from the same reccmp target?"""
+        """Were both reports derived from the same original binary?"""
+        if self.source_digest is not None or other.source_digest is not None:
+            return (
+                self.source_digest is not None
+                and self.source_digest == other.source_digest
+            )
         return self.filename.lower() == other.filename.lower()
 
     def update_function_count(self) -> None:
@@ -211,15 +257,14 @@ def _get_entity_for_addr(
 
 def _accuracy_sort_key(entity: ReccmpComparedEntity) -> float:
     """Helper to sort entity samples by accuracy score.
-    100% match is preferred over effective match.
-    Effective match is preferred over any accuracy.
+    Proven exact match is preferred over effective.
+    Effective match is preferred over any unproven accuracy.
     Stubs rank lower than any accuracy score."""
     if entity.is_stub:
         return -1.0
 
-    if entity.accuracy == 1.0:
-        if not entity.is_effective_match:
-            return 1000.0
+    if entity.analysis.status == ComparisonStatus.EXACT:
+        return 1000.0
 
     if entity.is_effective_match:
         return 1.0
@@ -236,7 +281,9 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
     if not all(samples[0].has_same_source(s) for s in samples):
         raise ReccmpReportSameSourceError
 
-    output = ReccmpStatusReport(filename=samples[0].filename)
+    output = ReccmpStatusReport(
+        filename=samples[0].filename, source_digest=samples[0].source_digest
+    )
 
     # Use the highest function total across all samples.
     # Some functions may have been inlined in some reports.
@@ -254,13 +301,15 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
         # Our aggregate accuracy score is the highest from any report.
         e_list.sort(key=_accuracy_sort_key, reverse=True)
 
-        output.entities[addr] = e_list[0]
+        chosen = replace(e_list[0])
+        output.entities[addr] = chosen
 
         # Keep the recomp_addr if it is the same across all samples.
         # i.e. to detect where function alignment ends
         if not all(e_list[0].recomp_addr == e.recomp_addr for e in e_list):
-            output.entities[addr].recomp_addr = None
-            output.entities[addr].recomp_addr_varies = True
+            output.entities[addr] = replace(
+                chosen, recomp_addr=None, recomp_addr_varies=True
+            )
 
     # Recalculate the count against the functions we actually have.
     # This may be higher than the count from any one sample.
@@ -319,6 +368,12 @@ class JSONEntityVersion1:
     diff: CombinedDiffOutput | None = None
     # EntityType as int. Older reports do not include this field.
     type: int | None = None
+    accuracy_modulo_stack: float | None = None
+    stack_permutation: list[dict[str, object]] | None = None
+    accuracy_modulo_inline: float | None = None
+    inline_expansions: list[dict[str, object]] | None = None
+    diagnostic_normalizations: list[str] | None = None
+    equivalence_level: str | None = None
 
 
 class JSONReportVersion1(BaseModel):
@@ -327,6 +382,7 @@ class JSONReportVersion1(BaseModel):
     timestamp: float
     data: list[JSONEntityVersion1]
     function_count: int | None = None
+    source_digest: str | None = None
 
 
 def _side_json(side: DifferenceSide) -> dict[str, object]:
@@ -444,6 +500,45 @@ def _serialize_version_1(
                 library=entity.is_library,
                 diff=(get_udiff_for_entity(entity) if diff_included else None),
                 type=int(entity.type) if entity.type is not None else None,
+                accuracy_modulo_stack=entity.accuracy_modulo_stack,
+                stack_permutation=(
+                    [
+                        {
+                            "orig": entry.orig,
+                            "recomp": entry.recomp,
+                            **({"symbol": entry.symbol} if entry.symbol else {}),
+                        }
+                        for entry in entity.stack_permutation
+                    ]
+                    if entity.stack_permutation
+                    else None
+                ),
+                accuracy_modulo_inline=entity.accuracy_modulo_inline,
+                inline_expansions=(
+                    [
+                        {
+                            "helper": entry.helper_name,
+                            "helper_orig": format_address(entry.helper_orig_addr),
+                            "helper_recomp": format_address(entry.helper_recomp_addr),
+                            "side": entry.side,
+                            "offset": entry.match_offset,
+                            "length": entry.match_length,
+                            "counterpart": entry.counterpart,
+                            "counterpart_offset": entry.counterpart_offset,
+                            "confidence": entry.confidence,
+                            **({"semantic": True} if entry.semantic else {}),
+                        }
+                        for entry in entity.inline_expansions
+                    ]
+                    if entity.inline_expansions
+                    else None
+                ),
+                diagnostic_normalizations=(
+                    [tag.value for tag in entity.diagnostic_normalizations]
+                    if entity.diagnostic_normalizations
+                    else None
+                ),
+                equivalence_level=entity.equivalence_level.value,
             )
         )
 
@@ -454,6 +549,7 @@ def _serialize_version_1(
         timestamp=report.timestamp.timestamp(),
         data=entities,
         function_count=report.function_count,
+        source_digest=report.source_digest,
     )
 
 
@@ -462,6 +558,7 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
         filename=obj.file,
         timestamp=datetime.fromtimestamp(obj.timestamp),
         from_version=1,
+        source_digest=obj.source_digest,
     )
     report.function_count = obj.function_count or 0
 
@@ -483,7 +580,8 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
         if e.comparison is not None:
             analysis = _parse_analysis(e.comparison)
         elif e.effective:
-            raise ReccmpReportDeserializeError
+            # Legacy reports only recorded a boolean; reason codes are unknown.
+            analysis = ComparisonAnalysis.effective(())
         elif e.matching == 1.0:
             analysis = ComparisonAnalysis.exact()
         else:
@@ -501,10 +599,164 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             udiff=e.diff,
             report_diff=e.diff,
             recomp_addr_varies=various,
+            accuracy_modulo_stack=e.accuracy_modulo_stack,
+            stack_permutation=_parse_stack_permutation(e.stack_permutation),
+            accuracy_modulo_inline=e.accuracy_modulo_inline,
+            inline_expansions=_parse_inline_expansions(e.inline_expansions),
+            diagnostic_normalizations=_parse_diagnostic_normalizations(
+                e.diagnostic_normalizations,
+                e.equivalence_level,
+                analysis,
+                e.accuracy_modulo_stack,
+                e.accuracy_modulo_inline,
+            ),
+            equivalence_level=_parse_equivalence_level(
+                e.equivalence_level,
+                analysis,
+                e.accuracy_modulo_stack,
+                e.accuracy_modulo_inline,
+            ),
         )
 
     report.update_function_count()
     return report
+
+
+def _parse_stack_permutation(
+    value: list[dict[str, object]] | None,
+) -> tuple[StackPermutationEntry, ...]:
+    if not value:
+        return ()
+    entries: list[StackPermutationEntry] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ReccmpReportDeserializeError
+        orig = item.get("orig")
+        recomp = item.get("recomp")
+        symbol = item.get("symbol")
+        if not isinstance(orig, str) or not isinstance(recomp, str):
+            raise ReccmpReportDeserializeError
+        if symbol is not None and not isinstance(symbol, str):
+            raise ReccmpReportDeserializeError
+        entries.append(StackPermutationEntry(orig, recomp, symbol))
+    return tuple(entries)
+
+
+def _parse_inline_expansions(
+    value: list[dict[str, object]] | None,
+) -> tuple[InlineExpansionEvidence, ...]:
+    if not value:
+        return ()
+    entries: list[InlineExpansionEvidence] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ReccmpReportDeserializeError
+        helper = item.get("helper")
+        helper_orig = item.get("helper_orig")
+        helper_recomp = item.get("helper_recomp")
+        side = item.get("side")
+        offset = item.get("offset")
+        length = item.get("length")
+        counterpart = item.get("counterpart")
+        counterpart_offset = item.get("counterpart_offset")
+        confidence = item.get("confidence", 0.0)
+        semantic = item.get("semantic", False)
+        if not isinstance(helper, str) or not isinstance(helper_orig, str):
+            raise ReccmpReportDeserializeError
+        if not isinstance(helper_recomp, str):
+            raise ReccmpReportDeserializeError
+        if side not in ("orig", "recomp", "both"):
+            raise ReccmpReportDeserializeError
+        if counterpart not in ("call", "inline", "absent"):
+            raise ReccmpReportDeserializeError
+        if not isinstance(offset, int) or not isinstance(length, int):
+            raise ReccmpReportDeserializeError
+        if counterpart_offset is not None and not isinstance(counterpart_offset, int):
+            raise ReccmpReportDeserializeError
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ReccmpReportDeserializeError
+        if not isinstance(semantic, bool):
+            raise ReccmpReportDeserializeError
+        entries.append(
+            InlineExpansionEvidence(
+                helper_name=helper,
+                helper_orig_addr=int(helper_orig, 16),
+                helper_recomp_addr=int(helper_recomp, 16),
+                side=side,
+                match_offset=offset,
+                match_length=length,
+                counterpart=counterpart,
+                counterpart_offset=counterpart_offset,
+                confidence=float(confidence),
+                semantic=semantic,
+            )
+        )
+    return tuple(entries)
+
+
+def _parse_diagnostic_normalizations(
+    value: list[str] | None,
+    legacy_level: str | None,
+    analysis: ComparisonAnalysis,
+    accuracy_modulo_stack: float | None,
+    accuracy_modulo_inline: float | None,
+) -> tuple[DiagnosticNormalization, ...]:
+    if value:
+        tags: list[DiagnosticNormalization] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ReccmpReportDeserializeError
+            try:
+                tags.append(DiagnosticNormalization(item))
+            except ValueError:
+                mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(item)
+                if mapped is None:
+                    raise ReccmpReportDeserializeError
+                tags.append(mapped)
+        # Stable order
+        order = list(DiagnosticNormalization)
+        return tuple(tag for tag in order if tag in set(tags))
+    if legacy_level is not None:
+        mapped = _LEGACY_LEVEL_TO_NORMALIZATION.get(legacy_level)
+        if mapped is not None:
+            return (mapped,)
+    return derive_diagnostic_normalizations(
+        analysis,
+        accuracy_modulo_stack=accuracy_modulo_stack,
+        accuracy_modulo_inline=accuracy_modulo_inline,
+    )
+
+
+def _parse_equivalence_level(
+    value: str | None,
+    analysis: ComparisonAnalysis,
+    accuracy_modulo_stack: float | None,
+    accuracy_modulo_inline: float | None = None,
+) -> EquivalenceLevel:
+    if value is not None:
+        # Accept both legacy "*_equivalent" strings and the shortened values.
+        try:
+            return EquivalenceLevel(value)
+        except ValueError:
+            aliases = {
+                "stack_layout_equivalent": EquivalenceLevel.STACK_LAYOUT_EQUIVALENT,
+                "register_allocation_equivalent": (
+                    EquivalenceLevel.REGISTER_ALLOCATION_EQUIVALENT
+                ),
+                "instruction_scheduling_equivalent": (
+                    EquivalenceLevel.INSTRUCTION_SCHEDULING_EQUIVALENT
+                ),
+                "cfg_layout_equivalent": EquivalenceLevel.CFG_LAYOUT_EQUIVALENT,
+                "known_inline_equivalent": EquivalenceLevel.KNOWN_INLINE_EQUIVALENT,
+            }
+            if value in aliases:
+                return aliases[value]
+            raise ReccmpReportDeserializeError
+    return derive_equivalence_level(
+        analysis,
+        accuracy_modulo_stack=accuracy_modulo_stack,
+        accuracy_modulo_inline=accuracy_modulo_inline,
+    )
 
 
 def _parse_report_diff(value: object) -> CombinedDiffOutput | None:

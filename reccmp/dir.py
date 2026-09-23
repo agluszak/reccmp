@@ -15,11 +15,15 @@ def _quiet_wine_env() -> dict[str, str]:
 
 
 def winepath_win_to_unix(path: str) -> str:
-    return subprocess.check_output(["winepath", path], text=True, env=_quiet_wine_env()).strip()
+    return subprocess.check_output(
+        ["winepath", path], text=True, env=_quiet_wine_env()
+    ).strip()
 
 
 def winepath_unix_to_win(path: str) -> str:
-    return subprocess.check_output(["winepath", "-w", path], text=True, env=_quiet_wine_env()).strip()
+    return subprocess.check_output(
+        ["winepath", "-w", path], text=True, env=_quiet_wine_env()
+    ).strip()
 
 
 def _iter_path_components(path: PurePath) -> Iterator[str]:

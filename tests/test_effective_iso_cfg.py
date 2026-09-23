@@ -17,7 +17,11 @@ import pytest
 
 from reccmp.compare.asm.effective import (
     FunctionMetadata,
+    SideState,
+    _CfgState,
+    _join_states,
     estimate_isomorphic_cfg_semantic_similarity,
+    verify_cfg_effective_match,
     verify_effective_match,
     verify_isomorphic_cfg_effective_match,
 )
@@ -52,20 +56,22 @@ def fixture_wobble_analysis():
     orig_meta_by_addr = orig_parser.collect_instruction_meta(orig_raw, base)
     recomp_meta_by_addr = recomp_parser.collect_instruction_meta(recomp_raw, base)
 
-    orig_asm = [x[1] for x in orig]
-    recomp_asm = [x[1] for x in recomp]
+    orig_asm = [x.display for x in orig]
+    recomp_asm = [x.display for x in recomp]
     codes = SequenceMatcherWithPins(orig_asm, recomp_asm, []).get_opcodes()
     return analyze_effective_match(
         codes,
         orig_asm,
         recomp_asm,
-        orig_addrs=[x[0] for x in orig],
+        orig_addrs=[x.address for x in orig],
         orig_meta=[
-            orig_meta_by_addr.get(a) if a is not None else None for a, _ in orig
+            orig_meta_by_addr.get(row.address) if row.address is not None else None
+            for row in orig
         ],
-        recomp_addrs=[x[0] for x in recomp],
+        recomp_addrs=[x.address for x in recomp],
         recomp_meta=[
-            recomp_meta_by_addr.get(a) if a is not None else None for a, _ in recomp
+            recomp_meta_by_addr.get(row.address) if row.address is not None else None
+            for row in recomp
         ],
     )
 
@@ -636,7 +642,9 @@ def test_test_self_equals_cmp_zero():
         "ret",
     ]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_effective_match(orig, recomp, metadata=metadata) is True
+    assert verify_effective_match(orig, recomp, metadata=metadata) is False
+    targets = [None, None, 4, None, None]
+    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
 
 
 def test_test_self_equals_cmp_zeroed_register():
@@ -857,3 +865,255 @@ def test_one_sided_push_live_at_call_rejected():
     t_o: list[int | None] = [None] * 2
     t_r: list[int | None] = [None] * 4
     assert verify_isomorphic_cfg_effective_match(orig, recomp, t_o, t_r) is False
+
+
+# --- Recognized switch jump tables -----------------------------------------
+
+
+def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
+    """Minimal cmp/ja + jmp-[idx*4+table] switch with two cases and a default."""
+    asm = [
+        # Shared stack argument so index-reg renames stay equivalent.
+        f"mov {index_reg}, dword ptr [ebp + 8]",
+        f"cmp {index_reg}, 1",
+        "ja 0x24",
+        f"jmp dword ptr [{index_reg}*4 + <OFFSET1>]",
+        "Jump table:",
+        "start + 0x14",
+        "start + 0x18",
+        f"mov {scratch}, 1",
+        "ret",
+        f"mov {scratch}, 2",
+        "ret",
+        f"xor {scratch}, {scratch}",
+        "ret",
+    ]
+    # Function start 0x1000; case0 at +0x14, case1 at +0x18, default at +0x24.
+    addrs: list[int | None] = [
+        0x1000,
+        0x1003,
+        0x1006,
+        0x1008,
+        None,
+        0x100C,  # table slot 0
+        0x1010,  # table slot 1
+        0x1014,  # case 0
+        0x1016,
+        0x1018,  # case 1
+        0x101A,
+        0x1024,  # default
+        0x1026,
+    ]
+    # ja -> default at index 11; table fills the rest.
+    targets: list[int | None] = [
+        None,
+        None,
+        11,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    return asm, addrs, targets
+
+
+def test_recognized_switch_table_iso_cfg_match_under_register_rename():
+    orig, orig_addrs, targets = _switch_fixture("eax", "edx")
+    recomp, recomp_addrs, _ = _switch_fixture("ecx", "edx")
+    # Shift recomp into a different VA range; relative start+ offsets unchanged.
+    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    metadata = FunctionMetadata(return_kind="void")
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig,
+            recomp,
+            targets,
+            list(targets),
+            metadata=metadata,
+            orig_addrs=orig_addrs,
+            recomp_addrs=recomp_addrs,
+        )
+        is True
+    )
+
+
+def test_recognized_switch_wrong_case_order_is_non_isomorphic():
+    orig, orig_addrs, targets = _switch_fixture()
+    recomp, recomp_addrs, _ = _switch_fixture()
+    # Swap case destinations in the recomp table.
+    recomp = list(recomp)
+    recomp[5], recomp[6] = recomp[6], recomp[5]
+    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    recorder = AnalysisRecorder(orig_addrs=orig_addrs, recomp_addrs=recomp_addrs)
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        targets,
+        list(targets),
+        metadata=FunctionMetadata(return_kind="void"),
+        recorder=recorder,
+        orig_addrs=orig_addrs,
+        recomp_addrs=recomp_addrs,
+    )
+    analysis = recorder.failure_analysis()
+    assert analysis.status != ComparisonStatus.EFFECTIVE
+    assert (
+        analysis.inconclusive_reason == "non_isomorphic_cfg"
+        or analysis.difference is not None
+    )
+
+
+def test_unresolved_switch_without_addrs_stays_jump_table_data():
+    orig, _addrs, targets = _switch_fixture()
+    recorder = AnalysisRecorder(
+        orig_addrs=[0x1000] * len(orig),
+        recomp_addrs=[0x2000] * len(orig),
+    )
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        list(orig),
+        targets,
+        list(targets),
+        recorder=recorder,
+        # No addrs → cannot resolve start+ entries.
+    )
+    assert recorder.failure_analysis().inconclusive_reason == "jump_table_data"
+
+
+# --- CFG canonicalization ----------------------------------------------------
+
+
+def test_empty_jump_only_block_canonicalizes_to_direct_edge():
+    """A → empty jmp → B is the same CFG as A → B after canonicalization.
+
+    Compilers sometimes emit a trampoline basic block that is only ``jmp``;
+    isomorphic matching should not fail solely because one side has it.
+    """
+    # orig: entry --jmp--> empty-jmp --jmp--> ret
+    orig = [
+        "xor eax, eax",
+        "jmp 0x2",
+        "jmp 0x3",
+        "ret",
+    ]
+    orig_targets: list[int | None] = [None, 2, 3, None]
+    # recomp: entry --jmp--> ret (no trampoline)
+    recomp = [
+        "xor eax, eax",
+        "jmp 0x2",
+        "ret",
+    ]
+    recomp_targets: list[int | None] = [None, 2, None]
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig, recomp, orig_targets, recomp_targets
+        )
+        is True
+    )
+
+
+def test_empty_jump_only_block_both_sides_still_match():
+    """Trampolines on both sides collapse to the same shape."""
+    side = [
+        "mov eax, ecx",
+        "jmp 0x2",
+        "jmp 0x3",
+        "mov dword ptr [esi], eax",
+        "ret",
+    ]
+    targets: list[int | None] = [None, 2, 3, None, None]
+    assert (
+        verify_isomorphic_cfg_effective_match(side, list(side), targets, list(targets))
+        is True
+    )
+
+
+def test_ret_and_ret_imm_are_not_collapsed_together():
+    """stdcall ``ret 4`` must not be equated with bare ``ret`` by CFG canon."""
+    # Two exit paths: bare ret vs ret 4 — different stack cleanup.
+    orig = [
+        "test eax, eax",
+        "je 0x4",
+        "ret",
+        "ret 4",
+    ]
+    orig_targets: list[int | None] = [None, 3, None, None]
+    recomp = [
+        "test eax, eax",
+        "je 0x4",
+        "ret 4",
+        "ret",
+    ]
+    recomp_targets: list[int | None] = [None, 3, None, None]
+    # If canon collapsed all rets into one, both sides would look isomorphic
+    # with swapped exits and could wrongly prove. Require divergence or at
+    # least no false EFFECTIVE via identical structure after bad collapse.
+    # With text-aware collapse, each side keeps two distinct ret blocks →
+    # edge roles still match (both have two ret exits), but bodies differ.
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig, recomp, orig_targets, recomp_targets
+        )
+        is False
+    )
+
+
+def test_branch_swapped_load_is_not_trap_equivalent():
+    """A load on opposite CFG arms is not the same trap-parity history.
+
+    Unioning load logs at the join would discharge both obligations even
+    though no single path performs both counterpart reads.
+    """
+    orig = [
+        "test eax, eax",
+        "je 0x4",
+        "mov ecx, dword ptr [esi]",
+        "mov edx, 1",
+        "jmp 0x2",
+        "mov edx, 1",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "je 0x4",
+        "mov edx, 1",
+        "jmp 0x2",
+        "mov ecx, dword ptr [esi]",
+        "mov edx, 1",
+        "ret",
+    ]
+    recorder = AnalysisRecorder(
+        orig_addrs=list(range(0x1000, 0x1007)),
+        recomp_addrs=list(range(0x2000, 0x2007)),
+    )
+    assert (
+        verify_isomorphic_cfg_effective_match(
+            orig,
+            recomp,
+            [None, 5, None, None, 6, None, None],
+            [None, 4, None, 6, None, None, None],
+            recorder=recorder,
+        )
+        is False
+    )
+    analysis = recorder.failure_analysis()
+    assert analysis.status != ComparisonStatus.EFFECTIVE
+
+
+def test_cfg_join_rejects_uncorrelated_trap_parity():
+    """Opposite-arm loads must not join by unioning trap-parity histories."""
+    addr = (("reg", "si"), 4)
+    gen = ("cfg_mem_init",)
+    fall_o, fall_r = SideState(), SideState()
+    fall_o.load_log.add((addr, gen))
+    taken_o, taken_r = SideState(), SideState()
+    taken_r.load_log.add((addr, gen))
+    fall = _CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
+    taken = _CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
+    assert _join_states(fall, taken, 0) is None

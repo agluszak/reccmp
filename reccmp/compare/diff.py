@@ -2,7 +2,16 @@ import dataclasses
 from typing import Iterable, Sequence
 from typing_extensions import NotRequired, TypedDict
 from reccmp.difflib import DiffOpcode, get_grouped_opcodes
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    DiagnosticNormalization,
+    EquivalenceLevel,
+    StackPermutationEntry,
+    derive_diagnostic_normalizations,
+    derive_equivalence_level,
+)
+from reccmp.compare.inlines import InlineExpansionEvidence
 
 CombinedDiffInput = list[tuple[str, str]]
 
@@ -16,15 +25,38 @@ class RawDiffOutput:
 
 @dataclasses.dataclass
 class EntityCompareResult:
+    # pylint: disable=too-many-instance-attributes
     diff: RawDiffOutput = dataclasses.field(default_factory=RawDiffOutput)
     match_ratio: float = 0.0
+    display_similarity: float | None = None
     analysis: ComparisonAnalysis = dataclasses.field(
         default_factory=lambda: ComparisonAnalysis.inconclusive("analysis_limit")
     )
+    stack_permutation: tuple[StackPermutationEntry, ...] = ()
+    accuracy_modulo_stack: float | None = None
+    inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
+    accuracy_modulo_inline: float | None = None
+    diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
+    equivalence_level: EquivalenceLevel = EquivalenceLevel.UNKNOWN_DIFFERENCE
+
+    def __post_init__(self) -> None:
+        self.refresh_equivalence_level()
 
     @property
     def is_effective_match(self) -> bool:
         return self.analysis.status == ComparisonStatus.EFFECTIVE
+
+    def refresh_equivalence_level(self) -> None:
+        self.diagnostic_normalizations = derive_diagnostic_normalizations(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
+        )
+        self.equivalence_level = derive_equivalence_level(
+            self.analysis,
+            accuracy_modulo_stack=self.accuracy_modulo_stack,
+            accuracy_modulo_inline=self.accuracy_modulo_inline,
+        )
 
 
 class MatchingOrMismatchingBlock(TypedDict):

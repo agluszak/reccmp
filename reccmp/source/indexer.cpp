@@ -7,7 +7,8 @@
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
 // `{"record":"variable",...}`, `{"record":"class",...}`,
-// `{"record":"size-assertion",...}` or `{"record":"dependency",...}`.
+// `{"record":"size-assertion",...}`, `{"record":"unit-abi",...}` or
+// `{"record":"dependency",...}`.
 
 #include <cstdlib>
 #include <memory>
@@ -23,6 +24,9 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/Mangle.h"
+#include "clang/AST/RecordLayout.h"
+#include "clang/AST/Type.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -180,6 +184,73 @@ class Indexer {
       current = pointer->getPointeeType();
     }
     return depth;
+  }
+
+  void describeStorage(llvm::json::Object& entry, QualType type) const {
+    QualType current = type.getCanonicalType();
+    if (current->getAs<ReferenceType>()) {
+      entry["storage_kind"] = "reference";
+      return;
+    }
+    if (current->getAs<PointerType>() || pointerDepth(type) > 0) {
+      entry["storage_kind"] = "pointer";
+      return;
+    }
+      if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+      QualType element = array->getElementType();
+      entry["storage_kind"] = "array";
+      entry["array_element_type"] = typeName(element);
+      entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
+      if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
+        entry["array_count"] = static_cast<int64_t>(constant->getSize().getZExtValue());
+      }
+      QualType element_canonical = element.getCanonicalType();
+      if (element_canonical->getAs<ReferenceType>()) {
+        entry["array_element_kind"] = "reference";
+      } else if (element_canonical->getAs<PointerType>() || pointerDepth(element) > 0) {
+        entry["array_element_kind"] = "pointer";
+      } else if (element_canonical->getAsArrayTypeUnsafe()) {
+        entry["array_element_kind"] = "array";
+      } else if (element_canonical->getAsCXXRecordDecl()) {
+        entry["array_element_kind"] = "embedded_record";
+      } else {
+        entry["array_element_kind"] = "scalar";
+      }
+      return;
+    }
+    if (current->getAsCXXRecordDecl()) {
+      entry["storage_kind"] = "embedded_record";
+      return;
+    }
+    entry["storage_kind"] = "scalar";
+  }
+
+  // Semantic id of the CXX record a type ultimately refers to (after peeling
+  // pointers, references and arrays). Empty when the type is not a record.
+  // Layout lookup uses this instead of stripping qualifiers from spellings.
+  std::string recordSemanticId(QualType type) const {
+    QualType current = type.getCanonicalType();
+    while (!current.isNull()) {
+      if (const auto* reference = current->getAs<ReferenceType>()) {
+        current = reference->getPointeeType().getCanonicalType();
+        continue;
+      }
+      if (const auto* pointer = current->getAs<PointerType>()) {
+        current = pointer->getPointeeType().getCanonicalType();
+        continue;
+      }
+      if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+        current = array->getElementType().getCanonicalType();
+        continue;
+      }
+      break;
+    }
+    const CXXRecordDecl* record = current->getAsCXXRecordDecl();
+    if (!record || !record->getIdentifier()) return "";
+    std::string qualified;
+    llvm::raw_string_ostream stream(qualified);
+    record->printQualifiedName(stream, policy_);
+    return "record:" + stream.str();
   }
 
   std::string templateArguments(const ClassTemplateSpecializationDecl* specialization) const {
@@ -481,7 +552,7 @@ class Indexer {
     if (!context->isDependentContext()) mangled = names_.getName(variable);
     std::string semanticId = mangled;
     if (semanticId.empty()) semanticId = "VarDecl:" + qualifiedName + "(" + type + ")";
-    emit(llvm::json::Object{
+    llvm::json::Object payload{
         {"record", "variable"},
         {"semantic_id", semanticId},
         {"qualified_name", qualifiedName},
@@ -493,7 +564,10 @@ class Indexer {
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-    });
+    };
+    std::string recordId = recordSemanticId(variable->getType());
+    if (!recordId.empty()) payload["record_semantic_id"] = recordId;
+    emit(std::move(payload));
   }
 
   static bool isVirtual(const FunctionDecl* function) {
@@ -506,17 +580,48 @@ class Indexer {
     llvm::json::Array bases;
     for (const CXXBaseSpecifier& base : record->bases()) bases.push_back(typeName(base.getType()));
 
+    const ASTRecordLayout* layout = nullptr;
+    if (record->isCompleteDefinition()) layout = &context_.getASTRecordLayout(record);
+
     llvm::json::Array fields;
     for (const FieldDecl* field : record->fields()) {
       if (!field->getIdentifier()) continue;
       Location where = locate(field);
-      fields.push_back(llvm::json::Object{
+      llvm::json::Object entry{
           {"name", field->getNameAsString()},
           {"type", typeName(field->getType())},
           {"pointer_depth", pointerDepth(field->getType())},
           {"source_file", relative(where.file)},
           {"line", where.line},
-      });
+      };
+      if (layout) {
+        const uint64_t bitOffset = layout->getFieldOffset(field->getFieldIndex());
+        entry["offset"] = static_cast<int64_t>(bitOffset / 8);
+        entry["size"] = context_.getTypeSizeInChars(field->getType()).getQuantity();
+        if (field->isBitField()) {
+          entry["bitfield_width"] = field->getBitWidthValue(context_);
+          entry["bitfield_offset"] = static_cast<int64_t>(bitOffset % 8);
+        }
+      }
+      describeStorage(entry, field->getType());
+      std::string recordId = recordSemanticId(field->getType());
+      if (!recordId.empty()) entry["record_semantic_id"] = recordId;
+      fields.push_back(std::move(entry));
+    }
+
+    llvm::json::Array baseOffsets;
+    if (layout) {
+      for (const CXXBaseSpecifier& base : record->bases()) {
+        const CXXRecordDecl* baseRecord = base.getType()->getAsCXXRecordDecl();
+        if (!baseRecord) continue;
+        // Virtual bases use a different layout API; skip until consumers
+        // understand vbtable-relative offsets (getVBaseClassOffset).
+        if (base.isVirtual()) continue;
+        baseOffsets.push_back(llvm::json::Object{
+            {"name", typeName(base.getType())},
+            {"offset", layout->getBaseClassOffset(baseRecord).getQuantity()},
+        });
+      }
     }
 
     // Every virtual introduced or overridden by this class, in declaration
@@ -529,7 +634,7 @@ class Indexer {
           semanticId(function, qualify(qualifiedName, function->getNameAsString())));
     }
 
-    emit(llvm::json::Object{
+    llvm::json::Object payload{
         {"record", "class"},
         {"semantic_id", ("record:" + qualifiedName).str()},
         {"qualified_name", qualifiedName},
@@ -539,7 +644,13 @@ class Indexer {
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-    });
+    };
+    if (layout) {
+      payload["size"] = layout->getSize().getQuantity();
+      payload["alignment"] = layout->getAlignment().getQuantity();
+      payload["base_offsets"] = std::move(baseOffsets);
+    }
+    emit(std::move(payload));
   }
 
   template <typename Predicate>
@@ -668,6 +779,14 @@ class IndexConsumer : public ASTConsumer {
       : instance_(instance), out_(out) {}
 
   void HandleTranslationUnit(ASTContext& context) override {
+    const TargetInfo& target = context.getTargetInfo();
+    out_ << llvm::json::Value(llvm::json::Object{
+                {"record", "unit-abi"},
+                {"target_triple", target.getTriple().str()},
+                {"pointer_width", static_cast<int64_t>(target.getPointerWidth(LangAS::Default) / 8)},
+                {"ms_abi", target.getCXXABI().isMicrosoft()},
+            })
+         << "\n";
     Indexer(context, out_).run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any

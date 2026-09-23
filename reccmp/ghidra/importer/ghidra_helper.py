@@ -121,9 +121,7 @@ def get_or_create_class_namespace(
         convert = getattr(symbols, "convertNamespaceToClass", None)
         if callable(convert):
             converted = convert(result)
-            logger.info(
-                "Converted plain namespace %s to GhidraClass", namespace_path
-            )
+            logger.info("Converted plain namespace %s to GhidraClass", namespace_path)
             return converted
         return result
     except ClassOrNamespaceNotFoundInGhidraError:

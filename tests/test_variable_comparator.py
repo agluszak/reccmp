@@ -511,6 +511,164 @@ def test_display_signed_unsigned(
     assert c.compared[0].values[0] == text
 
 
+def test_compare_uses_source_layout_field_paths(db: EntityDb):
+    """When SourceIndex has layout, differing members report dotted field paths."""
+    from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
+
+    key = CvdumpTypeKey(0x1000)
+    type_info = [
+        TypeInfo(
+            key=key,
+            size=8,
+            members=[
+                FieldListItem(offset=0, name="", type=CVInfoTypeEnum.T_INT4),
+                FieldListItem(offset=4, name="", type=CVInfoTypeEnum.T_INT4),
+            ],
+        )
+    ]
+    types = MockTypesDb(type_info)
+    create_matched_variable(db, 0, data_type=key)
+    # Rename to match source index variable.
+    with db.batch() as batch:
+        batch.set(ImageId.RECOMP, 0, name="gFoo")
+
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Foo",
+                qualified_name="Foo",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="bar",
+                        type="int",
+                        source_file="a.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                    ),
+                    SourceField(
+                        name="baz",
+                        type="int",
+                        source_file="a.h",
+                        line=3,
+                        offset=4,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=1,
+                end_line=4,
+                size=8,
+                alignment=4,
+                layout_trusted=True,
+            ),
+        ),
+        variables=(
+            SourceVariable(
+                semantic_id="gFoo",
+                qualified_name="gFoo",
+                type="Foo",
+                linkage="external",
+                storage_class="none",
+                definition_kind="definition",
+                source_file="a.cpp",
+                line=1,
+                end_line=1,
+            ),
+        ),
+    )
+
+    orig = RawImage.from_memory(b"\x01\x00\x00\x00\x02\x00\x00\x00")
+    recomp = RawImage.from_memory(b"\x01\x00\x00\x00\x03\x00\x00\x00")
+    comparator = VariableComparator(db, types, orig, recomp, source_index=index)
+    c = comparator.compare_variable(get_match(db, 0))
+
+    assert c is not None
+    assert c.result == CompareResult.DIFF
+    assert c.compared[0].name == "bar"
+    assert c.compared[1].name == "baz"
+    assert c.compared[1].match is False
+
+
+def test_compare_raw_only_uses_trusted_source_layout(
+    db: EntityDb, types: CvdumpTypesParser
+):
+    """Without PDB type format, trusted Clang layout still types the compare."""
+    from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
+
+    create_matched_variable(db, 0, size=8)
+    with db.batch() as batch:
+        batch.set(ImageId.RECOMP, 0, name="gFoo")
+
+    index = SourceIndex(
+        declarations=(),
+        markers=(),
+        classes=(
+            SourceClass(
+                semantic_id="record:Foo",
+                qualified_name="Foo",
+                bases=(),
+                fields=(
+                    SourceField(
+                        name="ptr",
+                        type="int *",
+                        source_file="a.h",
+                        line=2,
+                        offset=0,
+                        size=4,
+                        pointer_depth=1,
+                    ),
+                    SourceField(
+                        name="val",
+                        type="int",
+                        source_file="a.h",
+                        line=3,
+                        offset=4,
+                        size=4,
+                    ),
+                ),
+                virtual_declarations=(),
+                source_file="a.h",
+                line=1,
+                end_line=4,
+                size=8,
+                alignment=4,
+                layout_trusted=True,
+            ),
+        ),
+        variables=(
+            SourceVariable(
+                semantic_id="gFoo",
+                qualified_name="gFoo",
+                type="Foo",
+                linkage="external",
+                storage_class="none",
+                definition_kind="definition",
+                source_file="a.cpp",
+                line=1,
+                end_line=1,
+            ),
+        ),
+    )
+
+    orig = RawImage.from_memory(b"\x00\x00\x00\x00\x02\x00\x00\x00")
+    recomp = RawImage.from_memory(b"\x00\x00\x00\x00\x03\x00\x00\x00")
+    comparator = VariableComparator(db, types, orig, recomp, source_index=index)
+    c = comparator.compare_variable(get_match(db, 0))
+
+    assert c is not None
+    assert c.raw_only is False
+    assert len(c.compared) == 2
+    assert c.compared[0].name == "ptr"
+    assert c.compared[0].match is True  # both null
+    assert c.compared[1].name == "val"
+    assert c.compared[1].match is False
+
+
 def test_compare_empty_string_pointer_pooling(db: EntityDb, types: CvdumpTypesParser):
     """MSVC may pool empty strings as another string's NUL; treat both as matching."""
     create_matched_variable(db, 0, data_type=CVInfoTypeEnum.T_32PVOID)

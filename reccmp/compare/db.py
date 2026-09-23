@@ -20,6 +20,10 @@ EntityTypeLookup: dict[int, str] = {
 }
 
 
+class FrozenEntityDbError(RuntimeError):
+    """Raised when a frozen entity catalog is mutated."""
+
+
 class ReccmpEntity:
     """ORM object for Reccmp database entries."""
 
@@ -286,6 +290,28 @@ class EntityDb:
         self._addr_order = {ImageId.ORIG: [], ImageId.RECOMP: []}
 
         self._sections = {ImageId.ORIG: [], ImageId.RECOMP: []}
+        self._frozen = False
+        self._generation = 0
+
+    @property
+    def frozen(self) -> bool:
+        return getattr(self, "_frozen", False)
+
+    @property
+    def generation(self) -> int:
+        """Identity-cache generation; increments when pairings or aliases change."""
+        return getattr(self, "_generation", 0)
+
+    def _bump_generation(self) -> None:
+        self._generation = getattr(self, "_generation", 0) + 1
+
+    def freeze(self) -> None:
+        """Seal pairing/identity after ingest. Resolver caches may follow."""
+        self._frozen = True
+
+    def _require_mutable(self) -> None:
+        if self.frozen:
+            raise FrozenEntityDbError("entity catalog is frozen")
 
     def batch(self) -> EntityBatch:
         return EntityBatch(self)
@@ -302,6 +328,7 @@ class EntityDb:
         extent |= addrs
 
     def bulk_insert(self, image: ImageId, rows: Iterable[tuple[int, dict[str, Any]]]):
+        self._require_mutable()
         assert image in (ImageId.ORIG, ImageId.RECOMP), "Invalid image id"
         new_addrs = set()
         entities = self._entities[image]
@@ -319,9 +346,11 @@ class EntityDb:
                 entities[addr]._kvstore.update(values)
 
         self._update_addr_index(image, new_addrs)
+        self._bump_generation()
 
     def bulk_match(self, pairs: Iterable[tuple[int, int]]):
         """Expects iterable of `(orig_addr, recomp_addr)`."""
+        self._require_mutable()
 
         orig_entities = self._entities[ImageId.ORIG]
         recomp_entities = self._entities[ImageId.RECOMP]
@@ -365,8 +394,10 @@ class EntityDb:
 
         self._update_addr_index(ImageId.ORIG, new_x)
         self._update_addr_index(ImageId.RECOMP, new_y)
+        self._bump_generation()
 
     def add_section(self, img: ImageId, range_: range):
+        self._require_mutable()
         self._sections[img].append(range_)
 
     def sections(self, img: ImageId) -> Iterator[range]:
@@ -425,6 +456,7 @@ class EntityDb:
         when either endpoint is unsuitable rather than inventing an entity or
         replacing a one-to-one pair.
         """
+        self._require_mutable()
         assert image_id in (ImageId.ORIG, ImageId.RECOMP), "Invalid image id"
         if addr in self._matches[image_id]:
             return False
@@ -435,6 +467,7 @@ class EntityDb:
         if existing is not None:
             return False
         self._aliases[image_id][addr] = canonical_orig
+        self._bump_generation()
         return True
 
     def alias_canonical_orig(self, image_id: ImageId, addr: int) -> int | None:

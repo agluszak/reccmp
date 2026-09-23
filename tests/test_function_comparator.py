@@ -361,10 +361,21 @@ def test_line_annotation_wrong_order(db: EntityDb, lines_db: LinesDb, report):
 
     compare_functions(db, lines_db, code, code, report)
 
-    report.assert_called_with(
-        ReccmpEvent.WRONG_ORDER,
+    # LIS keeps the largest monotonic subset; with two crossing pins that is
+    # one annotation, and the other is reported as out of order.
+    wrong_order = [
+        call
+        for call in report.call_args_list
+        if call.args[0] == ReccmpEvent.WRONG_ORDER
+    ]
+    assert len(wrong_order) == 1
+    assert wrong_order[0].args[1] in (
+        ORIG_GLOBAL_OFFSET + 0,
         ORIG_GLOBAL_OFFSET + 3,
-        "Line annotation 'cppfile.cpp:384' is out of order relative to other line annotations.",
+    )
+    assert (
+        wrong_order[0].args[2]
+        == "Line annotation 'cppfile.cpp:384' is out of order relative to other line annotations."
     )
 
 

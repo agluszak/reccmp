@@ -61,7 +61,8 @@ class DecompCodebase:
 
             s_folded = isinstance(s, (ParserFunction, ParserVtable)) and s.is_folded
             prev_folded = (
-                isinstance(previous, (ParserFunction, ParserVtable)) and previous.is_folded
+                isinstance(previous, (ParserFunction, ParserVtable))
+                and previous.is_folded
             )
 
             if s_folded:

@@ -324,9 +324,10 @@ def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None
     assert not game_index.conflicts
     assert editor_index.variables[0].type in {"int", "float"}
     assert len(editor_index.conflicts) == 1
-    assert {
-        variant.signature for variant in editor_index.conflicts[0].variants
-    } == {("int", "external"), ("float", "external")}
+    assert {variant.signature for variant in editor_index.conflicts[0].variants} == {
+        ("int", "external"),
+        ("float", "external"),
+    }
 
 
 def test_internal_functions_are_distinct_per_translation_unit(tmp_path: Path) -> None:
