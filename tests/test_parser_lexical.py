@@ -176,8 +176,18 @@ SPLAYED_TYPES = [
 ]
 
 
-@pytest.mark.xfail(reason="TODO: #509")
-@pytest.mark.parametrize("marker_type", SPLAYED_TYPES)
+@pytest.mark.parametrize(
+    "marker_type",
+    [
+        # Function-like markers accept signatures spread over several lines.
+        (
+            pytest.param(t, marks=pytest.mark.xfail(reason="TODO: #509"))
+            if t in (MarkerType.GLOBAL, MarkerType.VTABLE)
+            else t
+        )
+        for t in SPLAYED_TYPES
+    ],
+)
 def test_splayed_line_completion_tokens(parser: DecompParser, marker_type: MarkerType):
     """Should match even when each component of the code completion token is on its own line."""
     token = completion_token(marker_type, AnnotationType.LINE).replace(" ", "\n")

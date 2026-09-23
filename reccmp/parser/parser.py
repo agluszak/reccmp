@@ -10,6 +10,7 @@ from .util import (
     get_class_name,
     get_variable_name,
     get_synthetic_name,
+    is_ignorable_marker_adjacent_comment,
     remove_trailing_comment,
     get_string_contents,
     ParserCodeString,
@@ -453,6 +454,7 @@ class DecompParser:
             self._syntax_warning(AlertCode.UNKNOWN_ANNOTATION)
 
     def read_line(self, line: str):
+        # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements
         if self.state == ReaderState.DONE:
             return
 
@@ -490,11 +492,16 @@ class DecompParser:
                 self._syntax_warning(AlertCode.UNEXPECTED_BLANK_LINE)
 
             elif line_strip.startswith("//"):
+                if is_ignorable_marker_adjacent_comment(line):
+                    return
+
                 # If we found a comment, assume implicit lookup-by-name
                 # function and end here. We know this is not a decomp marker
                 # because it would have been handled already.
                 synthetic_name = get_synthetic_name(line)
-                assert synthetic_name is not None
+                if synthetic_name is None:
+                    self._syntax_error(AlertCode.BAD_NAMEREF)
+                    return
                 self.function_sig = synthetic_name
                 self._function_starts_here()
                 self._function_done(lookup_by_name=True)
@@ -531,12 +538,44 @@ class DecompParser:
                     self.state = ReaderState.WANT_CURLY
 
         elif self.state == ReaderState.WANT_CURLY:
-            if line_strip == "{":
-                self.curly_indent_stops = line.index("{")
-                self.state = ReaderState.IN_FUNC
+            if len(line_strip) == 0:
+                return
+
+            if line_strip.startswith("//"):
+                return
+
+            if line_strip.startswith("#"):
+                return
+
+            # Function signatures can span multiple lines when the argument list is long.
+            # Keep appending signature fragments until we reach "{".
+            sig_line = remove_trailing_comment(line_strip)
+            self.function_sig = f"{self.function_sig} {sig_line}".strip()
+
+            if "{" in sig_line:
+                # A wrapped signature may end with an entire one-line body, most
+                # commonly an inline constructor initializer followed by `{}`.
+                # Do not leave the parser inside a function after both braces have
+                # already been consumed on this line.
+                if sig_line.count("{") == sig_line.count("}"):
+                    self._function_done()
+                else:
+                    self.curly_indent_stops = line.index("{")
+                    self.state = ReaderState.IN_FUNC
+            elif self.function_sig.endswith("}") or self.function_sig.endswith("};"):
+                self._function_done()
+            elif self.function_sig.endswith(");"):
+                # Detect forward reference or declaration
+                self._syntax_error(AlertCode.NO_IMPLEMENTATION)
 
         elif self.state == ReaderState.IN_FUNC:
-            if line_strip.startswith("}") and line[self.curly_indent_stops] == "}":
+            if line_strip.startswith("}") and (
+                (
+                    self.curly_indent_stops < len(line)
+                    and line[self.curly_indent_stops] == "}"
+                )
+                or line_strip == "}"
+            ):
                 self._function_done()
 
         elif self.state in (ReaderState.IN_GLOBAL, ReaderState.IN_FUNC_GLOBAL):

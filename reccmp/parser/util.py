@@ -14,6 +14,10 @@ trailingCommentRegex = re.compile(r"(\s*(?://|/\*).*)$")
 # Get string contents, ignore escape characters that might interfere
 doubleQuoteRegex = re.compile(r'(L)?("(?:[^"\\]|\\.)*")')
 
+# Clang-format directive comments can appear between FUNCTION marker and signature.
+# These are not implicit by-name lookup comments and should be ignored.
+clangFormatDirectiveRegex = re.compile(r"^\s*//\s*clang-format\s+(?:on|off)\s*$", re.I)
+
 
 def get_synthetic_name(line: str) -> str | None:
     """Synthetic names appear on a single line comment on the line after the marker.
@@ -24,6 +28,10 @@ def get_synthetic_name(line: str) -> str | None:
         return template_match.group(1).strip()
 
     return None
+
+
+def is_ignorable_marker_adjacent_comment(line: str) -> bool:
+    return clangFormatDirectiveRegex.match(line) is not None
 
 
 def remove_trailing_comment(line: str) -> str:

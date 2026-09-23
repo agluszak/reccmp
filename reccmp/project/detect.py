@@ -27,9 +27,18 @@ logger = logging.getLogger(__file__)
 
 
 def verify_target_names(
-    project_keys: set[str], user_keys: set[str], build_keys: set[str]
+    project_keys: set[str],
+    user_keys: set[str],
+    build_keys: set[str] | None,
+    build_required_keys: set[str] | None = None,
 ):
-    """Warn if the user or build files have different targets than the canonical list in the project file."""
+    """Warn if the user or build files have different targets than the canonical list in the project file.
+
+    Every project target should appear in the user config, but the generated
+    build config only contains source-backed targets. Original-only targets
+    (no source-root) are corpus metadata and are not expected there. When no
+    build config exists at all (build_keys is None) there is nothing to
+    compare."""
     user_missing_keys = project_keys - user_keys
     user_extra_keys = user_keys - project_keys
 
@@ -47,7 +56,13 @@ def verify_target_names(
             ",".join(user_extra_keys),
         )
 
-    build_missing_keys = project_keys - build_keys
+    if build_keys is None:
+        return
+
+    if build_required_keys is None:
+        build_required_keys = project_keys
+
+    build_missing_keys = build_required_keys - build_keys
     build_extra_keys = build_keys - project_keys
 
     if build_missing_keys:
@@ -172,6 +187,9 @@ class RecCmpPartialTarget:
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] | None = None
 
+    # Proven-equivalent original-address groups (member|canonical rows)
+    equivalence_groups: list[Path] | None = None
+
     marker_aliases: dict[str, str] | None = None
 
 
@@ -212,6 +230,9 @@ class RecCmpTarget:
 
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] = field(default_factory=list)
+
+    # Proven-equivalent original-address groups (member|canonical rows)
+    equivalence_groups: list[Path] = field(default_factory=list)
 
     marker_aliases: dict[str, str] = field(default_factory=dict)
 
@@ -271,6 +292,7 @@ class RecCmpProject:
             ghidra = GhidraConfig()
 
         data_sources = target.data_sources or []
+        equivalence_groups = target.equivalence_groups or []
         marker_aliases = target.marker_aliases or {}
 
         if target.report_config is not None:
@@ -289,6 +311,7 @@ class RecCmpProject:
             source_paths=target.source_paths,
             ghidra_config=ghidra,
             data_sources=data_sources,
+            equivalence_groups=equivalence_groups,
             marker_aliases=marker_aliases,
             report_config=report,
         )
@@ -363,7 +386,16 @@ class RecCmpProject:
         verify_target_names(
             project_keys=set(project_data.targets) if project_data else set(),
             user_keys=set(user_data.targets) if user_data else set(),
-            build_keys=set(build_data.targets) if build_data else set(),
+            build_keys=set(build_data.targets) if build_data else None,
+            build_required_keys=(
+                {
+                    target_id
+                    for target_id, target in project_data.targets.items()
+                    if target.source_root
+                }
+                if project_data
+                else None
+            ),
         )
 
         # Apply reccmp-project.yml
@@ -400,6 +432,9 @@ class RecCmpProject:
             data_sources = [
                 project_directory / ds_path for ds_path in target.data_sources
             ]
+            equivalence_groups = [
+                project_directory / eq_path for eq_path in target.equivalence_groups
+            ]
 
             project.targets[target_id] = RecCmpPartialTarget(
                 target_id=target_id,
@@ -409,6 +444,7 @@ class RecCmpProject:
                 source_paths=source_paths,
                 ghidra_config=ghidra,
                 data_sources=data_sources,
+                equivalence_groups=equivalence_groups,
                 marker_aliases=target.marker_aliases,
                 report_config=report,
             )

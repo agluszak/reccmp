@@ -52,7 +52,6 @@ def test_function_indent_allman_declaration_indented(parser: DecompParser):
     assert parser.functions[0].end_line == 4
 
 
-@pytest.mark.xfail(reason="Function range detection depends on whitespace.")
 def test_function_indent_allman_first_bracket_indented(parser: DecompParser):
     """First bracket indented. Second is not indented."""
     parser.read(dedent("""\
@@ -66,7 +65,6 @@ def test_function_indent_allman_first_bracket_indented(parser: DecompParser):
     assert parser.functions[0].end_line == 4
 
 
-@pytest.mark.xfail(reason="Function range detection depends on whitespace.")
 def test_function_indent_allman_second_bracket_indented(parser: DecompParser):
     """First bracket not indented. Second is indented."""
     parser.read(dedent("""\
@@ -104,7 +102,6 @@ def test_function_indent_knr_declaration_indented(parser: DecompParser):
     assert parser.functions[0].end_line == 3
 
 
-@pytest.mark.xfail(reason="Function range detection depends on whitespace.")
 def test_function_indent_knr_second_bracket_indented(parser: DecompParser):
     """Declaration and first bracket not indented. Second bracket indented."""
     parser.read(dedent("""\
@@ -202,7 +199,6 @@ def test_function_with_other_markers(parser: DecompParser):
     assert parser.strings[1].line_number == 12
 
 
-@pytest.mark.xfail(reason="Function range detection depends on whitespace.")
 def test_function_indent_multiple_functions(parser: DecompParser):
     """Brackets with different tab stobs should not raise MISSED_END_OF_FUNCTION when we read a second function."""
     parser.read(dedent("""\
