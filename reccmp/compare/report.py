@@ -14,6 +14,7 @@ from .diagnosis import (
     DiagnosticNormalization,
     DifferenceSide,
     StackPermutationEntry,
+    StrategyAttempt,
     derive_diagnostic_normalizations,
 )
 from .diff import (
@@ -378,20 +379,37 @@ def _side_json(side: DifferenceSide) -> dict[str, object]:
     }
 
 
+def _difference_json(difference: ComparisonDifference) -> dict[str, object]:
+    return {
+        "kind": difference.kind,
+        "orig": _side_json(difference.orig),
+        "recomp": _side_json(difference.recomp),
+    }
+
+
+def _attempt_json(attempt: StrategyAttempt) -> dict[str, object]:
+    value: dict[str, object] = {"strategy": attempt.strategy}
+    if attempt.difference is not None:
+        value["difference"] = _difference_json(attempt.difference)
+    if attempt.blocker is not None:
+        value["blocker"] = attempt.blocker
+    if attempt.location is not None:
+        value["location"] = _side_json(attempt.location)
+    return value
+
+
 def _analysis_json(analysis: ComparisonAnalysis) -> dict[str, object]:
     value: dict[str, object] = {"status": analysis.status.value}
     if analysis.effective_reasons:
         value["effective_reasons"] = list(analysis.effective_reasons)
     if analysis.difference is not None:
-        value["difference"] = {
-            "kind": analysis.difference.kind,
-            "orig": _side_json(analysis.difference.orig),
-            "recomp": _side_json(analysis.difference.recomp),
-        }
+        value["difference"] = _difference_json(analysis.difference)
     if analysis.inconclusive_reason is not None:
         value["inconclusive_reason"] = analysis.inconclusive_reason
     if analysis.inconclusive_location is not None:
         value["inconclusive_location"] = _side_json(analysis.inconclusive_location)
+    if analysis.attempts:
+        value["attempts"] = [_attempt_json(attempt) for attempt in analysis.attempts]
     return value
 
 
@@ -419,6 +437,33 @@ def _parse_side(value: object) -> DifferenceSide:
     return DifferenceSide(instruction_index, address, facts)
 
 
+def _parse_difference(value: dict) -> ComparisonDifference:
+    return ComparisonDifference(
+        kind=value["kind"],
+        orig=_parse_side(value["orig"]),
+        recomp=_parse_side(value["recomp"]),
+    )
+
+
+def _parse_attempt(value: object) -> StrategyAttempt:
+    if not isinstance(value, dict):
+        raise ReccmpReportDeserializeError
+    return StrategyAttempt(
+        strategy=value["strategy"],
+        difference=(
+            _parse_difference(value["difference"])
+            if value.get("difference") is not None
+            else None
+        ),
+        blocker=value.get("blocker"),
+        location=(
+            _parse_side(value["location"])
+            if value.get("location") is not None
+            else None
+        ),
+    )
+
+
 def _parse_analysis(value: object) -> ComparisonAnalysis:
     if not isinstance(value, dict):
         raise ReccmpReportDeserializeError
@@ -427,11 +472,7 @@ def _parse_analysis(value: object) -> ComparisonAnalysis:
         difference_value = value.get("difference")
         difference = None
         if difference_value is not None:
-            difference = ComparisonDifference(
-                kind=difference_value["kind"],
-                orig=_parse_side(difference_value["orig"]),
-                recomp=_parse_side(difference_value["recomp"]),
-            )
+            difference = _parse_difference(difference_value)
         return ComparisonAnalysis(
             status=status,
             effective_reasons=tuple(value.get("effective_reasons", ())),
@@ -442,6 +483,7 @@ def _parse_analysis(value: object) -> ComparisonAnalysis:
                 if value.get("inconclusive_location") is not None
                 else None
             ),
+            attempts=tuple(_parse_attempt(item) for item in value.get("attempts", ())),
         )
     except (KeyError, TypeError, ValueError) as ex:
         raise ReccmpReportDeserializeError from ex

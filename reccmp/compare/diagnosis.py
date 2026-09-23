@@ -166,6 +166,39 @@ class ComparisonDifference:
             raise ValueError(f"Unknown mismatch kind: {self.kind}")
 
 
+STRATEGIES = ("lockstep", "diff_aligned", "relocation", "cfg", "isomorphic_cfg")
+
+# Strategies whose instruction pairing is anchored by position or by matched
+# CFG blocks. The others pair instructions heuristically (diff opcodes,
+# undone relocations), so a difference they report may be an artifact of the
+# pairing rather than of the code.
+TRUSTED_ALIGNMENT_STRATEGIES = frozenset({"lockstep", "cfg", "isomorphic_cfg"})
+
+
+@dataclass(frozen=True)
+class StrategyAttempt:
+    """Where one verifier strategy stopped: a difference or a blocker."""
+
+    strategy: str
+    difference: ComparisonDifference | None = None
+    blocker: str | None = None
+    location: DifferenceSide | None = None
+
+    def __post_init__(self) -> None:
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"Unknown strategy: {self.strategy}")
+        if (self.difference is None) == (self.blocker is None):
+            raise ValueError("An attempt has exactly one of difference or blocker")
+        if self.blocker is not None and self.blocker not in INCONCLUSIVE_REASONS:
+            raise ValueError(f"Unknown inconclusive reason: {self.blocker}")
+        if self.location is not None and self.blocker is None:
+            raise ValueError("Only blocked attempts carry a location")
+
+    @property
+    def trusted_alignment(self) -> bool:
+        return self.strategy in TRUSTED_ALIGNMENT_STRATEGIES
+
+
 @dataclass(frozen=True)
 class ComparisonAnalysis:
     status: ComparisonStatus
@@ -173,6 +206,9 @@ class ComparisonAnalysis:
     difference: ComparisonDifference | None = None
     inconclusive_reason: str | None = None
     inconclusive_location: DifferenceSide | None = None
+    # Every strategy that ran, in execution order. The primary difference or
+    # reason above is chosen from these; the rest show what else blocked.
+    attempts: tuple[StrategyAttempt, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = normalize_effective_reasons(self.effective_reasons)
@@ -195,6 +231,8 @@ class ComparisonAnalysis:
             and self.inconclusive_location is not None
         ):
             raise ValueError("Only inconclusive results carry an analysis location")
+        if self.is_effective and self.attempts:
+            raise ValueError("Proven results do not carry failed attempts")
 
     @property
     def is_effective(self) -> bool:
@@ -311,6 +349,16 @@ class AnalysisRecorder:
 
     def effective_reasons(self, extra_reasons=()) -> frozenset[str]:
         return frozenset(self.reasons | set(extra_reasons))
+
+    def attempt(self, strategy: str) -> StrategyAttempt:
+        """Summarize where this recorder's strategy stopped."""
+        if self.best_difference is not None:
+            return StrategyAttempt(strategy, difference=self.best_difference)
+        return StrategyAttempt(
+            strategy,
+            blocker=self.inconclusive_reason or "analysis_limit",
+            location=self.inconclusive_location,
+        )
 
     def failure_analysis(self) -> ComparisonAnalysis:
         if self.best_difference is not None:

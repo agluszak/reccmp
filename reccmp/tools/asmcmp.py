@@ -27,6 +27,7 @@ from reccmp.formats.pe import PEImage
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
+    DifferenceSide,
 )
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
@@ -91,6 +92,43 @@ def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
             lines.append(f"  instruction index: {location.instruction_index}")
         for key, value in sorted(location.facts.items()):
             lines.append(f"  {key.replace('_', ' ')}: {value}")
+    return "\n".join(lines)
+
+
+def _side_text(side: DifferenceSide) -> str:
+    if side.address is not None:
+        text = format_address(side.address)
+    elif side.instruction_index is not None:
+        text = f"instruction {side.instruction_index}"
+    else:
+        text = "function exit"
+    path = side.facts.get("source_path")
+    line = side.facts.get("source_line")
+    if isinstance(path, str) and isinstance(line, int):
+        text += f" ({path}:{line})"
+    return text
+
+
+def strategy_attempts_text(analysis: ComparisonAnalysis) -> str | None:
+    """One line per verifier strategy: where it stopped and why."""
+    if not analysis.attempts:
+        return None
+    lines = ["verifier strategies:"]
+    for attempt in analysis.attempts:
+        name = attempt.strategy.replace("_", " ")
+        if attempt.difference is not None:
+            kind = attempt.difference.kind.replace("_", " ")
+            where = _side_text(attempt.difference.orig)
+            note = "" if attempt.trusted_alignment else " (heuristic pairing)"
+            lines.append(f"  {name}: {kind} difference at {where}{note}")
+        else:
+            reason = (attempt.blocker or "analysis_limit").replace("_", " ")
+            where = (
+                f" at {_side_text(attempt.location)}"
+                if attempt.location is not None
+                else ""
+            )
+            lines.append(f"  {name}: blocked by {reason}{where}")
     return "\n".join(lines)
 
 
@@ -219,6 +257,9 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         diagnostic = inconclusive_diagnostic_text(match.analysis)
         if diagnostic is not None:
             print(diagnostic)
+        attempts = strategy_attempts_text(match.analysis)
+        if attempts is not None:
+            print(attempts)
         if note is not None:
             print(note)
 

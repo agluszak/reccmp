@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from typing import Sequence
 
@@ -27,6 +28,7 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
+    StrategyAttempt,
 )
 from reccmp.compare.verification import (
     admit_effective,
@@ -251,24 +253,38 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
 
+    if not cfg_attempted:
+        cfg.mark_inconclusive("missing_metadata")
+    attempts = [lockstep.attempt("lockstep"), diff_aligned.attempt("diff_aligned")]
+    if relocation_normalized is not None:
+        attempts.append(relocation.attempt("relocation"))
+    attempts.append(cfg.attempt("cfg"))
+    attempts.append(
+        iso.attempt("isomorphic_cfg")
+        if iso_attempted
+        else StrategyAttempt("isomorphic_cfg", blocker="missing_metadata")
+    )
+
+    def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
+        return dataclasses.replace(
+            recorder.failure_analysis(), attempts=tuple(attempts)
+        )
+
     # Only positional lockstep and the two CFG strategies establish trusted
     # program points. Diff alignment and relocation are proof-only.
     if cfg_attempted and cfg.best_difference is not None:
-        return cfg.failure_analysis()
+        return failed(cfg)
     if lockstep.best_difference is not None:
-        return lockstep.failure_analysis()
+        return failed(lockstep)
     if iso_attempted and iso.best_difference is not None:
-        return iso.failure_analysis()
-    if not cfg_attempted:
-        cfg.mark_inconclusive("missing_metadata")
+        return failed(iso)
     for candidate in (iso, cfg, lockstep):
         if candidate.inconclusive_reason is not None:
             inconclusive = candidate
             break
     else:
         inconclusive = cfg
-        inconclusive.mark_inconclusive("analysis_limit")
-    analysis = inconclusive.failure_analysis()
+    analysis = failed(inconclusive)
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
     return analysis
 

@@ -42,6 +42,7 @@ from reccmp.compare.diagnosis import (
     ComparisonStatus,
     DifferenceSide,
     FactValue,
+    StrategyAttempt,
 )
 from reccmp.compare.verification import (
     admit_effective,
@@ -396,16 +397,43 @@ class FunctionComparator:
                         {**recomp_side.facts, **recomp_layout},
                     )
             enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
-            return ComparisonAnalysis.mismatch(enriched)
-        if (
-            analysis.status == ComparisonStatus.INCONCLUSIVE
-            and analysis.inconclusive_location is not None
-        ):
-            return ComparisonAnalysis.inconclusive(
-                analysis.inconclusive_reason or "analysis_limit",
-                self._enrich_side_with_source(analysis.inconclusive_location),
+            return dataclasses.replace(
+                analysis,
+                difference=enriched,
+                attempts=self._enrich_attempts_with_source(analysis.attempts),
+            )
+        if analysis.status == ComparisonStatus.INCONCLUSIVE:
+            location = analysis.inconclusive_location
+            return dataclasses.replace(
+                analysis,
+                inconclusive_location=(
+                    self._enrich_side_with_source(location)
+                    if location is not None
+                    else None
+                ),
+                attempts=self._enrich_attempts_with_source(analysis.attempts),
             )
         return analysis
+
+    def _enrich_attempts_with_source(
+        self, attempts: tuple[StrategyAttempt, ...]
+    ) -> tuple[StrategyAttempt, ...]:
+        enriched: list[StrategyAttempt] = []
+        for attempt in attempts:
+            if attempt.difference is not None:
+                diff = attempt.difference
+                attempt = dataclasses.replace(
+                    attempt,
+                    difference=ComparisonDifference(
+                        diff.kind, diff.orig, self._enrich_side_with_source(diff.recomp)
+                    ),
+                )
+            elif attempt.location is not None:
+                attempt = dataclasses.replace(
+                    attempt, location=self._enrich_side_with_source(attempt.location)
+                )
+            enriched.append(attempt)
+        return tuple(enriched)
 
     def _load_function_image(
         self,
