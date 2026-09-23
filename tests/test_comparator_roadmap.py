@@ -1,5 +1,9 @@
 """Tests for structured IR match keys and stack-normalized scoring."""
 
+from pathlib import PurePath
+from unittest.mock import MagicMock
+
+
 from reccmp.compare.asm.ir import (
     instruction_match_key,
     rewrite_stack_displacements,
@@ -8,8 +12,10 @@ from reccmp.compare.asm.ir import (
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     DiagnosticNormalization,
+    DifferenceSide,
     derive_diagnostic_normalizations,
 )
+from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.stack_layout import (
     StackPair,
@@ -263,9 +269,9 @@ def test_analyze_inline_layout_repeated_calls():
 
 
 def test_enrich_mismatch_side_preserves_kind():
-    from reccmp.compare.diagnosis import ComparisonDifference, DifferenceSide
-    from reccmp.compare.functions import FunctionComparator
-    from unittest.mock import MagicMock
+    from reccmp.compare.diagnosis import (  # pylint: disable=import-outside-toplevel
+        ComparisonDifference,
+    )
 
     comparator = FunctionComparator(
         db=MagicMock(),
@@ -291,6 +297,40 @@ def test_enrich_mismatch_side_preserves_kind():
     assert enriched.difference.recomp.facts["source_path"] == "foo.cpp"
     assert enriched.difference.recomp.facts["source_line"] == 183
     assert enriched.difference.recomp.facts["target"] == "bar"
+
+
+def test_enrich_inconclusive_orig_location_uses_recomp_counterpart():
+    """An orig address must never be looked up in the recomp PDB."""
+    lines_db = MagicMock()
+    lines_db.find_line_of_recomp_address.return_value = (PurePath("foo.cpp"), 7)
+    comparator = FunctionComparator(
+        db=MagicMock(),
+        lines_db=lines_db,
+        orig_bin=MagicMock(),
+        recomp_bin=MagicMock(),
+        report=MagicMock(),
+        types=MagicMock(),
+    )
+    enrich = comparator._enrich_analysis_with_source  # pylint: disable=protected-access
+
+    unpaired = enrich(
+        ComparisonAnalysis.inconclusive(
+            "non_isomorphic_cfg", DifferenceSide(3, 0x401000, {}, "orig")
+        )
+    )
+    assert unpaired.inconclusive_location is not None
+    assert "source_path" not in unpaired.inconclusive_location.facts
+    lines_db.find_line_of_recomp_address.assert_not_called()
+
+    paired = enrich(
+        ComparisonAnalysis.inconclusive(
+            "non_isomorphic_cfg",
+            DifferenceSide(3, 0x401000, {"recomp_address": 0x501010}, "orig"),
+        )
+    )
+    assert paired.inconclusive_location is not None
+    assert paired.inconclusive_location.facts["source_line"] == 7
+    lines_db.find_line_of_recomp_address.assert_called_once_with(0x501010)
 
 
 def test_longest_increasing_source_pins_beats_greedy():

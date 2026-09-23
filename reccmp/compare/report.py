@@ -372,11 +372,14 @@ class JSONReportVersion1(BaseModel):
 
 
 def _side_json(side: DifferenceSide) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "instruction_index": side.instruction_index,
         "address": side.address,
         "facts": side.facts,
     }
+    if side.image is not None:
+        value["image"] = side.image
+    return value
 
 
 def _difference_json(difference: ComparisonDifference) -> dict[str, object]:
@@ -434,7 +437,10 @@ def _parse_side(value: object) -> DifferenceSide:
         for key, fact in facts.items()
     ):
         raise ReccmpReportDeserializeError
-    return DifferenceSide(instruction_index, address, facts)
+    image = value.get("image")
+    if image not in (None, "orig", "recomp"):
+        raise ReccmpReportDeserializeError
+    return DifferenceSide(instruction_index, address, facts, image)
 
 
 def _parse_difference(value: dict) -> ComparisonDifference:

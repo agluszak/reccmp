@@ -299,13 +299,25 @@ class FunctionComparator:
             "source_line": path_line_pair[1],
         }
 
-    def _enrich_side_with_source(self, side: DifferenceSide) -> DifferenceSide:
-        """Attach PDB line info when the side address is a recomp VA."""
-        extra = self._source_facts_of_recomp_addr(side.address)
+    def _enrich_side_with_source(
+        self, side: DifferenceSide, *, recomp: bool = False
+    ) -> DifferenceSide:
+        """Attach PDB line info for the recomp address of this location.
+
+        Orig-side locations are pinned through their recorded recomp
+        counterpart; an orig address is never looked up in the recomp PDB.
+        """
+        recomp_address = (
+            side.address
+            if recomp or side.image == "recomp"
+            else side.facts.get("recomp_address")
+        )
+        if not isinstance(recomp_address, int) or isinstance(recomp_address, bool):
+            return side
+        extra = self._source_facts_of_recomp_addr(recomp_address)
         if not extra:
             return side
-        facts = {**side.facts, **extra}
-        return DifferenceSide(side.instruction_index, side.address, facts)
+        return dataclasses.replace(side, facts={**side.facts, **extra})
 
     def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
         """Resolve the class that owns ``this`` for layout enrichment."""
@@ -375,7 +387,7 @@ class FunctionComparator:
         ):
             diff = analysis.difference
             orig_side = diff.orig
-            recomp_side = self._enrich_side_with_source(diff.recomp)
+            recomp_side = self._enrich_side_with_source(diff.recomp, recomp=True)
             if diff.kind == "memory_address":
                 class_name = self._owning_class_for_match(match)
                 orig_layout = self._layout_facts_for_displacement(
@@ -385,16 +397,12 @@ class FunctionComparator:
                     class_name, recomp_side.facts
                 )
                 if orig_layout:
-                    orig_side = DifferenceSide(
-                        orig_side.instruction_index,
-                        orig_side.address,
-                        {**orig_side.facts, **orig_layout},
+                    orig_side = dataclasses.replace(
+                        orig_side, facts={**orig_side.facts, **orig_layout}
                     )
                 if recomp_layout:
-                    recomp_side = DifferenceSide(
-                        recomp_side.instruction_index,
-                        recomp_side.address,
-                        {**recomp_side.facts, **recomp_layout},
+                    recomp_side = dataclasses.replace(
+                        recomp_side, facts={**recomp_side.facts, **recomp_layout}
                     )
             enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
             return dataclasses.replace(
@@ -425,7 +433,9 @@ class FunctionComparator:
                 attempt = dataclasses.replace(
                     attempt,
                     difference=ComparisonDifference(
-                        diff.kind, diff.orig, self._enrich_side_with_source(diff.recomp)
+                        diff.kind,
+                        diff.orig,
+                        self._enrich_side_with_source(diff.recomp, recomp=True),
                     ),
                 )
             elif attempt.location is not None:

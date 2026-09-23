@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 FactValue: TypeAlias = str | int | bool | None
 
@@ -153,6 +153,8 @@ class DifferenceSide:
     instruction_index: int | None = None
     address: int | None = None
     facts: dict[str, FactValue] = field(default_factory=dict)
+    # Which binary instruction_index/address refer to, when known.
+    image: Literal["orig", "recomp"] | None = None
 
 
 @dataclass(frozen=True)
@@ -273,15 +275,24 @@ class AnalysisRecorder:
     inconclusive_reason: str | None = None
     inconclusive_location: DifferenceSide | None = None
 
-    def side(
-        self, which: str, instruction_index: int | None, facts: dict[str, FactValue]
-    ) -> DifferenceSide:
+    def address(
+        self, which: Literal["orig", "recomp"], instruction_index: int | None
+    ) -> int | None:
         addrs = self.orig_addrs if which == "orig" else self.recomp_addrs
-        address = None
         if addrs is not None and instruction_index is not None:
             if 0 <= instruction_index < len(addrs):
-                address = addrs[instruction_index]
-        return DifferenceSide(instruction_index, address, facts)
+                return addrs[instruction_index]
+        return None
+
+    def side(
+        self,
+        which: Literal["orig", "recomp"],
+        instruction_index: int | None,
+        facts: dict[str, FactValue],
+    ) -> DifferenceSide:
+        return DifferenceSide(
+            instruction_index, self.address(which, instruction_index), facts, which
+        )
 
     def record_difference(
         self,
@@ -317,6 +328,10 @@ class AnalysisRecorder:
             self.inconclusive_reason = reason
             detail = dict(facts or {})
             if orig_index is not None or (recomp_index is None and detail):
+                # Keep the counterpart so the location can be source-pinned.
+                recomp_address = self.address("recomp", recomp_index)
+                if recomp_address is not None:
+                    detail.setdefault("recomp_address", recomp_address)
                 self.inconclusive_location = self.side("orig", orig_index, detail)
             elif recomp_index is not None:
                 self.inconclusive_location = self.side("recomp", recomp_index, detail)
