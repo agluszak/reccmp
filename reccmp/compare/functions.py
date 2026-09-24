@@ -387,7 +387,10 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             ),
             extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
         )
-        analysis = self._refute(match, analysis, orig_size, recomp_size)
+        if orig_image.extent_closed and recomp_image.extent_closed:
+            # Emulation needs the real extents: with an open one it may run
+            # a different stretch of code than the comparison looked at.
+            analysis = self._refute(match, analysis, orig_size, recomp_size)
         if analysis is not result.analysis:
             result = dataclasses.replace(result, analysis=analysis)
         return result

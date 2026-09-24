@@ -25,11 +25,15 @@ DATA = 0x402000
 ORIG_FUNC, RECOMP_FUNC = CODE, CODE + 0x100
 ORIG_TABLE, RECOMP_TABLE = DATA, DATA + 0x40
 TABLE = bytes(range(16)) * 4  # 16 dwords
+# A paired callee (just ``ret``) at different addresses on the two sides.
+ORIG_CALLEE, RECOMP_CALLEE = CODE + 0x800, CODE + 0x900
 
 
 def _image(code_at: int, code: bytes, table_at: int):
     code_page = bytearray(0x1000)
     code_page[code_at - CODE : code_at - CODE + len(code)] = code
+    callee = ORIG_CALLEE if code_at == ORIG_FUNC else RECOMP_CALLEE
+    code_page[callee - CODE] = 0xC3
     data_page = bytearray(0x1000)
     data_page[table_at - DATA : table_at - DATA + len(TABLE)] = TABLE
 
@@ -59,8 +63,11 @@ def _search(orig_code: bytes, recomp_code: bytes, return_kind: str = "i32"):
         ):
             batch.set(image_id, func, type=EntityType.FUNCTION, size=0x100)
             batch.set(image_id, table, type=EntityType.DATA, size=len(TABLE))
+            callee = ORIG_CALLEE if image_id == ImageId.ORIG else RECOMP_CALLEE
+            batch.set(image_id, callee, type=EntityType.FUNCTION, size=1)
         batch.match(ORIG_FUNC, RECOMP_FUNC)
         batch.match(ORIG_TABLE, RECOMP_TABLE)
+        batch.match(ORIG_CALLEE, RECOMP_CALLEE)
     translator = Translator(
         db,
         SideMachine(_image(ORIG_FUNC, orig_code, ORIG_TABLE)),  # type: ignore[arg-type]
@@ -184,3 +191,48 @@ def test_agreeing_runs_record_reaching_the_location():
         result.agreeing_seeds
     )
     assert result.agreeing_runs_through(ORIG_FUNC + 0x80, None) == 0
+
+
+def _call(at: int, target: int) -> bytes:
+    return b"\xe8" + _abs32((target - (at + 5)) & 0xFFFFFFFF)
+
+
+def _store_then_call(value: int, func: int, callee: int) -> bytes:
+    # mov ecx, [esp+4]; mov dword ptr [ecx+8], imm32; call callee; ret
+    prefix = bytes.fromhex("8b4c2404c74108") + _abs32(value)
+    return prefix + _call(func + len(prefix), callee) + RET
+
+
+def test_store_before_a_call_is_not_settled():
+    """A callee may overwrite a store made before it (e.g. a base destructor
+    resetting the vtable pointer), so such a difference is no witness."""
+    result = _search(
+        _store_then_call(5, ORIG_FUNC, ORIG_CALLEE),
+        _store_then_call(6, RECOMP_FUNC, RECOMP_CALLEE),
+    )
+    assert result.witness is None
+    assert result.agreeing_seeds > 0
+
+
+def test_paired_call_is_matched_by_identity():
+    result = _search(
+        _store_then_call(5, ORIG_FUNC, ORIG_CALLEE),
+        _store_then_call(5, RECOMP_FUNC, RECOMP_CALLEE),
+    )
+    assert result.witness is None
+    assert "call_structure" not in result.skipped
+    assert result.agreeing_seeds > 0
+
+
+def test_store_before_a_tail_call_is_not_settled():
+    # mov ecx, [esp+4]; mov dword ptr [ecx+8], imm32; jmp callee
+    def body(value: int, func: int, callee: int) -> bytes:
+        prefix = bytes.fromhex("8b4c2404c74108") + _abs32(value)
+        at = func + len(prefix)
+        return prefix + b"\xe9" + _abs32((callee - (at + 5)) & 0xFFFFFFFF)
+
+    result = _search(
+        body(5, ORIG_FUNC, ORIG_CALLEE), body(6, RECOMP_FUNC, RECOMP_CALLEE)
+    )
+    assert result.witness is None
+    assert result.agreeing_seeds > 0

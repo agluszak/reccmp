@@ -24,6 +24,7 @@ from reccmp.types import ImageId
 from .machine import (
     LOW_PAGES,
     NEAR_IMAGE,
+    SEH_CHAIN,
     STACK_TOP,
     RunInput,
     SideMachine,
@@ -203,6 +204,8 @@ def _compare(
     locations: dict[Identity, int] = {}
     for side, trace in ((orig, t_o), (recomp, t_r)):
         for addr, size in trace.writes.items():
+            if addr in SEH_CHAIN:
+                continue
             ident = translator.identity(side, addr)
             if ident in (UNRESOLVED, STACK):
                 continue
@@ -211,10 +214,24 @@ def _compare(
     def mixes_pointer_bytes(trace: Trace, addr: int, size: int) -> bool:
         """Bytes of a stored pointer, not read back as that same store, have
         a layout-dependent value."""
-        writers = {trace.last_writer.get(b) for b in range(addr, addr + size)}
+        writers = {
+            w[:3] if w else None
+            for w in (trace.last_writer.get(b) for b in range(addr, addr + size))
+        }
         if writers in ({(addr, size, True)}, {(addr, size, False)}):
             return False
         return any(w is not None and w[2] for w in writers)
+
+    def settled(trace: Trace, addr: int, size: int) -> bool:
+        """Whether the final value is the function's own: a call after the
+        last write (or any call, if it never wrote) could have changed it,
+        and callees are modelled as leaving memory alone."""
+        for byte in range(addr, addr + size):
+            writer = trace.last_writer.get(byte)
+            calls_after = len(trace.calls) - (writer[3] if writer else 0)
+            if calls_after:
+                return False
+        return True
 
     for ident in sorted(locations, key=repr):
         size = locations[ident]
@@ -225,6 +242,8 @@ def _compare(
         if mixes_pointer_bytes(t_o, loc_o, size) or mixes_pointer_bytes(
             t_r, loc_r, size
         ):
+            continue
+        if not (settled(t_o, loc_o, size) and settled(t_r, loc_r, size)):
             continue
         raw_o = translator.machines[orig].read(loc_o, size)
         raw_r = translator.machines[recomp].read(loc_r, size)

@@ -155,7 +155,7 @@ class Trace:
     # pylint: disable=too-many-instance-attributes
 
     # return, truncated, limit, fault, foreign_access, uninitialized_read,
-    # pointer_bytes_read, bad_stack
+    # pointer_bytes_read, nondeterministic, bad_stack
     end: str
     calls: list[CallEvent] = field(default_factory=list)
     # (address, size) of every store outside the stack.
@@ -163,8 +163,8 @@ class Trace:
     # Instructions of the compared function that ran.
     executed: set[int] = field(default_factory=set)
     # For each byte outside the stack: the (address, size, value was an image
-    # address) of the store that wrote it last.
-    last_writer: dict[int, tuple[int, int, bool]] = field(default_factory=dict)
+    # address, calls made before it) of the store that wrote it last.
+    last_writer: dict[int, tuple[int, int, bool, int]] = field(default_factory=dict)
     # Data reads inside the image; each must hit a known object for the run
     # to be layout-independent.
     image_reads: set[int] = field(default_factory=set)
@@ -401,7 +401,12 @@ class SideMachine:
                 written_stack.update(range(addr, addr + size))
                 return
             trace.writes[addr] = max(size, trace.writes.get(addr, 0))
-            writer = (addr, size, (value & 0xFFFFFFFF) in self.image_range)
+            writer = (
+                addr,
+                size,
+                (value & 0xFFFFFFFF) in self.image_range,
+                len(trace.calls),
+            )
             for byte in range(addr, addr + size):
                 trace.last_writer[byte] = writer
             if addr in self.image_range:
@@ -417,7 +422,10 @@ class SideMachine:
             # that include a pointer) yields a layout-dependent value.
             if pointer_bytes_read or addr in self.image_range or self.in_stack(addr):
                 return
-            writers = {trace.last_writer.get(b) for b in range(addr, addr + size)}
+            writers = {
+                w[:3] if w else None
+                for w in (trace.last_writer.get(b) for b in range(addr, addr + size))
+            }
             if writers in ({(addr, size, True)}, {(addr, size, False)}):
                 return
             if any(w is not None and w[2] for w in writers):
@@ -438,6 +446,9 @@ class SideMachine:
         def on_code(_uc, addr, _size, _data):
             trace.executed.add(addr)
             insn = self.insn_at(addr)
+            if insn is not None and insn.mnemonic in NONDETERMINISTIC:
+                stop("nondeterministic", insn.mnemonic)
+                return
             if insn is None or insn.mnemonic != "call":
                 return
             op = insn.operands[0]
@@ -494,7 +505,18 @@ class SideMachine:
             if addr in func_range or addr == RETURN_SENTINEL:
                 return
             # Control left the function other than through ret: a tail call
-            # or a jump into shared code. Not modelled.
+            # or a jump into shared code. Recorded as a call (the target may
+            # overwrite anything stored so far) and the run ends there.
+            trace.calls.append(
+                CallEvent(
+                    addr,
+                    addr,
+                    None,
+                    uc.reg_read(UC_X86_REG_ECX),
+                    uc.reg_read(UC_X86_REG_EDX),
+                    (),
+                )
+            )
             stop("truncated", f"left function to {addr:#x}")
 
         hooks = [
@@ -556,6 +578,13 @@ class SideMachine:
 
 # Small integers used as pointers (including null-based arithmetic).
 LOW_PAGES = 0x100000
+# fs:[0], the SEH exception list head: fs has base 0 in the emulator, so SEH
+# frame registration writes here. It is bookkeeping, not program output.
+SEH_CHAIN = range(0, 4)
+# Instructions whose result depends on the host, not on the inputs.
+NONDETERMINISTIC = frozenset(
+    {"rdtsc", "rdtscp", "cpuid", "rdrand", "rdseed", "in", "out", "insb", "outsb"}
+)
 
 _BRANCHES = frozenset({"call", "jmp", "ret", "loop", "jecxz", "jcxz"}) | frozenset(
     f"j{cc}" for cc in "o no b ae e ne be a s ns p np l ge le g".split()
