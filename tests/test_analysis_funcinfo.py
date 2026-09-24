@@ -1,10 +1,12 @@
 """Test our detection of SEH data for PE images"""
 
+import struct
 from unittest.mock import Mock
 
 from reccmp.formats import PEImage
 from reccmp.formats.image import ImageRegion
 from reccmp.analysis.funcinfo import (
+    FuncInfo,
     UnwindMapEntry,
     find_mov_eax_jmp_in_buffer,
     find_eh_handlers,
@@ -84,3 +86,20 @@ def test_find_exception_registrations_requires_known_handler():
         ImageRegion(0x1000, memoryview(b"\x68\x78\x56\x34\x12"))
     ]
     assert not list(find_exception_registrations(image, iter(())))
+
+
+def test_funcinfo_in_a_writable_data_section():
+    """The retail Wizardry 8 executable has a writable .rdata: FuncInfo is
+    found in any readable, non-executable section. A magic number whose
+    unwind map is not in the section is noise."""
+    base = 0x5EB000
+    funcinfo = struct.pack("<4I", 0x19930520, 1, base + 0x10, 0)
+    unwind_map = struct.pack("<iI", -1, 0x401234)
+    noise = struct.pack("<3I", 0x19930520, 3, 0x7FFF0000)
+    data = funcinfo + unwind_map + b"\0" * 8 + noise
+    image = Mock(spec=PEImage)
+    image.get_data_regions.return_value = [ImageRegion(base, data, len(data))]
+
+    assert list(find_funcinfo(image)) == [
+        FuncInfo(base, (UnwindMapEntry(-1, 0x401234),))
+    ]
