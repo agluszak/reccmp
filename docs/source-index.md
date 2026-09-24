@@ -117,24 +117,40 @@ which one the marker's address is.
 
 ### Function facts
 
-Every function declaration carries `call`, what a caller may assume under the
-Microsoft x86 ABI: whether ecx and edx carry arguments, the argument bytes the
-callee removes (from Clang's parameter sizes; `null` when a record return or a
-non-trivial by-value argument leaves it undecided), and the return kind. The
-calling convention is the one Clang assigned, not one inferred from spelling.
-`SourceIndex.call_facts_for(semantic_id)` returns them as `CallFacts`; the
-comparator takes each field from the PDB type record first, then from Clang,
-then from the decorated name. On the Wizardry corpus Clang's facts agree with
-the PDB and the decorations for all 6,492 recompiled functions it declares.
+Every function declaration carries `call`, what a caller may assume: whether
+ecx and edx carry arguments, the argument bytes the callee removes, and the
+return kind. It is read from Clang's own ABI lowering (`CGFunctionInfo`, from
+a `CodeGenModule` that emits nothing), so hidden return pointers, `inalloca`
+argument blocks and small records returned in registers are Clang's decision,
+not ours. Anything not modelled exactly is `null`, never guessed: conventions
+other than cdecl/stdcall/thiscall/fastcall, expanded or coerced aggregates,
+constructors with a hidden virtual-base argument, incomplete types. The
+calling convention is the one Clang assigned. On the Wizardry corpus the stack
+cleanup agrees with the `ret N` MSVC emitted for every recompiled function
+checked (7,595).
 
-Member uses state the object of the access (`base`: `this`, `parameter` with
-its index, `local`, `global`, `member`, `other`), and each integer, enumeration
-or pointer conversion around a use states its widths and whether its source is
-signed. `function-facts` records list a body's calls: the callee's semantic id,
-whether the call is virtual (with the declaration introducing the slot and the
-object's static class), the call's object, and which arguments are plain field
-reads. `SourceIndex.function_facts_for(semantic_id)` assembles one function's
-call facts, accesses and calls into `FunctionFacts`.
+`SourceIndex.call_facts_for(key)` returns a declaration's facts;
+`call_facts_named(semantic_id)` answers by mangled name only when every
+declaration with that name agrees. The comparator takes each field from the
+PDB type record first, then from Clang (the declaration the function's marker
+binds, else the name lookup), then from the decorated name.
+
+Member uses state the object of the access (`base`): its root (`this`,
+`parameter` with its index, `local` or `global` with the declaration's
+identity, `call`, `other`) and the fields leading from the root to it, each
+step saying whether it went through a pointer; `arrow` says whether the access
+itself dereferences its base. `this->a.b.c` has root `this` and path `a, b`.
+A use's `conversions` are those of the field's own value: the casts wrapping
+the use before it becomes an operand of anything else. For integer,
+enumeration and pointer values they state widths and source signedness.
+
+`function-facts` records list a body's explicit calls (`CallExpr` nodes, not
+constructors, destructors or other implicit calls, so not a call graph): the
+callee's semantic id; for virtual calls every declaration introducing a slot
+the call may use (more than one under multiple inheritance) and the object's
+static class; the call's object; which arguments are plain field reads.
+`SourceIndex.function_facts_for(key)` assembles one function's call facts,
+accesses and calls into `FunctionFacts`.
 
 These facts describe the reconstruction. They may explain or constrain the
 recompiled side of a comparison; they never prove the original equivalent.

@@ -658,7 +658,7 @@ def test_function_facts_and_clang_call_facts(tmp_path: Path) -> None:
                 {
                     "callee": "?Run@Base@@UAEHH@Z",
                     "virtual": True,
-                    "slot": "?Run@Base@@UAEHH@Z",
+                    "slots": ["?Run@Base@@UAEHH@Z"],
                     "object_class": "record:Base",
                     "object": {"kind": "parameter", "index": 0},
                     "field_arguments": ["c:@S@Widget::field@w.h:4:3:0", None],
@@ -688,6 +688,6 @@ def test_function_facts_and_clang_call_facts(tmp_path: Path) -> None:
     )
     assert access.conversions[0].source_signed is False
     [call] = facts.calls
-    assert call.virtual and call.slot == "?Run@Base@@UAEHH@Z"
+    assert call.virtual and call.slots == ("?Run@Base@@UAEHH@Z",)
     assert call.object is not None and call.object.index == 0
     assert call.field_arguments == ("c:@S@Widget::field@w.h:4:3:0", None)

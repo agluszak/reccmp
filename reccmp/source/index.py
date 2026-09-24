@@ -174,12 +174,24 @@ class SourceConversion:
 
 
 @dataclass(frozen=True)
+class SourceAccessStep:
+    """One field on the way from an access's root to its object."""
+
+    field: str  # field identity
+    arrow: bool  # reached through a pointer (->)
+
+
+@dataclass(frozen=True)
 class SourceAccessBase:
-    """The object of a member access or call: this, parameter (with its
-    index), local, global, member, or other."""
+    """The object of a member access or call: its root (``this``,
+    ``parameter`` with its index, ``local`` or ``global`` with the
+    declaration's identity, ``call``, ``other``) and the fields leading from
+    the root to it. ``this->a.b.c`` has root ``this`` and path ``a, b``."""
 
     kind: str
     index: int | None = None
+    identity: str | None = None
+    path: tuple[SourceAccessStep, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,6 +226,7 @@ class SourceMemberUse:
     array_indices: tuple[SourceArrayIndex, ...]
     conversions: tuple[SourceConversion, ...]
     base: SourceAccessBase
+    arrow: bool = False  # the access dereferences its base (->)
 
 
 @dataclass(frozen=True)
@@ -226,9 +239,10 @@ class SourceCall:
     field_arguments: tuple[str | None, ...]
     line: int
     offset: int | None
-    # Virtual calls: the declaration introducing the vtable slot, and the
-    # static class of the object.
-    slot: str | None = None
+    # Virtual calls: every declaration introducing a vtable slot the call
+    # may use (more than one under multiple inheritance), and the static
+    # class of the object.
+    slots: tuple[str, ...] = ()
     object_class: str | None = None
     object: SourceAccessBase | None = None
 
@@ -922,7 +936,7 @@ def _member_use_from_dict(values: Mapping[str, Any]) -> SourceMemberUse:
     data["conversions"] = tuple(
         SourceConversion(**item) for item in data.get("conversions") or ()
     )
-    data["base"] = SourceAccessBase(**data["base"])
+    data["base"] = _access_base(data["base"])
     for key in (
         "owner_identity",
         "field_usr",
@@ -943,6 +957,17 @@ def _member_use_from_dict(values: Mapping[str, Any]) -> SourceMemberUse:
     return SourceMemberUse(**data)
 
 
+def _access_base(values: Mapping[str, Any]) -> SourceAccessBase:
+    return SourceAccessBase(
+        **{
+            **values,
+            "path": tuple(
+                SourceAccessStep(**step) for step in values.get("path") or ()
+            ),
+        }
+    )
+
+
 def _function_facts_from_dict(values: Mapping[str, Any]) -> SourceFunctionFacts:
     data = dict(values)
     data["calls"] = tuple(
@@ -950,8 +975,9 @@ def _function_facts_from_dict(values: Mapping[str, Any]) -> SourceFunctionFacts:
             **{
                 **call,
                 "field_arguments": tuple(call["field_arguments"]),
+                "slots": tuple(call.get("slots") or ()),
                 "object": (
-                    SourceAccessBase(**call["object"])
+                    _access_base(call["object"])
                     if call.get("object") is not None
                     else None
                 ),
@@ -1278,6 +1304,8 @@ def _unique_class_map(
 
 class SourceIndex:
     """Canonical marker plus Clang semantic source index."""
+
+    # pylint: disable=too-many-public-methods
 
     def __init__(
         self,

@@ -513,6 +513,29 @@ int Widget::Run(int value) {
   return self->Run(wide + sign) + Fast(1.0, 2, 3);
 }
 int Use(Widget& w) { return w.count; }
+struct Small { short a; short b; };
+Small MakeSmall(int);
+struct NonTrivial { NonTrivial(const NonTrivial&); int v; };
+int __stdcall TakesNonTrivial(NonTrivial n, int x);
+Big __stdcall MakeBigStd(int x);
+int __vectorcall Vec(int a, double b);
+struct VBase { int v; };
+struct Derived : virtual VBase { Derived(int x); };
+struct A { virtual void f(); };
+struct B { virtual void f(); };
+struct C : A, B { void f() override; };
+void CallF(C* c) { c->f(); }
+struct Inner { int x; short s; };
+struct Outer { Inner inner; Inner* ptr; void M(); };
+Outer g_outer;
+void Outer::M() {
+  inner.x = 1;
+  ptr->x = 2;
+  g_outer.inner.x = 3;
+  unsigned char narrowed = (unsigned char)(inner.s + 1);
+  int picked = narrowed ? inner.s : inner.x;
+  Helper(inner.s);
+}
 """
 
 
@@ -557,8 +580,17 @@ def test_function_facts_come_from_the_compiler(tmp_path: Path) -> None:
     assert facts("Widget::Fast") == CallFacts(True, True, 12, "i32")
     # variadic member: __cdecl with this on the stack
     assert facts("Widget::Vararg") == CallFacts(False, False, 0, "i32")
-    # a record return may come back through a hidden pointer: cleanup unknown
-    assert facts("Widget::MakeBig") == CallFacts(True, False, None, "unknown")
+    # Clang's ABI lowering decides record returns and arguments:
+    # a 12-byte record comes back through a hidden pointer the callee pops,
+    assert facts("Widget::MakeBig") == CallFacts(True, False, 4, "unknown")
+    assert facts("MakeBigStd") == CallFacts(False, False, 4 + 4, "unknown")
+    # a 4-byte one in eax,
+    assert facts("MakeSmall") == CallFacts(False, False, 0, "i32")
+    # a non-trivial one is passed by value in the argument block (inalloca).
+    assert facts("TakesNonTrivial") == CallFacts(False, False, 4 + 4, "i32")
+    # Not modelled: unknown rather than guessed.
+    assert facts("Vec") is None  # __vectorcall
+    assert facts("Derived::Derived") is None  # hidden virtual-base argument
     assert facts("Widget::Run") == CallFacts(True, False, 4, "i32")
     # operator delete is implicitly static: no this, the default convention
     assert facts("Widget::operator delete") == CallFacts(False, False, 0, "void")
@@ -583,10 +615,47 @@ def test_function_facts_come_from_the_compiler(tmp_path: Path) -> None:
     assert ("?Helper@@YAHH@Z", False) in calls
     assert ("?Run@Base@@UAEHH@Z", False) in calls  # Base::Run(value): qualified
     (virtual,) = [call for call in run.calls if call.virtual]
-    assert virtual.slot == "?Run@Base@@UAEHH@Z"
+    assert virtual.slots == ("?Run@Base@@UAEHH@Z",)
     assert virtual.object_class == "record:Base"
     helper = next(call for call in run.calls if call.callee == "?Helper@@YAHH@Z")
     assert helper.field_arguments[0] is not None  # Helper(count)
     use = index.function_facts_for(DeclarationKey("TEST", "?Use@@YAHAAVWidget@@@Z"))
     assert use is not None and use.accesses[0].base.kind == "parameter"
     assert use.accesses[0].base.index == 0
+
+    # One override can fill a slot of each base.
+    call_f = index.function_facts_for(DeclarationKey("TEST", "?CallF@@YAXPAUC@@@Z"))
+    assert call_f is not None
+    (call,) = call_f.calls
+    assert call.slots == ("?f@A@@UAEXXZ", "?f@B@@UAEXXZ")
+
+    method = index.function_facts_for(DeclarationKey("TEST", "?M@Outer@@QAEXXZ"))
+    assert method is not None
+    leaves = [use for use in method.accesses if use.name in ("x", "s")]
+
+    def line_of(text: str) -> int:
+        return next(
+            number
+            for number, line in enumerate(_FACTS_SOURCE.splitlines(), 1)
+            if text in line
+        )
+
+    lines = [line_of(text) for text in ("inner.x = 1", "ptr->x", "g_outer.inner")]
+    # Roots and field paths: inner.x, ptr->x, g_outer.inner.x
+    assert {
+        (use.use_line, use.base.kind, use.base.identity, len(use.base.path), use.arrow)
+        for use in leaves
+        if use.name == "x" and use.use_line in lines
+    } == {
+        (lines[0], "this", None, 1, False),
+        (lines[1], "this", None, 1, True),
+        (lines[2], "global", "?g_outer@@3UOuter@@A", 1, False),
+    }
+    # A field's conversions are its own value's: the promotion of inner.s to
+    # int, not the cast of (inner.s + 1) to unsigned char; the same inside a
+    # conditional and as a call argument.
+    assert {
+        tuple(f"{c.source_type}->{c.destination_type}" for c in use.conversions)
+        for use in leaves
+        if use.name == "s"
+    } == {("short->int",)}

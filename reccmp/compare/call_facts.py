@@ -46,6 +46,14 @@ def _c_decoration_facts(symbol: str) -> CallFacts:
     return CallFacts()
 
 
+def _is_record_value(type_name: str) -> bool:
+    """Whether a demangled type is a class, struct or union by value."""
+    name = " ".join(w for w in type_name.split() if w not in ("const", "volatile"))
+    return name.startswith(("class ", "struct ", "union ")) and not name.endswith(
+        ("*", "&")
+    )
+
+
 def mangled_facts(symbol: str) -> CallFacts:
     """Everything a decorated function name states about calling it."""
     if not symbol.startswith("?"):
@@ -56,7 +64,16 @@ def mangled_facts(symbol: str) -> CallFacts:
     facts = convention_facts(function.convention)
     if function.return_type is not None:
         facts = replace(facts, return_kind=type_return_kind(function.return_type))
-    if facts.stack_cleanup is None and function.convention != "fastcall":
+    returns_record = function.return_type is not None and _is_record_value(
+        function.return_type
+    )
+    # A record returned by value may come back through a hidden pointer
+    # argument the callee pops, depending on the record: unknown here.
+    if (
+        facts.stack_cleanup is None
+        and function.convention != "fastcall"
+        and not returns_record
+    ):
         sizes = [_parameter_bytes(parameter) for parameter in function.parameters]
         if all(size is not None for size in sizes):
             facts = replace(

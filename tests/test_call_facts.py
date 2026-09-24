@@ -23,6 +23,9 @@ from reccmp.compare.call_facts import import_facts, mangled_facts
         ("_RegOpenKeyExA@20", 20),  # stdcall C decoration
         ("__wtoi", 0),  # cdecl C decoration
         ("@Fast@8", None),  # fastcall: registers carry part of it
+        # returns a class by value: a hidden return pointer may be popped too
+        ("?getLocation@srNode@@QBE?AV?$srVector3T@N@@XZ", None),
+        ("?make@@YGPAVValue@@H@Z", 4),  # returns a pointer: no hidden argument
     ],
 )
 def test_mangled_cleanup(symbol: str, cleanup: int | None):
