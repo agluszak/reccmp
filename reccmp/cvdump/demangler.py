@@ -147,14 +147,6 @@ def demangle_vtable_ourselves(symbol: str) -> str:
     return t[0] + "::`vftable'"
 
 
-class FunctionSignatureInfo(NamedTuple):
-    """Calling convention and return-value register footprint recovered
-    from a decorated name. Either field may be unknown."""
-
-    return_kind: str  # void / i8 / i16 / i32 / i64 / float / unknown
-    convention: str | None  # cdecl / stdcall / thiscall / fastcall / None
-
-
 class DemangledFunction(NamedTuple):
     """The parts of a demangled MSVC function name that matter for calls."""
 
@@ -246,29 +238,3 @@ def type_return_kind(type_name: str) -> str:
     if name.endswith(("*", "&")) or name.startswith("enum "):
         return "i32"
     return _SCALAR_KINDS.get(name, "unknown")
-
-
-def parse_function_signature(symbol: str) -> FunctionSignatureInfo:
-    """Recover the calling convention and return kind from a decorated
-    function name. Anything unrecognized degrades to unknown."""
-    # pylint: disable=too-many-return-statements
-    if not symbol:
-        return FunctionSignatureInfo("unknown", None)
-    if not symbol.startswith("?"):
-        # C-style decoration: _name (cdecl), _name@N (stdcall), @name@N
-        # (fastcall). No return-type information.
-        if symbol.startswith("_"):
-            convention = "stdcall" if "@" in symbol[1:] else "cdecl"
-            return FunctionSignatureInfo("unknown", convention)
-        if symbol.startswith("@") and "@" in symbol[1:]:
-            return FunctionSignatureInfo("unknown", "fastcall")
-        return FunctionSignatureInfo("unknown", None)
-    function = demangle_function(symbol)
-    if function is None:
-        return FunctionSignatureInfo("unknown", None)
-    if function.return_type is None:
-        # Constructors return this; destructors return nothing useful.
-        return FunctionSignatureInfo("unknown", function.convention)
-    return FunctionSignatureInfo(
-        type_return_kind(function.return_type), function.convention
-    )

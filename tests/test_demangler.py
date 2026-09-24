@@ -6,7 +6,6 @@ from reccmp.cvdump.demangler import (
     InvalidEncodedNumberError,
     get_vtordisp_name,
     demangle_function,
-    parse_function_signature,
 )
 
 string_demangle_cases = [
@@ -84,26 +83,6 @@ def test_vtordisp():
 
     # A function called vtordisp
     assert get_vtordisp_name("?vtordisp@LegoExtraActor@@UBEPBDXZ") is None
-
-
-@pytest.mark.parametrize(
-    "symbol, return_kind, convention",
-    [
-        ("?setPos@srNode@@QAEXMMM@Z", "void", "thiscall"),
-        ("?make@A@@SGPAV1@HN@Z", "i32", "stdcall"),  # returns a pointer
-        ("?getChildCount@srNode@@QBEJXZ", "i32", "thiscall"),
-        ("??0srNode@@QAE@XZ", "unknown", "thiscall"),  # constructor
-        ("?f@@YANH@Z", "float", "cdecl"),  # double
-        ("?g@@YG_JH@Z", "i64", "stdcall"),
-        ("?b@@YA_NXZ", "i8", "cdecl"),  # bool
-        ("?c@@YAVValue@@XZ", "unknown", "cdecl"),  # class by value
-        ("_foo@8", "unknown", "stdcall"),
-        ("_bar", "unknown", "cdecl"),
-    ],
-)
-def test_parse_function_signature(symbol: str, return_kind: str, convention: str):
-    info = parse_function_signature(symbol)
-    assert (info.return_kind, info.convention) == (return_kind, convention)
 
 
 def test_demangle_function_splits_nested_parameters():

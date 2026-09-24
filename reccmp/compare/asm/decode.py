@@ -21,6 +21,7 @@ from capstone import (  # type: ignore
     CS_MODE_32,
     Cs,
     CsError,
+    CsInsn,
 )
 from capstone import x86_const  # type: ignore
 
@@ -54,6 +55,24 @@ def get_detail_disassembler(is_32: bool = True) -> Cs:
     disassembler = Cs(CS_ARCH_X86, CS_MODE_32 if is_32 else CS_MODE_16)
     disassembler.detail = True
     return disassembler
+
+
+def decode_one(code: bytes, address: int, is_32: bool = True) -> CsInsn | None:
+    """Decode the single instruction at the start of ``code``."""
+    return next(get_detail_disassembler(is_32).disasm(code, address, 1), None)
+
+
+def direct_branch_target(insn: CsInsn) -> int | None:
+    """Destination of a relative ``call``/``jmp``/``jcc``, else None."""
+    operands = insn.operands
+    if (
+        (insn.group(CS_GRP_JUMP) or insn.group(CS_GRP_CALL))
+        and insn.group(CS_GRP_BRANCH_RELATIVE)
+        and len(operands) == 1
+        and operands[0].type == x86_const.X86_OP_IMM
+    ):
+        return operands[0].imm
+    return None
 
 
 def stop_at_int3_detail(instructions) -> Iterable:
@@ -138,15 +157,8 @@ def from_capstone(insn) -> DecodedInstruction:
 
     is_jump = insn.group(CS_GRP_JUMP)
     is_call = insn.group(CS_GRP_CALL)
-    branch_target = None
+    branch_target = direct_branch_target(insn)
     cs_operands = insn.operands
-    if (
-        (is_jump or is_call)
-        and insn.group(CS_GRP_BRANCH_RELATIVE)
-        and len(cs_operands) == 1
-        and cs_operands[0].type == x86_const.X86_OP_IMM
-    ):
-        branch_target = cs_operands[0].imm
 
     prefix, mnemonic = split_mnemonic_prefix(insn.mnemonic)
     # Use the post-split mnemonic for lea size omission etc.

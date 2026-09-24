@@ -47,6 +47,10 @@ class ParserFunction(ParserSymbol):
     # True if this address is used by many identical functions.
     is_folded: bool = False
 
+    # Semantic ids of the definitions a line-based marker annotates: one, or
+    # one per template instantiation of the same source.
+    definitions: tuple[str, ...] = ()
+
     def should_skip(self) -> bool:
         return self.type == MarkerType.STUB
 

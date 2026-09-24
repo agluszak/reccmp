@@ -14,12 +14,12 @@ import re
 import pytest
 
 from reccmp.compare.asm.verifier import (
-    CallAbi,
+    CallFacts,
     FunctionMetadata,
     verify_effective_match,
 )
 
-CDECL = CallAbi(uses_ecx=False, uses_edx=False)
+CDECL = CallFacts(uses_ecx=False, uses_edx=False)
 
 # (name, orig, recomp, metadata) — all accepted as effective matches.
 ACCEPTED_PAIRS = [
@@ -93,7 +93,9 @@ ACCEPTED_PAIRS = [
             "push ecx",
             "call Helper (FUNCTION)",
         ],
-        FunctionMetadata(return_kind="void", call_abi={"Helper (FUNCTION)": CDECL}.get),
+        FunctionMetadata(
+            return_kind="void", call_facts={"Helper (FUNCTION)": CDECL}.get
+        ),
     ),
     (
         "callee_save_swap",

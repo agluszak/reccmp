@@ -1,9 +1,49 @@
 # Compiler-backed source index
 
-`SourceIndex.from_compile_database()` collects declarations and layouts directly
-from Clang, then binds reccmp markers to those records. Run reccmp inside the
-pinned analysis image (LLVM 19 + prebuilt `reccmp-source-indexer`): there is no
-Docker orchestration inside the Python package.
+`SourceIndex.from_compile_database()` collects declarations, layouts and reccmp
+markers directly from Clang. Run reccmp inside the pinned analysis image
+(LLVM 19 + prebuilt `reccmp-source-indexer`): there is no Docker orchestration
+inside the Python package.
+
+The index is the only source of markers: `reccmp-reccmp`, `Compare.from_target`
+and `reccmp-decomplint` read them from it. Point reccmp at the index with
+`source-index` in `reccmp-build.yml` (relative to that file), or with
+`RECCMP_SOURCE_INDEX`:
+
+```yml
+project: ..
+source-index: ../build/source-index.json
+targets:
+  GAME:
+    path: GAME.EXE
+    pdb: GAME.PDB
+```
+
+## Markers
+
+The indexer's preprocessor comment handler sees every `//` comment in active
+code. Each run of such comments on consecutive lines that contains something
+shaped like a marker becomes a `marker-block` record: the comment lines, and
+the declarations that begin at the first code token after them (functions with
+their extent and definition status, variables with local-static status and
+enclosing function, classes), plus the first string literal on that line as
+the bytes the compiler emits. A template header, a brace-less `extern "C"`,
+or a macro that expands to nothing on the same line do not separate a marker
+from its declaration.
+
+The marker grammar stays in `reccmp.parser`: `marker.py` reads one marker line
+and `reader.py` decides what a block annotates. `FUNCTION`/`STUB` bind to the
+function definition (one per template instantiation), `GLOBAL` to a variable
+(a local static belongs to its function's marker), `VTABLE` to a class,
+`STRING` to the string literal; a name comment after the markers completes
+them by name instead. `LINE` markers stand alone.
+
+Markers the compiler never saw — in files no translation unit includes, or in
+code the preprocessor skipped — are reported by `reccmp-decomplint` as
+`marker_not_compiled`. The index records the sha256 of every target source file
+it was collected from; reccmp refuses an index that is older than the sources,
+and decomplint reports `stale_source_index`. Pass every file under the
+target's source roots to `from_compile_database`.
 
 ```python
 from pathlib import Path
@@ -33,6 +73,8 @@ invalidate those artifacts: only Clang is expensive. Validated TU records are
 streamed once and aggregated into the final index. `force=True` rebuilds every
 wanted unit.
 
+## Records
+
 Records retain compiler-owned source signatures, parameter reference forms, and
 field pointer depth. Declarations carry linkage, storage class, and variadic
 status; only external-linkage variables are indexed. Markers store a
@@ -46,11 +88,15 @@ one link namespace.
 derive winners and conflicts. Compile-database entries that are not owned by any
 requested target are skipped before cache lookup or Clang.
 
-Run the collector integration test inside the pinned image:
+Run the collector integration tests inside the pinned image. The image's
+prebuilt collector predates any local change to `indexer.cpp`, so build one
+from the working tree:
 
 ```sh
-docker run --rm -v "$PWD:/work" -w /work \
-  -e RECCMP_SOURCE_INDEXER=/usr/local/bin/reccmp-source-indexer \
-  reccmp-source-test \
-  bash -lc 'uv venv -q /tmp/venv && uv pip install -q --python /tmp/venv -e . -r requirements-tests.txt && /tmp/venv/bin/python -m pytest tests/test_source_batch.py'
+docker run --rm -v "$PWD:/work" -w /work reccmp-source-test bash -lc '
+  clang++ -O1 -std=c++17 -fno-rtti -fno-exceptions -I/usr/lib/llvm-19/include \
+    reccmp/source/indexer.cpp -o /tmp/indexer \
+    /usr/lib/llvm-19/lib/libclang-cpp.so.19.1 /usr/lib/llvm-19/lib/libLLVM.so.19.1 &&
+  uv venv -q /tmp/venv && uv pip install -q --python /tmp/venv -e . -r requirements-tests.txt &&
+  RECCMP_SOURCE_INDEXER=/tmp/indexer /tmp/venv/bin/python -m pytest tests/test_source_batch.py'
 ```

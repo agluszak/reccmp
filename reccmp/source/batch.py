@@ -25,6 +25,7 @@ from .index import (
     TranslationUnitRecords,
     record_command,
     relative_unit_id,
+    source_digest,
 )
 from .variables import SourceConflict, SourceVariable
 
@@ -347,9 +348,7 @@ def collect_compile_database(
 
         indexes = [
             SourceIndex.from_units(
-                repository,
                 target,
-                paths,
                 units,
                 unit_ids={
                     unit.unit_id
@@ -404,6 +403,12 @@ def collect_compile_database(
                 target: part.abi
                 for (target, _paths), part in zip(targets.items(), indexes)
                 if part.abi is not None
+            },
+            marker_blocks=(block for unit in units for block in unit.marker_blocks),
+            source_digests={
+                relative_unit_id(repository, path): source_digest(path)
+                for paths in targets.values()
+                for path in paths
             },
         )
         result.write(cache / "source-index.json")

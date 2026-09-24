@@ -1,5 +1,5 @@
 from pathlib import PurePath
-from reccmp.parser import DecompParser, ReccmpParserResult
+from reccmp.parser import ReccmpParserResult
 from reccmp.parser.error import AlertCode
 from reccmp.parser.linter import (
     check_byname_allowed,
@@ -7,47 +7,79 @@ from reccmp.parser.linter import (
     check_offset_uniqueness,
     check_string_text,
 )
+from reccmp.parser.marker import MarkerType
+from reccmp.parser.node import ParserFunction, ParserString, ParserSymbol, ParserVtable
 
 
-def create_parser_result(code: str, path: PurePath) -> ReccmpParserResult:
-    """Since #416, the linter is a higher-level interpreter of parser results instead of a wrapper.
-    This converts the text/path into results to try to minimize changes to the existing tests.
-    """
-    parser = DecompParser()
-    parser.reset_and_set_filename(path)
-    parser.read(code)
-    parser.finish()
-    return parser.to_result()
+def create_parser_result(path: PurePath, *symbols: ParserSymbol) -> ReccmpParserResult:
+    """The linter interprets marker results; build them directly."""
+    return ReccmpParserResult(tokens=tuple(symbols), alerts=(), path=path)
+
+
+def function(
+    offset: int,
+    line: int,
+    module: str = "TEST",
+    *,
+    marker: MarkerType = MarkerType.FUNCTION,
+    by_name: bool = False,
+    folded: bool = False,
+) -> ParserFunction:
+    return ParserFunction(
+        type=marker,
+        line_number=line,
+        module=module,
+        offset=offset,
+        name="f",
+        filename=PurePath("test.cpp"),
+        lookup_by_name=by_name,
+        is_folded=folded,
+    )
+
+
+def string(offset: int, line: int, text: str) -> ParserString:
+    return ParserString(
+        type=MarkerType.STRING,
+        line_number=line,
+        module="TEST",
+        offset=offset,
+        name=text,
+        filename=PurePath("test.h"),
+    )
+
+
+def vtable(offset: int, line: int, *, folded: bool = False) -> ParserVtable:
+    return ParserVtable(
+        type=MarkerType.VTABLE,
+        line_number=line,
+        module="TEST",
+        offset=offset,
+        name="Class",
+        filename=PurePath("test.cpp"),
+        is_folded=folded,
+    )
 
 
 def test_order_in_order():
     """Functions from the same module are in order. No problems here."""
-    code = """\
-        // FUNCTION: TEST 0x1000
-        void function1() {}
-        // FUNCTION: TEST 0x2000
-        void function2() {}
-        // FUNCTION: TEST 0x3000
-        void function3() {}
-        """
-
-    result = create_parser_result(code, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x1000, 2),
+        function(0x2000, 4),
+        function(0x3000, 6),
+    )
     assert not check_function_order(result)
 
 
 def test_order_out_of_order():
     """Detect functions that are out of order."""
-    code = """\
-        // FUNCTION: TEST 0x1000
-        void function1() {}
-        // FUNCTION: TEST 0x3000
-        void function3() {}
-        // FUNCTION: TEST 0x2000
-        void function2() {}
-        """
-
     path = PurePath("test.cpp")
-    result = create_parser_result(code, path)
+    result = create_parser_result(
+        path,
+        function(0x1000, 2),
+        function(0x3000, 4),
+        function(0x2000, 6),
+    )
     alerts = check_function_order(result)
 
     assert len(alerts) == 1
@@ -61,34 +93,26 @@ def test_order_out_of_order():
 
 def test_order_ignore_lookup_by_name():
     """Should ignore lookup-by-name markers when checking order."""
-    code = """\
-        // FUNCTION: TEST 0x1000
-        void function1() {}
-        // FUNCTION: TEST 0x3000
-        // MyClass::MyMethod
-        // FUNCTION: TEST 0x2000
-        void function2() {}
-        """
-
-    result = create_parser_result(code, PurePath("test.h"))
+    result = create_parser_result(
+        PurePath("test.h"),
+        function(0x1000, 2),
+        function(0x3000, 4, by_name=True),
+        function(0x2000, 6),
+    )
     assert not check_function_order(result)
 
 
 def test_order_reports_all_modules():
     """Any ordering problems from any module are reported. The caller should filter for display."""
-    code = """\
-        // FUNCTION: ALPHA 0x0003
-        // FUNCTION: TEST 0x1000
-        void function1() {}
-        // FUNCTION: ALPHA 0x0002
-        // FUNCTION: TEST 0x2000
-        void function2() {}
-        // FUNCTION: ALPHA 0x0001
-        // FUNCTION: TEST 0x3000
-        void function3() {}
-        """
-
-    result = create_parser_result(code, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x0003, 3, "ALPHA"),
+        function(0x1000, 3),
+        function(0x0002, 6, "ALPHA"),
+        function(0x2000, 6),
+        function(0x0001, 9, "ALPHA"),
+        function(0x3000, 9),
+    )
     alerts = check_function_order(result)
 
     # ALPHA markers are out of order.
@@ -97,13 +121,9 @@ def test_order_reports_all_modules():
 
 def test_implicit_byname_headers_only():
     """Implementation markers that fall back to name lookup belong in headers."""
-    code = """\
-        // FUNCTION: TEST 0x1000
-        // MyClass::~MyClass
-        """
-
-    result_cpp = create_parser_result(code, PurePath("test.cpp"))
-    result_h = create_parser_result(code, PurePath("test.h"))
+    symbol = function(0x1000, 2, by_name=True)
+    result_cpp = create_parser_result(PurePath("test.cpp"), symbol)
+    result_h = create_parser_result(PurePath("test.h"), symbol)
 
     assert not check_byname_allowed(result_h)
 
@@ -113,29 +133,23 @@ def test_implicit_byname_headers_only():
 
 def test_explicit_byname_markers_allowed_in_cpp():
     """Explicit name-reference marker kinds are valid without an adjacent body."""
-    code = """\
-        // TEMPLATE: TEST 0x1000
-        // Template<int>::Method
-        // SYNTHETIC: TEST 0x2000
-        // MyClass::`scalar deleting destructor'
-        // LIBRARY: TEST 0x3000
-        // ThirdPartyFunction
-        """
-
-    result = create_parser_result(code, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x1000, 2, marker=MarkerType.TEMPLATE, by_name=True),
+        function(0x2000, 4, marker=MarkerType.SYNTHETIC, by_name=True),
+        function(0x3000, 6, marker=MarkerType.LIBRARY, by_name=True),
+    )
 
     assert not check_byname_allowed(result)
 
 
 def test_duplicate_offsets_module_scope():
     """All duplicate offsets from all modules are reported. The caller should filter for display."""
-    code = """\
-        // FUNCTION: TEST 0x1000
-        // FUNCTION: HELLO 0x1000
-        // MyClass::~MyClass
-        """
-
-    result = create_parser_result(code, PurePath("test.h"))
+    result = create_parser_result(
+        PurePath("test.h"),
+        function(0x1000, 3, by_name=True),
+        function(0x1000, 3, "HELLO", by_name=True),
+    )
 
     # Should not fail for duplicate offset 0x1000 because the modules are unique.
     assert not check_offset_uniqueness([result])
@@ -150,25 +164,19 @@ def test_duplicate_offsets_module_scope():
 
 def test_duplicate_strings():
     """Duplicate string markers are okay if the string value is the same."""
-    string_lines = """\
-        // STRING: TEST 0x1000
-        return "hello world";
-        """
-
-    string_hello = create_parser_result(string_lines, PurePath("test.h"))
+    string_hello = create_parser_result(
+        PurePath("test.h"), string(0x1000, 2, "hello world")
+    )
 
     assert not check_string_text([string_hello])
     assert not check_string_text([string_hello, string_hello])
     assert not check_offset_uniqueness([string_hello])
     assert not check_offset_uniqueness([string_hello, string_hello])
 
-    different_string = """\
-        // STRING: TEST 0x1000
-        return "hi there";
-        """
-
     # Same address but the string is different
-    string_hi = create_parser_result(different_string, PurePath("greeting.h"))
+    string_hi = create_parser_result(
+        PurePath("greeting.h"), string(0x1000, 2, "hi there")
+    )
     alerts = check_string_text([string_hello, string_hi])
     assert len(alerts) == 1
     assert alerts[0].code == AlertCode.WRONG_STRING
@@ -179,94 +187,64 @@ def test_duplicate_strings():
 
 def test_ignore_folded_duplicate():
     """Do not alert to folded functions that reuse an address."""
-    folded_lines = """\
-    // FUNCTION: TEST 0x1000 FOLDED
-    void folded() {}
-
-    // FUNCTION: TEST 0x1000 FOLDED
-    void first() {}
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x1000, 2, folded=True),
+        function(0x1000, 5, folded=True),
+    )
     assert not check_offset_uniqueness([result, result])
 
 
 def test_ignore_folded_and_regular_duplicate():
     """Should alert when folded and non-folded functions reuse an address."""
-    folded_lines = """\
-    // FUNCTION: TEST 0x1000 FOLDED
-    void folded() {}
-
-    // FUNCTION: TEST 0x1000
-    void first() {}
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x1000, 2, folded=True),
+        function(0x1000, 5),
+    )
     alerts = check_offset_uniqueness([result, result])
     assert alerts[0].code == AlertCode.DUPLICATE_OFFSET
 
 
 def test_ignore_folded_duplicate_vtable():
     """Do not alert to folded vtables that reuse an address."""
-    folded_lines = """\
-    // VTABLE: TEST 0x1000 FOLDED
-    class Folded {
-    };
-
-    // VTABLE: TEST 0x1000 FOLDED
-    class First {
-    };
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        vtable(0x1000, 2, folded=True),
+        vtable(0x1000, 6, folded=True),
+    )
     assert not check_offset_uniqueness([result, result])
 
 
 def test_ignore_folded_and_regular_duplicate_vtable():
     """Should alert when folded and non-folded vtables reuse an address."""
-    folded_lines = """\
-    // VTABLE: TEST 0x1000 FOLDED
-    class Folded {
-    };
-
-    // VTABLE: TEST 0x1000
-    class First {
-    };
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        vtable(0x1000, 2, folded=True),
+        vtable(0x1000, 6),
+    )
     alerts = check_offset_uniqueness([result, result])
     assert alerts[0].code == AlertCode.DUPLICATE_OFFSET
 
 
 def test_ignore_folded_order():
     """Skip folded functions and do not check their order."""
-    folded_lines = """\
-    // FUNCTION: TEST 0x2000 FOLDED
-    void folded() {}
-
-    // FUNCTION: TEST 0x1000
-    void first() {}
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x2000, 2, folded=True),
+        function(0x1000, 5),
+    )
     assert not check_function_order(result)
 
 
 def test_folded_with_real_order_error():
     """Folded functions should not prevent us from reporting
     that regular functions are out of order."""
-    folded_lines = """\
-    // FUNCTION: TEST 0x3000
-    void third() {}
-
-    // FUNCTION: TEST 0x2000 FOLDED
-    void folded() {}
-
-    // FUNCTION: TEST 0x1000
-    void first() {}
-    """
-
-    result = create_parser_result(folded_lines, PurePath("test.cpp"))
+    result = create_parser_result(
+        PurePath("test.cpp"),
+        function(0x3000, 2),
+        function(0x2000, 5, folded=True),
+        function(0x1000, 8),
+    )
     alerts = check_function_order(result)
     assert alerts

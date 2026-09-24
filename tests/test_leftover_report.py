@@ -246,6 +246,7 @@ def test_source_index_is_not_auto_discovered(tmp_path: Path):
     target.target_id = "GAME"
     target.recompiled_path = tmp_path / "game.exe"
     target.source_paths = ()
+    target.source_index = None
     assert resolve_source_index_path(target) is None
     assert load_source_index_for_target(target) is None
 
@@ -267,6 +268,7 @@ def test_source_index_rejects_incompatible_abi(tmp_path: Path):
     target.target_id = "GAME"
     target.recompiled_path = tmp_path / "game.exe"
     target.source_paths = ()
+    target.source_index = None
     assert (
         source_index_abi_compatible(SourceAbi("x86_64-pc-windows-msvc", 8, True))
         is False
@@ -301,6 +303,7 @@ def test_source_index_scopes_variable_only_targets(tmp_path: Path):
     target.target_id = "GAME"
     target.recompiled_path = tmp_path / "game.exe"
     target.source_paths = ()
+    target.source_index = None
     assert load_source_index_for_target(target, explicit=path) is None
 
 

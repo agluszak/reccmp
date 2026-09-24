@@ -35,10 +35,10 @@ from .analysis import analyze_effective_match
 from .cfg import verify_cfg_effective_match
 from .iso_cfg import verify_isomorphic_cfg_effective_match
 from .lockstep import verify_effective_match
-from .state import CallAbi, FunctionMetadata
+from .state import CallFacts, FunctionMetadata
 
 __all__ = [
-    "CallAbi",
+    "CallFacts",
     "FunctionMetadata",
     "analyze_effective_match",
     "verify_cfg_effective_match",

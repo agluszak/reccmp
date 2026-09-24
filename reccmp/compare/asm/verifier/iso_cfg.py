@@ -42,6 +42,7 @@ from reccmp.compare.asm.verifier.obligations import (
     one_sided_ok,
     switch_index_observation,
 )
+from reccmp.compare.asm.verifier.schedule import schedule_like
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
@@ -134,6 +135,10 @@ def verify_isomorphic_cfg_effective_match(
         start_r, end_r = cfg_r.starts[block_r], cfg_r.ends[block_r]
         indices_o = [i for i in range(start_o, end_o) if i not in cfg_o.owned_data]
         indices_r = [i for i in range(start_r, end_r) if i not in cfg_r.owned_data]
+        scheduled = schedule_like(orig_stream, recomp_stream, indices_o, indices_r)
+        if scheduled != indices_r:
+            indices_r = scheduled
+            any_shifted = True
         aligned = align_block_lines(
             [dp_line(orig_stream, i) for i in indices_o],
             [dp_line(recomp_stream, i) for i in indices_r],

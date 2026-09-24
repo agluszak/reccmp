@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 import pytest
 
 from reccmp.compare.asm.verifier import (
-    CallAbi,
+    CallFacts,
     FunctionMetadata,
 )
 from reccmp.compare.asm.verifier.evidence import (
@@ -164,7 +164,7 @@ def test_call_target_difference():
 def test_thiscall_argument_difference():
     metadata = FunctionMetadata(
         return_kind="void",
-        call_abi={"TView::Refresh": CallAbi(True, False)}.get,
+        call_facts={"TView::Refresh": CallFacts(True, False)}.get,
     )
     result = analyze(
         [

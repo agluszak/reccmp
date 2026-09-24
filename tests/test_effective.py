@@ -6,7 +6,7 @@
 import difflib
 
 from reccmp.compare.asm.verifier import (
-    CallAbi,
+    CallFacts,
     FunctionMetadata,
     verify_effective_match,
 )
@@ -968,9 +968,9 @@ def test_cdecl_call_ignores_dead_ecx():
         "ret",
     ]
     assert verify_effective_match(orig, recomp) is False
-    cdecl = CallAbi(uses_ecx=False, uses_edx=False)
+    cdecl = CallFacts(uses_ecx=False, uses_edx=False)
     metadata = FunctionMetadata(
-        return_kind="i32", call_abi={"Helper (FUNCTION)": cdecl}.get
+        return_kind="i32", call_facts={"Helper (FUNCTION)": cdecl}.get
     )
     # eax at ret is the callee's identical result, so the return kind
     # does not matter here; the dead ecx at the call does.
@@ -990,10 +990,10 @@ def test_thiscall_receiver_still_compared_with_metadata():
         "call TView::RefreshControl (FUNCTION)",
         "ret",
     ]
-    thiscall = CallAbi(uses_ecx=True, uses_edx=False)
+    thiscall = CallFacts(uses_ecx=True, uses_edx=False)
     metadata = FunctionMetadata(
         return_kind="void",
-        call_abi={"TView::RefreshControl (FUNCTION)": thiscall}.get,
+        call_facts={"TView::RefreshControl (FUNCTION)": thiscall}.get,
     )
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
 

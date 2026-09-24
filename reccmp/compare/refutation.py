@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from reccmp.compare.call_cleanup import import_cleanup
+from reccmp.compare.call_facts import CallFacts, import_facts
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
@@ -20,6 +20,7 @@ from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
 
 if TYPE_CHECKING:
+    from reccmp.compare.asm.ir import FunctionImage
     from reccmp.compare.db import ReccmpMatch
     from reccmp.compare.witness import SearchResult, Translator
 
@@ -56,17 +57,32 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             # pylint: disable-next=import-outside-toplevel
             from reccmp.compare.witness import SideMachine, Translator
 
+            # pylint: disable-next=import-outside-toplevel
+            from reccmp.compare.witness.machine import import_registry
+
             # Import names are the same in both binaries; the recompiled PDB
             # carries their decorations.
-            cleanup = import_cleanup(
+            by_import = import_facts(
                 node.decorated_name
                 for node in self.func_nodes.values()
                 if node.decorated_name is not None
             )
+            registry = import_registry(self.orig_bin, self.recomp_bin)
+
+            def callee_facts(identity) -> CallFacts | None:
+                if identity[0] == "import":
+                    return by_import.get(identity[1].split("!", 1)[1])
+                if identity[0] == "entity" and identity[2] == 0:
+                    match = self.db.get_one_match(identity[1])
+                    if match is not None and match.recomp_addr is not None:
+                        return self._call_facts_at(match.recomp_addr)
+                return None
+
             self._witness_translator = Translator(
                 self.db,
-                SideMachine(self.orig_bin, cleanup),
-                SideMachine(self.recomp_bin, cleanup),
+                SideMachine(self.orig_bin, registry, by_import),
+                SideMachine(self.recomp_bin, registry, by_import),
+                call_facts=callee_facts,
             )
         return self._witness_translator
 
@@ -74,8 +90,8 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
         self,
         match: ReccmpMatch,
         analysis: ComparisonAnalysis,
-        orig_size: int,
-        recomp_size: int,
+        orig_image: FunctionImage,
+        recomp_image: FunctionImage,
     ) -> ComparisonAnalysis:
         if not self.witness_search or analysis.status not in (
             ComparisonStatus.MISMATCH,
@@ -85,12 +101,12 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
         # pylint: disable-next=import-outside-toplevel
         from reccmp.compare.witness import find_witness
 
-        metadata = self._function_metadata(match)
+        facts = self._call_facts_at(match.recomp_addr)
         result = find_witness(
             self._witness_machines(),
-            range(match.orig_addr, match.orig_addr + orig_size),
-            range(match.recomp_addr, match.recomp_addr + recomp_size),
-            return_kind=metadata.return_kind if metadata is not None else "unknown",
+            orig_image,
+            recomp_image,
+            return_kind=facts.return_kind if facts is not None else "unknown",
         )
         if result.witness is None:
             return dataclasses.replace(
