@@ -58,7 +58,7 @@ from reccmp.source import (
     SourceIndex,
     SourceVariable,
 )
-from reccmp.source.batch import _file_digest_factory
+from reccmp.source.batch import DigestCache
 from reccmp.tools.find_inlines import _resolve_helper
 from reccmp.types import EntityType, ImageId
 from tests.raw_image import RawImage
@@ -749,15 +749,24 @@ def test_cvdump_run_raises_on_nonzero_status():
                 Cvdump("App.pdb").run()
 
 
-def test_file_digest_factory_caches_sha256_bytes(tmp_path: Path):
+def test_digest_cache_reuses_digests_until_the_file_changes(tmp_path: Path):
     path = tmp_path / "a.cpp"
     path.write_bytes(b"abc")
-    digest = _file_digest_factory()
-    first = digest(path)
+    cache = DigestCache(tmp_path / "digests.json")
+    assert cache.digest(path) == hashlib.sha256(b"abc").hexdigest()
+    cache.save()
+
+    # A later run trusts the stored digest while the file's stat is unchanged
+    # (the forged entry proves nothing was read), and rehashes on any change.
+    reloaded = DigestCache(tmp_path / "digests.json")
+    reloaded._entries[str(path)][4] = "forged"  # pylint: disable=protected-access
+    assert reloaded.digest(path) == "forged"
+    assert DigestCache(tmp_path / "digests.json", paranoid=True).digest(path) == (
+        hashlib.sha256(b"abc").hexdigest()
+    )
     path.write_bytes(b"changed")
-    second = digest(path)
-    assert first == second == hashlib.sha256(b"abc").digest()
-    assert len(first) == 32
+    assert reloaded.digest(path) == hashlib.sha256(b"changed").hexdigest()
+    assert reloaded.digest(tmp_path / "missing.cpp") is None
 
 
 def test_report_identity_prefers_source_digest():

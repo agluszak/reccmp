@@ -1,5 +1,6 @@
 """Exercise the actual collector inside the pinned LLVM 19 analysis environment."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -201,7 +202,7 @@ def _write(index: SourceIndex, directory: Path) -> Path:
 
 
 def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
-    # pylint: disable=too-many-statements
+    # pylint: disable=too-many-statements,too-many-locals
     _require_collector()
     repository = tmp_path / "source with spaces"
     repository.mkdir()
@@ -304,6 +305,11 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
 
     try:
         index = collect()
+        profile = json.loads((cache / "profile.json").read_text())
+        assert profile["miss_reasons"] == {"new": 4}
+        assert profile["records"]["declaration"] > 0
+        assert profile["indexer_totals_ms"]["frontend_ms"] > 0
+        assert "owner.h" in index.unit_dependencies["first.cpp"]
         owners = [item for item in index.classes if item.qualified_name == "Owner"]
         assert len(owners) == 2
         assert {item.target for item in owners} == {"WIZ8", "SURRENDER"}
@@ -405,10 +411,24 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert collect().to_dict() == index.to_dict()
         after = sorted(path.stat().st_mtime_ns for path in tu_cache.glob("*.ndjson"))
         assert after == before
+        assert json.loads((cache / "profile.json").read_text())["units"] == {
+            "hits": 4,
+            "misses": 0,
+        }
+        # Collectors sharing one cache do not wait for each other.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: collect().to_dict(), range(2)))
+        assert results == [index.to_dict()] * 2
         header.write_text(
             header.read_text().replace("**pointers", "*pointers"), encoding="utf-8"
         )
         refreshed = collect()
+        reasons = json.loads((cache / "profile.json").read_text())["misses"]
+        assert set(reasons) == {"first.cpp", "second.cpp", "repeat.cpp"}
+        assert all(
+            reason.startswith("dependency_changed:") and reason.endswith("owner.h")
+            for reason in reasons.values()
+        )
         assert all(
             item.fields[0].pointer_depth == 1
             for item in refreshed.classes

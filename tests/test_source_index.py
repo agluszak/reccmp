@@ -382,8 +382,6 @@ def test_marker_blocks_and_source_digests_survive_a_round_trip(tmp_path: Path) -
     other = tmp_path / "b.cpp"
     other.write_text("", encoding="utf-8")
     assert revived.stale_sources([source, other]) == [source, other]
-    with pytest.raises(SourceIndexError, match="schema"):
-        SourceIndex.from_dict({**index.to_dict(), "schema": "reccmp-source-index-v6"})
 
 
 def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None:
@@ -456,3 +454,68 @@ def test_internal_functions_are_distinct_per_translation_unit(tmp_path: Path) ->
     namespace = collector.derive(target="GAME", unit_ids={"a.cpp", "b.cpp"})
     assert len(namespace.declarations) == 2
     assert not namespace.conflicts
+
+
+def test_tu_local_functions_with_one_mangled_name_bind_by_location(
+    tmp_path: Path,
+) -> None:
+    """Two files each define ``static void* copyMemory(...)``: the mangled
+    names are equal, the definitions are not."""
+    collector = SourceCollector(tmp_path)
+    for unit, line, address in (
+        ("huffman.cpp", 565, 0x1000),
+        ("renderer.cpp", 79, 0x2000),
+    ):
+        collector.collect_record(
+            _declaration(
+                semantic_id="?copyMemory@@YAPAXPAXPBXJ@Z",
+                qualified_name="copyMemory",
+                linkage="internal",
+                storage_class="static",
+                source_file=unit,
+                line=line,
+            ),
+            unit_id=unit,
+        )
+        collector.collect_record(
+            _marker_block(
+                unit,
+                line - 1,
+                f"// FUNCTION: TEST 0x{address:x}",
+                candidates=(
+                    _function_candidate(
+                        "?copyMemory@@YAPAXPAXPBXJ@Z", "copyMemory", line
+                    ),
+                ),
+            ),
+            unit_id=unit,
+        )
+    # A header's static function has one identical winner per including unit.
+    for unit in ("a.cpp", "b.cpp"):
+        collector.collect_record(
+            _declaration(
+                semantic_id="?helper@@YAXXZ",
+                qualified_name="helper",
+                linkage="internal",
+                source_file="util.h",
+                line=3,
+            ),
+            unit_id=unit,
+        )
+        collector.collect_record(
+            _marker_block(
+                "util.h",
+                2,
+                "// FUNCTION: TEST 0x3000",
+                candidates=(_function_candidate("?helper@@YAXXZ", "helper", 3),),
+            ),
+            unit_id=unit,
+        )
+
+    index = SourceIndex.from_collector("TEST", collector)
+
+    assert {
+        marker.address: marker.declaration.source_file
+        for marker in index.markers
+        if marker.declaration is not None
+    } == {0x1000: "huffman.cpp", 0x2000: "renderer.cpp", 0x3000: "util.h"}

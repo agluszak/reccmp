@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence, TextIO
 
@@ -32,7 +32,6 @@ from reccmp.parser.reader import MarkerBlock, local_paths, read_marker_blocks
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v7"
 
 
 class SourceIndexError(ValueError):
@@ -301,39 +300,31 @@ class TranslationUnitRecords:
     marker_blocks: list[MarkerBlock] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     abi: SourceAbi | None = None
+    # Where the indexer's time went for this unit; not part of the index.
+    profile: dict[str, Any] | None = None
 
     def add(self, record: Mapping[str, Any]) -> None:
         """Store one compiler observation from this unit."""
         values = dict(record)
         kind = values.pop("record")
-        if kind == "marker-block":
-            self.marker_blocks.append(MarkerBlock.from_dict(values))
-            return
-        if kind == "dependency":
+        if kind in _UNIT_RECORDS:
+            self._add_unit_record(kind, values)
+        else:
+            self._append(kind, self._fact(kind, values))
+
+    def _add_unit_record(self, kind: str, values: dict[str, Any]) -> None:
+        """A record about the unit itself, never shared with other units."""
+        if kind == "profile":
+            self.profile = values
+        elif kind == "dependency":
             self.dependencies = [str(path) for path in values.get("files") or ()]
-            return
-        if kind == "unit-abi":
+        elif kind == "unit-abi":
             self.abi = SourceAbi(
                 target_triple=str(values["target_triple"]),
                 pointer_width=int(values["pointer_width"]),
                 ms_abi=bool(values["ms_abi"]),
             )
-            return
-        if kind == "declaration":
-            self.declarations.append(
-                _declaration_from_dict({**values, "unit_id": self.unit_id})
-            )
-        elif kind == "variable":
-            variable = _variable_from_dict({**values, "unit_id": self.unit_id})
-            if variable.is_external:
-                self.variables.append(variable)
-        elif kind == "class":
-            self.classes.append(_class_from_dict({**values, "unit_id": self.unit_id}))
-        elif kind == "member-use":
-            self.member_uses.append(
-                _member_use_from_dict({**values, "unit_id": self.unit_id})
-            )
-        elif kind == "size-assertion":
+        else:
             self.size_assertions.append(
                 _SizeAssertion(
                     unit_id=self.unit_id,
@@ -341,23 +332,80 @@ class TranslationUnitRecords:
                     asserted_size=int(values["asserted_size"]),
                 )
             )
+
+    def _fact(self, kind: str, values: dict[str, Any]) -> Any:
+        """A record about source code: identical in every unit that sees it."""
+        if kind == "marker-block":
+            return MarkerBlock.from_dict(values)
+        if kind == "declaration":
+            return _declaration_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "variable":
+            return _variable_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "class":
+            return _class_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "member-use":
+            return _member_use_from_dict({**values, "unit_id": self.unit_id})
+        raise SourceIndexError(
+            f"the source indexer emitted an unknown record: {kind!r}"
+        )
+
+    def _append(self, kind: str, fact: Any) -> None:
+        if kind == "marker-block":
+            self.marker_blocks.append(fact)
+        elif kind == "declaration":
+            self.declarations.append(fact)
+        elif kind == "variable":
+            if fact.is_external:
+                self.variables.append(fact)
+        elif kind == "class":
+            self.classes.append(fact)
         else:
-            raise SourceIndexError(
-                f"the source indexer emitted an unknown record: {kind!r}"
-            )
+            self.member_uses.append(fact)
 
     @classmethod
-    def load(cls, path: Path, unit_id: str) -> "TranslationUnitRecords":
-        """Stream one NDJSON artifact into a TU record set."""
+    def load(
+        cls, path: Path, unit_id: str, pool: RecordPool | None = None
+    ) -> "TranslationUnitRecords":
+        """Stream one NDJSON artifact into a TU record set. With a pool,
+        records already read from another unit are shared, not parsed again:
+        most of a unit's records describe headers many units include."""
         unit = cls(unit_id=unit_id)
-        with path.open(encoding="utf-8") as handle:
-            unit.extend_stream(handle)
+        with path.open("rb") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                shared = pool.facts.get(line) if pool is not None else None
+                if shared is not None:
+                    unit._append(*shared)
+                    continue
+                values = json.loads(line)
+                kind = values.pop("record")
+                if kind in _UNIT_RECORDS:
+                    unit._add_unit_record(kind, values)
+                    continue
+                fact = unit._fact(kind, values)
+                if pool is not None:
+                    pool.facts[line] = (kind, fact)
+                unit._append(kind, fact)
         return unit
 
     def extend_stream(self, handle: TextIO) -> None:
         for line in handle:
             if line.strip():
                 self.add(json.loads(line))
+
+
+# Records about a translation unit rather than about source code.
+_UNIT_RECORDS = frozenset({"profile", "dependency", "unit-abi", "size-assertion"})
+
+
+class RecordPool:
+    """Parsed source records by their exact artifact line, shared across
+    every unit loaded with the pool. A shared record keeps the unit id of
+    the first unit that read it."""
+
+    def __init__(self) -> None:
+        self.facts: dict[bytes, tuple[str, Any]] = {}
 
 
 def relative_unit_id(
@@ -388,10 +436,15 @@ def derive_namespace(
         return unit_ids is None or unit_id in unit_ids
 
     selected = [unit for unit in units if belongs(unit.unit_id)]
-    declarations = [item for unit in selected for item in unit.declarations]
-    variables = [item for unit in selected for item in unit.variables]
-    classes = [item for unit in selected for item in unit.classes]
-    member_uses = [item for unit in selected for item in unit.member_uses]
+
+    def distinct(items: Iterable[Any]) -> list[Any]:
+        """Each record once: units loaded with a RecordPool share them."""
+        return list({id(item): item for item in items}.values())
+
+    declarations = distinct(item for unit in selected for item in unit.declarations)
+    variables = distinct(item for unit in selected for item in unit.variables)
+    classes = distinct(item for unit in selected for item in unit.classes)
+    member_uses = distinct(item for unit in selected for item in unit.member_uses)
     assertions = [item for unit in selected for item in unit.size_assertions]
 
     derived_declarations, declaration_conflicts = _derive_entities(
@@ -435,6 +488,47 @@ def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...
     return tuple(merged[key] for key in sorted(merged))
 
 
+class _RepositoryPaths:
+    """Repository-relative spellings of absolute paths, each resolved once:
+    every unit lists the same headers."""
+
+    def __init__(self, repository: Path):
+        self.root = repository.resolve()
+        self._known: dict[str, str | None] = {}
+
+    def relative(self, raw: str) -> str | None:
+        if raw not in self._known:
+            try:
+                self._known[raw] = Path(raw).resolve().relative_to(self.root).as_posix()
+            except ValueError:
+                self._known[raw] = None
+        return self._known[raw]
+
+    def files(self, paths: Iterable[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted({path for raw in paths if (path := self.relative(raw)) is not None})
+        )
+
+
+def _with_target(item: Any, target: str) -> Any:
+    """A copy of a frozen record with ``target`` set, without re-running its
+    constructor (``dataclasses.replace`` does, which dominates deriving)."""
+    copy = object.__new__(type(item))
+    copy.__dict__.update(item.__dict__)
+    object.__setattr__(copy, "target", target)
+    return copy
+
+
+def _plain(value: Any) -> Any:
+    """JSON-ready form of a record (``dataclasses.asdict`` without its deep
+    copies, which dominate writing the index)."""
+    if hasattr(value, "__dataclass_fields__"):
+        return {key: _plain(item) for key, item in value.__dict__.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
 def source_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -465,7 +559,7 @@ def _derive_member_uses(
     """Attach the target namespace and collapse identical repeated-TU rows."""
     unique: dict[tuple[Any, ...], SourceMemberUse] = {}
     for item in observations:
-        projected = replace(item, target=target) if target is not None else item
+        projected = _with_target(item, target) if target is not None else item
         unique.setdefault(_member_use_key(projected), projected)
     return tuple(unique[key] for key in sorted(unique))
 
@@ -525,7 +619,7 @@ def _derive_entities(
         for item in group[1:]:
             if rank(item) > rank(winner):
                 winner = item
-        winners.append(replace(winner, target=target) if target is not None else winner)
+        winners.append(_with_target(winner, target) if target is not None else winner)
 
         variants: dict[tuple[str, ...], list[str]] = {}
         for item in group:
@@ -935,10 +1029,14 @@ def _join_markers(
         for symbol in result.tokens
         if symbol.module == target.upper()
     ]
-    definitions: dict[str, list[SourceDeclaration]] = {}
+    # By location as well as identity: TU-local functions of different files
+    # can share a mangled name.
+    definitions: dict[tuple[str, str, int], list[SourceDeclaration]] = {}
     for declaration in namespace.declarations:
         if declaration.is_definition:
-            definitions.setdefault(declaration.semantic_id, []).append(declaration)
+            definitions.setdefault(
+                (declaration.semantic_id, declaration.source_file, declaration.line), []
+            ).append(declaration)
 
     markers: list[SourceMarker] = []
     for method_symbol in symbols:
@@ -953,10 +1051,16 @@ def _join_markers(
             method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
             and not method_symbol.is_nameref()
         ):
+            # One per definition: a TU-local function in a header has one
+            # (identical) winner per including unit.
             candidates = [
-                declaration
+                found[0]
                 for semantic_id in method_symbol.definitions
-                for declaration in definitions.get(semantic_id, ())
+                if (
+                    found := definitions.get(
+                        (semantic_id, relative, method_symbol.line_number)
+                    )
+                )
             ]
             if len(candidates) != 1:
                 raise SourceIndexError(
@@ -1068,6 +1172,7 @@ class SourceIndex:
         target_abis: Mapping[str, SourceAbi] | None = None,
         marker_blocks: Iterable[MarkerBlock] = (),
         source_digests: Mapping[str, str] | None = None,
+        unit_dependencies: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         # pylint: disable=too-many-arguments
         # Every marker block the compiler saw, for all targets: the marker
@@ -1077,6 +1182,11 @@ class SourceIndex:
         self.source_digests: dict[str, str] = dict(
             sorted((source_digests or {}).items())
         )
+        # Repository files each translation unit includes, by unit id.
+        self.unit_dependencies: dict[str, tuple[str, ...]] = {
+            unit: tuple(sorted(paths))
+            for unit, paths in sorted((unit_dependencies or {}).items())
+        }
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
         )
@@ -1108,7 +1218,7 @@ class SourceIndex:
         """Return a view restricted to one link-namespace / reccmp target."""
         abi = self.target_abis.get(target)
         if abi is None and self.abi is not None:
-            # Single-ABI indexes (and legacy JSON) may only carry ``abi``.
+            # An index built directly (not per target) may only carry ``abi``.
             targets_present = {
                 item.target for item in self.classes if item.target is not None
             }
@@ -1137,6 +1247,7 @@ class SourceIndex:
             target_abis={target: abi} if abi is not None else {},
             marker_blocks=self.marker_blocks,
             source_digests=self.source_digests,
+            unit_dependencies=self.unit_dependencies,
         )
 
     def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:
@@ -1346,30 +1457,62 @@ class SourceIndex:
     @classmethod
     def from_units(
         cls,
-        target: str,
         units: Sequence[TranslationUnitRecords],
+        targets: Mapping[str, set[str] | None],
         *,
-        unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
+        source_digests: Mapping[str, str] | None = None,
+        repository: Path | None = None,
     ) -> "SourceIndex":
-        """Derive one link namespace from TU observations, then join markers.
+        """Derive every target's link namespace from TU observations in one
+        pass, then join markers. ``targets`` maps each target to the units
+        compiled into it (None: all of them).
 
-        Markers come from every unit: a header's markers for this target may
-        only be compiled by another target's translation units."""
-        namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+        Marker blocks come from every unit and are merged once: a header's
+        markers for one target may only be compiled by another target's
+        translation units."""
         blocks = merge_marker_blocks(
             block for unit in units for block in unit.marker_blocks
         )
-        classes, markers = _join_markers(target, namespace, blocks, aliases=aliases)
+        declarations: list[SourceDeclaration] = []
+        classes: list[SourceClass] = []
+        markers: list[SourceMarker] = []
+        variables: list[SourceVariable] = []
+        member_uses: list[SourceMemberUse] = []
+        conflicts: list[SourceConflict] = []
+        abis: dict[str, SourceAbi] = {}
+        for target, unit_ids in targets.items():
+            namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+            target_classes, target_markers = _join_markers(
+                target, namespace, blocks, aliases=aliases
+            )
+            declarations.extend(namespace.declarations)
+            classes.extend(target_classes)
+            markers.extend(target_markers)
+            variables.extend(namespace.variables)
+            member_uses.extend(namespace.member_uses)
+            conflicts.extend(namespace.conflicts)
+            if namespace.abi is not None:
+                abis[target] = namespace.abi
+        distinct = set(abis.values())
+        dependencies = None
+        if repository is not None:
+            paths = _RepositoryPaths(repository)
+            dependencies = {
+                unit.unit_id: paths.files(unit.dependencies) for unit in units
+            }
         return cls(
-            declarations=namespace.declarations,
+            declarations=declarations,
             classes=classes,
             markers=markers,
-            variables=namespace.variables,
-            member_uses=namespace.member_uses,
-            conflicts=namespace.conflicts,
-            abi=namespace.abi,
+            variables=variables,
+            member_uses=member_uses,
+            conflicts=conflicts,
+            abi=distinct.pop() if len(distinct) == 1 else None,
+            target_abis=abis,
             marker_blocks=blocks,
+            source_digests=source_digests,
+            unit_dependencies=dependencies,
         )
 
     @classmethod
@@ -1381,22 +1524,16 @@ class SourceIndex:
         unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
-        """Derive from a fixture ``SourceCollector`` (tests)."""
+        """Derive one target from a fixture ``SourceCollector`` (tests)."""
         return cls.from_units(
-            target,
-            tuple(collector.units.values()),
-            unit_ids=unit_ids,
-            aliases=aliases,
+            tuple(collector.units.values()), {target: unit_ids}, aliases=aliases
         )
 
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
-        """Read the public JSON projection back into its canonical records."""
-        if document.get("schema") != _SCHEMA:
-            raise SourceIndexError(
-                f"source index schema {document.get('schema')!r} is not {_SCHEMA!r}; "
-                "collect the index again"
-            )
+        """Read the public JSON projection back into its canonical records.
+        A document of another shape raises (usually KeyError); collect the
+        index again."""
         declarations = tuple(
             _declaration_from_dict(item) for item in document["declarations"]
         )
@@ -1404,15 +1541,8 @@ class SourceIndex:
         markers: list[SourceMarker] = []
         for item in document["markers"]:
             values = dict(item)
-            if "declaration_key" in values:
-                key = values.pop("declaration_key")
-                values.pop("declaration", None)
-                declaration = by_key.get(tuple(key)) if key else None
-            elif values.get("declaration"):
-                declaration = _declaration_from_dict(values.pop("declaration"))
-            else:
-                values.pop("declaration", None)
-                declaration = None
+            key = values.pop("declaration_key")
+            declaration = by_key[tuple(key)] if key else None
             markers.append(SourceMarker(**values, declaration=declaration))
         return cls(
             declarations=declarations,
@@ -1423,20 +1553,16 @@ class SourceIndex:
                 _member_use_from_dict(item) for item in document["member_uses"]
             ),
             conflicts=(_conflict_from_dict(item) for item in document["conflicts"]),
-            abi=(
-                SourceAbi(**document["abi"])
-                if isinstance(document.get("abi"), Mapping)
-                else None
-            ),
+            abi=SourceAbi(**document["abi"]) if document["abi"] is not None else None,
             target_abis={
-                str(target): SourceAbi(**values)
-                for target, values in (document.get("target_abis") or {}).items()
-                if isinstance(values, Mapping)
+                target: SourceAbi(**values)
+                for target, values in document["target_abis"].items()
             },
             marker_blocks=(
                 MarkerBlock.from_dict(item) for item in document["marker_blocks"]
             ),
             source_digests=document["source_digests"],
+            unit_dependencies=document["unit_dependencies"],
         )
 
     def functions_by_address(
@@ -1474,6 +1600,7 @@ class SourceIndex:
         cache_dir: Path | None = None,
         force: bool = False,
         aliases: ProjectAliases | None = None,
+        paranoid: bool = False,
     ) -> "SourceIndex":
         # pylint: disable=too-many-arguments
         """Collect direct AST records natively, once for all marker targets.
@@ -1495,27 +1622,27 @@ class SourceIndex:
             cache_dir=cache_dir,
             force=force,
             aliases=aliases,
+            paranoid=paranoid,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        document: dict[str, Any] = {
-            "schema": _SCHEMA,
+        return {
             "markers": [_marker_projection(item) for item in self.markers],
-            "declarations": [asdict(item) for item in self.declarations],
-            "classes": [asdict(item) for item in self.classes],
-            "variables": [asdict(item) for item in self.variables],
-            "member_uses": [asdict(item) for item in self.member_uses],
-            "conflicts": [asdict(item) for item in self.conflicts],
+            "declarations": [_plain(item) for item in self.declarations],
+            "classes": [_plain(item) for item in self.classes],
+            "variables": [_plain(item) for item in self.variables],
+            "member_uses": [_plain(item) for item in self.member_uses],
+            "conflicts": [_plain(item) for item in self.conflicts],
             "marker_blocks": [item.to_dict() for item in self.marker_blocks],
             "source_digests": self.source_digests,
+            "unit_dependencies": {
+                unit: list(paths) for unit, paths in self.unit_dependencies.items()
+            },
+            "abi": _plain(self.abi),
+            "target_abis": {
+                target: _plain(abi) for target, abi in sorted(self.target_abis.items())
+            },
         }
-        if self.abi is not None:
-            document["abi"] = asdict(self.abi)
-        if self.target_abis:
-            document["target_abis"] = {
-                target: asdict(abi) for target, abi in sorted(self.target_abis.items())
-            }
-        return document
 
     @classmethod
     def read(cls, path: Path) -> "SourceIndex":

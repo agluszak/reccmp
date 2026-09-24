@@ -12,7 +12,9 @@
 // `{"record":"dependency",...}`.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <set>
@@ -35,6 +37,7 @@
 #include "clang/AST/ParentMapContext.h"
 #include "clang/Index/USRGeneration.h"
 #include "clang/Basic/TargetInfo.h"
+#include "clang/Basic/Version.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -56,6 +59,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
@@ -106,6 +110,54 @@ struct CachedFile {
   std::string absolute;
 };
 
+using Clock = std::chrono::steady_clock;
+
+double millisecondsSince(Clock::time_point start) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+// Where one translation unit's indexing time went, and what it produced.
+// Emitted as the unit's last record so reccmp can report it; it is never
+// part of the index itself.
+struct Profile {
+  double invocationMs = 0;   // driver, -cc1 job and CompilerInvocation
+  double frontendMs = 0;     // ExecuteAction: parse, Sema and our consumer
+  double consumerMs = 0;     // HandleTranslationUnit, inside frontendMs
+  double memberUseMs = 0;    // member-use traversal, inside consumerMs
+  double markerMs = 0;       // marker blocks, inside consumerMs
+  double serializeMs = 0;    // JSON rendering and writing, inside consumerMs
+  llvm::StringMap<int64_t> records;
+  llvm::StringMap<int64_t> bytes;
+
+  llvm::json::Object toJson() const {
+    llvm::json::Object counts, sizes;
+    for (const auto& entry : records) counts[entry.getKey()] = entry.getValue();
+    for (const auto& entry : bytes) sizes[entry.getKey()] = entry.getValue();
+    return llvm::json::Object{
+        {"record", "profile"},
+        {"invocation_ms", invocationMs},
+        {"frontend_ms", frontendMs},
+        {"consumer_ms", consumerMs},
+        {"member_use_ms", memberUseMs},
+        {"marker_ms", markerMs},
+        {"serialize_ms", serializeMs},
+        {"records", std::move(counts)},
+        {"bytes", std::move(sizes)},
+    };
+  }
+};
+
+// Accumulates the time of one scope into a profile field.
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(double& total) : total_(total), start_(Clock::now()) {}
+  ~ScopedTimer() { total_ += millisecondsSince(start_); }
+
+ private:
+  double& total_;
+  Clock::time_point start_;
+};
+
 // One `//` comment that is the first thing on its line: the only shape a
 // reccmp marker (or the name line completing one) can take.
 struct LineComment {
@@ -153,8 +205,9 @@ class LineCommentCollector : public CommentHandler {
 class Indexer {
  public:
   Indexer(ASTContext& context, llvm::raw_ostream& out, Preprocessor& preprocessor,
-          const LineCommentCollector& comments)
-      : context_(context),
+          const LineCommentCollector& comments, Profile& profile)
+      : profile_(profile),
+        context_(context),
         sources_(context.getSourceManager()),
         policy_(context.getPrintingPolicy()),
         names_(context),
@@ -164,8 +217,11 @@ class Indexer {
 
   void run() {
     walkContext(context_.getTranslationUnitDecl(), "");
+    ScopedTimer timer(profile_.markerMs);
     emitMarkerBlocks();
   }
+
+  Profile& profile_;
 
  private:
   // One normalized absolute path and repository membership per FileID. System
@@ -1011,6 +1067,7 @@ class Indexer {
   void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
                       llvm::StringRef functionName, const Location& functionLocation) {
     if (!function->doesThisDeclarationHaveABody()) return;
+    ScopedTimer timer(profile_.memberUseMs);
     MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
     visitor.TraverseStmt(function->getBody());
   }
@@ -1134,7 +1191,15 @@ class Indexer {
   }
 
   void emit(llvm::json::Object record) {
-    out_ << llvm::json::Value(std::move(record)) << "\n";
+    ScopedTimer timer(profile_.serializeMs);
+    std::string kind = record.getString("record").value_or("").str();
+    std::string line;
+    llvm::raw_string_ostream rendered(line);
+    rendered << llvm::json::Value(std::move(record)) << "\n";
+    rendered.flush();
+    profile_.records[kind] += 1;
+    profile_.bytes[kind] += static_cast<int64_t>(line.size());
+    out_ << line;
   }
 
   // -- marker blocks ---------------------------------------------------------
@@ -1442,14 +1507,15 @@ class Indexer {
 
 class IndexConsumer : public ASTConsumer {
  public:
-  IndexConsumer(CompilerInstance& instance, llvm::raw_ostream& out)
-      : instance_(instance), out_(out) {
+  IndexConsumer(CompilerInstance& instance, llvm::raw_ostream& out, Profile& profile)
+      : instance_(instance), out_(out), profile_(profile) {
     instance_.getPreprocessor().addCommentHandler(&comments_);
   }
 
   ~IndexConsumer() override { instance_.getPreprocessor().removeCommentHandler(&comments_); }
 
   void HandleTranslationUnit(ASTContext& context) override {
+    ScopedTimer timer(profile_.consumerMs);
     const TargetInfo& target = context.getTargetInfo();
     out_ << llvm::json::Value(llvm::json::Object{
                 {"record", "unit-abi"},
@@ -1458,7 +1524,7 @@ class IndexConsumer : public ASTConsumer {
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";
-    Indexer(context, out_, instance_.getPreprocessor(), comments_).run();
+    Indexer(context, out_, instance_.getPreprocessor(), comments_, profile_).run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any
     // DetailedRecord / PreprocessingRecord.
@@ -1478,20 +1544,22 @@ class IndexConsumer : public ASTConsumer {
  private:
   CompilerInstance& instance_;
   llvm::raw_ostream& out_;
+  Profile& profile_;
   LineCommentCollector comments_;
 };
 
 class IndexAction : public ASTFrontendAction {
  public:
-  explicit IndexAction(llvm::raw_ostream& out) : out_(out) {}
+  IndexAction(llvm::raw_ostream& out, Profile& profile) : out_(out), profile_(profile) {}
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& instance,
                                                  llvm::StringRef) override {
-    return std::make_unique<IndexConsumer>(instance, out_);
+    return std::make_unique<IndexConsumer>(instance, out_, profile_);
   }
 
  private:
   llvm::raw_ostream& out_;
+  Profile& profile_;
 };
 
 class ChangeDirectory {
@@ -1525,6 +1593,8 @@ class ChangeDirectory {
 // Diagnostics go to `diagnostics`. LLVM targets must already be initialized.
 int indexOneTranslationUnit(llvm::ArrayRef<const char*> argv, llvm::raw_ostream& out,
                             llvm::raw_ostream& diagnostics) {
+  Profile profile;
+  Clock::time_point start = Clock::now();
   if (argv.empty()) {
     diagnostics << "indexer: empty driver command line\n";
     return 1;
@@ -1581,103 +1651,95 @@ int indexOneTranslationUnit(llvm::ArrayRef<const char*> argv, llvm::raw_ostream&
   instance.setInvocation(std::move(invocation));
   instance.createDiagnostics(&printer, /*ShouldOwnClient=*/false);
   if (!instance.hasDiagnostics()) return 1;
+  profile.invocationMs = millisecondsSince(start);
 
-  IndexAction action(out);
+  IndexAction action(out, profile);
+  Clock::time_point frontend = Clock::now();
   if (!instance.ExecuteAction(action)) return 1;
-  return instance.getDiagnostics().hasErrorOccurred() ? 1 : 0;
+  profile.frontendMs = millisecondsSince(frontend);
+  if (instance.getDiagnostics().hasErrorOccurred()) return 1;
+  out << llvm::json::Value(profile.toJson()) << "\n";
+  return 0;
 }
 
-int runBatch(llvm::StringRef manifestPath) {
-  auto buffer = llvm::MemoryBuffer::getFile(manifestPath);
-  if (!buffer) {
-    llvm::errs() << "indexer: cannot read manifest " << manifestPath << ": "
-                 << buffer.getError().message() << "\n";
-    return 1;
+// Index one job: {"directory", "output", "arguments"}. Returns the reply
+// sent back to reccmp: {"output", "ok", "diagnostics"}.
+llvm::json::Object runJob(const llvm::json::Object& job) {
+  std::optional<llvm::StringRef> directory = job.getString("directory");
+  std::optional<llvm::StringRef> output = job.getString("output");
+  const llvm::json::Array* arguments = job.getArray("arguments");
+  llvm::json::Object reply{{"output", output ? output->str() : ""}, {"ok", false}};
+  if (!directory || !output || !arguments || arguments->empty()) {
+    reply["diagnostics"] = "job needs directory, output, and arguments";
+    return reply;
   }
+  std::vector<std::string> storage;
+  for (const llvm::json::Value& value : *arguments) {
+    std::optional<llvm::StringRef> argument = value.getAsString();
+    if (!argument) {
+      reply["diagnostics"] = "arguments must be strings";
+      return reply;
+    }
+    storage.emplace_back(argument->str());
+  }
+  std::vector<const char*> argv;
+  for (const std::string& argument : storage) argv.push_back(argument.c_str());
 
-  bool failed = false;
-  llvm::StringRef remaining = buffer.get()->getBuffer();
-  while (!remaining.empty()) {
-    auto [line, rest] = remaining.split('\n');
-    remaining = rest;
-    line = line.trim();
-    if (line.empty()) continue;
+  ChangeDirectory cwd(*directory);
+  if (cwd.error()) {
+    reply["diagnostics"] = ("cannot chdir to " + *directory + ": " + cwd.error().message()).str();
+    return reply;
+  }
+  std::error_code ec;
+  llvm::raw_fd_ostream fileOut(*output, ec, llvm::sys::fs::OF_Text);
+  if (ec) {
+    reply["diagnostics"] = ("cannot write " + *output + ": " + ec.message()).str();
+    return reply;
+  }
+  std::string diagnosticText;
+  llvm::raw_string_ostream diagnosticStream(diagnosticText);
+  int status = indexOneTranslationUnit(argv, fileOut, diagnosticStream);
+  fileOut.close();
+  diagnosticStream.flush();
+  if (status != 0) llvm::sys::fs::remove(*output);
+  reply["ok"] = status == 0;
+  reply["diagnostics"] = diagnosticText;
+  return reply;
+}
 
+// A persistent worker: one JSON job per stdin line, one JSON reply per stdout
+// line. LLVM initialization happens once per worker, and reccmp hands each
+// idle worker the next job, so a slow unit never holds up a whole chunk.
+int serve() {
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (llvm::StringRef(line).trim().empty()) continue;
+    llvm::json::Object reply;
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(line);
     if (!parsed) {
-      llvm::errs() << "indexer: bad manifest line: "
-                   << llvm::toString(parsed.takeError()) << "\n";
-      failed = true;
-      continue;
+      reply = llvm::json::Object{{"output", ""}, {"ok", false},
+                                 {"diagnostics", llvm::toString(parsed.takeError())}};
+    } else if (const llvm::json::Object* job = parsed->getAsObject()) {
+      reply = runJob(*job);
+    } else {
+      reply = llvm::json::Object{{"output", ""}, {"ok", false},
+                                 {"diagnostics", "job is not a JSON object"}};
     }
-    llvm::json::Object* object = parsed->getAsObject();
-    if (!object) {
-      llvm::errs() << "indexer: manifest line is not a JSON object\n";
-      failed = true;
-      continue;
-    }
-    std::optional<llvm::StringRef> directory = object->getString("directory");
-    std::optional<llvm::StringRef> output = object->getString("output");
-    llvm::json::Array* arguments = object->getArray("arguments");
-    if (!directory || !output || !arguments || arguments->empty()) {
-      llvm::errs() << "indexer: manifest line needs directory, output, and arguments\n";
-      failed = true;
-      continue;
-    }
-
-    std::vector<std::string> storage;
-    storage.reserve(arguments->size());
-    for (const llvm::json::Value& value : *arguments) {
-      std::optional<llvm::StringRef> argument = value.getAsString();
-      if (!argument) {
-        llvm::errs() << "indexer: argument list must be strings\n";
-        storage.clear();
-        break;
-      }
-      storage.emplace_back(argument->str());
-    }
-    if (storage.empty()) {
-      failed = true;
-      continue;
-    }
-    std::vector<const char*> argv;
-    argv.reserve(storage.size());
-    for (const std::string& argument : storage) argv.push_back(argument.c_str());
-    llvm::StringRef mainFile = storage.back();
-
-    ChangeDirectory cwd(*directory);
-    if (cwd.error()) {
-      llvm::errs() << "indexer: " << mainFile << ": cannot chdir to " << *directory << ": "
-                   << cwd.error().message() << "\n";
-      failed = true;
-      continue;
-    }
-
-    std::error_code ec;
-    llvm::raw_fd_ostream fileOut(*output, ec, llvm::sys::fs::OF_Text);
-    if (ec) {
-      llvm::errs() << "indexer: " << mainFile << ": cannot write " << *output << ": "
-                   << ec.message() << "\n";
-      failed = true;
-      continue;
-    }
-
-    std::string diagnosticText;
-    llvm::raw_string_ostream diagnosticStream(diagnosticText);
-    int status = indexOneTranslationUnit(argv, fileOut, diagnosticStream);
-    fileOut.close();
-    if (status == 0) continue;
-
-    llvm::sys::fs::remove(*output);
-    llvm::errs() << "indexer: " << mainFile << ":\n" << diagnosticText;
-    failed = true;
+    llvm::outs() << llvm::json::Value(std::move(reply)) << "\n";
+    llvm::outs().flush();
   }
-  return failed ? 1 : 0;
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, const char** argv) {
+  // The identity of the Clang libraries this collector runs against, which
+  // decide its output as much as its own source does.
+  if (argc == 2 && llvm::StringRef(argv[1]) == "--version") {
+    llvm::outs() << clang::getClangFullVersion() << "\n";
+    return 0;
+  }
   const char* root = std::getenv("RECCMP_SOURCE_ROOT");
   if (!root) {
     llvm::errs() << "RECCMP_SOURCE_ROOT is required\n";
@@ -1694,16 +1756,11 @@ int main(int argc, const char** argv) {
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmParsers();
 
-  if (argc >= 2 && llvm::StringRef(argv[1]) == "--batch") {
-    if (argc != 3) {
-      llvm::errs() << "usage: indexer --batch <manifest.jsonl>\n";
-      return 2;
-    }
-    return runBatch(argv[2]);
-  }
+  if (argc == 2 && llvm::StringRef(argv[1]) == "--serve") return serve();
   if (argc < 3) {
     llvm::errs() << "usage: indexer <clang-cl driver command line...>\n"
-                 << "       indexer --batch <manifest.jsonl>\n";
+                 << "       indexer --serve   (jobs on stdin, replies on stdout)\n"
+                 << "       indexer --version\n";
     return 2;
   }
   return indexOneTranslationUnit(llvm::ArrayRef(argv + 1, argv + argc), llvm::outs(),
