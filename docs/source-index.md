@@ -66,12 +66,29 @@ collector built against LLVM 19. Without that, the first collection compiles
 `RECCMP_SOURCE_ROOT` must be the repository root the compile database paths use.
 `clang` optionally overrides the compiler named in the database.
 
-Each wanted translation unit is cached by indexer identity, compile command,
-main-file contents, and Clang's reported dependency digests. Shared headers are
-hashed at most once per invocation. Python merge code and marker aliases do not
-invalidate those artifacts: only Clang is expensive. Validated TU records are
-streamed once and aggregated into the final index. `force=True` rebuilds every
-wanted unit.
+Each wanted translation unit is cached by indexer identity (the collector
+binary plus the Clang libraries it reports with `--version`), compile command,
+main-file contents, and the digests of every file Clang reported it including.
+File digests persist in `digests.json`, reused while a file's size, mtime,
+inode and ctime are unchanged (`paranoid=True` rehashes everything). Python
+merge code and marker aliases do not invalidate artifacts. `force=True`
+rebuilds every wanted unit.
+
+Misses run on persistent `indexer --serve` workers (one JSON job per stdin
+line, one reply per stdout line), each handed the next job when idle, so LLVM
+starts once per worker and one slow unit does not hold up others. A wrapper
+around the collector (e.g. `docker run`) must keep stdin attached (`-i`).
+
+Several processes may share one cache: artifacts are published by atomic
+rename and never locked; only building the collector takes a lock. Every
+collection writes `profile.json` to the cache: Python phase times, hits,
+misses with reasons (`new`, `forced`, `indexer_changed`, `command_changed`,
+`main_file_changed`, `dependency_changed:<path>`), and for fresh units the
+indexer's own phases (driver setup, frontend, our consumer, member-use
+traversal, marker blocks, serialization) plus records and bytes by kind.
+
+The index also lists, per unit, the repository files it includes
+(`unit_dependencies`).
 
 ## Records
 

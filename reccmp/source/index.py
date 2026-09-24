@@ -32,7 +32,7 @@ from reccmp.parser.reader import MarkerBlock, local_paths, read_marker_blocks
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v7"
+_SCHEMA = "reccmp-source-index-v8"
 
 
 class SourceIndexError(ValueError):
@@ -301,11 +301,16 @@ class TranslationUnitRecords:
     marker_blocks: list[MarkerBlock] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     abi: SourceAbi | None = None
+    # Where the indexer's time went for this unit; not part of the index.
+    profile: dict[str, Any] | None = None
 
     def add(self, record: Mapping[str, Any]) -> None:
         """Store one compiler observation from this unit."""
         values = dict(record)
         kind = values.pop("record")
+        if kind == "profile":
+            self.profile = values
+            return
         if kind == "marker-block":
             self.marker_blocks.append(MarkerBlock.from_dict(values))
             return
@@ -433,6 +438,18 @@ def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...
         previous = merged.get(block.key)
         merged[block.key] = block if previous is None else previous.merged(block)
     return tuple(merged[key] for key in sorted(merged))
+
+
+def _repository_files(paths: Iterable[str], repository: Path) -> tuple[str, ...]:
+    """The repository-relative paths among ``paths``."""
+    root = repository.resolve()
+    result = []
+    for raw in paths:
+        try:
+            result.append(Path(raw).resolve().relative_to(root).as_posix())
+        except ValueError:
+            continue
+    return tuple(sorted(set(result)))
 
 
 def source_digest(path: Path) -> str:
@@ -1078,6 +1095,7 @@ class SourceIndex:
         target_abis: Mapping[str, SourceAbi] | None = None,
         marker_blocks: Iterable[MarkerBlock] = (),
         source_digests: Mapping[str, str] | None = None,
+        unit_dependencies: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         # pylint: disable=too-many-arguments
         # Every marker block the compiler saw, for all targets: the marker
@@ -1087,6 +1105,11 @@ class SourceIndex:
         self.source_digests: dict[str, str] = dict(
             sorted((source_digests or {}).items())
         )
+        # Repository files each translation unit includes, by unit id.
+        self.unit_dependencies: dict[str, tuple[str, ...]] = {
+            unit: tuple(sorted(paths))
+            for unit, paths in sorted((unit_dependencies or {}).items())
+        }
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
         )
@@ -1147,6 +1170,7 @@ class SourceIndex:
             target_abis={target: abi} if abi is not None else {},
             marker_blocks=self.marker_blocks,
             source_digests=self.source_digests,
+            unit_dependencies=self.unit_dependencies,
         )
 
     def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:
@@ -1356,30 +1380,63 @@ class SourceIndex:
     @classmethod
     def from_units(
         cls,
-        target: str,
         units: Sequence[TranslationUnitRecords],
+        targets: Mapping[str, set[str] | None],
         *,
-        unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
+        source_digests: Mapping[str, str] | None = None,
+        repository: Path | None = None,
     ) -> "SourceIndex":
-        """Derive one link namespace from TU observations, then join markers.
+        """Derive every target's link namespace from TU observations in one
+        pass, then join markers. ``targets`` maps each target to the units
+        compiled into it (None: all of them).
 
-        Markers come from every unit: a header's markers for this target may
-        only be compiled by another target's translation units."""
-        namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+        Marker blocks come from every unit and are merged once: a header's
+        markers for one target may only be compiled by another target's
+        translation units."""
         blocks = merge_marker_blocks(
             block for unit in units for block in unit.marker_blocks
         )
-        classes, markers = _join_markers(target, namespace, blocks, aliases=aliases)
+        declarations: list[SourceDeclaration] = []
+        classes: list[SourceClass] = []
+        markers: list[SourceMarker] = []
+        variables: list[SourceVariable] = []
+        member_uses: list[SourceMemberUse] = []
+        conflicts: list[SourceConflict] = []
+        abis: dict[str, SourceAbi] = {}
+        for target, unit_ids in targets.items():
+            namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+            target_classes, target_markers = _join_markers(
+                target, namespace, blocks, aliases=aliases
+            )
+            declarations.extend(namespace.declarations)
+            classes.extend(target_classes)
+            markers.extend(target_markers)
+            variables.extend(namespace.variables)
+            member_uses.extend(namespace.member_uses)
+            conflicts.extend(namespace.conflicts)
+            if namespace.abi is not None:
+                abis[target] = namespace.abi
+        distinct = set(abis.values())
         return cls(
-            declarations=namespace.declarations,
+            declarations=declarations,
             classes=classes,
             markers=markers,
-            variables=namespace.variables,
-            member_uses=namespace.member_uses,
-            conflicts=namespace.conflicts,
-            abi=namespace.abi,
+            variables=variables,
+            member_uses=member_uses,
+            conflicts=conflicts,
+            abi=distinct.pop() if len(distinct) == 1 else None,
+            target_abis=abis,
             marker_blocks=blocks,
+            source_digests=source_digests,
+            unit_dependencies=(
+                {
+                    unit.unit_id: _repository_files(unit.dependencies, repository)
+                    for unit in units
+                }
+                if repository is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -1391,12 +1448,9 @@ class SourceIndex:
         unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
-        """Derive from a fixture ``SourceCollector`` (tests)."""
+        """Derive one target from a fixture ``SourceCollector`` (tests)."""
         return cls.from_units(
-            target,
-            tuple(collector.units.values()),
-            unit_ids=unit_ids,
-            aliases=aliases,
+            tuple(collector.units.values()), {target: unit_ids}, aliases=aliases
         )
 
     @classmethod
@@ -1447,6 +1501,7 @@ class SourceIndex:
                 MarkerBlock.from_dict(item) for item in document["marker_blocks"]
             ),
             source_digests=document["source_digests"],
+            unit_dependencies=document["unit_dependencies"],
         )
 
     def functions_by_address(
@@ -1484,6 +1539,7 @@ class SourceIndex:
         cache_dir: Path | None = None,
         force: bool = False,
         aliases: ProjectAliases | None = None,
+        paranoid: bool = False,
     ) -> "SourceIndex":
         # pylint: disable=too-many-arguments
         """Collect direct AST records natively, once for all marker targets.
@@ -1505,6 +1561,7 @@ class SourceIndex:
             cache_dir=cache_dir,
             force=force,
             aliases=aliases,
+            paranoid=paranoid,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1518,6 +1575,9 @@ class SourceIndex:
             "conflicts": [asdict(item) for item in self.conflicts],
             "marker_blocks": [item.to_dict() for item in self.marker_blocks],
             "source_digests": self.source_digests,
+            "unit_dependencies": {
+                unit: list(paths) for unit, paths in self.unit_dependencies.items()
+            },
         }
         if self.abi is not None:
             document["abi"] = asdict(self.abi)
