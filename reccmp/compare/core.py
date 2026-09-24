@@ -80,7 +80,6 @@ from .mutate import (
 from .verify import (
     check_vtables,
 )
-from .source_capability import load_source_index_for_target
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +115,7 @@ class Compare:
     variable_comparator: VariableComparator
     data_sources: list[TextFile]
     project_aliases: ProjectAliases
-    codebase: DecompCodebase | None
+    codebase: DecompCodebase
     source_index: SourceIndex | None
 
     # pylint: disable=too-many-arguments
@@ -142,7 +141,7 @@ class Compare:
         self.src_encoding = encoding or "utf-8"
         self.bin_encoding = encoding or "latin1"
         self.project_aliases = normalize_project_aliases(project_aliases or {})
-        self.codebase = codebase
+        self.codebase = codebase or DecompCodebase([], target_id)
 
         if isinstance(code_files, list):
             self.code_files = code_files
@@ -251,12 +250,10 @@ class Compare:
             self.code_files,
             self._lines_db,
             self.orig_bin,
-            self.target_id,
+            self.codebase,
             self._db,
             self.bin_encoding,
-            self.project_aliases,
             self.report,
-            self.codebase,
         )
 
         load_data_sources(self._db, self.data_sources)
@@ -271,14 +268,13 @@ class Compare:
             truncate=truncate,
             equivalence_groups=self.equivalence_groups,
         )
-        if self.codebase is not None:
-            match_folded_function_aliases(
-                self._db,
-                self.codebase,
-                self._lines_db,
-                self.report,
-                truncate=truncate,
-            )
+        match_folded_function_aliases(
+            self._db,
+            self.codebase,
+            self._lines_db,
+            self.report,
+            truncate=truncate,
+        )
         match_vtables(self._db, self.report)
         classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         match_static_variables(self._db, self.report)
@@ -354,9 +350,8 @@ class Compare:
             orig_addrs=orig_addrs,
             recomp_addrs=recomp_addrs,
             use_cache=use_cache,
+            source_index=source_index,
         )
-        if source_index is None:
-            source_index = load_source_index_for_target(target)
         compare = cls(
             loaded.orig_bin,
             loaded.recomp_bin,
@@ -368,7 +363,7 @@ class Compare:
             project_aliases=loaded.project_aliases,
             codebase=loaded.codebase,
             equivalence_sources=loaded.equivalence_sources,
-            source_index=source_index,
+            source_index=loaded.source_index,
         )
         prepared = loaded.load_prepared()
         if prepared is not None:

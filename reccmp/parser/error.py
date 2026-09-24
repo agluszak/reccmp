@@ -108,6 +108,14 @@ class AlertCode(Enum):
     # ERROR: An alias matches a built-in marker type string, and was dropped.
     ALIAS_REDEFINES_BUILTIN = 209
 
+    # ERROR: A marker that annotates a declaration is not followed by one of
+    # the kind it needs (a function, variable or class).
+    NO_DECLARATION = 210
+
+    # ERROR: The compiler never saw this marker: its file is not part of any
+    # translation unit, or the preprocessor skipped the code around it.
+    MARKER_NOT_COMPILED = 211
+
     # This code or higher is a critical error
     DECOMP_CRITICAL_START = 300
 
@@ -116,6 +124,10 @@ class AlertCode(Enum):
 
     # CRITICAL: Wrapper for UnicodeDecodeError
     UNICODE_DECODE_ERROR = 302
+
+    # CRITICAL: The file changed (or appeared) after the source index was
+    # collected, so its markers are not known.
+    STALE_SOURCE_INDEX = 303
 
 
 @dataclass

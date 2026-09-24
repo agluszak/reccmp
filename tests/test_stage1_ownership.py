@@ -142,6 +142,7 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
     target.target_id = "GAME"
     target.recompiled_path = tmp_path / "game.exe"
     target.source_paths = ()
+    target.source_index = None
 
     assert resolve_source_index_path(target, explicit=index_path) == index_path
     scoped = load_source_index_for_target(target, explicit=index_path)

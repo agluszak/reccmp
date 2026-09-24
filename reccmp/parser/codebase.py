@@ -1,10 +1,9 @@
 """For aggregating decomp markers read from an entire directory and for a single module."""
 
 from pathlib import PurePath
-from typing import Callable, Iterable, Iterator
-from reccmp.formats import TextFile
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 from .marker import ProjectAliases
-from .parser import DecompParser
+from .reader import local_paths, read_marker_blocks
 from .node import (
     ParserLineSymbol,
     ParserSymbol,
@@ -14,22 +13,32 @@ from .node import (
     ParserString,
 )
 
+if TYPE_CHECKING:
+    from reccmp.source.index import SourceIndex
+
 
 class DecompCodebase:
-    def __init__(
-        self,
-        files: Iterable[TextFile],
+    def __init__(self, symbols: Iterable[ParserSymbol], module: str) -> None:
+        self._symbols: list[ParserSymbol] = [
+            symbol for symbol in symbols if symbol.module == module.upper()
+        ]
+
+    @classmethod
+    def from_source_index(
+        cls,
+        index: "SourceIndex",
         module: str,
+        files: Iterable[PurePath],
+        *,
         aliases: ProjectAliases | None = None,
-    ) -> None:
-        self._symbols: list[ParserSymbol] = []
-
-        parser = DecompParser(aliases)
-        for f in files:
-            parser.reset_and_set_filename(f.path)
-            parser.read(f.text)
-
-            self._symbols += parser.iter_symbols(module.upper())
+        encoding: str = "latin1",
+    ) -> "DecompCodebase":
+        """The module's markers in ``files``, as the compiler saw them."""
+        paths = local_paths({block.source_file for block in index.marker_blocks}, files)
+        results = read_marker_blocks(
+            index.marker_blocks, paths, aliases=aliases, encoding=encoding
+        )
+        return cls((symbol for result in results for symbol in result.tokens), module)
 
     def prune_invalid_addrs(
         self, is_valid: Callable[[int], bool]

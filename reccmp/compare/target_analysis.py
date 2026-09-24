@@ -22,11 +22,13 @@ from reccmp.cvdump.targeted import (
 from reccmp.dir import source_code_search
 from reccmp.formats import Image, TextFile, detect_image
 from reccmp.parser import DecompCodebase
-from reccmp.parser.marker import ProjectAliases
+from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
 from reccmp.project.detect import RecCmpTarget
+from reccmp.source.index import SourceIndex, SourceIndexError
 
 from .db import EntityDb
 from .lines import LinesDb
+from .source_capability import require_source_index
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ _MARKER_CACHE_INPUTS = (
     _PACKAGE_ROOT / "parser" / "codebase.py",
     _PACKAGE_ROOT / "parser" / "marker.py",
     _PACKAGE_ROOT / "parser" / "node.py",
-    _PACKAGE_ROOT / "parser" / "parser.py",
+    _PACKAGE_ROOT / "parser" / "reader.py",
 )
 _COMPARE_CACHE_INPUTS = tuple(
     sorted((_PACKAGE_ROOT / "compare").rglob("*.py"), key=str)
@@ -73,6 +75,7 @@ class LoadedTargetAnalysis:
     equivalence_sources: list[TextFile]
     project_aliases: ProjectAliases
     codebase: DecompCodebase
+    source_index: SourceIndex
     cache: AnalysisCache
     prepared_cache_name: str
     prepared_fingerprint: str
@@ -142,33 +145,39 @@ def _load_module_cvdump(
 def _load_source_markers(
     target: RecCmpTarget,
     code_files: list[TextFile],
-    cache: AnalysisCache,
+    source_index: SourceIndex,
     *,
     use_cache: bool,
 ) -> tuple[DecompCodebase, str]:
+    """The target's markers as the compiler saw them in the current sources."""
+    stale = source_index.stale_sources(file.path for file in code_files)
+    if stale:
+        listed = ", ".join(str(path) for path in stale[:5])
+        more = f" and {len(stale) - 5} more" if len(stale) > 5 else ""
+        raise SourceIndexError(
+            f"the source index is older than {listed}{more}; collect it again"
+        )
+    codebase = DecompCodebase.from_source_index(
+        source_index,
+        target.target_id,
+        (file.path for file in code_files),
+        aliases=normalize_project_aliases({target.target_id: target.marker_aliases}),
+        encoding=target.encoding or "latin1",
+    )
     marker_fingerprint = ""
-    codebase: DecompCodebase | None = None
     if use_cache:
-        marker_code_fingerprint = fingerprint_files(
-            _MARKER_CACHE_INPUTS, context="marker-parser-v1"
+        marker_fingerprint = fingerprint_files(
+            _MARKER_CACHE_INPUTS,
+            context=json.dumps(
+                {
+                    "target": target.target_id,
+                    "aliases": target.marker_aliases,
+                    "sources": source_index.source_digests,
+                    "blocks": [block.to_dict() for block in source_index.marker_blocks],
+                },
+                sort_keys=True,
+            ),
         )
-        marker_context = json.dumps(
-            {
-                "target": target.target_id,
-                "aliases": target.marker_aliases,
-                "parser": marker_code_fingerprint,
-            },
-            sort_keys=True,
-        )
-        marker_fingerprint = fingerprint_text_files(code_files, context=marker_context)
-        codebase = cache.load("source-markers", marker_fingerprint)
-    if codebase is None:
-        codebase = DecompCodebase(
-            code_files,
-            target.target_id,
-            aliases={target.target_id: target.marker_aliases},
-        )
-        cache.store("source-markers", marker_fingerprint, codebase)
     return codebase, marker_fingerprint
 
 
@@ -256,8 +265,11 @@ def load_target_analysis(
     orig_addrs: Iterable[int] = (),
     recomp_addrs: Iterable[int] = (),
     use_cache: bool = True,
+    source_index: SourceIndex | None = None,
 ) -> LoadedTargetAnalysis:
     """Load fresh binaries plus cached deterministic analysis inputs."""
+    if source_index is None:
+        source_index = require_source_index(target)
     orig_addrs = tuple(orig_addrs)
     recomp_addrs = tuple(recomp_addrs)
     orig_bin = detect_image(filepath=target.original_path)
@@ -274,7 +286,7 @@ def load_target_analysis(
         target.recompiled_pdb.parent / ".reccmp-cache", enabled=use_cache
     )
     codebase, marker_fingerprint = _load_source_markers(
-        target, code_files, cache, use_cache=use_cache
+        target, code_files, source_index, use_cache=use_cache
     )
 
     logger.info("Parsing %s ...", target.recompiled_pdb)
@@ -342,6 +354,7 @@ def load_target_analysis(
         equivalence_sources=equivalence_sources,
         project_aliases={target.target_id: target.marker_aliases},
         codebase=codebase,
+        source_index=source_index,
         cache=cache,
         prepared_cache_name=(
             "prepared-full" if symbol_scope == "full" else "prepared-targeted"

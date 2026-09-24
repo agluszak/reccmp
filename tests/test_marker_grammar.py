@@ -1,37 +1,13 @@
+"""The marker grammar: marker lines, aliases, and name comments."""
+
 import pytest
-from reccmp.parser.parser import MarkerDict
 from reccmp.parser.marker import (
-    DecompMarker,
     MarkerType,
     match_marker,
     is_marker_exact,
     normalize_project_aliases,
 )
-from reccmp.parser.util import (
-    is_blank_or_comment,
-    get_class_name,
-    get_variable_name,
-    get_string_contents,
-)
-
-blank_or_comment_param = [
-    (True, ""),
-    (True, "\t"),
-    (True, "    "),
-    (False, "\tint abc=123;"),
-    (True, "// OFFSET: LEGO1 0xdeadbeef"),
-    (True, "   /* Block comment beginning"),
-    (True, "Block comment ending */   "),
-    # TODO: does clang-format have anything to say about these cases?
-    (False, "x++; // Comment follows"),
-    (False, "x++; /* Block comment begins"),
-]
-
-
-@pytest.mark.parametrize("expected, line", blank_or_comment_param)
-def test_is_blank_or_comment(line: str, expected: bool):
-    assert is_blank_or_comment(line) is expected
-
+from reccmp.parser.reader import get_class_name, get_string_contents
 
 marker_samples = [
     # (can_parse: bool, exact_match: bool, line: str)
@@ -87,31 +63,6 @@ def test_marker_exact(line: str, exact: bool, _):
     assert is_marker_exact(line) is exact
 
 
-def test_marker_dict_simple():
-    d = MarkerDict()
-    d.insert(DecompMarker(MarkerType.FUNCTION, "TEST", 0x1234))
-    markers = list(d.iter())
-    assert len(markers) == 1
-
-
-def test_marker_dict_ofs_replace():
-    d = MarkerDict()
-    d.insert(DecompMarker(MarkerType.FUNCTION, "TEST", 0x1234))
-    d.insert(DecompMarker(MarkerType.FUNCTION, "TEST", 0x555))
-    markers = list(d.iter())
-    assert len(markers) == 1
-    assert markers[0].offset == 0x1234
-
-
-def test_marker_dict_type_replace():
-    d = MarkerDict()
-    d.insert(DecompMarker(MarkerType.FUNCTION, "TEST", 0x1234))
-    d.insert(DecompMarker(MarkerType.STUB, "TEST", 0x1234))
-    markers = list(d.iter())
-    assert len(markers) == 1
-    assert markers[0].type == MarkerType.FUNCTION
-
-
 class_name_match_cases = [
     ("struct MxString {", "MxString"),
     ("class MxString {", "MxString"),
@@ -145,37 +96,6 @@ class_name_no_match_cases = [
 @pytest.mark.parametrize("line", class_name_no_match_cases)
 def test_get_class_name_none(line: str):
     assert get_class_name(line) is None
-
-
-variable_name_cases = [
-    # With "g_" prefix, formerly a requirement for variables in reccmp-enabled code.
-    ("char* g_test;", "g_test"),
-    ("g_test;", "g_test"),
-    ("void (*g_test)(int);", "g_test"),
-    ("void (*g_test)(char*, int);", "g_test"),
-    ("char g_test[50];", "g_test"),
-    ("char g_test[50] = {1234,", "g_test"),
-    ("int g_test = 500;", "g_test"),
-    # no prefix
-    ("char* hello;", "hello"),
-    ("hello;", "hello"),
-    ("void (*hello)(int);", "hello"),
-    ("char hello[];", "hello"),
-    ("char hello[][];", "hello"),
-    ("char hello[50];", "hello"),
-    ("char hello[10][50];", "hello"),
-    ("char hello[50] = {1234,", "hello"),
-    ("int hello = 500;", "hello"),
-    ("char* gBoring_material_names[2];", "gBoring_material_names"),
-    ("const FloatConstant g_floatConst4096(4096.0f);", "g_floatConst4096"),
-    ("int really::really::qualified::variable hello;", "hello"),
-    ("fully::qualified::type test = 5;", "test"),
-]
-
-
-@pytest.mark.parametrize("line,name", variable_name_cases)
-def test_get_variable_name(line: str, name: str):
-    assert get_variable_name(line) == name
 
 
 string_match_cases = [

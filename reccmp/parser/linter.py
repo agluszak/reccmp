@@ -1,7 +1,7 @@
 from pathlib import PurePath
 from typing import Iterator, Sequence
 from .marker import MarkerType
-from .parser import ReccmpParserResult
+from .reader import ReccmpParserResult
 from .error import AlertCode, ParserAlert
 from .node import ParserFunction, ParserString, ParserVtable
 

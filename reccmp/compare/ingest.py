@@ -11,7 +11,6 @@ from reccmp.formats.exceptions import (
 from reccmp.formats import PEImage, TextFile
 from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.parser import DecompCodebase
-from reccmp.parser.marker import ProjectAliases
 from reccmp.parser.node import ParserVtable
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.event import (
@@ -152,16 +151,12 @@ def load_markers(
     code_files: Sequence[TextFile],
     lines_db: LinesDb,
     orig_bin: PEImage,
-    target_id: str,
+    codebase: DecompCodebase,
     db: EntityDb,
     encoding: str = "latin1",
-    project_aliases: ProjectAliases | None = None,
     report: ReccmpReportProtocol = reccmp_report_nop,
-    codebase: DecompCodebase | None = None,
 ):
     lines_db.add_local_paths((f.path for f in code_files))
-    if codebase is None:
-        codebase = DecompCodebase(code_files, target_id, aliases=project_aliases)
 
     # If the address of any annotation would cause an exception,
     # remove it and report an error.

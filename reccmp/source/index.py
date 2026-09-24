@@ -1,9 +1,11 @@
 """Join reccmp markers to semantic declarations from the Clang AST.
 
-The marker parser owns annotation syntax and addresses. Clang owns C++ names,
-function and variable kinds, types, linkage, class membership, inheritance,
-and virtual declarations. This module joins those two models by source location
-and writes disposable JSON projections for downstream tools.
+The marker grammar (``reccmp.parser``) owns annotation syntax and addresses.
+Clang owns C++ names, function and variable kinds, types, linkage, class
+membership, inheritance, virtual declarations, and which declaration each
+marker block annotates. This module keeps the indexer's marker blocks, joins
+them to the declaration records by semantic id, and writes disposable JSON
+projections for downstream tools.
 
 Compiler records arrive as per-TU observations. Link-namespace partitioning,
 winner selection, and conflict derivation happen after collection — never by
@@ -17,19 +19,20 @@ from __future__ import annotations
 # The optional execution backend imports this record model when first used.
 # pylint: disable=cyclic-import
 
+import hashlib
 import json
 import shlex
 from dataclasses import asdict, dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence, TextIO
 
-from reccmp.formats import TextFile
-from reccmp.parser.codebase import DecompCodebase
 from reccmp.parser.marker import MarkerType, ProjectAliases
+from reccmp.parser.node import ParserFunction, ParserVtable
+from reccmp.parser.reader import MarkerBlock, local_paths, read_marker_blocks
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v6"
+_SCHEMA = "reccmp-source-index-v7"
 
 
 class SourceIndexError(ValueError):
@@ -295,6 +298,7 @@ class TranslationUnitRecords:
     classes: list[SourceClass] = field(default_factory=list)
     member_uses: list[SourceMemberUse] = field(default_factory=list)
     size_assertions: list[_SizeAssertion] = field(default_factory=list)
+    marker_blocks: list[MarkerBlock] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     abi: SourceAbi | None = None
 
@@ -302,6 +306,9 @@ class TranslationUnitRecords:
         """Store one compiler observation from this unit."""
         values = dict(record)
         kind = values.pop("record")
+        if kind == "marker-block":
+            self.marker_blocks.append(MarkerBlock.from_dict(values))
+            return
         if kind == "dependency":
             self.dependencies = [str(path) for path in values.get("files") or ()]
             return
@@ -417,6 +424,19 @@ def derive_namespace(
         size_assertions=size_assertions,
         abi=abi,
     )
+
+
+def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...]:
+    """One block per source position; a header is seen by many units."""
+    merged: dict[tuple[str, int], MarkerBlock] = {}
+    for block in blocks:
+        previous = merged.get(block.key)
+        merged[block.key] = block if previous is None else previous.merged(block)
+    return tuple(merged[key] for key in sorted(merged))
+
+
+def source_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _member_use_key(item: SourceMemberUse) -> tuple[Any, ...]:
@@ -902,48 +922,42 @@ def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
 
 
 def _join_markers(
-    repository: Path,
     target: str,
-    source_paths: Sequence[Path],
     namespace: _NamespaceRecords,
+    blocks: Sequence[MarkerBlock],
     *,
     aliases: ProjectAliases | None,
 ) -> tuple[list[SourceClass], list[SourceMarker]]:
-    files = tuple(TextFile.from_files(source_paths))
-    codebase = DecompCodebase(files, target, aliases=aliases)
-    declarations = namespace.declarations
-    by_location: dict[tuple[str, int], list[SourceDeclaration]] = {}
-    for declaration in declarations:
+    identity = {block.source_file: PurePath(block.source_file) for block in blocks}
+    symbols = [
+        symbol
+        for result in read_marker_blocks(blocks, identity, aliases=aliases)
+        for symbol in result.tokens
+        if symbol.module == target.upper()
+    ]
+    definitions: dict[str, list[SourceDeclaration]] = {}
+    for declaration in namespace.declarations:
         if declaration.is_definition:
-            by_location.setdefault(
-                (declaration.source_file, declaration.line), []
-            ).append(declaration)
+            definitions.setdefault(declaration.semantic_id, []).append(declaration)
 
     markers: list[SourceMarker] = []
-    for method_symbol in (
-        *codebase.iter_line_functions(),
-        *codebase.iter_name_functions(),
-    ):
-        relative = (
-            Path(method_symbol.filename)
-            .resolve()
-            .relative_to(repository.resolve())
-            .as_posix()
-        )
-        candidates = by_location.get((relative, method_symbol.line_number), [])
+    for method_symbol in symbols:
+        if not isinstance(method_symbol, ParserFunction):
+            continue
+        relative = method_symbol.filename.as_posix()
         marker_declaration: SourceDeclaration | None = None
         # Name-reference markers (TEMPLATE/SYNTHETIC/LIBRARY, and FUNCTION with a
         # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
-        # point at their name line, not a definition, so they cannot bind by
-        # location.
+        # name their entity instead of annotating a definition.
         if (
-            method_symbol.type
-            in {
-                MarkerType.FUNCTION,
-                MarkerType.STUB,
-            }
+            method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
             and not method_symbol.is_nameref()
         ):
+            candidates = [
+                declaration
+                for semantic_id in method_symbol.definitions
+                for declaration in definitions.get(semantic_id, ())
+            ]
             if len(candidates) != 1:
                 raise SourceIndexError(
                     f"{relative}:{method_symbol.line_number}: {method_symbol.type.name} "
@@ -967,21 +981,12 @@ def _join_markers(
         )
 
     classes = list(namespace.classes)
-    class_by_location = {
-        (item.source_file, item.line): index for index, item in enumerate(classes)
-    }
     class_by_name = {item.qualified_name: index for index, item in enumerate(classes)}
-    for vtable_symbol in codebase.iter_vtables():
-        relative = (
-            Path(vtable_symbol.filename)
-            .resolve()
-            .relative_to(repository.resolve())
-            .as_posix()
-        )
-        key = (relative, vtable_symbol.line_number)
-        index = class_by_location.get(key)
-        if index is None:
-            index = class_by_name.get(vtable_symbol.name)
+    for vtable_symbol in symbols:
+        if not isinstance(vtable_symbol, ParserVtable):
+            continue
+        relative = vtable_symbol.filename.as_posix()
+        index = class_by_name.get(vtable_symbol.name)
         if index is None:
             source_class = SourceClass(
                 semantic_id=f"record:{vtable_symbol.name}",
@@ -1061,8 +1066,17 @@ class SourceIndex:
         conflicts: Iterable[SourceConflict] = (),
         abi: SourceAbi | None = None,
         target_abis: Mapping[str, SourceAbi] | None = None,
+        marker_blocks: Iterable[MarkerBlock] = (),
+        source_digests: Mapping[str, str] | None = None,
     ) -> None:
         # pylint: disable=too-many-arguments
+        # Every marker block the compiler saw, for all targets: the marker
+        # grammar picks out each target's markers when reading them.
+        self.marker_blocks = merge_marker_blocks(marker_blocks)
+        # sha256 of every target source file when the index was collected.
+        self.source_digests: dict[str, str] = dict(
+            sorted((source_digests or {}).items())
+        )
         self.declarations = tuple(
             sorted(declarations, key=lambda item: item.semantic_id)
         )
@@ -1121,7 +1135,23 @@ class SourceIndex:
             conflicts=(item for item in self.conflicts if item.target == target),
             abi=abi,
             target_abis={target: abi} if abi is not None else {},
+            marker_blocks=self.marker_blocks,
+            source_digests=self.source_digests,
         )
+
+    def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:
+        """Source files that changed, or appeared, since the index was collected."""
+        paths = list(paths)
+        known = {
+            path: relative
+            for relative, path in local_paths(self.source_digests, paths).items()
+        }
+        return [
+            path
+            for path in paths
+            if path not in known
+            or source_digest(Path(path)) != self.source_digests[known[path]]
+        ]
 
     def class_named(
         self, qualified_name: str, *, target: str | None = None
@@ -1316,19 +1346,21 @@ class SourceIndex:
     @classmethod
     def from_units(
         cls,
-        repository: Path,
         target: str,
-        source_paths: Sequence[Path],
         units: Sequence[TranslationUnitRecords],
         *,
         unit_ids: set[str] | None = None,
         aliases: ProjectAliases | None = None,
     ) -> "SourceIndex":
-        """Derive one link namespace from TU observations, then join markers."""
+        """Derive one link namespace from TU observations, then join markers.
+
+        Markers come from every unit: a header's markers for this target may
+        only be compiled by another target's translation units."""
         namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
-        classes, markers = _join_markers(
-            repository, target, source_paths, namespace, aliases=aliases
+        blocks = merge_marker_blocks(
+            block for unit in units for block in unit.marker_blocks
         )
+        classes, markers = _join_markers(target, namespace, blocks, aliases=aliases)
         return cls(
             declarations=namespace.declarations,
             classes=classes,
@@ -1337,14 +1369,13 @@ class SourceIndex:
             member_uses=namespace.member_uses,
             conflicts=namespace.conflicts,
             abi=namespace.abi,
+            marker_blocks=blocks,
         )
 
     @classmethod
     def from_collector(
         cls,
-        repository: Path,
         target: str,
-        source_paths: Sequence[Path],
         collector: SourceCollector,
         *,
         unit_ids: set[str] | None = None,
@@ -1352,9 +1383,7 @@ class SourceIndex:
     ) -> "SourceIndex":
         """Derive from a fixture ``SourceCollector`` (tests)."""
         return cls.from_units(
-            repository,
             target,
-            source_paths,
             tuple(collector.units.values()),
             unit_ids=unit_ids,
             aliases=aliases,
@@ -1363,6 +1392,11 @@ class SourceIndex:
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records."""
+        if document.get("schema") != _SCHEMA:
+            raise SourceIndexError(
+                f"source index schema {document.get('schema')!r} is not {_SCHEMA!r}; "
+                "collect the index again"
+            )
         declarations = tuple(
             _declaration_from_dict(item) for item in document["declarations"]
         )
@@ -1399,6 +1433,10 @@ class SourceIndex:
                 for target, values in (document.get("target_abis") or {}).items()
                 if isinstance(values, Mapping)
             },
+            marker_blocks=(
+                MarkerBlock.from_dict(item) for item in document["marker_blocks"]
+            ),
+            source_digests=document["source_digests"],
         )
 
     def functions_by_address(
@@ -1468,6 +1506,8 @@ class SourceIndex:
             "variables": [asdict(item) for item in self.variables],
             "member_uses": [asdict(item) for item in self.member_uses],
             "conflicts": [asdict(item) for item in self.conflicts],
+            "marker_blocks": [item.to_dict() for item in self.marker_blocks],
+            "source_digests": self.source_digests,
         }
         if self.abi is not None:
             document["abi"] = asdict(self.abi)
@@ -1476,6 +1516,18 @@ class SourceIndex:
                 target: asdict(abi) for target, abi in sorted(self.target_abis.items())
             }
         return document
+
+    @classmethod
+    def read(cls, path: Path) -> "SourceIndex":
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            return cls.from_dict(document)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if isinstance(exc, SourceIndexError):
+                raise
+            raise SourceIndexError(
+                f"source index at {path} is unusable: {exc}"
+            ) from exc
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

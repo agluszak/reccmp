@@ -38,6 +38,13 @@ them can conflict on the next rebase. So:
 - **Don't reformat or tidy upstream code** that the fork doesn't otherwise
   need to change.
 
+One deliberate exception: markers come only from the Clang source index
+(`docs/source-index.md`), so upstream's handwritten C++ reader is deleted —
+`reccmp/parser/tokenizer.py`, `parser.py`, `util.py`, the `samples/*.cpp`
+corpus and the `test_tokenizer_*`/`test_parser*` tests. When a rebase
+conflicts on one of them, keep it deleted and port any marker-grammar change
+to `reccmp/parser/reader.py` (block grammar) or `marker.py` (marker lines).
+
 ## Rebasing onto upstream
 
 ```sh

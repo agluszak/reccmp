@@ -59,6 +59,11 @@ appear in either headers or source files. `reccmp-decomplint` warns when an
 implementation marker such as `FUNCTION` has no adjacent declaration in a source
 file and therefore falls back to name lookup.
 
+Markers are read by Clang (see [source-index.md](source-index.md)): a marker
+annotates the declaration that begins at the first code line after its comment
+block, so it must be in code the compiler sees. Markers in files no translation
+unit includes, or inside `#if 0`, are reported as `marker_not_compiled`.
+
 ### Annotating a comment of the function's symbol
 
 There are a few cases where two functions of the same name need to be annotated by comment (e.g. in function overloads). In such cases, you can annotate a comment of the function's debug symbol:

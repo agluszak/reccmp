@@ -133,3 +133,9 @@ class BuildFile(YmlFileModel):
 
     project: Path
     targets: dict[str, BuildFileTarget]
+    # The Clang source index (``source-index.json``) of this build's sources:
+    # where every target's markers come from.
+    source_index: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("source-index", "source_index"),
+    )

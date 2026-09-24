@@ -1,2 +1,2 @@
 from .codebase import DecompCodebase
-from .parser import DecompParser, ReccmpParserResult
+from .reader import ReccmpParserResult, read_marker_blocks

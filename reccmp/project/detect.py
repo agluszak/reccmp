@@ -192,6 +192,9 @@ class RecCmpPartialTarget:
 
     marker_aliases: dict[str, str] | None = None
 
+    # Clang source index holding this target's markers (from reccmp-build.yml).
+    source_index: Path | None = None
+
 
 @dataclass
 class RecCmpTarget:
@@ -235,6 +238,9 @@ class RecCmpTarget:
     equivalence_groups: list[Path] = field(default_factory=list)
 
     marker_aliases: dict[str, str] = field(default_factory=dict)
+
+    # Clang source index holding this target's markers (from reccmp-build.yml).
+    source_index: Path | None = None
 
 
 class RecCmpProject:
@@ -314,6 +320,7 @@ class RecCmpProject:
             equivalence_groups=equivalence_groups,
             marker_aliases=marker_aliases,
             report_config=report,
+            source_index=target.source_index,
         )
 
     def find_build_config(self, search_path: Path) -> BuildFile | None:
@@ -473,6 +480,10 @@ class RecCmpProject:
                 project.targets[target_id].recompiled_pdb = (
                     build_directory / build_target.pdb
                 )
+                if build_data.source_index is not None:
+                    project.targets[target_id].source_index = (
+                        build_directory / build_data.source_index
+                    )
 
         return project
 

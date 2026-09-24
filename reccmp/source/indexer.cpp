@@ -7,10 +7,13 @@
 //
 // Output is one JSON object per line: `{"record":"declaration",...}`,
 // `{"record":"variable",...}`, `{"record":"class",...}`,
+// `{"record":"member-use",...}`, `{"record":"marker-block",...}`,
 // `{"record":"size-assertion",...}`, `{"record":"unit-abi",...}` or
 // `{"record":"dependency",...}`.
 
+#include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -44,17 +47,21 @@
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Lex/LiteralSupport.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
@@ -99,16 +106,66 @@ struct CachedFile {
   std::string absolute;
 };
 
+// One `//` comment that is the first thing on its line: the only shape a
+// reccmp marker (or the name line completing one) can take.
+struct LineComment {
+  unsigned offset = 0;
+  unsigned endOffset = 0;
+  unsigned line = 0;
+  unsigned column = 0;
+  std::string text;
+};
+
+// The preprocessor reports every comment it lexes, which is exactly the set of
+// comments in active code: markers inside `#if 0` never reach the index.
+class LineCommentCollector : public CommentHandler {
+ public:
+  bool HandleComment(Preprocessor& preprocessor, SourceRange range) override {
+    SourceManager& sources = preprocessor.getSourceManager();
+    SourceLocation begin = range.getBegin();
+    if (!begin.isFileID()) return false;
+    auto [file, offset] = sources.getDecomposedLoc(begin);
+    bool invalid = false;
+    llvm::StringRef buffer = sources.getBufferData(file, &invalid);
+    if (invalid || !buffer.substr(offset).starts_with("//")) return false;
+    unsigned lineStart = offset;
+    while (lineStart > 0 && buffer[lineStart - 1] != '\n' && buffer[lineStart - 1] != '\r') {
+      --lineStart;
+    }
+    if (!buffer.slice(lineStart, offset).trim(" \t\f\v").empty()) return false;
+    unsigned endOffset = sources.getFileOffset(range.getEnd());
+    comments_[file].push_back(LineComment{
+        offset,
+        endOffset,
+        sources.getLineNumber(file, offset),
+        offset - lineStart + 1,
+        buffer.slice(offset, endOffset).rtrim("\r\n").str(),
+    });
+    return false;
+  }
+
+  const llvm::DenseMap<FileID, std::vector<LineComment>>& comments() const { return comments_; }
+
+ private:
+  llvm::DenseMap<FileID, std::vector<LineComment>> comments_;
+};
+
 class Indexer {
  public:
-  Indexer(ASTContext& context, llvm::raw_ostream& out)
+  Indexer(ASTContext& context, llvm::raw_ostream& out, Preprocessor& preprocessor,
+          const LineCommentCollector& comments)
       : context_(context),
         sources_(context.getSourceManager()),
         policy_(context.getPrintingPolicy()),
         names_(context),
-        out_(out) {}
+        out_(out),
+        preprocessor_(preprocessor),
+        comments_(comments) {}
 
-  void run() { walkContext(context_.getTranslationUnitDecl(), ""); }
+  void run() {
+    walkContext(context_.getTranslationUnitDecl(), "");
+    emitMarkerBlocks();
+  }
 
  private:
   // One normalized absolute path and repository membership per FileID. System
@@ -559,9 +616,7 @@ class Indexer {
         // its definition is not a concrete emitted function that owns a reccmp
         // FUNCTION marker. Keep its marker-join row declaration-only; an emitted
         // specialization carries the concrete function identity and extent.
-        {"is_definition",
-         function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed() &&
-             !function->getDescribedFunctionTemplate()},
+        {"is_definition", isEmittedDefinition(function)},
     };
     emit(std::move(record));
     emitMemberUses(function, functionIdentity, qualifiedName, location);
@@ -573,18 +628,21 @@ class Indexer {
   // Mangling a variable in a dependent context is meaningless, so those fall
   // back to a qualified signature identity, mirroring uninstantiated
   // template patterns for functions.
+  std::string variableSemanticId(const VarDecl* variable, llvm::StringRef qualifiedName) const {
+    std::string mangled;
+    if (!variable->getDeclContext()->isDependentContext()) mangled = names_.getName(variable);
+    if (!mangled.empty()) return mangled;
+    return ("VarDecl:" + qualifiedName + "(" + canonicalName(variable->getType()) + ")").str();
+  }
+
   void emitVariable(const VarDecl* variable, const Location& location) {
     const DeclContext* context = variable->getDeclContext();
     std::string scope = scopeOf(context);
     std::string qualifiedName = qualify(scope, variable->getNameAsString());
     std::string type = canonicalName(variable->getType());
-    std::string mangled;
-    if (!context->isDependentContext()) mangled = names_.getName(variable);
-    std::string semanticId = mangled;
-    if (semanticId.empty()) semanticId = "VarDecl:" + qualifiedName + "(" + type + ")";
     llvm::json::Object payload{
         {"record", "variable"},
-        {"semantic_id", semanticId},
+        {"semantic_id", variableSemanticId(variable, qualifiedName)},
         {"qualified_name", qualifiedName},
         {"type", type},
         {"linkage", linkageName(variable->getLinkageInternal())},
@@ -603,6 +661,11 @@ class Indexer {
   static bool isVirtual(const FunctionDecl* function) {
     const auto* method = dyn_cast<CXXMethodDecl>(function);
     return method && method->isVirtual();
+  }
+
+  static bool isEmittedDefinition(const FunctionDecl* function) {
+    return function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed() &&
+           !function->getDescribedFunctionTemplate();
   }
 
   class MemberUseVisitor : public RecursiveASTVisitor<MemberUseVisitor> {
@@ -1074,12 +1137,229 @@ class Indexer {
     out_ << llvm::json::Value(std::move(record)) << "\n";
   }
 
-  void walkContext(const DeclContext* context, const std::string& scope) {
-    for (const Decl* declaration : context->decls()) walkDecl(declaration, scope);
+  // -- marker blocks ---------------------------------------------------------
+  //
+  // A marker block is a run of `//` comments on consecutive lines, at least one
+  // of which is shaped like a reccmp marker. The marker grammar stays in reccmp;
+  // the indexer only states where each block is and which declarations begin
+  // at the first code token after it, so reccmp never has to find a declaration
+  // by reading C++ itself.
+
+  // Declarations a marker may annotate, keyed by the file offset where their
+  // source (or an enclosing template header / `extern "C"`) begins.
+  void registerAnchor(const Decl* declaration, SourceLocation begin) {
+    SourceLocation location = sources_.getExpansionLoc(begin);
+    if (!location.isValid() || !location.isFileID()) return;
+    if (!fileInfo(location).indexed) return;
+    auto [file, offset] = sources_.getDecomposedLoc(location);
+    std::vector<const Decl*>& slot = anchors_[file][offset];
+    if (std::find(slot.begin(), slot.end(), declaration) == slot.end()) {
+      slot.push_back(declaration);
+    }
   }
 
-  void walkDecl(const Decl* declaration, const std::string& scope) {
+  static bool isAnchorKind(const Decl* declaration) {
+    if (const auto* function = dyn_cast<FunctionDecl>(declaration)) {
+      return !function->isImplicit() && !function->getNameAsString().empty();
+    }
+    if (const auto* variable = dyn_cast<VarDecl>(declaration)) {
+      return !variable->isImplicit() && !isa<ParmVarDecl>(variable) &&
+             !variable->getNameAsString().empty();
+    }
+    if (const auto* record = dyn_cast<CXXRecordDecl>(declaration)) {
+      return !record->isImplicit() && record->getIdentifier();
+    }
+    return false;
+  }
+
+  void registerAnchors(const Decl* declaration, SourceLocation outerBegin) {
+    if (!isAnchorKind(declaration)) return;
+    registerAnchor(declaration, declaration->getBeginLoc());
+    if (const auto* declarator = dyn_cast<DeclaratorDecl>(declaration)) {
+      registerAnchor(declaration, declarator->getOuterLocStart());
+    }
+    if (outerBegin.isValid()) registerAnchor(declaration, outerBegin);
+  }
+
+  llvm::json::Value anchorCandidate(const Decl* declaration) const {
+    if (const auto* function = dyn_cast<FunctionDecl>(declaration)) {
+      std::string qualifiedName =
+          qualify(scopeOf(function->getDeclContext()), function->getNameAsString());
+      Location location = locate(function);
+      return llvm::json::Object{
+          {"kind", "function"},
+          {"semantic_id", semanticId(function, qualifiedName)},
+          {"qualified_name", qualifiedName},
+          {"is_definition", isEmittedDefinition(function)},
+          {"line", location.line},
+          {"end_line", location.endLine},
+      };
+    }
+    if (const auto* variable = dyn_cast<VarDecl>(declaration)) {
+      std::string qualifiedName =
+          qualify(scopeOf(variable->getDeclContext()), variable->getNameAsString());
+      llvm::json::Object candidate{
+          {"kind", "variable"},
+          {"semantic_id", variableSemanticId(variable, qualifiedName)},
+          {"qualified_name", qualifiedName},
+          {"name", variable->getNameAsString()},
+          {"local_static", variable->isStaticLocal()},
+          {"enclosing_function", nullptr},
+      };
+      if (const auto* function =
+              dyn_cast_or_null<FunctionDecl>(variable->getParentFunctionOrMethod())) {
+        std::string functionName =
+            qualify(scopeOf(function->getDeclContext()), function->getNameAsString());
+        candidate["enclosing_function"] = semanticId(function, functionName);
+      }
+      return candidate;
+    }
+    const auto* record = cast<CXXRecordDecl>(declaration);
+    std::string qualifiedName = qualify(scopeOf(record->getDeclContext()), component(record));
+    return llvm::json::Object{
+        {"kind", "class"},
+        {"semantic_id", "record:" + qualifiedName},
+        {"qualified_name", qualifiedName},
+    };
+  }
+
+  // The first code token after `offset`, skipping comments, whitespace and
+  // whole preprocessor directive lines.
+  Token nextCodeToken(FileID file, unsigned offset) const {
+    llvm::StringRef buffer = sources_.getBufferData(file);
+    Lexer lexer(sources_.getLocForStartOfFile(file), context_.getLangOpts(), buffer.begin(),
+                buffer.begin() + offset, buffer.end());
+    Token token;
+    lexer.LexFromRawLexer(token);
+    while (token.is(tok::hash) && token.isAtStartOfLine()) {
+      do {
+        lexer.LexFromRawLexer(token);
+      } while (!token.is(tok::eof) && !token.isAtStartOfLine());
+    }
+    return token;
+  }
+
+  // The first string literal (with adjacent literals concatenated) on the
+  // line that starts at `token`, as the bytes the compiler would emit.
+  llvm::json::Value lineString(FileID file, const Token& first) const {
+    llvm::StringRef buffer = sources_.getBufferData(file);
+    unsigned offset = sources_.getFileOffset(first.getLocation());
+    Lexer lexer(sources_.getLocForStartOfFile(file), context_.getLangOpts(), buffer.begin(),
+                buffer.begin() + offset, buffer.end());
+    std::vector<Token> literal;
+    Token token;
+    for (bool atStart = true;; atStart = false) {
+      lexer.LexFromRawLexer(token);
+      if (token.is(tok::eof) || (!atStart && token.isAtStartOfLine() && literal.empty())) break;
+      if (tok::isStringLiteral(token.getKind())) {
+        literal.push_back(token);
+      } else if (!literal.empty()) {
+        break;
+      }
+    }
+    if (literal.empty()) return nullptr;
+    StringLiteralParser parser(literal, preprocessor_);
+    if (parser.hadError) return nullptr;
+    const TargetInfo& target = context_.getTargetInfo();
+    unsigned width = 1;
+    if (parser.isWide()) width = target.getWCharWidth() / 8;
+    if (parser.isUTF16()) width = target.getChar16Width() / 8;
+    if (parser.isUTF32()) width = target.getChar32Width() / 8;
+    return llvm::json::Object{
+        {"hex", llvm::toHex(parser.GetString(), /*LowerCase=*/true)},
+        {"char_width", static_cast<int64_t>(width)},
+    };
+  }
+
+  static bool looksLikeMarker(llvm::StringRef text) {
+    static const llvm::Regex pattern(
+        "^//[[:space:]]*[[:alnum:]_]+:[[:space:]]*[[:alnum:]_]+[[:space:]]+0[xX][[:xdigit:]]+");
+    return pattern.match(text);
+  }
+
+  void emitMarkerBlock(FileID file, const std::vector<LineComment>& group) {
+    llvm::json::Array comments;
+    for (const LineComment& comment : group) {
+      comments.push_back(llvm::json::Object{
+          {"text", comment.text},
+          {"line", comment.line},
+          {"column", comment.column},
+          {"offset", comment.offset},
+      });
+    }
+    const CachedFile& info = fileInfo(sources_.getLocForStartOfFile(file));
+    llvm::json::Object record{
+        {"record", "marker-block"},
+        {"source_file", relative(info.absolute)},
+        {"comments", std::move(comments)},
+        {"anchor", nullptr},
+    };
+    Token token = nextCodeToken(file, group.back().endOffset);
+    if (!token.is(tok::eof)) {
+      unsigned offset = sources_.getFileOffset(token.getLocation());
+      llvm::json::Array candidates;
+      auto fileAnchors = anchors_.find(file);
+      if (fileAnchors != anchors_.end()) {
+        const auto& byOffset = fileAnchors->second;
+        auto exact = byOffset.find(offset);
+        if (exact != byOffset.end()) {
+          for (const Decl* declaration : exact->second) {
+            candidates.push_back(anchorCandidate(declaration));
+          }
+        } else {
+          // A macro that expands to nothing (an export decoration) may come
+          // before the declaration on the same line.
+          unsigned line = sources_.getLineNumber(file, offset);
+          auto after = byOffset.lower_bound(offset);
+          if (after != byOffset.end() && sources_.getLineNumber(file, after->first) == line) {
+            for (const Decl* declaration : after->second) {
+              candidates.push_back(anchorCandidate(declaration));
+            }
+          }
+        }
+      }
+      record["anchor"] = llvm::json::Object{
+          {"line", sources_.getLineNumber(file, offset)},
+          {"column", sources_.getColumnNumber(file, offset)},
+          {"candidates", std::move(candidates)},
+          {"string", lineString(file, token)},
+      };
+    }
+    emit(std::move(record));
+  }
+
+  void emitMarkerBlocks() {
+    for (const auto& entry : comments_.comments()) {
+      FileID file = entry.first;
+      const std::vector<LineComment>& comments = entry.second;
+      if (!fileInfo(sources_.getLocForStartOfFile(file)).indexed) continue;
+      std::vector<LineComment> group;
+      bool marked = false;
+      auto flush = [&]() {
+        if (marked) emitMarkerBlock(file, group);
+        group.clear();
+        marked = false;
+      };
+      for (const LineComment& comment : comments) {
+        if (!group.empty() && comment.line != group.back().line + 1) flush();
+        group.push_back(comment);
+        marked = marked || looksLikeMarker(comment.text);
+      }
+      flush();
+    }
+  }
+
+  void walkContext(const DeclContext* context, const std::string& scope,
+                   SourceLocation outerBegin = {}) {
+    for (const Decl* declaration : context->decls()) walkDecl(declaration, scope, outerBegin);
+  }
+
+  // `outerBegin` is where an enclosing template header or brace-less
+  // `extern "C"` starts: a marker above either annotates the declaration.
+  void walkDecl(const Decl* declaration, const std::string& scope,
+                SourceLocation outerBegin = {}) {
     if (!visited_.insert(declaration).second) return;
+    registerAnchors(declaration, outerBegin);
 
     std::string childScope = scope;
     std::string part = component(declaration);
@@ -1126,17 +1406,22 @@ class Indexer {
     // an implicit instantiation is where a recovered template body's emitted
     // code actually lives.
     if (const auto* classTemplate = dyn_cast<ClassTemplateDecl>(declaration)) {
-      walkDecl(classTemplate->getTemplatedDecl(), scope);
+      walkDecl(classTemplate->getTemplatedDecl(), scope, classTemplate->getBeginLoc());
       for (const auto* specialization : classTemplate->specializations()) {
         walkDecl(specialization, scope);
       }
       return;
     }
     if (const auto* functionTemplate = dyn_cast<FunctionTemplateDecl>(declaration)) {
-      walkDecl(functionTemplate->getTemplatedDecl(), scope);
+      walkDecl(functionTemplate->getTemplatedDecl(), scope, functionTemplate->getBeginLoc());
       for (const auto* specialization : functionTemplate->specializations()) {
         walkDecl(specialization, scope);
       }
+      return;
+    }
+    if (const auto* linkage = dyn_cast<LinkageSpecDecl>(declaration)) {
+      SourceLocation outer = linkage->hasBraces() ? SourceLocation() : linkage->getBeginLoc();
+      walkContext(linkage, childScope, outer);
       return;
     }
 
@@ -1148,14 +1433,21 @@ class Indexer {
   PrintingPolicy policy_;
   mutable ASTNameGenerator names_;
   llvm::raw_ostream& out_;
+  Preprocessor& preprocessor_;
+  const LineCommentCollector& comments_;
   llvm::DenseSet<const Decl*> visited_;
   mutable llvm::DenseMap<FileID, CachedFile> files_;
+  llvm::DenseMap<FileID, std::map<unsigned, std::vector<const Decl*>>> anchors_;
 };
 
 class IndexConsumer : public ASTConsumer {
  public:
   IndexConsumer(CompilerInstance& instance, llvm::raw_ostream& out)
-      : instance_(instance), out_(out) {}
+      : instance_(instance), out_(out) {
+    instance_.getPreprocessor().addCommentHandler(&comments_);
+  }
+
+  ~IndexConsumer() override { instance_.getPreprocessor().removeCommentHandler(&comments_); }
 
   void HandleTranslationUnit(ASTContext& context) override {
     const TargetInfo& target = context.getTargetInfo();
@@ -1166,7 +1458,7 @@ class IndexConsumer : public ASTConsumer {
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";
-    Indexer(context, out_).run();
+    Indexer(context, out_, instance_.getPreprocessor(), comments_).run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any
     // DetailedRecord / PreprocessingRecord.
@@ -1186,6 +1478,7 @@ class IndexConsumer : public ASTConsumer {
  private:
   CompilerInstance& instance_;
   llvm::raw_ostream& out_;
+  LineCommentCollector comments_;
 };
 
 class IndexAction : public ASTFrontendAction {

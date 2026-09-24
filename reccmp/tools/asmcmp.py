@@ -40,6 +40,7 @@ from reccmp.compare.report import (
     format_address,
 )
 from reccmp.types import EntityType
+from reccmp.source.index import SourceIndexError
 from reccmp.project.logging import (
     argparse_add_logging_args,
     argparse_parse_logging,
@@ -426,12 +427,16 @@ def main() -> int:
     setup_orig_addresses = list(args.orig_address)
     if args.verbose is not None:
         setup_orig_addresses.append(args.verbose)
-    compare = Compare.from_target(
-        target,
-        orig_addrs=setup_orig_addresses,
-        recomp_addrs=args.recomp_address,
-        use_cache=not args.no_cache,
-    )
+    try:
+        compare = Compare.from_target(
+            target,
+            orig_addrs=setup_orig_addresses,
+            recomp_addrs=args.recomp_address,
+            use_cache=not args.no_cache,
+        )
+    except SourceIndexError as e:
+        logger.error("%s", e)
+        return 1
     compare.function_comparator.witness_search = args.witness
 
     print()

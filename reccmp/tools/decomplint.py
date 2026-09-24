@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Iterable
@@ -9,14 +10,16 @@ import colorama
 import reccmp
 import reccmp.color
 from reccmp.dir import source_code_search
-from reccmp.parser import DecompParser, ReccmpParserResult
-from reccmp.parser.marker import MarkerType, ProjectAliases, normalize_project_aliases
+from reccmp.parser import ReccmpParserResult, read_marker_blocks
+from reccmp.parser.marker import MarkerType, normalize_project_aliases
+from reccmp.parser.reader import local_paths, uncompiled_markers
 from reccmp.parser.linter import (
     check_byname_allowed,
     check_function_order,
     lint_file_collections,
 )
 from reccmp.parser.error import AlertCode, ParserAlert
+from reccmp.source.index import SourceIndex, SourceIndexError
 from reccmp.project.common import RECCMP_BUILD_CONFIG, RECCMP_PROJECT_CONFIG
 from reccmp.project.error import (
     RecCmpProjectException,
@@ -103,6 +106,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="The encoding of the checked files.",
     )
+    parser.add_argument(
+        "--source-index",
+        metavar="<source-index.json>",
+        type=Path,
+        help="The Clang source index to read markers from. Defaults to "
+        "RECCMP_SOURCE_INDEX, then `source-index` in reccmp-build.yml.",
+    )
     argparse_add_logging_args(parser)
 
     args = parser.parse_args()
@@ -117,6 +127,8 @@ class DecomplintTarget:
     paths: tuple[Path, ...]
     module: str | None
     encoding: str
+    # The Clang source index holding the markers of these files.
+    source_index: Path | None = None
     # Project-file only:
     project_file_path: Path | None = None
     aliases: dict[str, str] | None = None
@@ -130,12 +142,17 @@ def decomplint_parse_args(
     2. Target: Lint its files only
     3. List of paths: Lint these files (with optional target scope)
     """
+    explicit_index = args.source_index or (
+        Path(os.environ["RECCMP_SOURCE_INDEX"])
+        if os.environ.get("RECCMP_SOURCE_INDEX")
+        else None
+    )
     if args.paths:
         paths = tuple(source_code_search(args.paths))
         module = args.target
         encoding = args.encoding
 
-        return (DecomplintTarget(paths, module, encoding),)
+        return (DecomplintTarget(paths, module, encoding, explicit_index),)
 
     project = RecCmpProject.from_directory(Path.cwd())
     if not project:
@@ -158,20 +175,13 @@ def decomplint_parse_args(
                 paths,
                 module,
                 encoding,
+                source_index=explicit_index or target.source_index,
                 project_file_path=project.project_config_path,
                 aliases=target.marker_aliases,
             )
         )
 
     return tuple(options)
-
-
-def parse_file(file: TextFile, aliases: ProjectAliases | None) -> ReccmpParserResult:
-    parser = DecompParser(aliases)
-    parser.reset_and_set_filename(file.path)
-    parser.read(file.text)
-    parser.finish()
-    return parser.to_result()
 
 
 def check_aliases(lint_targets: tuple[DecomplintTarget, ...]) -> list[ParserAlert]:
@@ -234,7 +244,9 @@ def lint_all_targets(lint_targets: tuple[DecomplintTarget, ...]) -> list[ParserA
     # In the unlikely event that the same path appears with different encodings,
     # try to open using each encoding and report an error if (when) this fails.
     all_paths = set(
-        (path, target.encoding) for target in lint_targets for path in target.paths
+        (path, target.encoding, target.source_index)
+        for target in lint_targets
+        for path in target.paths
     )
 
     # Collect all parser/linter alerts here and worry about sorting/collating later.
@@ -250,12 +262,21 @@ def lint_all_targets(lint_targets: tuple[DecomplintTarget, ...]) -> list[ParserA
     }
     project_aliases = normalize_project_aliases(project_aliases)
 
-    # Open each (path, encoding) combination once, then collect code annotations.
-    parser_results = {}
-    for path, encoding in all_paths:
+    indexes: dict[Path, SourceIndex] = {}
+    for index_path in {index_path for _, _, index_path in all_paths}:
+        if index_path is None:
+            raise SourceIndexError(
+                "decomplint reads markers from a Clang source index: pass "
+                "--source-index, set RECCMP_SOURCE_INDEX, or set `source-index` "
+                "in reccmp-build.yml"
+            )
+        indexes[index_path] = SourceIndex.read(index_path)
+
+    # Open each (path, encoding) combination once; the markers come from the index.
+    texts: dict[tuple[Path, str], str] = {}
+    for path, encoding, _ in all_paths:
         try:
-            file = TextFile.from_file(path, encoding=encoding)
-            parser_results[(path, encoding)] = parse_file(file, project_aliases)
+            texts[(path, encoding)] = TextFile.from_file(path, encoding=encoding).text
 
         except FileNotFoundError:
             all_alerts.append(ParserAlert(code=AlertCode.FILE_NOT_FOUND, path=path))
@@ -266,6 +287,36 @@ def lint_all_targets(lint_targets: tuple[DecomplintTarget, ...]) -> list[ParserA
                     code=AlertCode.UNICODE_DECODE_ERROR,
                     path=path,
                     detail=encoding,
+                )
+            )
+
+    parser_results: dict[tuple[Path, str], ReccmpParserResult] = {}
+    for index_path, index in indexes.items():
+        entries = {
+            (path, encoding)
+            for path, encoding, entry_index in all_paths
+            if entry_index == index_path and (path, encoding) in texts
+        }
+        blocks = index.marker_blocks
+        for stale in index.stale_sources({path for path, _ in entries}):
+            all_alerts.append(
+                ParserAlert(code=AlertCode.STALE_SOURCE_INDEX, path=stale)
+            )
+        for encoding in {encoding for _, encoding in entries}:
+            files = [
+                path for path, entry_encoding in entries if entry_encoding == encoding
+            ]
+            paths = local_paths({block.source_file for block in blocks}, files)
+            for result in read_marker_blocks(
+                blocks, paths, aliases=project_aliases, encoding=encoding
+            ):
+                parser_results[(Path(result.path), encoding)] = result
+            all_alerts.extend(
+                uncompiled_markers(
+                    ((path, texts[(path, encoding)]) for path in files),
+                    blocks,
+                    paths,
+                    project_aliases,
                 )
             )
 
@@ -299,7 +350,11 @@ def main() -> int:
         logger.error("%s", e.args[0])
         return 1
 
-    all_alerts = lint_all_targets(lint_targets)
+    try:
+        all_alerts = lint_all_targets(lint_targets)
+    except SourceIndexError as e:
+        logger.error("%s", e)
+        return 1
     all_alerts.extend(check_aliases(lint_targets))
 
     # Finished linting: report errors.

@@ -1,8 +1,12 @@
 """Marker join and link-namespace derivation from direct compiler records."""
 
+import json
 from pathlib import Path
 
-from reccmp.source import SourceCollector, SourceIndex
+import pytest
+
+from reccmp.source import SourceCollector, SourceIndex, SourceIndexError
+from reccmp.source.index import source_digest
 
 
 def _declaration(**fields) -> dict:
@@ -36,20 +40,50 @@ def _class(**fields) -> dict:
     return base
 
 
+def _marker_block(
+    source_file: str,
+    first_line: int,
+    *comments: str,
+    candidates: tuple[dict, ...] = (),
+) -> dict:
+    """A marker block as the indexer reports it."""
+    return {
+        "record": "marker-block",
+        "source_file": source_file,
+        "comments": [
+            {
+                "text": text,
+                "line": first_line + index,
+                "column": 1,
+                "offset": 100 * (first_line + index),
+            }
+            for index, text in enumerate(comments)
+        ],
+        "anchor": {
+            "line": first_line + len(comments),
+            "column": 1,
+            "candidates": list(candidates),
+            "string": None,
+        },
+    }
+
+
+def _function_candidate(semantic_id: str, name: str, line: int) -> dict:
+    return {
+        "kind": "function",
+        "semantic_id": semantic_id,
+        "qualified_name": name,
+        "is_definition": True,
+        "line": line,
+        "end_line": line,
+    }
+
+
+def _class_candidate(name: str) -> dict:
+    return {"kind": "class", "semantic_id": f"record:{name}", "qualified_name": name}
+
+
 def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
-    source = tmp_path / "sample.cpp"
-    source.write_text(
-        "namespace N {\n"
-        "class Base {};\n"
-        "// VTABLE: TEST 0x2000\n"
-        "class Widget : public Base {\n"
-        "public:\n"
-        "  // FUNCTION: TEST 0x1000\n"
-        "  virtual int Run(short value) { return value; }\n"
-        "};\n"
-        "}\n",
-        encoding="utf-8",
-    )
     collector = SourceCollector(tmp_path)
     collector.collect_record(
         _class(
@@ -88,10 +122,28 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
         ),
         unit_id="sample.cpp",
     )
-
-    index = SourceIndex.from_collector(
-        tmp_path, "TEST", [source], collector, unit_ids={"sample.cpp"}
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            3,
+            "// VTABLE: TEST 0x2000",
+            candidates=(_class_candidate("N::Widget"),),
+        ),
+        unit_id="sample.cpp",
     )
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            6,
+            "// FUNCTION: TEST 0x1000",
+            candidates=(
+                _function_candidate("?Run@Widget@N@@UAEHF@Z", "N::Widget::Run", 7),
+            ),
+        ),
+        unit_id="sample.cpp",
+    )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
 
     assert len(index.markers) == 1
     declaration = index.markers[0].declaration
@@ -107,18 +159,10 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
         ("value", "int")
     ]
     assert index.classes[0].vtable_address == 0x2000
+    assert len(index.marker_blocks) == 2
 
 
 def test_source_index_records_isle_style_base_vtables(tmp_path: Path) -> None:
-    source = tmp_path / "sample.cpp"
-    source.write_text(
-        "class Primary {};\n"
-        "class Secondary {};\n"
-        "// VTABLE: TEST 0x2000 Widget\n"
-        "// VTABLE: TEST 0x2100 Secondary\n"
-        "class Widget : public Primary, public Secondary {};\n",
-        encoding="utf-8",
-    )
     collector = SourceCollector(tmp_path)
     collector.collect_record(
         _class(
@@ -130,10 +174,18 @@ def test_source_index_records_isle_style_base_vtables(tmp_path: Path) -> None:
         ),
         unit_id="sample.cpp",
     )
-
-    index = SourceIndex.from_collector(
-        tmp_path, "TEST", [source], collector, unit_ids={"sample.cpp"}
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            3,
+            "// VTABLE: TEST 0x2000 Widget",
+            "// VTABLE: TEST 0x2100 Secondary",
+            candidates=(_class_candidate("Widget"),),
+        ),
+        unit_id="sample.cpp",
     )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
 
     assert len(index.classes) == 1
     assert index.classes[0].vtable_address == 0x2000
@@ -143,12 +195,6 @@ def test_source_index_records_isle_style_base_vtables(tmp_path: Path) -> None:
 
 
 def test_source_index_preserves_template_specialization_owner(tmp_path: Path) -> None:
-    source = tmp_path / "vector.cpp"
-    source.write_text(
-        "// FUNCTION: TEST 0x3000\n"
-        "template<> Vec<float>* Vec<float>::Convert(double) { return this; }\n",
-        encoding="utf-8",
-    )
     collector = SourceCollector(tmp_path)
     collector.collect_record(
         _declaration(
@@ -166,10 +212,21 @@ def test_source_index_preserves_template_specialization_owner(tmp_path: Path) ->
         ),
         unit_id="vector.cpp",
     )
-
-    index = SourceIndex.from_collector(
-        tmp_path, "TEST", [source], collector, unit_ids={"vector.cpp"}
+    collector.collect_record(
+        _marker_block(
+            "vector.cpp",
+            1,
+            "// FUNCTION: TEST 0x3000",
+            candidates=(
+                _function_candidate(
+                    "?Convert@?$Vec@M@@QAEPAV1@N@Z", "Vec<float>::Convert", 2
+                ),
+            ),
+        ),
+        unit_id="vector.cpp",
     )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
 
     declaration = index.markers[0].declaration
     assert declaration is not None
@@ -177,14 +234,35 @@ def test_source_index_preserves_template_specialization_owner(tmp_path: Path) ->
     assert declaration.owning_class == "Vec<float>"
 
 
-def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -> None:
-    source = tmp_path / "vector.cpp"
-    source.write_text(
-        "template<class T> class Vec {};\n"
-        "// VTABLE: TEST 0x2000\n"
-        "// class Vec<float>\n",
-        encoding="utf-8",
+def test_source_index_refuses_an_ambiguous_function_marker(tmp_path: Path) -> None:
+    collector = SourceCollector(tmp_path)
+    for semantic_id in ("?Get@?$Vec@H@@QAEHXZ", "?Get@?$Vec@M@@QAEMXZ"):
+        collector.collect_record(
+            _declaration(
+                semantic_id=semantic_id,
+                qualified_name="Vec::Get",
+                source_file="vec.h",
+                line=2,
+            ),
+            unit_id="a.cpp",
+        )
+    collector.collect_record(
+        _marker_block(
+            "vec.h",
+            1,
+            "// FUNCTION: TEST 0x3000",
+            candidates=(
+                _function_candidate("?Get@?$Vec@H@@QAEHXZ", "Vec<int>::Get", 2),
+                _function_candidate("?Get@?$Vec@M@@QAEMXZ", "Vec<float>::Get", 2),
+            ),
+        ),
+        unit_id="a.cpp",
     )
+    with pytest.raises(SourceIndexError, match="binds to 2 function definitions"):
+        SourceIndex.from_collector("TEST", collector, unit_ids={"a.cpp"})
+
+
+def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -> None:
     collector = SourceCollector(tmp_path)
     collector.collect_record(
         _class(
@@ -195,10 +273,12 @@ def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -
         ),
         unit_id="vector.cpp",
     )
-
-    index = SourceIndex.from_collector(
-        tmp_path, "TEST", [source], collector, unit_ids={"vector.cpp"}
+    collector.collect_record(
+        _marker_block("vector.cpp", 2, "// VTABLE: TEST 0x2000", "// class Vec<float>"),
+        unit_id="vector.cpp",
     )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
 
     assert len(index.classes) == 1
     assert index.classes[0].qualified_name == "Vec<float>"
@@ -208,16 +288,13 @@ def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -
 def test_source_index_preserves_standalone_template_vtable_without_compiler_record(
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "vector.cpp"
-    source.write_text(
-        "// VTABLE: TEST 0x2000\n// class Vec<float>\n",
-        encoding="utf-8",
-    )
     collector = SourceCollector(tmp_path)
-
-    index = SourceIndex.from_collector(
-        tmp_path, "TEST", [source], collector, unit_ids={"vector.cpp"}
+    collector.collect_record(
+        _marker_block("vector.cpp", 1, "// VTABLE: TEST 0x2000", "// class Vec<float>"),
+        unit_id="vector.cpp",
     )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
 
     assert len(index.classes) == 1
     assert index.classes[0].semantic_id == "record:Vec<float>"
@@ -227,39 +304,31 @@ def test_source_index_preserves_standalone_template_vtable_without_compiler_reco
 
 
 def test_source_index_combines_distinct_marker_targets(tmp_path: Path) -> None:
-    first = tmp_path / "first.cpp"
-    second = tmp_path / "second.cpp"
-    first.write_text("// FUNCTION: FIRST 0x1000\nvoid One() {}\n", encoding="utf-8")
-    second.write_text("// FUNCTION: SECOND 0x2000\nvoid Two() {}\n", encoding="utf-8")
     collector = SourceCollector(tmp_path)
-    collector.collect_record(
-        _declaration(
-            semantic_id="?One@@YAXXZ",
-            qualified_name="One",
-            source_file="first.cpp",
-            line=2,
-            end_line=2,
-        ),
-        unit_id="first.cpp",
-    )
-    collector.collect_record(
-        _declaration(
-            semantic_id="?Two@@YAXXZ",
-            qualified_name="Two",
-            source_file="second.cpp",
-            line=2,
-            end_line=2,
-        ),
-        unit_id="second.cpp",
-    )
+    for unit, target, address, name in (
+        ("first.cpp", "FIRST", 0x1000, "One"),
+        ("second.cpp", "SECOND", 0x2000, "Two"),
+    ):
+        semantic_id = f"?{name}@@YAXXZ"
+        collector.collect_record(
+            _declaration(
+                semantic_id=semantic_id, qualified_name=name, source_file=unit, line=2
+            ),
+            unit_id=unit,
+        )
+        collector.collect_record(
+            _marker_block(
+                unit,
+                1,
+                f"// FUNCTION: {target} 0x{address:x}",
+                candidates=(_function_candidate(semantic_id, name, 2),),
+            ),
+            unit_id=unit,
+        )
 
     indexes = [
-        SourceIndex.from_collector(
-            tmp_path, "FIRST", [first], collector, unit_ids={"first.cpp"}
-        ),
-        SourceIndex.from_collector(
-            tmp_path, "SECOND", [second], collector, unit_ids={"second.cpp"}
-        ),
+        SourceIndex.from_collector("FIRST", collector, unit_ids={"first.cpp"}),
+        SourceIndex.from_collector("SECOND", collector, unit_ids={"second.cpp"}),
     ]
     index = SourceIndex(
         declarations=(item for part in indexes for item in part.declarations),
@@ -276,6 +345,45 @@ def test_source_index_combines_distinct_marker_targets(tmp_path: Path) -> None:
         (0x1000, "One"),
         (0x2000, "Two"),
     ]
+
+
+def test_marker_blocks_and_source_digests_survive_a_round_trip(tmp_path: Path) -> None:
+    source = tmp_path / "a.cpp"
+    source.write_text("// FUNCTION: TEST 0x1000\nvoid f() {}\n", encoding="utf-8")
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _declaration(
+            semantic_id="?f@@YAXXZ", qualified_name="f", source_file="a.cpp", line=2
+        ),
+        unit_id="a.cpp",
+    )
+    collector.collect_record(
+        _marker_block(
+            "a.cpp",
+            1,
+            "// FUNCTION: TEST 0x1000",
+            candidates=(_function_candidate("?f@@YAXXZ", "f", 2),),
+        ),
+        unit_id="a.cpp",
+    )
+    derived = SourceIndex.from_collector("TEST", collector, unit_ids={"a.cpp"})
+    index = SourceIndex(
+        declarations=derived.declarations,
+        classes=derived.classes,
+        markers=derived.markers,
+        marker_blocks=derived.marker_blocks,
+        source_digests={"a.cpp": source_digest(source)},
+    )
+    revived = SourceIndex.from_dict(json.loads(json.dumps(index.to_dict())))
+    assert revived.marker_blocks == index.marker_blocks
+    assert revived.source_digests == {"a.cpp": source_digest(source)}
+    assert not revived.stale_sources([source])
+    source.write_text("// FUNCTION: TEST 0x2000\nvoid f() {}\n", encoding="utf-8")
+    other = tmp_path / "b.cpp"
+    other.write_text("", encoding="utf-8")
+    assert revived.stale_sources([source, other]) == [source, other]
+    with pytest.raises(SourceIndexError, match="schema"):
+        SourceIndex.from_dict({**index.to_dict(), "schema": "reccmp-source-index-v6"})
 
 
 def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None:
@@ -313,11 +421,9 @@ def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None
         unit_id="editor.cpp",
     )
 
-    game_index = SourceIndex.from_collector(
-        tmp_path, "GAME", [game], collector, unit_ids={"game.cpp"}
-    )
+    game_index = SourceIndex.from_collector("GAME", collector, unit_ids={"game.cpp"})
     editor_index = SourceIndex.from_collector(
-        tmp_path, "EDITOR", [editor], collector, unit_ids={"editor.cpp"}
+        "EDITOR", collector, unit_ids={"editor.cpp"}
     )
 
     assert [item.type for item in game_index.variables] == ["int"]
