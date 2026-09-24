@@ -935,10 +935,14 @@ def _join_markers(
         for symbol in result.tokens
         if symbol.module == target.upper()
     ]
-    definitions: dict[str, list[SourceDeclaration]] = {}
+    # By location as well as identity: TU-local functions of different files
+    # can share a mangled name.
+    definitions: dict[tuple[str, str, int], list[SourceDeclaration]] = {}
     for declaration in namespace.declarations:
         if declaration.is_definition:
-            definitions.setdefault(declaration.semantic_id, []).append(declaration)
+            definitions.setdefault(
+                (declaration.semantic_id, declaration.source_file, declaration.line), []
+            ).append(declaration)
 
     markers: list[SourceMarker] = []
     for method_symbol in symbols:
@@ -953,10 +957,16 @@ def _join_markers(
             method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
             and not method_symbol.is_nameref()
         ):
+            # One per definition: a TU-local function in a header has one
+            # (identical) winner per including unit.
             candidates = [
-                declaration
+                found[0]
                 for semantic_id in method_symbol.definitions
-                for declaration in definitions.get(semantic_id, ())
+                if (
+                    found := definitions.get(
+                        (semantic_id, relative, method_symbol.line_number)
+                    )
+                )
             ]
             if len(candidates) != 1:
                 raise SourceIndexError(
