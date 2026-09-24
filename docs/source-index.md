@@ -104,6 +104,32 @@ status; only external-linkage variables are indexed. Markers store a
 nested copy of the declaration. Conflicting size assertions are errors inside
 one link namespace.
 
+### Function facts
+
+Every function declaration carries `call`, what a caller may assume under the
+Microsoft x86 ABI: whether ecx and edx carry arguments, the argument bytes the
+callee removes (from Clang's parameter sizes; `null` when a record return or a
+non-trivial by-value argument leaves it undecided), and the return kind. The
+calling convention is the one Clang assigned, not one inferred from spelling.
+`SourceIndex.call_facts_for(semantic_id)` returns them as `CallFacts`; the
+comparator takes each field from the PDB type record first, then from Clang,
+then from the decorated name. On the Wizardry corpus Clang's facts agree with
+the PDB and the decorations for all 6,492 recompiled functions it declares.
+
+Member uses state the object of the access (`base`: `this`, `parameter` with
+its index, `local`, `global`, `member`, `other`), and each integer, enumeration
+or pointer conversion around a use states its widths and whether its source is
+signed. `function-facts` records list a body's calls: the callee's semantic id,
+whether the call is virtual (with the declaration introducing the slot and the
+object's static class), the call's object, and which arguments are plain field
+reads. `SourceIndex.function_facts_for(semantic_id)` assembles one function's
+call facts, accesses and calls into `FunctionFacts`.
+
+These facts describe the reconstruction. They may explain or constrain the
+recompiled side of a comparison; they never prove the original equivalent.
+
+### Derivation
+
 `TranslationUnitRecords` holds one unit's observations. `derive_namespace()` /
 `SourceIndex.from_units()` partition by target, group external entities by
 `semantic_id` and non-external functions by `(unit_id, semantic_id)`, then

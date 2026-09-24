@@ -2,12 +2,8 @@
 
 import pytest
 
-from reccmp.compare.call_facts import (
-    CallFacts,
-    convention_facts,
-    import_facts,
-    mangled_facts,
-)
+from reccmp.call_facts import CallFacts, convention_facts
+from reccmp.compare.call_facts import import_facts, mangled_facts
 
 
 @pytest.mark.parametrize(
@@ -38,7 +34,8 @@ def test_mangled_registers_and_return_kind():
         True, False, 12, "void"
     )
     assert mangled_facts("?count@@YGJXZ") == CallFacts(False, False, 0, "i32")
-    assert mangled_facts("@Fast@8") == CallFacts(True, True, None, "unknown")
+    # fastcall: which registers carry arguments depends on the parameters
+    assert mangled_facts("@Fast@8") == CallFacts(None, None, None, "unknown")
     assert mangled_facts("plain") == CallFacts()
 
 

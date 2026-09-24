@@ -5,7 +5,8 @@ from dataclasses import replace
 
 from reccmp.compare.asm.replacement import canonical_callee_name
 from reccmp.compare.asm.verifier import FunctionMetadata
-from reccmp.compare.call_facts import CallFacts, convention_facts, mangled_facts
+from reccmp.call_facts import CallFacts, convention_facts
+from reccmp.compare.call_facts import mangled_facts
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
 from reccmp.cvdump.analysis import CvdumpNode
@@ -84,9 +85,11 @@ class FunctionMetadataMixin(ComparatorState):
         return result
 
     def _call_facts_of_node(self, node: CvdumpNode) -> CallFacts:
-        """Call facts of one function node. Each field prefers the PDB TYPES
-        record and falls back to the decorated name, which encodes the
-        convention, return type and parameters even when the PDB (like
+        """Call facts of one function node. Each field comes from the first
+        producer that knows it: the PDB TYPES record (what MSVC compiled),
+        then Clang's declaration from the source index (exact parameter
+        sizes, so the stack cleanup), then the decorated name, which encodes
+        the convention, return type and parameters even when the PDB (like
         Imperialism's) carries no type records at all."""
         facts = CallFacts()
         if node.symbol_entry is not None:
@@ -101,6 +104,10 @@ class FunctionMetadataMixin(ComparatorState):
             except CvdumpKeyError:
                 pass
         if node.decorated_name:
+            if self.source_index is not None:
+                clang = self.source_index.call_facts_for(node.decorated_name)
+                if clang is not None:
+                    facts = facts.merged(clang)
             facts = facts.merged(mangled_facts(node.decorated_name))
         return facts
 

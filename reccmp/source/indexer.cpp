@@ -17,6 +17,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <system_error>
@@ -463,6 +464,12 @@ class Indexer {
         .str();
   }
 
+  // A function's semantic id, as its declaration record states it.
+  std::string functionIdentity(const FunctionDecl* function) const {
+    return semanticId(
+        function, qualify(scopeOf(function->getDeclContext()), function->getNameAsString()));
+  }
+
   std::vector<std::string> parameterTypes(const FunctionDecl* function) const {
     std::vector<std::string> parameters;
     for (const ParmVarDecl* parameter : function->parameters()) {
@@ -476,19 +483,16 @@ class Indexer {
            semanticKind == "instance_method";
   }
 
-  // On the x86 MS ABI the convention is a consequence of the semantic kind
-  // unless the source spells one, and a spelled convention survives into the
-  // printed function type.
-  static std::string callingConvention(llvm::StringRef functionType,
-                                       llvm::StringRef semanticKind) {
-    std::string lowered = functionType.lower();
-    for (llvm::StringRef spelling :
-         {"thiscall", "stdcall", "fastcall", "vectorcall", "cdecl"}) {
-      if (lowered.find(spelling.str()) != std::string::npos) {
-        return ("__" + spelling).str();
-      }
+  // The convention Clang assigned: spelled, or the target default for the
+  // kind of function (a variadic member function is __cdecl).
+  static std::string callingConvention(const FunctionDecl* function) {
+    switch (function->getType()->castAs<FunctionType>()->getCallConv()) {
+      case CC_X86StdCall: return "__stdcall";
+      case CC_X86FastCall: return "__fastcall";
+      case CC_X86ThisCall: return "__thiscall";
+      case CC_X86VectorCall: return "__vectorcall";
+      default: return "__cdecl";
     }
-    return hasThis(semanticKind) ? "__thiscall" : "__cdecl";
   }
 
   // Linkage as computed by Clang, spelled for the index. Consumers that join
@@ -586,6 +590,122 @@ class Indexer {
     return signature;
   }
 
+  // The identity a field has in every unit: its owner's USR, declaration
+  // position and index.
+  std::string fieldIdentity(const FieldDecl* field) const {
+    const auto* owner = dyn_cast<CXXRecordDecl>(field->getParent());
+    if (owner) {
+      const auto* definition = dyn_cast_or_null<CXXRecordDecl>(owner->getDefinition());
+      owner = definition ? definition : owner->getCanonicalDecl();
+    }
+    std::string ownerIdentity = owner ? declarationUsr(owner) : "";
+    if (ownerIdentity.empty()) ownerIdentity = "unknown-owner";
+    Location location = locate(field);
+    return ownerIdentity + "::field@" + relative(location.file) + ":" +
+           std::to_string(location.line) + ":" + std::to_string(location.column) + ":" +
+           std::to_string(field->getFieldIndex());
+  }
+
+  // Width in bits and signedness of an integer, enumeration or pointer value.
+  std::optional<std::pair<int64_t, bool>> integerShape(QualType type) const {
+    if (type.isNull() || type->isDependentType() || type->isIncompleteType()) return {};
+    QualType canonical = type.getCanonicalType();
+    if (canonical->isIntegralOrEnumerationType()) {
+      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)),
+                            canonical->isSignedIntegerOrEnumerationType());
+    }
+    if (canonical->isPointerType()) {
+      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)), false);
+    }
+    return {};
+  }
+
+  // Register footprint of a returned value: void, i8/i16/i32/i64, float, or
+  // unknown (aggregates, whose return convention this does not decide).
+  std::string returnKind(QualType type) const {
+    if (type.isNull() || type->isDependentType()) return "unknown";
+    QualType canonical = type.getCanonicalType();
+    if (canonical->isVoidType()) return "void";
+    if (canonical->isRealFloatingType()) return "float";
+    if (auto shape = integerShape(canonical)) {
+      switch (shape->first) {
+        case 8: return "i8";
+        case 16: return "i16";
+        case 32: return "i32";
+        case 64: return "i64";
+        default: return "unknown";
+      }
+    }
+    if (canonical->isReferenceType()) return "i32";
+    return "unknown";
+  }
+
+  // What a caller may assume about calling `function` on 32-bit x86 under
+  // the Microsoft ABI: register arguments, the argument bytes the callee
+  // removes, and the return kind. Unknown fields are null.
+  llvm::json::Value callFacts(const FunctionDecl* function, llvm::StringRef convention,
+                              llvm::StringRef semanticKind) const {
+    if (function->isDependentContext() || function->getDescribedFunctionTemplate()) {
+      return nullptr;
+    }
+    bool variadic = function->isVariadic();
+    // A variadic member function is __cdecl with `this` on the stack.
+    bool thiscall = convention == "__thiscall";
+    bool fastcall = convention == "__fastcall";
+    bool calleePops = !variadic && (convention == "__stdcall" || thiscall || fastcall);
+    bool usesEcx = thiscall;
+    bool usesEdx = false;
+    int64_t stack = 0;
+    bool stackKnown = true;
+    int fastcallRegisters = 0;
+    if (hasThis(semanticKind)) {
+      if (fastcall) {
+        usesEcx = true;  // `this` is the first register argument
+        fastcallRegisters = 1;
+      } else if (!thiscall) {
+        stack += 4;
+      }
+    }
+    QualType returned = function->getReturnType().getCanonicalType();
+    if (!returned->isVoidType() && returned->getAsCXXRecordDecl()) {
+      // Whether a record comes back in registers or through a hidden
+      // pointer argument is not decided here.
+      stackKnown = false;
+    }
+    for (const ParmVarDecl* parameter : function->parameters()) {
+      QualType type = parameter->getType().getCanonicalType();
+      if (type->isDependentType() || type->isIncompleteType()) {
+        stackKnown = false;
+        continue;
+      }
+      int64_t size = type->isReferenceType()
+                         ? 4
+                         : context_.getTypeSizeInChars(type).getQuantity();
+      bool inRegister = fastcall && fastcallRegisters < 2 && size <= 4 &&
+                        (type->isIntegralOrEnumerationType() || type->isPointerType() ||
+                         type->isReferenceType());
+      if (inRegister) {
+        (fastcallRegisters++ == 0 ? usesEcx : usesEdx) = true;
+        continue;
+      }
+      if (type->getAsCXXRecordDecl() && !type->getAsCXXRecordDecl()->isTrivial()) {
+        stackKnown = false;  // passed by address or with a temporary copy
+      }
+      stack += (size + 3) / 4 * 4;
+    }
+    llvm::json::Value cleanup = nullptr;
+    if (!calleePops) cleanup = 0;
+    else if (stackKnown) cleanup = stack;
+    return llvm::json::Object{
+        {"uses_ecx", usesEcx},
+        {"uses_edx", usesEdx},
+        {"stack_cleanup", std::move(cleanup)},
+        {"return_kind", semanticKind == "constructor" || semanticKind == "destructor"
+                            ? std::string("unknown")
+                            : returnKind(function->getReturnType())},
+    };
+  }
+
   void emitDeclaration(const FunctionDecl* function, const Location& location) {
     const DeclContext* context = function->getDeclContext();
     bool isMember = isa<CXXRecordDecl>(context);
@@ -599,9 +719,9 @@ class Indexer {
     } else if (isa<CXXDestructorDecl>(function)) {
       semanticKind = "destructor";
     } else if (isMember) {
-      semanticKind = function->getCanonicalDecl()->getStorageClass() == SC_Static
-                         ? "static_method"
-                         : "instance_method";
+      // isStatic covers implicitly static members (operator new/delete).
+      const auto* method = dyn_cast<CXXMethodDecl>(function);
+      semanticKind = method && method->isStatic() ? "static_method" : "instance_method";
     } else {
       semanticKind = scope.empty() ? "free_function" : "namespace_function";
     }
@@ -646,7 +766,7 @@ class Indexer {
       });
     }
 
-    std::string convention = callingConvention(functionType, semanticKind);
+    std::string convention = callingConvention(function);
     llvm::json::Object record{
         {"record", "declaration"},
         {"semantic_id", functionIdentity},
@@ -673,6 +793,7 @@ class Indexer {
         // FUNCTION marker. Keep its marker-join row declaration-only; an emitted
         // specialization carries the concrete function identity and extent.
         {"is_definition", isEmittedDefinition(function)},
+        {"call", callFacts(function, convention, semanticKind)},
     };
     emit(std::move(record));
     emitMemberUses(function, functionIdentity, qualifiedName, location);
@@ -748,7 +869,69 @@ class Indexer {
       return true;
     }
 
+    // Every call the body makes: the callee's identity (or, for a virtual
+    // call, the declaration that introduces the vtable slot), and which
+    // arguments are plain field reads.
+    bool VisitCallExpr(CallExpr* call) {
+      llvm::json::Object entry;
+      const FunctionDecl* callee = call->getDirectCallee();
+      entry["callee"] = callee ? llvm::json::Value(indexer_.functionIdentity(callee))
+                               : llvm::json::Value(nullptr);
+      const auto* member = dyn_cast<CXXMemberCallExpr>(call);
+      const CXXMethodDecl* method = member ? member->getMethodDecl() : nullptr;
+      const auto* access =
+          member ? dyn_cast<MemberExpr>(member->getCallee()->IgnoreParens()) : nullptr;
+      bool isVirtual = method && method->isVirtual() && !(access && access->hasQualifier());
+      entry["virtual"] = isVirtual;
+      if (isVirtual) {
+        const CXXMethodDecl* slot = method;
+        while (slot->size_overridden_methods() > 0) slot = *slot->begin_overridden_methods();
+        entry["slot"] = indexer_.functionIdentity(slot);
+        entry["object_class"] = indexer_.recordSemanticId(
+            member->getImplicitObjectArgument()->getType());
+      }
+      if (member) {
+        entry["object"] = baseKind(member->getImplicitObjectArgument());
+      }
+      llvm::json::Array arguments;
+      for (const Expr* argument : call->arguments()) {
+        const auto* read = dyn_cast<MemberExpr>(argument->IgnoreParenImpCasts());
+        const auto* field = read ? dyn_cast<FieldDecl>(read->getMemberDecl()) : nullptr;
+        arguments.push_back(field ? llvm::json::Value(indexer_.fieldIdentity(field))
+                                  : llvm::json::Value(nullptr));
+      }
+      entry["field_arguments"] = std::move(arguments);
+      Location where = indexer_.locate(call->getBeginLoc());
+      entry["line"] = where.line;
+      entry["offset"] = where.offset >= 0 ? llvm::json::Value(where.offset)
+                                          : llvm::json::Value(nullptr);
+      calls_.push_back(std::move(entry));
+      return true;
+    }
+
+    llvm::json::Array takeCalls() { return std::move(calls_); }
+
    private:
+    // What the object of a member access or call is: this, a parameter
+    // (with its index), a local, a global, another member, or other.
+    llvm::json::Object baseKind(const Expr* base) const {
+      if (!base) return llvm::json::Object{{"kind", "this"}};
+      base = base->IgnoreParenImpCasts();
+      if (isa<CXXThisExpr>(base)) return llvm::json::Object{{"kind", "this"}};
+      if (const auto* reference = dyn_cast<DeclRefExpr>(base)) {
+        if (const auto* parameter = dyn_cast<ParmVarDecl>(reference->getDecl())) {
+          return llvm::json::Object{
+              {"kind", "parameter"},
+              {"index", static_cast<int64_t>(parameter->getFunctionScopeIndex())}};
+        }
+        if (const auto* variable = dyn_cast<VarDecl>(reference->getDecl())) {
+          return llvm::json::Object{{"kind", variable->hasLocalStorage() ? "local" : "global"}};
+        }
+      }
+      if (isa<MemberExpr>(base)) return llvm::json::Object{{"kind", "member"}};
+      return llvm::json::Object{{"kind", "other"}};
+    }
+
     static bool contains(const Stmt* root, const Stmt* sought) {
       if (!root) return false;
       if (root == sought) return true;
@@ -881,14 +1064,8 @@ class Indexer {
       Location useLocation = indexer_.locate(expression->getMemberLoc());
       const std::string ownerIdentity = owner ? indexer_.declarationUsr(owner) : "";
       const std::string fieldUsr = indexer_.declarationUsr(field);
-      const std::string identityOwner = ownerIdentity.empty() ? "unknown-owner" : ownerIdentity;
-      const std::string fieldIdentity =
-          identityOwner + "::field@" + relative(declarationLocation.file) + ":" +
-          std::to_string(declarationLocation.line) + ":" +
-          std::to_string(declarationLocation.column) + ":" +
-          std::to_string(field->getFieldIndex());
       emit(field, expression, useLocation, ownerName, field->getNameAsString(),
-           ownerIdentity, fieldUsr, &declarationLocation, fieldIdentity);
+           ownerIdentity, fieldUsr, &declarationLocation, indexer_.fieldIdentity(field));
     }
 
     void emit(const FieldDecl* field, const Expr* expression,
@@ -900,19 +1077,28 @@ class Indexer {
       std::set<std::string> operations;
       llvm::json::Array arrayIndices;
       llvm::json::Array conversions;
-      std::string conversionSource = field ? indexer_.canonicalName(expression->getType()) :
-                                             indexer_.canonicalName(expression->getType());
+      std::string conversionSource = indexer_.canonicalName(expression->getType());
+      QualType conversionSourceType = expression->getType();
       for (const Stmt* ancestor : ancestors) {
         if (const auto* cast = dyn_cast<CastExpr>(ancestor)) {
           std::string destination = indexer_.canonicalName(cast->getType());
           if (destination != conversionSource) {
-            conversions.push_back(llvm::json::Object{
+            llvm::json::Object conversion{
                 {"kind", cast->getCastKindName()},
                 {"source_type", conversionSource},
                 {"destination_type", destination},
-            });
+            };
+            auto from = indexer_.integerShape(conversionSourceType);
+            auto to = indexer_.integerShape(cast->getType());
+            if (from && to) {
+              conversion["source_bits"] = from->first;
+              conversion["source_signed"] = from->second;
+              conversion["destination_bits"] = to->first;
+            }
+            conversions.push_back(std::move(conversion));
           }
           conversionSource = destination;
+          conversionSourceType = cast->getType();
         }
         if (const auto* subscript = dyn_cast<ArraySubscriptExpr>(ancestor)) {
           if (contains(subscript->getBase(), expression)) {
@@ -1054,14 +1240,24 @@ class Indexer {
           {"operations", std::move(operationList)},
           {"array_indices", std::move(arrayIndices)},
           {"conversions", std::move(conversions)},
+          {"base", baseKind(accessBase(expression))},
       };
       indexer_.emit(std::move(record));
+    }
+
+    static const Expr* accessBase(const Expr* expression) {
+      if (const auto* member = dyn_cast<MemberExpr>(expression)) return member->getBase();
+      if (const auto* dependent = dyn_cast<CXXDependentScopeMemberExpr>(expression)) {
+        return dependent->isImplicitAccess() ? nullptr : dependent->getBase();
+      }
+      return nullptr;
     }
 
     Indexer& indexer_;
     llvm::StringRef functionIdentity_;
     llvm::StringRef functionName_;
     Location functionLocation_;
+    llvm::json::Array calls_;
   };
 
   void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
@@ -1070,6 +1266,14 @@ class Indexer {
     ScopedTimer timer(profile_.memberUseMs);
     MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
     visitor.TraverseStmt(function->getBody());
+    llvm::json::Array calls = visitor.takeCalls();
+    if (!calls.empty()) {
+      emit(llvm::json::Object{
+          {"record", "function-facts"},
+          {"function", functionIdentity.str()},
+          {"calls", std::move(calls)},
+      });
+    }
   }
 
   void emitClass(const CXXRecordDecl* record, llvm::StringRef qualifiedName,

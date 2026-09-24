@@ -10,7 +10,8 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from reccmp.compare.call_facts import CallFacts, import_facts
+from reccmp.call_facts import CallFacts
+from reccmp.compare.call_facts import import_facts
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,

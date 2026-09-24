@@ -79,7 +79,7 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
 )
 
 from reccmp.compare.asm.decode import decode_one, direct_branch_target
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 from reccmp.formats import Image
 from reccmp.formats.image import ImageSectionFlags
 

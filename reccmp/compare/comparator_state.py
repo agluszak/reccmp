@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from reccmp.compare.asm.parse import ParseAsm
-    from reccmp.compare.call_facts import CallFacts
+    from reccmp.call_facts import CallFacts
     from reccmp.compare.db import EntityDb
     from reccmp.compare.inlines import HelperCatalogEntry
     from reccmp.compare.lines import LinesDb

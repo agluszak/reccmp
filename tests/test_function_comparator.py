@@ -2,7 +2,11 @@ from pathlib import PureWindowsPath
 from typing import Callable
 from unittest.mock import Mock
 import pytest
+from reccmp.call_facts import CallFacts
+from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.types import CvdumpTypesParser
+from reccmp.source import SourceIndex
+from reccmp.source.index import SourceDeclaration
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 from reccmp.compare.functions import (
@@ -689,3 +693,50 @@ def test_addr_test_entity_range_check_exclusive(db: EntityDb):
     assert addr_test(0x1000) is True
     assert addr_test(0x1001) is True
     assert addr_test(0x1002) is False
+
+
+def test_call_facts_take_each_field_from_the_strongest_producer(
+    db: EntityDb, lines_db: LinesDb, report: ReccmpReportProtocol
+):
+    """A stdcall function taking a class by value: its decorated name states
+    the convention but not the argument bytes; Clang's declaration knows the
+    class's size."""
+    symbol = "?g@@YGXVValue@@@Z"
+    index = SourceIndex(
+        declarations=(
+            SourceDeclaration(
+                semantic_id=symbol,
+                qualified_name="g",
+                semantic_kind="free_function",
+                calling_convention="__stdcall",
+                return_type="void",
+                parameter_types=("class Value",),
+                owning_class=None,
+                has_this=False,
+                is_virtual=False,
+                source_file="g.cpp",
+                line=1,
+                end_line=1,
+                is_definition=True,
+                call=CallFacts(False, False, 12, "void"),
+            ),
+        ),
+        classes=(),
+        markers=(),
+    )
+    comp = FunctionComparator(
+        db,
+        lines_db,
+        RawImage.from_memory(b""),
+        RawImage.from_memory(b""),
+        report,
+        CvdumpTypesParser(),
+        source_index=index,
+    )
+    node = CvdumpNode(0, 0)
+    node.decorated_name = symbol
+    # pylint: disable-next=protected-access
+    assert comp._call_facts_of_node(node) == CallFacts(False, False, 12, "void")
+    comp.source_index = None
+    # pylint: disable-next=protected-access
+    assert comp._call_facts_of_node(node).stack_cleanup is None

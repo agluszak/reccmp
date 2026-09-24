@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from reccmp.call_facts import CallFacts
 from reccmp.parser import DecompCodebase
 from reccmp.parser.error import AlertCode
 from reccmp.parser.marker import MarkerType
@@ -466,3 +467,106 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
             os.environ.pop("RECCMP_SOURCE_ROOT", None)
         else:
             os.environ["RECCMP_SOURCE_ROOT"] = previous_root
+
+
+_FACTS_SOURCE = """\
+struct Point { int x; short y; unsigned char flags; };
+struct Big { int a, b, c; };
+class Base { public: virtual int Run(int value); int field; };
+class Widget : public Base {
+public:
+  int Run(int value) override;
+  static int __stdcall Stat(Point p, double d, char c);
+  int __fastcall Fast(double d, int a, int b);
+  int Vararg(int n, ...);
+  Big MakeBig();
+  void operator delete(void* block);
+  Point point;
+  int count;
+};
+int Helper(int);
+int __fastcall One(int a);
+int Widget::Run(int value) {
+  int wide = point.flags;
+  int sign = point.y;
+  Helper(count);
+  Base::Run(value);
+  Base* self = this;
+  return self->Run(wide + sign) + Fast(1.0, 2, 3);
+}
+int Use(Widget& w) { return w.count; }
+"""
+
+
+def test_function_facts_come_from_the_compiler(tmp_path: Path) -> None:
+    _require_collector()
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    source = repository / "facts.cpp"
+    source.write_text(_FACTS_SOURCE, encoding="utf-8")
+    database = repository / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(repository),
+                    "file": str(source),
+                    "arguments": [
+                        _clang_cl(repository),
+                        "--target=i686-pc-windows-msvc",
+                        "/c",
+                        str(source),
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    index = SourceIndex.from_compile_database(
+        repository, database, {"TEST": [source]}, cache_dir=tmp_path / "cache", jobs=1
+    )
+
+    def facts(name: str) -> CallFacts | None:
+        return next(
+            item.call for item in index.declarations if item.qualified_name == name
+        )
+
+    # Microsoft x86 conventions, from the parameter types.
+    assert facts("Widget::Stat") == CallFacts(False, False, 8 + 8 + 4, "i32")
+    # fastcall member: this in ecx, the double on the stack, a in edx, b on the stack
+    assert facts("Widget::Fast") == CallFacts(True, True, 12, "i32")
+    # variadic member: __cdecl with this on the stack
+    assert facts("Widget::Vararg") == CallFacts(False, False, 0, "i32")
+    # a record return may come back through a hidden pointer: cleanup unknown
+    assert facts("Widget::MakeBig") == CallFacts(True, False, None, "unknown")
+    assert facts("Widget::Run") == CallFacts(True, False, 4, "i32")
+    # operator delete is implicitly static: no this, the default convention
+    assert facts("Widget::operator delete") == CallFacts(False, False, 0, "void")
+    # a fastcall function with one argument leaves edx dead
+    assert facts("One") == CallFacts(True, False, 0, "i32")
+
+    run = index.function_facts_for("?Run@Widget@@UAEHH@Z")
+    assert run is not None
+    assert run.call == CallFacts(True, False, 4, "i32")
+    extensions = {
+        use.name: use.conversions[-1]
+        for use in run.accesses
+        if use.name in ("flags", "y") and use.conversions
+    }
+    assert (extensions["flags"].source_bits, extensions["flags"].source_signed) == (
+        8,
+        False,
+    )
+    assert (extensions["y"].source_bits, extensions["y"].source_signed) == (16, True)
+    assert {use.base.kind for use in run.accesses if use.name == "count"} == {"this"}
+    calls = {(call.callee, call.virtual) for call in run.calls}
+    assert ("?Helper@@YAHH@Z", False) in calls
+    assert ("?Run@Base@@UAEHH@Z", False) in calls  # Base::Run(value): qualified
+    (virtual,) = [call for call in run.calls if call.virtual]
+    assert virtual.slot == "?Run@Base@@UAEHH@Z"
+    assert virtual.object_class == "record:Base"
+    helper = next(call for call in run.calls if call.callee == "?Helper@@YAHH@Z")
+    assert helper.field_arguments[0] is not None  # Helper(count)
+    use = index.function_facts_for("?Use@@YAHAAVWidget@@@Z")
+    assert use is not None and use.accesses[0].base.kind == "parameter"
+    assert use.accesses[0].base.index == 0
