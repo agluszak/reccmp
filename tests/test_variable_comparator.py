@@ -7,7 +7,7 @@ from reccmp.cvdump.types import (
     TypeInfo,
 )
 from reccmp.compare.db import EntityDb, ReccmpMatch
-from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable
+from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable, keyed
 from reccmp.types import EntityType, ImageId
 from .mock_types_db import MockTypesDb
 from .raw_image import RawImage
@@ -533,52 +533,56 @@ def test_compare_uses_source_layout_field_paths(db: EntityDb):
         batch.set(ImageId.RECOMP, 0, name="gFoo")
 
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="bar",
-                        type="int",
-                        source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=4,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Foo",
+                    qualified_name="Foo",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="bar",
+                            type="int",
+                            source_file="a.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                        ),
+                        SourceField(
+                            name="baz",
+                            type="int",
+                            source_file="a.h",
+                            line=3,
+                            offset=4,
+                            size=4,
+                        ),
                     ),
-                    SourceField(
-                        name="baz",
-                        type="int",
-                        source_file="a.h",
-                        line=3,
-                        offset=4,
-                        size=4,
-                    ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=4,
+                    size=8,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=4,
-                size=8,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
-        variables=(
-            SourceVariable(
-                semantic_id="gFoo",
-                qualified_name="gFoo",
-                type="Foo",
-                linkage="external",
-                storage_class="none",
-                definition_kind="definition",
-                source_file="a.cpp",
-                line=1,
-                end_line=1,
-            ),
+        variables=keyed(
+            (
+                SourceVariable(
+                    semantic_id="gFoo",
+                    qualified_name="gFoo",
+                    type="Foo",
+                    linkage="external",
+                    storage_class="none",
+                    definition_kind="definition",
+                    source_file="a.cpp",
+                    line=1,
+                    end_line=1,
+                ),
+            )
         ),
     )
 
@@ -604,53 +608,57 @@ def test_compare_raw_only_uses_trusted_source_layout(
         batch.set(ImageId.RECOMP, 0, name="gFoo")
 
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="ptr",
-                        type="int *",
-                        source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        pointer_depth=1,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Foo",
+                    qualified_name="Foo",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="ptr",
+                            type="int *",
+                            source_file="a.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            pointer_depth=1,
+                        ),
+                        SourceField(
+                            name="val",
+                            type="int",
+                            source_file="a.h",
+                            line=3,
+                            offset=4,
+                            size=4,
+                        ),
                     ),
-                    SourceField(
-                        name="val",
-                        type="int",
-                        source_file="a.h",
-                        line=3,
-                        offset=4,
-                        size=4,
-                    ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=4,
+                    size=8,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=4,
-                size=8,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
-        variables=(
-            SourceVariable(
-                semantic_id="gFoo",
-                qualified_name="gFoo",
-                type="Foo",
-                linkage="external",
-                storage_class="none",
-                definition_kind="definition",
-                source_file="a.cpp",
-                line=1,
-                end_line=1,
-            ),
+        variables=keyed(
+            (
+                SourceVariable(
+                    semantic_id="gFoo",
+                    qualified_name="gFoo",
+                    type="Foo",
+                    linkage="external",
+                    storage_class="none",
+                    definition_kind="definition",
+                    source_file="a.cpp",
+                    line=1,
+                    end_line=1,
+                ),
+            )
         ),
     )
 

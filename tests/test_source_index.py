@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from reccmp.source import SourceCollector, SourceIndex, SourceIndexError
+from reccmp.source import (
+    DeclarationKey,
+    SourceCollector,
+    SourceIndex,
+    SourceIndexError,
+    keyed,
+)
 from reccmp.source.index import source_digest
 
 
@@ -154,11 +160,11 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
     assert declaration.parameter_types == ("short",)
     assert declaration.owning_class == "N::Widget"
     assert declaration.is_virtual
-    assert index.classes[0].bases == ("N::Base",)
-    assert [(field.name, field.type) for field in index.classes[0].fields] == [
-        ("value", "int")
-    ]
-    assert index.classes[0].vtable_address == 0x2000
+    assert list(index.classes.values())[0].bases == ("N::Base",)
+    assert [
+        (field.name, field.type) for field in list(index.classes.values())[0].fields
+    ] == [("value", "int")]
+    assert list(index.classes.values())[0].vtable_address == 0x2000
     assert len(index.marker_blocks) == 2
 
 
@@ -188,9 +194,10 @@ def test_source_index_records_isle_style_base_vtables(tmp_path: Path) -> None:
     index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
 
     assert len(index.classes) == 1
-    assert index.classes[0].vtable_address == 0x2000
+    assert list(index.classes.values())[0].vtable_address == 0x2000
     assert [
-        (item.address, item.base_class) for item in index.classes[0].base_vtables
+        (item.address, item.base_class)
+        for item in list(index.classes.values())[0].base_vtables
     ] == [(0x2100, "Secondary")]
 
 
@@ -281,8 +288,8 @@ def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -
     index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
 
     assert len(index.classes) == 1
-    assert index.classes[0].qualified_name == "Vec<float>"
-    assert index.classes[0].vtable_address == 0x2000
+    assert list(index.classes.values())[0].qualified_name == "Vec<float>"
+    assert list(index.classes.values())[0].vtable_address == 0x2000
 
 
 def test_source_index_preserves_standalone_template_vtable_without_compiler_record(
@@ -297,10 +304,10 @@ def test_source_index_preserves_standalone_template_vtable_without_compiler_reco
     index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
 
     assert len(index.classes) == 1
-    assert index.classes[0].semantic_id == "record:Vec<float>"
-    assert index.classes[0].qualified_name == "Vec<float>"
-    assert index.classes[0].source_file == "vector.cpp"
-    assert index.classes[0].vtable_address == 0x2000
+    assert list(index.classes.values())[0].semantic_id == "record:Vec<float>"
+    assert list(index.classes.values())[0].qualified_name == "Vec<float>"
+    assert list(index.classes.values())[0].source_file == "vector.cpp"
+    assert list(index.classes.values())[0].vtable_address == 0x2000
 
 
 def test_source_index_combines_distinct_marker_targets(tmp_path: Path) -> None:
@@ -331,8 +338,10 @@ def test_source_index_combines_distinct_marker_targets(tmp_path: Path) -> None:
         SourceIndex.from_collector("SECOND", collector, unit_ids={"second.cpp"}),
     ]
     index = SourceIndex(
-        declarations=(item for part in indexes for item in part.declarations),
-        classes=(),
+        declarations=keyed(
+            (item for part in indexes for item in part.declarations.values())
+        ),
+        classes={},
         markers=(item for part in indexes for item in part.markers),
     )
 
@@ -424,9 +433,9 @@ def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None
         "EDITOR", collector, unit_ids={"editor.cpp"}
     )
 
-    assert [item.type for item in game_index.variables] == ["int"]
+    assert [item.type for item in game_index.variables.values()] == ["int"]
     assert not game_index.conflicts
-    assert editor_index.variables[0].type in {"int", "float"}
+    assert list(editor_index.variables.values())[0].type in {"int", "float"}
     assert len(editor_index.conflicts) == 1
     assert {variant.signature for variant in editor_index.conflicts[0].variants} == {
         ("int", "external"),
@@ -454,6 +463,38 @@ def test_internal_functions_are_distinct_per_translation_unit(tmp_path: Path) ->
     namespace = collector.derive(target="GAME", unit_ids={"a.cpp", "b.cpp"})
     assert len(namespace.declarations) == 2
     assert not namespace.conflicts
+
+
+def _member_use(function: str, name: str, unit: str) -> dict:
+    return {
+        "record": "member-use",
+        "owner_identity": "c:@S@Buffer",
+        "owner_status": "resolved",
+        "owner": "Buffer",
+        "field_identity": f"c:@S@Buffer::field@buffer.h:{name}",
+        "field_usr": None,
+        "name": name,
+        "declaration_file": "buffer.h",
+        "declaration_line": 1,
+        "declaration_column": 1,
+        "declaration_offset": None,
+        "offset_bits": 0,
+        "extent_bits": 32,
+        "offset_bytes": 0,
+        "extent_bytes": 4,
+        "declared_type": "int",
+        "function_identity": function,
+        "function": "copyMemory",
+        "function_file": unit,
+        "function_line": 1,
+        "use_file": unit,
+        "use_line": 2,
+        "use_column": 3,
+        "use_offset": None,
+        "operations": ["read"],
+        "array_indices": [],
+        "conversions": [],
+    }
 
 
 def test_tu_local_functions_with_one_mangled_name_bind_by_location(
@@ -512,10 +553,34 @@ def test_tu_local_functions_with_one_mangled_name_bind_by_location(
             unit_id=unit,
         )
 
-    index = SourceIndex.from_collector("TEST", collector)
+    # Each copyMemory reads a different field.
+    for unit, field_name in (("huffman.cpp", "bits"), ("renderer.cpp", "pixels")):
+        collector.collect_record(
+            _member_use("?copyMemory@@YAPAXPAXPBXJ@Z", field_name, unit),
+            unit_id=unit,
+        )
+
+    derived = SourceIndex.from_collector("TEST", collector)
+    # Identity survives the JSON projection.
+    index = SourceIndex.from_dict(json.loads(json.dumps(derived.to_dict())))
 
     assert {
-        marker.address: marker.declaration.source_file
+        marker.address: (marker.declaration.source_file, marker.declaration_key)
         for marker in index.markers
         if marker.declaration is not None
-    } == {0x1000: "huffman.cpp", 0x2000: "renderer.cpp", 0x3000: "util.h"}
+    } == {
+        0x1000: (
+            "huffman.cpp",
+            DeclarationKey("TEST", "?copyMemory@@YAPAXPAXPBXJ@Z", "huffman.cpp"),
+        ),
+        0x2000: (
+            "renderer.cpp",
+            DeclarationKey("TEST", "?copyMemory@@YAPAXPAXPBXJ@Z", "renderer.cpp"),
+        ),
+        # A header's TU-local function: the first including unit's copy.
+        0x3000: ("util.h", DeclarationKey("TEST", "?helper@@YAXXZ", "a.cpp")),
+    }
+    assert {
+        key.unit_id: [use.name for use in uses]
+        for key, uses in index.member_uses.items()
+    } == {"huffman.cpp": ["bits"], "renderer.cpp": ["pixels"]}

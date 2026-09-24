@@ -67,9 +67,9 @@ def test_definition_replaces_a_declaration_from_another_unit() -> None:
     collector.collect_records(_records(definition), unit_id="b.cpp")
     collector.collect_records(_records(DECLARATION), unit_id="c.cpp")
 
-    kept = {item.semantic_id: item for item in collector.derive().declarations}[
-        "?Grow@Vector@@QAEHH@Z"
-    ]
+    kept = {
+        item.semantic_id: item for item in collector.derive().declarations.values()
+    }["?Grow@Vector@@QAEHH@Z"]
     assert kept.is_definition
     assert (kept.line, kept.end_line) == (105, 118)
     assert kept.parameter_types == ("int",)
@@ -87,7 +87,7 @@ def test_class_is_kept_from_the_first_unit_that_located_it() -> None:
         _records({**CLASS, "line": 99, "end_line": 99}), unit_id="c.cpp"
     )
 
-    kept = {item.semantic_id: item for item in collector.derive().classes}[
+    kept = {item.semantic_id: item for item in collector.derive().classes.values()}[
         "record:Vector"
     ]
     assert (kept.line, kept.end_line) == (12, 30)
@@ -161,7 +161,9 @@ def test_variable_rank_prefers_initialized_definitions() -> None:
         ),
         unit_id="b.cpp",
     )
-    kept = {item.semantic_id: item for item in collector.derive().variables}["_gThing"]
+    kept = {item.semantic_id: item for item in collector.derive().variables.values()}[
+        "_gThing"
+    ]
     assert kept.definition_kind == "tentative"
 
     collector.collect_records(
@@ -175,7 +177,7 @@ def test_variable_rank_prefers_initialized_definitions() -> None:
         unit_id="c.cpp",
     )
     namespace = collector.derive()
-    assert {item.semantic_id: item for item in namespace.variables}[
+    assert {item.semantic_id: item for item in namespace.variables.values()}[
         "_gThing"
     ].definition_kind == "definition"
 
@@ -191,7 +193,7 @@ def test_variable_rank_prefers_initialized_definitions() -> None:
         unit_id="d.cpp",
     )
     namespace = collector.derive()
-    assert {item.semantic_id: item for item in namespace.variables}[
+    assert {item.semantic_id: item for item in namespace.variables.values()}[
         "_gThing"
     ].source_file == "src/wiz8/c.cpp"
     assert not namespace.conflicts
@@ -214,7 +216,7 @@ def test_conflicting_global_spellings_are_retained() -> None:
 
     namespace = collector.derive()
     # The definition still wins the merged index, but the disagreement survives.
-    assert {item.semantic_id: item for item in namespace.variables}[
+    assert {item.semantic_id: item for item in namespace.variables.values()}[
         "_gThing"
     ].type == "int"
     (conflict,) = namespace.conflicts
@@ -236,7 +238,7 @@ def test_identical_header_spellings_do_not_conflict() -> None:
         )
     namespace = collector.derive()
     assert not namespace.conflicts
-    assert {item.semantic_id: item for item in namespace.variables}[
+    assert {item.semantic_id: item for item in namespace.variables.values()}[
         "_gThing"
     ].source_file == "src/wiz8/a.cpp"
 
@@ -344,8 +346,8 @@ def test_conflicts_survive_a_json_round_trip() -> None:
     )
     namespace = collector.derive()
     index = SourceIndex(
-        declarations=(),
-        classes=(),
+        declarations={},
+        classes={},
         markers=(),
         variables=namespace.variables,
         conflicts=namespace.conflicts,
@@ -353,8 +355,8 @@ def test_conflicts_survive_a_json_round_trip() -> None:
 
     revived = SourceIndex.from_dict(json.loads(json.dumps(index.to_dict())))
     assert revived.to_dict() == index.to_dict()
-    assert revived.variables[0].is_external
-    assert revived.variables[0].definition_kind == "definition"
+    assert list(revived.variables.values())[0].is_external
+    assert list(revived.variables.values())[0].definition_kind == "definition"
 
 
 def test_size_assertions_may_differ_across_link_namespaces() -> None:

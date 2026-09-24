@@ -142,7 +142,7 @@ class SourcePinMixin(ComparatorState):
                 and marker.declaration.owning_class
             ):
                 return marker.declaration.owning_class
-            for declaration in self.source_index.declarations:
+            for declaration in self.source_index.declarations.values():
                 if declaration.owning_class and declaration.qualified_name in {
                     match.name,
                     match.best_name(),

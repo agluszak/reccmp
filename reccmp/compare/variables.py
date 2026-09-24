@@ -253,7 +253,7 @@ class VariableComparator:
         if self.source_index is None or not var.name:
             return None
 
-        for item in self.source_index.variables:
+        for item in self.source_index.variables.values():
             if item.qualified_name != var.name and not item.qualified_name.endswith(
                 f"::{var.name}"
             ):
