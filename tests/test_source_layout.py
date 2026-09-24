@@ -20,83 +20,85 @@ from reccmp.source import (
     SourceField,
     SourceIndex,
 )
-from reccmp.source import SourceAbi
+from reccmp.source import SourceAbi, keyed
 
 
 def _index_with_layout() -> SourceIndex:
     return SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="bar",
-                        type="Bar",
-                        source_file="foo.h",
-                        line=10,
-                        offset=0,
-                        size=8,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Foo",
+                    qualified_name="Foo",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="bar",
+                            type="Bar",
+                            source_file="foo.h",
+                            line=10,
+                            offset=0,
+                            size=8,
+                        ),
+                        SourceField(
+                            name="flag",
+                            type="int",
+                            source_file="foo.h",
+                            line=11,
+                            offset=8,
+                            size=4,
+                        ),
+                        SourceField(
+                            name="tail",
+                            type="char",
+                            source_file="foo.h",
+                            line=12,
+                            offset=12,
+                            size=1,
+                        ),
                     ),
-                    SourceField(
-                        name="flag",
-                        type="int",
-                        source_file="foo.h",
-                        line=11,
-                        offset=8,
-                        size=4,
-                    ),
-                    SourceField(
-                        name="tail",
-                        type="char",
-                        source_file="foo.h",
-                        line=12,
-                        offset=12,
-                        size=1,
-                    ),
+                    virtual_declarations=(),
+                    source_file="foo.h",
+                    line=1,
+                    end_line=20,
+                    size=16,
+                    alignment=4,
+                    base_offsets=(),
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="foo.h",
-                line=1,
-                end_line=20,
-                size=16,
-                alignment=4,
-                base_offsets=(),
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Bar",
-                qualified_name="Bar",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="baz",
-                        type="int",
-                        source_file="foo.h",
-                        line=3,
-                        offset=0,
-                        size=4,
+                SourceClass(
+                    semantic_id="record:Bar",
+                    qualified_name="Bar",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="baz",
+                            type="int",
+                            source_file="foo.h",
+                            line=3,
+                            offset=0,
+                            size=4,
+                        ),
+                        SourceField(
+                            name="qux",
+                            type="int",
+                            source_file="foo.h",
+                            line=4,
+                            offset=4,
+                            size=4,
+                        ),
                     ),
-                    SourceField(
-                        name="qux",
-                        type="int",
-                        source_file="foo.h",
-                        line=4,
-                        offset=4,
-                        size=4,
-                    ),
+                    virtual_declarations=(),
+                    source_file="foo.h",
+                    line=1,
+                    end_line=5,
+                    size=8,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="foo.h",
-                line=1,
-                end_line=5,
-                size=8,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
 
@@ -135,54 +137,56 @@ def test_resolve_field_absolute_offsets_for_nested_and_bases():
     assert nested.base_chain == ()
 
     derived_index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Base",
-                qualified_name="Base",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="base_x",
-                        type="int",
-                        source_file="a.h",
-                        line=1,
-                        offset=0,
-                        size=4,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Base",
+                    qualified_name="Base",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="base_x",
+                            type="int",
+                            source_file="a.h",
+                            line=1,
+                            offset=0,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=2,
+                    size=4,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=2,
-                size=4,
-                alignment=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Derived",
-                qualified_name="Derived",
-                bases=("Base",),
-                fields=(
-                    SourceField(
-                        name="derived_y",
-                        type="int",
-                        source_file="a.h",
-                        line=5,
-                        offset=4,
-                        size=4,
+                SourceClass(
+                    semantic_id="record:Derived",
+                    qualified_name="Derived",
+                    bases=("Base",),
+                    fields=(
+                        SourceField(
+                            name="derived_y",
+                            type="int",
+                            source_file="a.h",
+                            line=5,
+                            offset=4,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=3,
+                    end_line=6,
+                    size=8,
+                    alignment=4,
+                    base_offsets=(SourceBaseOffset(name="Base", offset=0),),
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=3,
-                end_line=6,
-                size=8,
-                alignment=4,
-                base_offsets=(SourceBaseOffset(name="Base", offset=0),),
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     base = derived_index.resolve_field("Derived", 0)
@@ -201,54 +205,56 @@ def test_resolve_field_absolute_offsets_for_nested_and_bases():
 
 def test_field_at_searches_base_subobjects():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Base",
-                qualified_name="Base",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="base_x",
-                        type="int",
-                        source_file="a.h",
-                        line=1,
-                        offset=0,
-                        size=4,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Base",
+                    qualified_name="Base",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="base_x",
+                            type="int",
+                            source_file="a.h",
+                            line=1,
+                            offset=0,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=2,
+                    size=4,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=2,
-                size=4,
-                alignment=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Derived",
-                qualified_name="Derived",
-                bases=("Base",),
-                fields=(
-                    SourceField(
-                        name="derived_y",
-                        type="int",
-                        source_file="a.h",
-                        line=5,
-                        offset=4,
-                        size=4,
+                SourceClass(
+                    semantic_id="record:Derived",
+                    qualified_name="Derived",
+                    bases=("Base",),
+                    fields=(
+                        SourceField(
+                            name="derived_y",
+                            type="int",
+                            source_file="a.h",
+                            line=5,
+                            offset=4,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=3,
+                    end_line=6,
+                    size=8,
+                    alignment=4,
+                    base_offsets=(SourceBaseOffset(name="Base", offset=0),),
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=3,
-                end_line=6,
-                size=8,
-                alignment=4,
-                base_offsets=(SourceBaseOffset(name="Base", offset=0),),
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     field = index.field_at("Derived", 0)
@@ -261,43 +267,45 @@ def test_field_at_searches_base_subobjects():
 
 def test_resolve_field_rejects_overlapping_bitfields():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Bits",
-                qualified_name="Bits",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="a",
-                        type="unsigned",
-                        source_file="b.h",
-                        line=2,
-                        offset=0,
-                        size=1,
-                        bitfield_width=3,
-                        bitfield_offset=0,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Bits",
+                    qualified_name="Bits",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="a",
+                            type="unsigned",
+                            source_file="b.h",
+                            line=2,
+                            offset=0,
+                            size=1,
+                            bitfield_width=3,
+                            bitfield_offset=0,
+                        ),
+                        SourceField(
+                            name="b",
+                            type="unsigned",
+                            source_file="b.h",
+                            line=3,
+                            offset=0,
+                            size=1,
+                            bitfield_width=5,
+                            bitfield_offset=3,
+                        ),
                     ),
-                    SourceField(
-                        name="b",
-                        type="unsigned",
-                        source_file="b.h",
-                        line=3,
-                        offset=0,
-                        size=1,
-                        bitfield_width=5,
-                        bitfield_offset=3,
-                    ),
+                    virtual_declarations=(),
+                    source_file="b.h",
+                    line=1,
+                    end_line=4,
+                    size=1,
+                    alignment=1,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="b.h",
-                line=1,
-                end_line=4,
-                size=1,
-                alignment=1,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     assert index.resolve_field("Bits", 0) is None
@@ -359,10 +367,10 @@ def test_layout_conflict_marks_untrusted():
     )
     namespace = collector.derive()
     assert len(namespace.classes) == 1
-    assert namespace.classes[0].layout_trusted is False
+    assert list(namespace.classes.values())[0].layout_trusted is False
     assert any(c.record_kind == "class_layout" for c in namespace.conflicts)
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
         classes=namespace.classes,
         conflicts=namespace.conflicts,
@@ -406,12 +414,12 @@ def test_asserted_size_mismatch_untrusts_layout():
         unit_id="a.cpp",
     )
     namespace = collector.derive()
-    assert namespace.classes[0].asserted_size == 16
-    assert namespace.classes[0].layout_trusted is False
+    assert list(namespace.classes.values())[0].asserted_size == 16
+    assert list(namespace.classes.values())[0].layout_trusted is False
 
 
 def test_source_index_reader_fails_when_a_field_is_missing():
-    document = SourceIndex(declarations=(), classes=(), markers=()).to_dict()
+    document = SourceIndex(declarations={}, classes={}, markers=()).to_dict()
     del document["member_uses"]
 
     with pytest.raises(KeyError, match="member_uses"):
@@ -421,8 +429,8 @@ def test_source_index_reader_fails_when_a_field_is_missing():
 def test_unit_abi_round_trips_in_index_projection():
 
     index = SourceIndex(
-        declarations=(),
-        classes=(),
+        declarations={},
+        classes={},
         markers=(),
         abi=SourceAbi(
             target_triple="i386-pc-windows-msvc",
@@ -440,54 +448,56 @@ def test_unit_abi_round_trips_in_index_projection():
 def test_record_semantic_id_preferred_for_nested_lookup():
 
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Bar",
-                qualified_name="Bar",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="x",
-                        type="int",
-                        source_file="b.h",
-                        line=1,
-                        offset=0,
-                        size=4,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Bar",
+                    qualified_name="Bar",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="x",
+                            type="int",
+                            source_file="b.h",
+                            line=1,
+                            offset=0,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="b.h",
+                    line=1,
+                    end_line=2,
+                    size=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="b.h",
-                line=1,
-                end_line=2,
-                size=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="inner",
-                        # Embedded record: peeling would leave ``Bar``; the
-                        # semantic id must still win over the spelling.
-                        type="volatile const struct WeirdSpelling",
-                        source_file="f.h",
-                        line=1,
-                        offset=0,
-                        size=4,
-                        record_semantic_id="record:Bar",
+                SourceClass(
+                    semantic_id="record:Foo",
+                    qualified_name="Foo",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="inner",
+                            # Embedded record: peeling would leave ``Bar``; the
+                            # semantic id must still win over the spelling.
+                            type="volatile const struct WeirdSpelling",
+                            source_file="f.h",
+                            line=1,
+                            offset=0,
+                            size=4,
+                            record_semantic_id="record:Bar",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="f.h",
+                    line=1,
+                    end_line=2,
+                    size=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="f.h",
-                line=1,
-                end_line=2,
-                size=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     resolved = index.resolve_field("Foo", 0)
@@ -499,85 +509,87 @@ def test_record_semantic_id_preferred_for_nested_lookup():
 def test_pointer_and_reference_fields_are_layout_leaves():
     """Pointer/reference storage must not descend into the pointee layout."""
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Node",
-                qualified_name="Node",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="next",
-                        type="Node *",
-                        source_file="n.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        pointer_depth=1,
-                        record_semantic_id="record:Node",
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Node",
+                    qualified_name="Node",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="next",
+                            type="Node *",
+                            source_file="n.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            pointer_depth=1,
+                            record_semantic_id="record:Node",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="n.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="n.h",
-                line=1,
-                end_line=3,
-                size=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Child",
-                qualified_name="Child",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="value",
-                        type="int",
-                        source_file="c.h",
-                        line=2,
-                        offset=0,
-                        size=4,
+                SourceClass(
+                    semantic_id="record:Child",
+                    qualified_name="Child",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="value",
+                            type="int",
+                            source_file="c.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="c.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="c.h",
-                line=1,
-                end_line=3,
-                size=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Holder",
-                qualified_name="Holder",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="ptr",
-                        type="Child *",
-                        source_file="h.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        pointer_depth=1,
-                        record_semantic_id="record:Child",
+                SourceClass(
+                    semantic_id="record:Holder",
+                    qualified_name="Holder",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="ptr",
+                            type="Child *",
+                            source_file="h.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            pointer_depth=1,
+                            record_semantic_id="record:Child",
+                        ),
+                        SourceField(
+                            name="ref",
+                            type="Child &",
+                            source_file="h.h",
+                            line=3,
+                            offset=4,
+                            size=4,
+                            record_semantic_id="record:Child",
+                        ),
                     ),
-                    SourceField(
-                        name="ref",
-                        type="Child &",
-                        source_file="h.h",
-                        line=3,
-                        offset=4,
-                        size=4,
-                        record_semantic_id="record:Child",
-                    ),
+                    virtual_declarations=(),
+                    source_file="h.h",
+                    line=1,
+                    end_line=4,
+                    size=8,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="h.h",
-                line=1,
-                end_line=4,
-                size=8,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     # Recursive Node* must terminate at the pointer field.
@@ -600,52 +612,54 @@ def test_pointer_and_reference_fields_are_layout_leaves():
 
 def test_untrusted_nested_layout_is_not_published():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Child",
-                qualified_name="Child",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="value",
-                        type="int",
-                        source_file="c.h",
-                        line=2,
-                        offset=0,
-                        size=4,
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Child",
+                    qualified_name="Child",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="value",
+                            type="int",
+                            source_file="c.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="c.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    layout_trusted=False,
                 ),
-                virtual_declarations=(),
-                source_file="c.h",
-                line=1,
-                end_line=3,
-                size=4,
-                layout_trusted=False,
-            ),
-            SourceClass(
-                semantic_id="record:Parent",
-                qualified_name="Parent",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="child",
-                        type="Child",
-                        source_file="p.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        record_semantic_id="record:Child",
+                SourceClass(
+                    semantic_id="record:Parent",
+                    qualified_name="Parent",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="child",
+                            type="Child",
+                            source_file="p.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            record_semantic_id="record:Child",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="p.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="p.h",
-                line=1,
-                end_line=3,
-                size=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     assert index.has_layout("Parent") is True
@@ -655,54 +669,62 @@ def test_untrusted_nested_layout_is_not_published():
 
 def test_cross_target_class_name_is_not_last_wins():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="a",
-                        type="char",
+        classes={
+            **keyed(
+                (
+                    SourceClass(
+                        semantic_id="record:Foo",
+                        qualified_name="Foo",
+                        bases=(),
+                        fields=(
+                            SourceField(
+                                name="a",
+                                type="char",
+                                source_file="a.h",
+                                line=1,
+                                offset=0,
+                                size=1,
+                            ),
+                        ),
+                        virtual_declarations=(),
                         source_file="a.h",
                         line=1,
-                        offset=0,
-                        size=1,
+                        end_line=2,
+                        size=8,
+                        layout_trusted=True,
                     ),
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=2,
-                size=8,
-                layout_trusted=True,
-                target="EXE",
+                "EXE",
             ),
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="a",
-                        type="char",
+            **keyed(
+                (
+                    SourceClass(
+                        semantic_id="record:Foo",
+                        qualified_name="Foo",
+                        bases=(),
+                        fields=(
+                            SourceField(
+                                name="a",
+                                type="char",
+                                source_file="a.h",
+                                line=1,
+                                offset=0,
+                                size=1,
+                            ),
+                        ),
+                        virtual_declarations=(),
                         source_file="a.h",
                         line=1,
-                        offset=0,
-                        size=1,
+                        end_line=2,
+                        size=4,
+                        layout_trusted=True,
                     ),
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=2,
-                size=4,
-                layout_trusted=True,
-                target="DLL",
+                "DLL",
             ),
-        ),
+        },
     )
     assert index.class_named("Foo") is None
     exe = index.for_target("EXE")

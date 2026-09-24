@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from reccmp.source import keyed
+
 from reccmp.compare import Compare
 from reccmp.compare.asm.verifier.cfg_build import (
     extract_switch_tables,
@@ -253,9 +255,9 @@ def test_source_index_is_not_auto_discovered(tmp_path: Path):
 
 def test_source_index_rejects_incompatible_abi(tmp_path: Path):
     document = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(),
+        classes={},
         abi=SourceAbi(
             target_triple="x86_64-pc-windows-msvc",
             pointer_width=8,
@@ -278,24 +280,28 @@ def test_source_index_rejects_incompatible_abi(tmp_path: Path):
 
 def test_source_index_scopes_variable_only_targets(tmp_path: Path):
     document = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(),
+        classes={},
         abi=SourceAbi("i386-pc-windows-msvc", 4, True),
-        variables=(
-            SourceVariable(
-                semantic_id="gOnly",
-                qualified_name="gOnly",
-                type="int",
-                linkage="external",
-                storage_class="none",
-                definition_kind="definition",
-                source_file="a.cpp",
-                line=1,
-                end_line=1,
-                target="OTHER",
-            ),
-        ),
+        variables={
+            **keyed(
+                (
+                    SourceVariable(
+                        semantic_id="gOnly",
+                        qualified_name="gOnly",
+                        type="int",
+                        linkage="external",
+                        storage_class="none",
+                        definition_kind="definition",
+                        source_file="a.cpp",
+                        line=1,
+                        end_line=1,
+                    ),
+                ),
+                "OTHER",
+            )
+        },
     ).to_dict()
     path = tmp_path / "source-index.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -309,59 +315,61 @@ def test_source_index_scopes_variable_only_targets(tmp_path: Path):
 
 def test_array_field_resolves_later_elements():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Child",
-                qualified_name="Child",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="value",
-                        type="int",
-                        source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        storage_kind="scalar",
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Child",
+                    qualified_name="Child",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="value",
+                            type="int",
+                            source_file="a.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            storage_kind="scalar",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=3,
-                size=4,
-                alignment=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Parent",
-                qualified_name="Parent",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="children",
-                        type="Child [4]",
-                        source_file="a.h",
-                        line=6,
-                        offset=0,
-                        size=16,
-                        record_semantic_id="record:Child",
-                        storage_kind="array",
-                        array_element_type="Child",
-                        array_stride=4,
-                        array_count=4,
+                SourceClass(
+                    semantic_id="record:Parent",
+                    qualified_name="Parent",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="children",
+                            type="Child [4]",
+                            source_file="a.h",
+                            line=6,
+                            offset=0,
+                            size=16,
+                            record_semantic_id="record:Child",
+                            storage_kind="array",
+                            array_element_type="Child",
+                            array_stride=4,
+                            array_count=4,
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=5,
+                    end_line=7,
+                    size=16,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=5,
-                end_line=7,
-                size=16,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     first = index.resolve_field("Parent", 0)
@@ -575,60 +583,62 @@ def test_include_diff_false_still_computes_stack_diagnostics():
 
 def test_pointer_array_does_not_descend_into_pointee():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Child",
-                qualified_name="Child",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="value",
-                        type="int",
-                        source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                        storage_kind="scalar",
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Child",
+                    qualified_name="Child",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="value",
+                            type="int",
+                            source_file="a.h",
+                            line=2,
+                            offset=0,
+                            size=4,
+                            storage_kind="scalar",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=3,
+                    size=4,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=3,
-                size=4,
-                alignment=4,
-                layout_trusted=True,
-            ),
-            SourceClass(
-                semantic_id="record:Parent",
-                qualified_name="Parent",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="children",
-                        type="Child *[4]",
-                        source_file="a.h",
-                        line=6,
-                        offset=0,
-                        size=16,
-                        record_semantic_id="record:Child",
-                        storage_kind="array",
-                        array_element_type="Child *",
-                        array_stride=4,
-                        array_count=4,
-                        array_element_kind="pointer",
+                SourceClass(
+                    semantic_id="record:Parent",
+                    qualified_name="Parent",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="children",
+                            type="Child *[4]",
+                            source_file="a.h",
+                            line=6,
+                            offset=0,
+                            size=16,
+                            record_semantic_id="record:Child",
+                            storage_kind="array",
+                            array_element_type="Child *",
+                            array_stride=4,
+                            array_count=4,
+                            array_element_kind="pointer",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=5,
+                    end_line=7,
+                    size=16,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=5,
-                end_line=7,
-                size=16,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     later = index.resolve_field("Parent", 8)
@@ -640,36 +650,38 @@ def test_pointer_array_does_not_descend_into_pointee():
 
 def test_scalar_array_uses_element_stride():
     index = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
-        classes=(
-            SourceClass(
-                semantic_id="record:Parent",
-                qualified_name="Parent",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="values",
-                        type="int [4]",
-                        source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=16,
-                        storage_kind="array",
-                        array_element_type="int",
-                        array_stride=4,
-                        array_count=4,
-                        array_element_kind="scalar",
+        classes=keyed(
+            (
+                SourceClass(
+                    semantic_id="record:Parent",
+                    qualified_name="Parent",
+                    bases=(),
+                    fields=(
+                        SourceField(
+                            name="values",
+                            type="int [4]",
+                            source_file="a.h",
+                            line=2,
+                            offset=0,
+                            size=16,
+                            storage_kind="array",
+                            array_element_type="int",
+                            array_stride=4,
+                            array_count=4,
+                            array_element_kind="scalar",
+                        ),
                     ),
+                    virtual_declarations=(),
+                    source_file="a.h",
+                    line=1,
+                    end_line=3,
+                    size=16,
+                    alignment=4,
+                    layout_trusted=True,
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=3,
-                size=16,
-                alignment=4,
-                layout_trusted=True,
-            ),
+            )
         ),
     )
     later = index.resolve_field("Parent", 8)

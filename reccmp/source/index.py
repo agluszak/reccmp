@@ -40,9 +40,35 @@ class SourceIndexError(ValueError):
 
 
 @dataclass(frozen=True)
+class DeclarationKey:
+    """The identity of a declared entity inside the index.
+
+    A mangled name alone is not one: TU-local functions of different units
+    can share it. External entities are identified by (target, semantic id);
+    TU-local ones also by the unit that defines them."""
+
+    target: str | None
+    semantic_id: str
+    unit_id: str | None = None
+
+    def sort_key(self) -> tuple[str, str, str]:
+        return (self.target or "", self.semantic_id, self.unit_id or "")
+
+    def to_json(self) -> list[str | None]:
+        return [self.target, self.semantic_id, self.unit_id]
+
+    @classmethod
+    def from_json(cls, values: Sequence[str | None]) -> "DeclarationKey":
+        target, semantic_id, unit_id = values
+        assert semantic_id is not None
+        return cls(target, semantic_id, unit_id)
+
+
+@dataclass(frozen=True)
 # pylint: disable=too-many-instance-attributes
 class SourceDeclaration:
-    """One semantic function declaration emitted by Clang."""
+    """One semantic function declaration emitted by Clang. A compiler fact:
+    which target and unit it belongs to is its DeclarationKey's business."""
 
     semantic_id: str
     qualified_name: str
@@ -63,8 +89,6 @@ class SourceDeclaration:
     linkage: str = ""
     storage_class: str = ""
     is_variadic: bool = False
-    unit_id: str = ""
-    target: str | None = None
     # How callers call it, under the Microsoft x86 ABI.
     call: CallFacts | None = None
 
@@ -94,12 +118,11 @@ class SourceDeclaration:
             "..." if self.is_variadic else "",
         )
 
-    @property
-    def merge_key(self) -> tuple[str, ...]:
-        """Identity used when grouping observations inside one link namespace."""
-        if self.is_external:
-            return (self.semantic_id,)
-        return (self.unit_id, self.semantic_id)
+    def key(self, target: str | None, unit_id: str) -> DeclarationKey:
+        """Its identity when observed by ``unit_id`` in ``target``."""
+        return DeclarationKey(
+            target, self.semantic_id, None if self.is_external else unit_id
+        )
 
 
 @dataclass(frozen=True)
@@ -191,8 +214,6 @@ class SourceMemberUse:
     array_indices: tuple[SourceArrayIndex, ...]
     conversions: tuple[SourceConversion, ...]
     base: SourceAccessBase
-    unit_id: str = ""
-    target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -217,9 +238,9 @@ class SourceFunctionFacts:
     """Facts about one function body beyond its field uses."""
 
     function: str  # semantic id
+    # The explicit calls (CallExpr nodes) in the body: not constructors,
+    # destructors or other implicit calls, so not a complete call graph.
     calls: tuple[SourceCall, ...]
-    unit_id: str = ""
-    target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,10 +249,10 @@ class FunctionFacts:
     called, the fields it accesses and the calls it makes. These explain the
     recompiled side; they never prove the original equivalent."""
 
-    function: str
+    key: DeclarationKey
     call: CallFacts | None
     accesses: tuple[SourceMemberUse, ...]
-    calls: tuple[SourceCall, ...]
+    calls: tuple[SourceCall, ...]  # explicit calls only
 
 
 @dataclass(frozen=True)
@@ -275,8 +296,6 @@ class SourceClass:
     asserted_size: int | None = None
     vtable_address: int | None = None
     base_vtables: tuple[SourceBaseVtable, ...] = ()
-    unit_id: str = ""
-    target: str | None = None
     size: int | None = None
     alignment: int | None = None
     base_offsets: tuple[SourceBaseOffset, ...] = ()
@@ -309,6 +328,7 @@ class SourceMarker:
     marker_name: str | None = None
     folded: bool = False
     target: str | None = None
+    declaration_key: DeclarationKey | None = None
 
     @property
     def name(self) -> str:
@@ -331,11 +351,12 @@ class _SizeAssertion:
 class _NamespaceRecords:
     """Winners and conflicts derived inside one link namespace."""
 
-    declarations: tuple[SourceDeclaration, ...]
-    variables: tuple[SourceVariable, ...]
-    classes: tuple[SourceClass, ...]
-    member_uses: tuple[SourceMemberUse, ...]
-    function_facts: tuple[SourceFunctionFacts, ...]
+    declarations: dict[DeclarationKey, SourceDeclaration]
+    variables: dict[DeclarationKey, SourceVariable]
+    classes: dict[DeclarationKey, SourceClass]
+    # By the key of the function whose body makes them.
+    member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]]
+    function_facts: dict[DeclarationKey, SourceFunctionFacts]
     conflicts: tuple[SourceConflict, ...]
     size_assertions: dict[str, int]
     abi: SourceAbi | None = None
@@ -397,15 +418,15 @@ class TranslationUnitRecords:
         if kind == "marker-block":
             return MarkerBlock.from_dict(values)
         if kind == "declaration":
-            return _declaration_from_dict({**values, "unit_id": self.unit_id})
+            return _declaration_from_dict(values)
         if kind == "variable":
-            return _variable_from_dict({**values, "unit_id": self.unit_id})
+            return _variable_from_dict(values)
         if kind == "class":
-            return _class_from_dict({**values, "unit_id": self.unit_id})
+            return _class_from_dict(values)
         if kind == "member-use":
-            return _member_use_from_dict({**values, "unit_id": self.unit_id})
+            return _member_use_from_dict(values)
         if kind == "function-facts":
-            return _function_facts_from_dict({**values, "unit_id": self.unit_id})
+            return _function_facts_from_dict(values)
         raise SourceIndexError(
             f"the source indexer emitted an unknown record: {kind!r}"
         )
@@ -464,8 +485,8 @@ _UNIT_RECORDS = frozenset({"profile", "dependency", "unit-abi", "size-assertion"
 
 class RecordPool:
     """Parsed source records by their exact artifact line, shared across
-    every unit loaded with the pool. A shared record keeps the unit id of
-    the first unit that read it."""
+    every unit loaded with the pool. Records are compiler facts without unit
+    or target: a unit observes a fact by listing it."""
 
     def __init__(self) -> None:
         self.facts: dict[bytes, tuple[str, Any]] = {}
@@ -494,61 +515,78 @@ def derive_namespace(
     unit_ids: set[str] | None = None,
 ) -> _NamespaceRecords:
     """Partition TU observations, then derive winners and conflicts."""
-
-    def belongs(unit_id: str) -> bool:
-        return unit_ids is None or unit_id in unit_ids
-
-    selected = [unit for unit in units if belongs(unit.unit_id)]
-
-    def distinct(items: Iterable[Any]) -> list[Any]:
-        """Each record once: units loaded with a RecordPool share them."""
-        return list({id(item): item for item in items}.values())
-
-    declarations = distinct(item for unit in selected for item in unit.declarations)
-    variables = distinct(item for unit in selected for item in unit.variables)
-    classes = distinct(item for unit in selected for item in unit.classes)
-    member_uses = distinct(item for unit in selected for item in unit.member_uses)
-    function_facts: dict[str, SourceFunctionFacts] = {}
+    selected = [unit for unit in units if unit_ids is None or unit.unit_id in unit_ids]
+    declarations: dict[DeclarationKey, list[SourceDeclaration]] = {}
+    variables: dict[DeclarationKey, list[SourceVariable]] = {}
+    classes: dict[DeclarationKey, list[SourceClass]] = {}
+    uses: dict[DeclarationKey, dict[tuple[Any, ...], SourceMemberUse]] = {}
+    function_facts: dict[DeclarationKey, SourceFunctionFacts] = {}
     for unit in selected:
-        for item in unit.function_facts:
-            # One body per identity: template instantiations of it agree.
-            function_facts.setdefault(item.function, item)
+        # Units share fact objects; each key keeps each object once.
+        local: dict[str, DeclarationKey] = {}
+        for declaration in unit.declarations:
+            key = declaration.key(target, unit.unit_id)
+            local[declaration.semantic_id] = key
+            _add_observation(declarations, key, declaration)
+        for variable in unit.variables:
+            _add_observation(
+                variables, DeclarationKey(target, variable.semantic_id), variable
+            )
+        for source_class in unit.classes:
+            _add_observation(
+                classes, DeclarationKey(target, source_class.semantic_id), source_class
+            )
+        for use in unit.member_uses:
+            function = local.get(use.function_identity) or DeclarationKey(
+                target, use.function_identity
+            )
+            uses.setdefault(function, {}).setdefault(_member_use_key(use), use)
+        for facts in unit.function_facts:
+            # One body per key: template instantiations of it agree.
+            function_facts.setdefault(
+                local.get(facts.function) or DeclarationKey(target, facts.function),
+                facts,
+            )
     assertions = [item for unit in selected for item in unit.size_assertions]
 
     derived_declarations, declaration_conflicts = _derive_entities(
         declarations,
-        key=lambda item: item.merge_key,
         rank=lambda item: 1 if item.is_definition else 0,
         record_kind="declaration",
         target=target,
     )
     derived_variables, variable_conflicts = _derive_entities(
         variables,
-        key=lambda item: (item.semantic_id,),
         rank=lambda item: _VARIABLE_RANK.get(item.definition_kind, 0),
         record_kind="variable",
         target=target,
     )
     derived_classes, class_conflicts = _derive_classes(classes, target=target)
-    derived_member_uses = _derive_member_uses(member_uses, target=target)
     size_assertions = _derive_size_assertions(assertions)
-    abi = _derive_abi(selected)
     return _NamespaceRecords(
         declarations=derived_declarations,
         variables=derived_variables,
-        classes=tuple(
-            _apply_asserted_size(item, size_assertions.get(item.qualified_name))
-            for item in derived_classes
-        ),
-        member_uses=derived_member_uses,
-        function_facts=tuple(
-            _with_target(item, target) if target is not None else item
-            for item in function_facts.values()
-        ),
+        classes={
+            key: _apply_asserted_size(item, size_assertions.get(item.qualified_name))
+            for key, item in derived_classes.items()
+        },
+        member_uses={
+            key: tuple(found[use_key] for use_key in sorted(found))
+            for key, found in uses.items()
+        },
+        function_facts=function_facts,
         conflicts=declaration_conflicts + variable_conflicts + class_conflicts,
         size_assertions=size_assertions,
-        abi=abi,
+        abi=_derive_abi(selected),
     )
+
+
+def _add_observation(
+    groups: dict[DeclarationKey, list], key: DeclarationKey, fact
+) -> None:
+    group = groups.setdefault(key, [])
+    if not any(item is fact for item in group):
+        group.append(fact)
 
 
 def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...]:
@@ -582,15 +620,6 @@ class _RepositoryPaths:
         )
 
 
-def _with_target(item: Any, target: str) -> Any:
-    """A copy of a frozen record with ``target`` set, without re-running its
-    constructor (``dataclasses.replace`` does, which dominates deriving)."""
-    copy = object.__new__(type(item))
-    copy.__dict__.update(item.__dict__)
-    object.__setattr__(copy, "target", target)
-    return copy
-
-
 def _plain(value: Any) -> Any:
     """JSON-ready form of a record (``dataclasses.asdict`` without its deep
     copies, which dominate writing the index)."""
@@ -606,9 +635,8 @@ def source_digest(path: Path) -> str:
 
 
 def _member_use_key(item: SourceMemberUse) -> tuple[Any, ...]:
-    """Deduplicate a repeated header observation without collapsing functions."""
+    """Deduplicate a repeated header observation without collapsing uses."""
     return (
-        item.target or "",
         item.owner_identity or "",
         item.field_identity,
         item.function_identity,
@@ -623,17 +651,6 @@ def _member_use_key(item: SourceMemberUse) -> tuple[Any, ...]:
             for conversion in item.conversions
         ),
     )
-
-
-def _derive_member_uses(
-    observations: Sequence[SourceMemberUse], *, target: str | None
-) -> tuple[SourceMemberUse, ...]:
-    """Attach the target namespace and collapse identical repeated-TU rows."""
-    unique: dict[tuple[Any, ...], SourceMemberUse] = {}
-    for item in observations:
-        projected = _with_target(item, target) if target is not None else item
-        unique.setdefault(_member_use_key(projected), projected)
-    return tuple(unique[key] for key in sorted(unique))
 
 
 # Test/fixture helper: accumulate observations across units without merging.
@@ -660,10 +677,6 @@ class SourceCollector:
     def variables(self) -> list[SourceVariable]:
         return [item for unit in self.units.values() for item in unit.variables]
 
-    @property
-    def member_uses(self) -> list[SourceMemberUse]:
-        return [item for unit in self.units.values() for item in unit.member_uses]
-
     def derive(
         self, *, target: str | None = None, unit_ids: set[str] | None = None
     ) -> _NamespaceRecords:
@@ -673,25 +686,20 @@ class SourceCollector:
 
 
 def _derive_entities(
-    observations: Sequence[Any],
+    groups: Mapping[DeclarationKey, Sequence[Any]],
     *,
-    key,
     rank,
     record_kind: str,
     target: str | None,
-) -> tuple[tuple[Any, ...], tuple[SourceConflict, ...]]:
-    groups: dict[tuple[str, ...], list[Any]] = {}
-    for item in observations:
-        groups.setdefault(key(item), []).append(item)
-
-    winners: list[Any] = []
+) -> tuple[dict[DeclarationKey, Any], tuple[SourceConflict, ...]]:
+    winners: dict[DeclarationKey, Any] = {}
     conflicts: list[SourceConflict] = []
-    for group in groups.values():
+    for key, group in groups.items():
         winner = group[0]
         for item in group[1:]:
             if rank(item) > rank(winner):
                 winner = item
-        winners.append(_with_target(winner, target) if target is not None else winner)
+        winners[key] = winner
 
         variants: dict[tuple[str, ...], list[str]] = {}
         for item in group:
@@ -700,11 +708,10 @@ def _derive_entities(
             if location not in variants[item.signature]:
                 variants[item.signature].append(location)
         if len(variants) > 1:
-            sample = group[0]
             conflicts.append(
                 SourceConflict(
-                    semantic_id=sample.semantic_id,
-                    qualified_name=sample.qualified_name,
+                    semantic_id=winner.semantic_id,
+                    qualified_name=winner.qualified_name,
                     record_kind=record_kind,
                     variants=tuple(
                         SourceConflictVariant(
@@ -715,7 +722,7 @@ def _derive_entities(
                     target=target,
                 )
             )
-    return tuple(winners), tuple(conflicts)
+    return winners, tuple(conflicts)
 
 
 def _layout_identity(source_class: SourceClass) -> tuple:
@@ -774,15 +781,11 @@ def _apply_asserted_size(
 
 
 def _derive_classes(
-    observations: Sequence[SourceClass], *, target: str | None
-) -> tuple[tuple[SourceClass, ...], tuple[SourceConflict, ...]]:
-    groups: dict[str, list[SourceClass]] = {}
-    for item in observations:
-        groups.setdefault(item.semantic_id, []).append(item)
-
-    winners: list[SourceClass] = []
+    groups: Mapping[DeclarationKey, Sequence[SourceClass]], *, target: str | None
+) -> tuple[dict[DeclarationKey, SourceClass], tuple[SourceConflict, ...]]:
+    winners: dict[DeclarationKey, SourceClass] = {}
     conflicts: list[SourceConflict] = []
-    for group in groups.values():
+    for key, group in groups.items():
         winner = group[0]
         for item in group[1:]:
             if not winner.line and item.line:
@@ -818,12 +821,8 @@ def _derive_classes(
         elif _has_layout_evidence(winner):
             layout_trusted = True
 
-        if target is not None:
-            winner = replace(winner, target=target, layout_trusted=layout_trusted)
-        else:
-            winner = replace(winner, layout_trusted=layout_trusted)
-        winners.append(winner)
-    return tuple(winners), tuple(conflicts)
+        winners[key] = replace(winner, layout_trusted=layout_trusted)
+    return winners, tuple(conflicts)
 
 
 def _derive_size_assertions(assertions: Sequence[_SizeAssertion]) -> dict[str, int]:
@@ -901,7 +900,6 @@ def _declaration_from_dict(values: Mapping[str, Any]) -> SourceDeclaration:
     data = dict(values)
     for key in ("parameter_types", "parameter_references", "parameter_reference_forms"):
         data[key] = tuple(data.get(key) or ())
-    data.pop("declaration_key", None)
     if data.get("call") is not None:
         data["call"] = CallFacts(**data["call"])
     return SourceDeclaration(**data)
@@ -1072,8 +1070,6 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
         base_vtables=tuple(
             SourceBaseVtable(**item) for item in values.get("base_vtables", ())
         ),
-        unit_id=str(values.get("unit_id") or ""),
-        target=values.get("target"),
         size=values.get("size"),
         alignment=values.get("alignment"),
         base_offsets=tuple(
@@ -1084,9 +1080,41 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
     )
 
 
+def keyed(
+    records: Iterable[Any], target: str | None = None
+) -> dict[DeclarationKey, Any]:
+    """Records of external entities (or classes) keyed in ``target``: for
+    building an index directly."""
+    return {DeclarationKey(target, item.semantic_id): item for item in records}
+
+
+def _sorted_by_key(records: Mapping[DeclarationKey, Any]) -> dict[DeclarationKey, Any]:
+    return {key: records[key] for key in sorted(records, key=DeclarationKey.sort_key)}
+
+
+def _flattened(records: Mapping[DeclarationKey, Any]) -> list[dict[str, Any]]:
+    """JSON rows: each record with its key's target and unit."""
+    return [
+        {**_plain(item), "target": key.target, "unit_id": key.unit_id}
+        for key, item in records.items()
+    ]
+
+
+def _keyed(
+    rows: Iterable[Mapping[str, Any]], parse, *, id_field: str = "semantic_id"
+) -> dict[DeclarationKey, Any]:
+    """Inverse of ``_flattened``."""
+    records: dict[DeclarationKey, Any] = {}
+    for row in rows:
+        values = dict(row)
+        target, unit_id = values.pop("target"), values.pop("unit_id")
+        records[DeclarationKey(target, values[id_field], unit_id)] = parse(values)
+    return records
+
+
 def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
     """Serialize a marker with a declaration key instead of a nested copy."""
-    payload = {
+    return {
         "address": marker.address,
         "marker_kind": marker.marker_kind,
         "source_file": marker.source_file,
@@ -1094,14 +1122,12 @@ def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
         "marker_name": marker.marker_name,
         "folded": marker.folded,
         "target": marker.target,
-        "declaration_key": None,
+        "declaration_key": (
+            marker.declaration_key.to_json()
+            if marker.declaration_key is not None
+            else None
+        ),
     }
-    if marker.declaration is not None:
-        payload["declaration_key"] = [
-            marker.declaration.target,
-            marker.declaration.semantic_id,
-        ]
-    return payload
 
 
 def _join_markers(
@@ -1110,7 +1136,7 @@ def _join_markers(
     blocks: Sequence[MarkerBlock],
     *,
     aliases: ProjectAliases | None,
-) -> tuple[list[SourceClass], list[SourceMarker]]:
+) -> tuple[dict[DeclarationKey, SourceClass], list[SourceMarker]]:
     identity = {block.source_file: PurePath(block.source_file) for block in blocks}
     symbols = [
         symbol
@@ -1120,19 +1146,19 @@ def _join_markers(
     ]
     # By location as well as identity: TU-local functions of different files
     # can share a mangled name.
-    definitions: dict[tuple[str, str, int], list[SourceDeclaration]] = {}
-    for declaration in namespace.declarations:
+    definitions: dict[tuple[str, str, int], list[DeclarationKey]] = {}
+    for key, declaration in namespace.declarations.items():
         if declaration.is_definition:
             definitions.setdefault(
                 (declaration.semantic_id, declaration.source_file, declaration.line), []
-            ).append(declaration)
+            ).append(key)
 
     markers: list[SourceMarker] = []
     for method_symbol in symbols:
         if not isinstance(method_symbol, ParserFunction):
             continue
         relative = method_symbol.filename.as_posix()
-        marker_declaration: SourceDeclaration | None = None
+        marker_key: DeclarationKey | None = None
         # Name-reference markers (TEMPLATE/SYNTHETIC/LIBRARY, and FUNCTION with a
         # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
         # name their entity instead of annotating a definition.
@@ -1140,10 +1166,12 @@ def _join_markers(
             method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
             and not method_symbol.is_nameref()
         ):
-            # One per definition: a TU-local function in a header has one
-            # (identical) winner per including unit.
+            # One per definition. A TU-local function defined in a header
+            # has an identical copy in each including unit, and nothing here
+            # says which copy the marker's address is: it binds the first
+            # unit's.
             candidates = [
-                found[0]
+                min(found, key=DeclarationKey.sort_key)
                 for semantic_id in method_symbol.definitions
                 if (
                     found := definitions.get(
@@ -1157,7 +1185,10 @@ def _join_markers(
                     f"0x{method_symbol.offset:08x} "
                     f"binds to {len(candidates)} function definitions"
                 )
-            marker_declaration = candidates[0]
+            marker_key = candidates[0]
+        marker_declaration = (
+            namespace.declarations[marker_key] if marker_key is not None else None
+        )
         markers.append(
             SourceMarker(
                 address=method_symbol.offset,
@@ -1170,17 +1201,18 @@ def _join_markers(
                 marker_name=(
                     method_symbol.name if marker_declaration is None else None
                 ),
+                declaration_key=marker_key,
             )
         )
 
-    classes = list(namespace.classes)
-    class_by_name = {item.qualified_name: index for index, item in enumerate(classes)}
+    classes = dict(namespace.classes)
+    class_by_name = {item.qualified_name: key for key, item in classes.items()}
     for vtable_symbol in symbols:
         if not isinstance(vtable_symbol, ParserVtable):
             continue
         relative = vtable_symbol.filename.as_posix()
-        index = class_by_name.get(vtable_symbol.name)
-        if index is None:
+        class_key = class_by_name.get(vtable_symbol.name)
+        if class_key is None:
             source_class = SourceClass(
                 semantic_id=f"record:{vtable_symbol.name}",
                 qualified_name=vtable_symbol.name,
@@ -1191,12 +1223,12 @@ def _join_markers(
                 line=vtable_symbol.line_number,
                 end_line=vtable_symbol.line_number,
                 vtable_address=vtable_symbol.offset,
-                target=target,
             )
-            classes.append(source_class)
-            class_by_name[source_class.qualified_name] = len(classes) - 1
+            class_key = DeclarationKey(target, source_class.semantic_id)
+            classes[class_key] = source_class
+            class_by_name[source_class.qualified_name] = class_key
             continue
-        source_class = classes[index]
+        source_class = classes[class_key]
         base_class = vtable_symbol.base_class
         class_names = {
             source_class.qualified_name,
@@ -1209,7 +1241,7 @@ def _join_markers(
                     f"{relative}:{vtable_symbol.line_number}: duplicate VTABLE marker "
                     f"for base {base_class}"
                 )
-            classes[index] = replace(
+            classes[class_key] = replace(
                 source_class,
                 base_vtables=(*source_class.base_vtables, base_vtable),
             )
@@ -1219,30 +1251,29 @@ def _join_markers(
                 f"{relative}:{vtable_symbol.line_number}: class has more than one "
                 "primary VTABLE marker"
             )
-        classes[index] = replace(source_class, vtable_address=vtable_symbol.offset)
+        classes[class_key] = replace(source_class, vtable_address=vtable_symbol.offset)
     return classes, markers
 
 
 def _unique_class_map(
-    classes: Sequence[SourceClass],
+    classes: Mapping[DeclarationKey, SourceClass],
     *,
     key,
 ) -> dict[str, SourceClass]:
     """Build an unscoped lookup that drops names colliding across targets."""
-    by_key: dict[str, SourceClass] = {}
+    by_key: dict[str, tuple[str | None, SourceClass]] = {}
     ambiguous: set[str] = set()
-    for item in classes:
+    for class_key, item in classes.items():
         map_key = key(item)
         if map_key in ambiguous:
             continue
         previous = by_key.get(map_key)
         if previous is None:
-            by_key[map_key] = item
-            continue
-        if previous.target != item.target:
+            by_key[map_key] = (class_key.target, item)
+        elif previous[0] != class_key.target:
             del by_key[map_key]
             ambiguous.add(map_key)
-    return by_key
+    return {name: item for name, (_, item) in by_key.items()}
 
 
 class SourceIndex:
@@ -1251,12 +1282,12 @@ class SourceIndex:
     def __init__(
         self,
         *,
-        declarations: Iterable[SourceDeclaration],
-        classes: Iterable[SourceClass],
+        declarations: Mapping[DeclarationKey, SourceDeclaration],
+        classes: Mapping[DeclarationKey, SourceClass],
         markers: Iterable[SourceMarker],
-        variables: Iterable[SourceVariable] = (),
-        member_uses: Iterable[SourceMemberUse] = (),
-        function_facts: Iterable[SourceFunctionFacts] = (),
+        variables: Mapping[DeclarationKey, SourceVariable] | None = None,
+        member_uses: Mapping[DeclarationKey, Sequence[SourceMemberUse]] | None = None,
+        function_facts: Mapping[DeclarationKey, SourceFunctionFacts] | None = None,
         conflicts: Iterable[SourceConflict] = (),
         abi: SourceAbi | None = None,
         target_abis: Mapping[str, SourceAbi] | None = None,
@@ -1277,20 +1308,22 @@ class SourceIndex:
             unit: tuple(sorted(paths))
             for unit, paths in sorted((unit_dependencies or {}).items())
         }
-        self.declarations = tuple(
-            sorted(declarations, key=lambda item: item.semantic_id)
-        )
-        self.classes = tuple(sorted(classes, key=lambda item: item.semantic_id))
+        self.declarations = _sorted_by_key(declarations)
+        self.classes = _sorted_by_key(classes)
         self.markers = tuple(
             sorted(markers, key=lambda item: (item.address, item.source_file))
         )
-        self.variables = tuple(sorted(variables, key=lambda item: item.semantic_id))
-        self.member_uses = tuple(sorted(member_uses, key=_member_use_key))
-        self.function_facts = tuple(
-            sorted(function_facts, key=lambda item: (item.target or "", item.function))
+        self.variables = _sorted_by_key(variables or {})
+        # Field uses by the key of the function whose body makes them.
+        self.member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]] = {
+            key: tuple(uses) for key, uses in _sorted_by_key(member_uses or {}).items()
+        }
+        # Explicit calls by the key of the function whose body makes them.
+        self.function_facts: dict[DeclarationKey, SourceFunctionFacts] = _sorted_by_key(
+            function_facts or {}
         )
-        self._function_views: dict[str, FunctionFacts] | None = None
-        self._call_facts: dict[str, CallFacts | None] | None = None
+        self._keys_by_name: dict[str, list[DeclarationKey]] | None = None
+        self._owner_keys: dict[int, DeclarationKey] | None = None
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
         self.abi = abi
         self.target_abis: dict[str, SourceAbi] = dict(target_abis or {})
@@ -1303,43 +1336,37 @@ class SourceIndex:
             self.classes, key=lambda item: item.semantic_id
         )
         self._classes_by_target_name: dict[tuple[str | None, str], SourceClass] = {
-            (item.target, item.qualified_name): item for item in self.classes
+            (key.target, item.qualified_name): item
+            for key, item in self.classes.items()
         }
         self._classes_by_target_semantic_id: dict[
             tuple[str | None, str], SourceClass
-        ] = {(item.target, item.semantic_id): item for item in self.classes}
+        ] = {(key.target, key.semantic_id): item for key, item in self.classes.items()}
+
+    def targets(self) -> set[str]:
+        """The targets any record belongs to."""
+        keys = (*self.declarations, *self.classes, *self.variables, *self.member_uses)
+        found = {key.target for key in keys} | {item.target for item in self.markers}
+        return {target for target in found if target is not None}
 
     def for_target(self, target: str) -> "SourceIndex":
         """Return a view restricted to one link-namespace / reccmp target."""
         abi = self.target_abis.get(target)
         if abi is None and self.abi is not None:
             # An index built directly (not per target) may only carry ``abi``.
-            targets_present = {
-                item.target for item in self.classes if item.target is not None
-            }
-            targets_present.update(
-                item.target for item in self.markers if item.target is not None
-            )
-            targets_present.update(
-                item.target for item in self.variables if item.target is not None
-            )
-            targets_present.update(
-                item.target for item in self.declarations if item.target is not None
-            )
-            targets_present.update(
-                item.target for item in self.member_uses if item.target is not None
-            )
-            if not targets_present or targets_present == {target}:
+            if self.targets() <= {target}:
                 abi = self.abi
+
+        def scoped(records: Mapping[DeclarationKey, Any]) -> dict[DeclarationKey, Any]:
+            return {key: item for key, item in records.items() if key.target == target}
+
         return SourceIndex(
-            declarations=(item for item in self.declarations if item.target == target),
-            classes=(item for item in self.classes if item.target == target),
+            declarations=scoped(self.declarations),
+            classes=scoped(self.classes),
             markers=(item for item in self.markers if item.target == target),
-            variables=(item for item in self.variables if item.target == target),
-            member_uses=(item for item in self.member_uses if item.target == target),
-            function_facts=(
-                item for item in self.function_facts if item.target == target
-            ),
+            variables=scoped(self.variables),
+            member_uses=scoped(self.member_uses),
+            function_facts=scoped(self.function_facts),
             conflicts=(item for item in self.conflicts if item.target == target),
             abi=abi,
             target_abis={target: abi} if abi is not None else {},
@@ -1348,42 +1375,53 @@ class SourceIndex:
             unit_dependencies=self.unit_dependencies,
         )
 
-    def call_facts_for(self, semantic_id: str) -> CallFacts | None:
-        """Clang's call facts for a declaration (a mangled name for concrete
-        functions). Declarations sharing the id keep the facts they agree on."""
-        if self._call_facts is None:
-            facts: dict[str, CallFacts | None] = {}
-            for declaration in self.declarations:
-                if declaration.call is None:
-                    continue
-                previous = facts.get(declaration.semantic_id, declaration.call)
-                facts[declaration.semantic_id] = (
-                    previous.agreed(declaration.call) if previous is not None else None
-                )
-            self._call_facts = facts
-        return self._call_facts.get(semantic_id)
+    def call_facts_for(self, key: DeclarationKey) -> CallFacts | None:
+        """Clang's call facts for the declaration with this key."""
+        declaration = self.declarations.get(key)
+        return declaration.call if declaration is not None else None
 
-    def function_facts_for(self, semantic_id: str) -> FunctionFacts | None:
+    def declaration_key_at(self, address: int) -> DeclarationKey | None:
+        """The key of the declaration a function marker at ``address`` (an
+        original-binary address) binds, when exactly one owner does."""
+        if self._owner_keys is None:
+            try:
+                owners = self.functions_by_address()
+            except SourceIndexError:
+                owners = {}
+            self._owner_keys = {
+                address: marker.declaration_key
+                for address, marker in owners.items()
+                if marker.declaration_key is not None
+            }
+        return self._owner_keys.get(address)
+
+    def call_facts_named(self, semantic_id: str) -> CallFacts | None:
+        """Call facts by mangled name alone: only when every declaration with
+        that name states the same facts. TU-local functions can share a
+        name; prefer ``call_facts_for`` with a marker's key."""
+        if self._keys_by_name is None:
+            self._keys_by_name = {}
+            for key in self.declarations:
+                self._keys_by_name.setdefault(key.semantic_id, []).append(key)
+        found = {
+            self.declarations[key].call
+            for key in self._keys_by_name.get(semantic_id, ())
+        }
+        return found.pop() if len(found) == 1 else None
+
+    def function_facts_for(self, key: DeclarationKey) -> FunctionFacts | None:
         """Everything Clang states about one function body, or None when the
-        index has no definition of it."""
-        if self._function_views is None:
-            accesses: dict[str, list[SourceMemberUse]] = {}
-            for use in self.member_uses:
-                accesses.setdefault(use.function_identity, []).append(use)
-            calls = {item.function: item.calls for item in self.function_facts}
-            defined = {
-                item.semantic_id for item in self.declarations if item.is_definition
-            }
-            self._function_views = {
-                function: FunctionFacts(
-                    function,
-                    self.call_facts_for(function),
-                    tuple(accesses.get(function, ())),
-                    calls.get(function, ()),
-                )
-                for function in defined | set(accesses) | set(calls)
-            }
-        return self._function_views.get(semantic_id)
+        index knows nothing of it."""
+        accesses = self.member_uses.get(key, ())
+        facts = self.function_facts.get(key)
+        if key not in self.declarations and not accesses and facts is None:
+            return None
+        return FunctionFacts(
+            key,
+            self.call_facts_for(key),
+            accesses,
+            facts.calls if facts is not None else (),
+        )
 
     def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:
         """Source files that changed, or appeared, since the index was collected."""
@@ -1609,12 +1647,12 @@ class SourceIndex:
         blocks = merge_marker_blocks(
             block for unit in units for block in unit.marker_blocks
         )
-        declarations: list[SourceDeclaration] = []
-        classes: list[SourceClass] = []
+        declarations: dict[DeclarationKey, SourceDeclaration] = {}
+        classes: dict[DeclarationKey, SourceClass] = {}
         markers: list[SourceMarker] = []
-        variables: list[SourceVariable] = []
-        member_uses: list[SourceMemberUse] = []
-        function_facts: list[SourceFunctionFacts] = []
+        variables: dict[DeclarationKey, SourceVariable] = {}
+        member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]] = {}
+        function_facts: dict[DeclarationKey, SourceFunctionFacts] = {}
         conflicts: list[SourceConflict] = []
         abis: dict[str, SourceAbi] = {}
         for target, unit_ids in targets.items():
@@ -1622,12 +1660,12 @@ class SourceIndex:
             target_classes, target_markers = _join_markers(
                 target, namespace, blocks, aliases=aliases
             )
-            declarations.extend(namespace.declarations)
-            classes.extend(target_classes)
+            declarations.update(namespace.declarations)
+            classes.update(target_classes)
             markers.extend(target_markers)
-            variables.extend(namespace.variables)
-            member_uses.extend(namespace.member_uses)
-            function_facts.extend(namespace.function_facts)
+            variables.update(namespace.variables)
+            member_uses.update(namespace.member_uses)
+            function_facts.update(namespace.function_facts)
             conflicts.extend(namespace.conflicts)
             if namespace.abi is not None:
                 abis[target] = namespace.abi
@@ -1672,26 +1710,38 @@ class SourceIndex:
         """Read the public JSON projection back into its canonical records.
         A document of another shape raises (usually KeyError); collect the
         index again."""
-        declarations = tuple(
-            _declaration_from_dict(item) for item in document["declarations"]
-        )
-        by_key = {(item.target, item.semantic_id): item for item in declarations}
+        declarations = _keyed(document["declarations"], _declaration_from_dict)
         markers: list[SourceMarker] = []
         for item in document["markers"]:
             values = dict(item)
-            key = values.pop("declaration_key")
-            declaration = by_key[tuple(key)] if key else None
-            markers.append(SourceMarker(**values, declaration=declaration))
+            encoded = values.pop("declaration_key")
+            key = DeclarationKey.from_json(encoded) if encoded else None
+            markers.append(
+                SourceMarker(
+                    **values,
+                    declaration=declarations[key] if key is not None else None,
+                    declaration_key=key,
+                )
+            )
+        member_uses: dict[DeclarationKey, list[SourceMemberUse]] = {}
+        for item in document["member_uses"]:
+            values = dict(item)
+            key = DeclarationKey(
+                values.pop("target"),
+                values["function_identity"],
+                values.pop("function_unit_id"),
+            )
+            member_uses.setdefault(key, []).append(_member_use_from_dict(values))
         return cls(
             declarations=declarations,
-            classes=(_class_from_dict(item) for item in document["classes"]),
+            classes=_keyed(document["classes"], _class_from_dict),
             markers=markers,
-            variables=(_variable_from_dict(item) for item in document["variables"]),
-            member_uses=(
-                _member_use_from_dict(item) for item in document["member_uses"]
-            ),
-            function_facts=(
-                _function_facts_from_dict(item) for item in document["function_facts"]
+            variables=_keyed(document["variables"], _variable_from_dict),
+            member_uses=member_uses,
+            function_facts=_keyed(
+                document["function_facts"],
+                _function_facts_from_dict,
+                id_field="function",
             ),
             conflicts=(_conflict_from_dict(item) for item in document["conflicts"]),
             abi=SourceAbi(**document["abi"]) if document["abi"] is not None else None,
@@ -1769,11 +1819,18 @@ class SourceIndex:
     def to_dict(self) -> dict[str, Any]:
         return {
             "markers": [_marker_projection(item) for item in self.markers],
-            "declarations": [_plain(item) for item in self.declarations],
-            "classes": [_plain(item) for item in self.classes],
-            "variables": [_plain(item) for item in self.variables],
-            "member_uses": [_plain(item) for item in self.member_uses],
-            "function_facts": [_plain(item) for item in self.function_facts],
+            "declarations": _flattened(self.declarations),
+            "classes": _flattened(self.classes),
+            "variables": _flattened(self.variables),
+            "member_uses": [
+                {**_plain(use), "target": key.target, "function_unit_id": key.unit_id}
+                for key, uses in self.member_uses.items()
+                for use in uses
+            ],
+            "function_facts": [
+                {**_plain(facts), "target": key.target, "unit_id": key.unit_id}
+                for key, facts in self.function_facts.items()
+            ],
             "conflicts": [_plain(item) for item in self.conflicts],
             "marker_blocks": [item.to_dict() for item in self.marker_blocks],
             "source_digests": self.source_digests,

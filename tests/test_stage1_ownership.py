@@ -17,6 +17,7 @@ from reccmp.compare.source_capability import (
 from reccmp.compare.variables import VariableComparator
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.source import (
+    keyed,
     SourceAbi,
     SourceClass,
     SourceField,
@@ -59,7 +60,7 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
     db = EntityDb()
     types = CvdumpTypesParser()
     document = SourceIndex(
-        declarations=(),
+        declarations={},
         markers=(),
         abi=SourceAbi(
             target_triple="i386-pc-windows-msvc",
@@ -73,67 +74,79 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
                 ms_abi=True,
             )
         },
-        classes=(
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(
-                    SourceField(
-                        name="bar",
-                        type="int",
+        classes={
+            **keyed(
+                (
+                    SourceClass(
+                        semantic_id="record:Foo",
+                        qualified_name="Foo",
+                        bases=(),
+                        fields=(
+                            SourceField(
+                                name="bar",
+                                type="int",
+                                source_file="a.h",
+                                line=2,
+                                offset=0,
+                                size=4,
+                            ),
+                            SourceField(
+                                name="ptr",
+                                type="int *",
+                                source_file="a.h",
+                                line=3,
+                                offset=4,
+                                size=4,
+                                pointer_depth=1,
+                            ),
+                        ),
+                        virtual_declarations=(),
                         source_file="a.h",
-                        line=2,
-                        offset=0,
-                        size=4,
-                    ),
-                    SourceField(
-                        name="ptr",
-                        type="int *",
-                        source_file="a.h",
-                        line=3,
-                        offset=4,
-                        size=4,
-                        pointer_depth=1,
+                        line=1,
+                        end_line=4,
+                        size=8,
+                        alignment=4,
+                        layout_trusted=True,
                     ),
                 ),
-                virtual_declarations=(),
-                source_file="a.h",
-                line=1,
-                end_line=4,
-                size=8,
-                alignment=4,
-                layout_trusted=True,
-                target="GAME",
+                "GAME",
             ),
-            SourceClass(
-                semantic_id="record:Foo",
-                qualified_name="Foo",
-                bases=(),
-                fields=(),
-                virtual_declarations=(),
-                source_file="other.h",
-                line=1,
-                end_line=2,
-                size=4,
-                layout_trusted=True,
-                target="OTHER",
+            **keyed(
+                (
+                    SourceClass(
+                        semantic_id="record:Foo",
+                        qualified_name="Foo",
+                        bases=(),
+                        fields=(),
+                        virtual_declarations=(),
+                        source_file="other.h",
+                        line=1,
+                        end_line=2,
+                        size=4,
+                        layout_trusted=True,
+                    ),
+                ),
+                "OTHER",
             ),
-        ),
-        variables=(
-            SourceVariable(
-                semantic_id="gFoo",
-                qualified_name="gFoo",
-                type="Foo",
-                linkage="external",
-                storage_class="none",
-                definition_kind="definition",
-                source_file="a.cpp",
-                line=1,
-                end_line=1,
-                target="GAME",
-            ),
-        ),
+        },
+        variables={
+            **keyed(
+                (
+                    SourceVariable(
+                        semantic_id="gFoo",
+                        qualified_name="gFoo",
+                        type="Foo",
+                        linkage="external",
+                        storage_class="none",
+                        definition_kind="definition",
+                        source_file="a.cpp",
+                        line=1,
+                        end_line=1,
+                    ),
+                ),
+                "GAME",
+            )
+        },
     ).to_dict()
     index_path = tmp_path / "source-index.json"
     index_path.write_text(json.dumps(document), encoding="utf-8")

@@ -49,15 +49,7 @@ def source_index_abi_compatible(abi: SourceAbi | None) -> bool:
 
 
 def _records_have_targets(index: SourceIndex) -> bool:
-    for group in (
-        index.classes,
-        index.variables,
-        index.declarations,
-        index.markers,
-    ):
-        if any(item.target is not None for item in group):
-            return True
-    return False
+    return bool(index.targets())
 
 
 def _scoped_is_empty(index: SourceIndex) -> bool:

@@ -76,7 +76,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                 if identity[0] == "entity" and identity[2] == 0:
                     match = self.db.get_one_match(identity[1])
                     if match is not None and match.recomp_addr is not None:
-                        return self._call_facts_at(match.recomp_addr)
+                        return self._call_facts_at(match.recomp_addr, match.orig_addr)
                 return None
 
             self._witness_translator = Translator(
@@ -102,7 +102,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
         # pylint: disable-next=import-outside-toplevel
         from reccmp.compare.witness import find_witness
 
-        facts = self._call_facts_at(match.recomp_addr)
+        facts = self._call_facts_at(match.recomp_addr, match.orig_addr)
         result = find_witness(
             self._witness_machines(),
             orig_image,

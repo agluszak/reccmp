@@ -99,10 +99,21 @@ The index also lists, per unit, the repository files it includes
 
 Records retain compiler-owned source signatures, parameter reference forms, and
 field pointer depth. Declarations carry linkage, storage class, and variadic
-status; only external-linkage variables are indexed. Markers store a
-`(target, semantic_id)` declaration key in the JSON projection rather than a
-nested copy of the declaration. Conflicting size assertions are errors inside
-one link namespace.
+status; only external-linkage variables are indexed. Conflicting size
+assertions are errors inside one link namespace.
+
+Records are compiler facts: they say nothing about which target or unit they
+belong to, so units loaded through the `RecordPool` share them. That context
+is the record's `DeclarationKey`: `(target, semantic_id)` for external
+entities, plus the defining `unit_id` for TU-local ones, since TU-local
+functions of different units can share a mangled name. The index keys
+declarations, classes and variables by it, and member uses by the key of the
+function making them. Markers carry the key of their declaration. The JSON
+projection writes each record with its key's `target` and `unit_id` (member
+uses: `function_unit_id`), and markers a `[target, semantic_id, unit_id]`
+`declaration_key`. A marker on a TU-local function defined in a header binds
+the first including unit's copy: the copies are identical, and nothing states
+which one the marker's address is.
 
 ### Function facts
 
@@ -131,9 +142,8 @@ recompiled side of a comparison; they never prove the original equivalent.
 ### Derivation
 
 `TranslationUnitRecords` holds one unit's observations. `derive_namespace()` /
-`SourceIndex.from_units()` partition by target, group external entities by
-`semantic_id` and non-external functions by `(unit_id, semantic_id)`, then
-derive winners and conflicts. Compile-database entries that are not owned by any
+`SourceIndex.from_units()` partition by target, group observations by key,
+then derive winners and conflicts. Compile-database entries that are not owned by any
 requested target are skipped before cache lookup or Clang.
 
 Run the collector integration tests inside the pinned image. The image's
