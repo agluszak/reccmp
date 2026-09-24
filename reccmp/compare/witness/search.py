@@ -14,6 +14,7 @@ and the input may not be reachable from the program's real callers.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 
@@ -116,7 +117,7 @@ class Translator:
 class SearchResult:
     witness: Witness | None = None
     # Why seeds produced no verdict, e.g. {"call_structure": 3, "limit": 1}.
-    skipped: dict[str, int] = field(default_factory=dict)
+    skipped: Counter[str] = field(default_factory=Counter)
     agreeing_seeds: int = 0
     runs: int = 0
     # Instructions executed by the seeds on which both sides agreed.
@@ -130,9 +131,6 @@ class SearchResult:
             and (recomp is None or recomp in executed_r)
             for executed_o, executed_r in zip(self.agreeing_orig, self.agreeing_recomp)
         )
-
-    def skip(self, reason: str) -> None:
-        self.skipped[reason] = self.skipped.get(reason, 0) + 1
 
 
 def _fmt(ident: Identity) -> str:
@@ -211,17 +209,6 @@ def _compare(
                 continue
             locations[ident] = max(size, locations.get(ident, 0))
 
-    def mixes_pointer_bytes(trace: Trace, addr: int, size: int) -> bool:
-        """Bytes of a stored pointer, not read back as that same store, have
-        a layout-dependent value."""
-        writers = {
-            w[:3] if w else None
-            for w in (trace.last_writer.get(b) for b in range(addr, addr + size))
-        }
-        if writers in ({(addr, size, True)}, {(addr, size, False)}):
-            return False
-        return any(w is not None and w[2] for w in writers)
-
     def settled(trace: Trace, addr: int, size: int) -> bool:
         """Whether the final value is the function's own: a call after the
         last write (or any call, if it never wrote) could have changed it,
@@ -239,9 +226,7 @@ def _compare(
         loc_r = translator.address(recomp, ident)
         if loc_o is None or loc_r is None:
             continue
-        if mixes_pointer_bytes(t_o, loc_o, size) or mixes_pointer_bytes(
-            t_r, loc_r, size
-        ):
+        if t_o.mixes_pointer_bytes(loc_o, size) or t_r.mixes_pointer_bytes(loc_r, size):
             continue
         if not (settled(t_o, loc_o, size) and settled(t_r, loc_r, size)):
             continue
@@ -345,7 +330,7 @@ def find_witness(
             result.witness = witness
             return result
         if reason is not None:
-            result.skip(reason)
+            result.skipped[reason] += 1
         else:
             result.agreeing_seeds += 1
             result.agreeing_orig.append(frozenset(t_o.executed))

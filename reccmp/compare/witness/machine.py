@@ -18,18 +18,47 @@ The model, identical for the original and the recompiled side:
 from __future__ import annotations
 
 import collections
+import functools
 import hashlib
 import struct
 from dataclasses import dataclass, field
 from typing import Callable
 
-from capstone import (  # type: ignore[import-untyped]
-    CS_ARCH_X86,
-    CS_MODE_32,
-    Cs,
-    CsInsn,
+from capstone import CS_GRP_CALL, CsInsn  # type: ignore[import-untyped]
+from capstone.x86 import (  # type: ignore
+    X86_INS_ADD,
+    X86_INS_CALL,
+    X86_INS_CPUID,
+    X86_INS_ENTER,
+    X86_INS_IN,
+    X86_INS_INSB,
+    X86_INS_JMP,
+    X86_INS_LEAVE,
+    X86_INS_OUT,
+    X86_INS_OUTSB,
+    X86_INS_POP,
+    X86_INS_POPAL,
+    X86_INS_POPFD,
+    X86_INS_PUSH,
+    X86_INS_PUSHAL,
+    X86_INS_PUSHFD,
+    X86_INS_RDRAND,
+    X86_INS_RDSEED,
+    X86_INS_RDTSC,
+    X86_INS_RDTSCP,
+    X86_INS_RET,
+    X86_OP_IMM,
+    X86_OP_MEM,
+    X86_OP_REG,
+    X86_REG_EAX,
+    X86_REG_EBP,
+    X86_REG_EBX,
+    X86_REG_ECX,
+    X86_REG_EDI,
+    X86_REG_EDX,
+    X86_REG_ESI,
+    X86_REG_ESP,
 )
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG  # type: ignore
 from unicorn import (  # type: ignore[import-untyped]
     UC_ARCH_X86,
     UC_HOOK_BLOCK,
@@ -54,6 +83,11 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
     UC_X86_REG_ESP,
 )
 
+from reccmp.compare.asm.decode import (
+    decode_one,
+    direct_branch_target,
+    transfers_control,
+)
 from reccmp.formats import Image
 from reccmp.formats.image import ImageSectionFlags
 
@@ -131,9 +165,9 @@ def page_contents(seed: int, page: int, pool: tuple[int, ...] = ()) -> bytes:
         # Small integers used as pointers land here; like a null page it
         # reads as zeros, so further dereferences stay in shared memory.
         return bytes(PAGE)
-    return b"".join(
-        model_dword(seed, page, i, pool=pool).to_bytes(4, "little")
-        for i in range(PAGE // 4)
+    return struct.pack(
+        f"<{PAGE // 4}I",
+        *(model_dword(seed, page, i, pool=pool) for i in range(PAGE // 4)),
     )
 
 
@@ -176,6 +210,17 @@ class Trace:
     esp_after_return: int = 0
     detail: str = ""
 
+    def mixes_pointer_bytes(self, addr: int, size: int) -> bool:
+        """Bytes of a stored pointer, not read back as that same store, have
+        a layout-dependent value."""
+        writers = {
+            w[:3] if w else None
+            for w in (self.last_writer.get(b) for b in range(addr, addr + size))
+        }
+        if writers in ({(addr, size, True)}, {(addr, size, False)}):
+            return False
+        return any(w is not None and w[2] for w in writers)
+
 
 @dataclass(frozen=True)
 class RunInput:
@@ -212,9 +257,6 @@ class SideMachine:
         # Argument bytes popped by imported callees, by import name.
         self.import_cleanup = import_cleanup or {}
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
-        self.cs = Cs(CS_ARCH_X86, CS_MODE_32)
-        self.cs.detail = True
-        self._image_pages: dict[int, bytes] = {}
         lo = min(s.virtual_address for s in image.sections) & ~(PAGE - 1)
         hi = max(s.virtual_address + s.extent for s in image.sections)
         hi = (hi + PAGE - 1) & ~(PAGE - 1)
@@ -241,8 +283,12 @@ class SideMachine:
         self.uc.mem_map(RETURN_SENTINEL, PAGE)
         self._lazy_pages: set[int] = set()
         self._dirty_image_pages: set[int] = set()
-        self._insn_cache: dict[int, CsInsn | None] = {}
-        self._pop_cache: dict[int, int | None] = {}
+        # One flag per stack byte: nonzero once the current run wrote it.
+        self._written_stack = bytearray(STACK_SIZE)
+        # Decoding reads the pristine image, which runs never change, so
+        # results are cached per machine.
+        self.insn_at = functools.cache(self._decode)
+        self.callee_pop_bytes = functools.cache(self._callee_pop_bytes)
         self._seed = 0
         self._pool: tuple[int, ...] = ()
         # First address the last run touched outside all shared memory.
@@ -250,38 +296,30 @@ class SideMachine:
 
     # -- decoding --------------------------------------------------------
 
-    def insn_at(self, addr: int) -> CsInsn | None:
-        if addr not in self._insn_cache:
-            try:
-                code = bytes(self.uc.mem_read(addr, 16))
-            except UcError:
-                code = b""
-            self._insn_cache[addr] = next(self.cs.disasm(code, addr, 1), None)
-        return self._insn_cache[addr]
+    def _decode(self, addr: int) -> CsInsn | None:
+        if addr not in self.image_range:
+            return None
+        offset = addr - self.image_range.start
+        return decode_one(self._pristine[offset : offset + 16], addr)
 
-    def callee_pop_bytes(self, target: int) -> int | None:
+    def _callee_pop_bytes(self, target: int) -> int | None:
         """``ret N`` of a callee in the image, following ``jmp`` thunks."""
-        if target in self._pop_cache:
-            return self._pop_cache[target]
-        result = None
         addr, seen = target, 0
         while addr in self.image_range and seen < 4000:
             insn = self.insn_at(addr)
             if insn is None:
                 break
             seen += 1
-            if insn.mnemonic == "ret":
-                result = insn.operands[0].imm if insn.operands else 0
-                break
-            if insn.mnemonic == "jmp" and seen == 1:
-                op = insn.operands[0]
-                if op.type == X86_OP_IMM:
-                    addr = op.imm
-                    continue
-                break
+            if insn.id == X86_INS_RET:
+                return insn.operands[0].imm if insn.operands else 0
+            if insn.id == X86_INS_JMP and seen == 1:
+                jump = direct_branch_target(insn)
+                if jump is None:
+                    break
+                addr = jump
+                continue
             addr += insn.size
-        self._pop_cache[target] = result
-        return result
+        return None
 
     def _pushed_bytes(self, recent: collections.deque[int]) -> int:
         """Bytes pushed on the executed path right before the current call."""
@@ -291,24 +329,20 @@ class SideMachine:
             insn = self.insn_at(addr)
             if insn is None:
                 break
-            if insn.mnemonic == "push":
+            if insn.id == X86_INS_PUSH:
                 total += 4
                 continue
-            written = insn.op_str.split(",", 1)[0].strip()
-            if insn.mnemonic in _STACK_BARRIERS or written in ("esp", "ebp"):
+            if insn.id in _STACK_BARRIERS or _is_reg(insn, 0, X86_REG_ESP, X86_REG_EBP):
                 break
         return total
 
     def _caller_cleanup(self, after_call: int) -> int | None:
         """Bytes the caller removes right after the call (cdecl)."""
         insn = self.insn_at(after_call)
-        if insn is None:
-            return None
         if (
-            insn.mnemonic == "add"
-            and len(insn.operands) == 2
-            and insn.operands[0].type == X86_OP_REG
-            and insn.reg_name(insn.operands[0].reg) == "esp"
+            insn is not None
+            and insn.id == X86_INS_ADD
+            and _is_reg(insn, 0, X86_REG_ESP)
             and insn.operands[1].type == X86_OP_IMM
         ):
             return insn.operands[1].imm
@@ -325,7 +359,14 @@ class SideMachine:
             off = page - lo
             self.uc.mem_write(page, self._pristine[off : off + PAGE])
         self._dirty_image_pages.clear()
-        self.uc.mem_write(STACK_BASE, b"\0" * STACK_SIZE)
+        # Every stack store of a run is flagged, so only the span between the
+        # first and last flagged byte can differ from the zeroed stack. The
+        # argument frame above it is rewritten by each run.
+        first = self._written_stack.find(1)
+        if first >= 0:
+            zeros = bytes(self._written_stack.rfind(1) + 1 - first)
+            self.uc.mem_write(STACK_BASE + first, zeros)
+            self._written_stack[first : first + len(zeros)] = zeros
         self._seed = seed
         self._pool = pool
         self.foreign_access = None
@@ -361,11 +402,13 @@ class SideMachine:
             insn = self.insn_at(addr)
             if insn is None:
                 break
-            for op in insn.operands:
-                if op.type == X86_OP_IMM and insn.mnemonic not in _BRANCHES:
-                    value = op.imm & 0xFFFFFFFF
-                    if value not in self.image_range:
-                        found.add(value)
+            if not transfers_control(insn):
+                found.update(
+                    op.imm & 0xFFFFFFFF
+                    for op in insn.operands
+                    if op.type == X86_OP_IMM
+                    and op.imm & 0xFFFFFFFF not in self.image_range
+                )
             addr += insn.size
         return found
 
@@ -375,7 +418,7 @@ class SideMachine:
             if target not in self.image_range:
                 break
             insn = self.insn_at(target)
-            if insn is None or insn.mnemonic != "jmp" or not insn.operands:
+            if insn is None or insn.id != X86_INS_JMP or not insn.operands:
                 break
             op = insn.operands[0]
             if op.type == X86_OP_IMM:
@@ -408,19 +451,22 @@ class SideMachine:
             uc.reg_write(_GP[name], value)
         uc.reg_write(UC_X86_REG_EFLAGS, 0x202)
         esp = STACK_TOP
-        uc.mem_write(esp, RETURN_SENTINEL.to_bytes(4, "little"))
-        for i, value in enumerate(run_input.stack_args):
-            uc.mem_write(esp + 4 + 4 * i, value.to_bytes(4, "little"))
+        frame = (RETURN_SENTINEL, *run_input.stack_args)
+        uc.mem_write(esp, struct.pack(f"<{len(frame)}I", *frame))
         uc.reg_write(UC_X86_REG_ESP, esp)
         lo = self.image_range.start
+        written_stack = self._written_stack
 
-        written_stack: set[int] = set()
+        def mark_stack_written(addr: int, size: int) -> None:
+            offset = addr - STACK_BASE
+            written_stack[offset : offset + size] = b"\1" * size
+
         recent: collections.deque[int] = collections.deque(maxlen=64)
         uninitialized_read: list[int] = []
 
         def on_write(_uc, _access, addr, size, value, _data):
             if self.in_stack(addr):
-                written_stack.update(range(addr, addr + size))
+                mark_stack_written(addr, size)
                 return
             trace.writes[addr] = max(size, trace.writes.get(addr, 0))
             writer = (
@@ -444,21 +490,14 @@ class SideMachine:
             # that include a pointer) yields a layout-dependent value.
             if pointer_bytes_read or addr in self.image_range or self.in_stack(addr):
                 return
-            writers = {
-                w[:3] if w else None
-                for w in (trace.last_writer.get(b) for b in range(addr, addr + size))
-            }
-            if writers in ({(addr, size, True)}, {(addr, size, False)}):
-                return
-            if any(w is not None and w[2] for w in writers):
+            if trace.mixes_pointer_bytes(addr, size):
                 pointer_bytes_read.append(addr)
 
         def on_stack_read(_uc, _access, addr, size, _value, _data):
             # A local read before anything wrote it holds stale data whose
             # position depends on each side's frame layout.
-            if not uninitialized_read and any(
-                byte not in written_stack for byte in range(addr, addr + size)
-            ):
+            offset = addr - STACK_BASE
+            if not uninitialized_read and 0 in written_stack[offset : offset + size]:
                 uninitialized_read.append(addr)
 
         def stop(reason: str, detail: str = "") -> None:
@@ -469,20 +508,18 @@ class SideMachine:
             trace.executed.add(addr)
             recent.append(addr)
             insn = self.insn_at(addr)
-            if insn is not None and insn.mnemonic in NONDETERMINISTIC:
+            if insn is not None and insn.id in NONDETERMINISTIC:
                 stop("nondeterministic", insn.mnemonic)
                 return
-            if insn is None or insn.mnemonic != "call":
+            if insn is None or not insn.group(CS_GRP_CALL):
                 return
             op = insn.operands[0]
-            target: int | None = None
+            target: int | None = direct_branch_target(insn)
             slot: int | None = None
-            if op.type == X86_OP_IMM:
-                target = op.imm
-            elif op.type == X86_OP_REG:
-                target = uc.reg_read(_reg_id(insn.reg_name(op.reg)))
+            if op.type == X86_OP_REG:
+                target = uc.reg_read(_UC_REGS[op.reg])
             elif op.type == X86_OP_MEM:
-                slot = _effective_address(uc, insn, op)
+                slot = _effective_address(uc, op)
                 target = int.from_bytes(uc.mem_read(slot, 4), "little")
             after = addr + insn.size
             pop = None
@@ -525,7 +562,7 @@ class SideMachine:
                 if STACK_BASE <= value < STACK_TOP and value >= cur_esp:
                     fill = model_dword(self._seed, 5, index, arg_index, pool=self._pool)
                     uc.mem_write(value, fill.to_bytes(4, "little"))
-                    written_stack.update(range(value, value + 4))
+                    mark_stack_written(value, 4)
             eax, edx = call_result(index)
             uc.reg_write(UC_X86_REG_EAX, eax)
             uc.reg_write(UC_X86_REG_EDX, edx)
@@ -611,18 +648,34 @@ class SideMachine:
 LOW_PAGES = 0x100000
 # Instructions that end the run of argument pushes before a call.
 _STACK_BARRIERS = frozenset(
-    {"call", "pop", "leave", "ret", "pushal", "popal", "pushfd", "popfd", "enter"}
+    {
+        X86_INS_CALL,
+        X86_INS_POP,
+        X86_INS_LEAVE,
+        X86_INS_RET,
+        X86_INS_PUSHAL,
+        X86_INS_POPAL,
+        X86_INS_PUSHFD,
+        X86_INS_POPFD,
+        X86_INS_ENTER,
+    }
 )
 # fs:[0], the SEH exception list head: fs has base 0 in the emulator, so SEH
 # frame registration writes here. It is bookkeeping, not program output.
 SEH_CHAIN = range(0, 4)
 # Instructions whose result depends on the host, not on the inputs.
 NONDETERMINISTIC = frozenset(
-    {"rdtsc", "rdtscp", "cpuid", "rdrand", "rdseed", "in", "out", "insb", "outsb"}
-)
-
-_BRANCHES = frozenset({"call", "jmp", "ret", "loop", "jecxz", "jcxz"}) | frozenset(
-    f"j{cc}" for cc in "o no b ae e ne be a s ns p np l ge le g".split()
+    {
+        X86_INS_RDTSC,
+        X86_INS_RDTSCP,
+        X86_INS_CPUID,
+        X86_INS_RDRAND,
+        X86_INS_RDSEED,
+        X86_INS_IN,
+        X86_INS_OUT,
+        X86_INS_INSB,
+        X86_INS_OUTSB,
+    }
 )
 
 
@@ -639,21 +692,34 @@ def _shared_region(addr: int) -> bool:
     )
 
 
-_REG_IDS = {
-    **_GP,
-    "esp": UC_X86_REG_ESP,
+# Capstone register -> Unicorn register, for operands evaluated at run time.
+_UC_REGS = {
+    X86_REG_EAX: UC_X86_REG_EAX,
+    X86_REG_EBX: UC_X86_REG_EBX,
+    X86_REG_ECX: UC_X86_REG_ECX,
+    X86_REG_EDX: UC_X86_REG_EDX,
+    X86_REG_ESI: UC_X86_REG_ESI,
+    X86_REG_EDI: UC_X86_REG_EDI,
+    X86_REG_EBP: UC_X86_REG_EBP,
+    X86_REG_ESP: UC_X86_REG_ESP,
 }
 
 
-def _reg_id(name: str) -> int:
-    return _REG_IDS[name]
+def _is_reg(insn: CsInsn, index: int, *regs: int) -> bool:
+    """Whether operand ``index`` of ``insn`` is one of the registers ``regs``."""
+    operands = insn.operands
+    return (
+        len(operands) > index
+        and operands[index].type == X86_OP_REG
+        and operands[index].reg in regs
+    )
 
 
-def _effective_address(uc: Uc, insn: CsInsn, op) -> int:
+def _effective_address(uc: Uc, op) -> int:
     mem = op.mem
     addr = mem.disp
     if mem.base:
-        addr += uc.reg_read(_reg_id(insn.reg_name(mem.base)))
+        addr += uc.reg_read(_UC_REGS[mem.base])
     if mem.index:
-        addr += uc.reg_read(_reg_id(insn.reg_name(mem.index))) * mem.scale
+        addr += uc.reg_read(_UC_REGS[mem.index]) * mem.scale
     return addr & 0xFFFFFFFF

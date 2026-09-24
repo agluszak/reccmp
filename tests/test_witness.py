@@ -18,6 +18,7 @@ pytest.importorskip("unicorn")
 
 # pylint: disable=wrong-import-position
 from reccmp.compare.witness import SideMachine, Translator, find_witness
+from reccmp.compare.witness.machine import STACK_BASE, STACK_TOP, RunInput
 
 CODE = 0x401000
 DATA = 0x402000
@@ -236,6 +237,39 @@ def test_store_before_a_tail_call_is_not_settled():
     )
     assert result.witness is None
     assert result.skipped.get("truncated")
+
+
+def test_instruction_facts_come_from_capstone_detail():
+    # push 7; call callee; add esp, 4; cmp eax, 0x1234; je +0; ret 0xc
+    body = bytes.fromhex("6a07") + _call(ORIG_FUNC + 2, ORIG_FUNC + 0x40)
+    body += bytes.fromhex("83c4043d341200007400c20c00")
+    # A jmp thunk at +0x40 to a callee ending in ``ret 8``.
+    thunk = b"\xe9" + _abs32((0x50 - 0x45) & 0xFFFFFFFF)
+    code = body.ljust(0x40, b"\x90") + thunk.ljust(0x10, b"\x90") + b"\xc2\x08\x00"
+    machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+
+    # Branch targets and the ``ret`` immediate are not constants.
+    body_range = range(ORIG_FUNC, ORIG_FUNC + len(body))
+    assert machine.code_constants(body_range) == {4, 7, 0x1234}
+    assert machine.callee_pop_bytes(ORIG_FUNC + 0x40) == 8
+    # pylint: disable-next=protected-access
+    assert machine._caller_cleanup(ORIG_FUNC + 7) == 4
+
+
+def test_reset_clears_every_stack_store_of_the_previous_run():
+    # sub esp, 0x200; mov edi, esp; mov ecx, 0x80; xor eax, eax; dec eax;
+    # rep stosd; push eax; pop eax; add esp, 0x200; ret
+    code = bytes.fromhex("81ec000200008bfcb98000000031c048f3ab505881c400020000c3")
+    machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+    below_frame = (STACK_BASE, STACK_TOP - STACK_BASE)
+
+    trace = machine.run(
+        range(ORIG_FUNC, ORIG_FUNC + len(code)), RunInput.from_seed(0), lambda _: (0, 0)
+    )
+    assert trace.end == "return"
+    assert any(machine.uc.mem_read(*below_frame))
+    machine._reset(1)  # pylint: disable=protected-access
+    assert not any(machine.uc.mem_read(*below_frame))
 
 
 def test_return_differing_only_above_al_is_not_a_witness():
