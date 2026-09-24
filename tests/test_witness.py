@@ -235,7 +235,7 @@ def test_store_before_a_tail_call_is_not_settled():
         body(5, ORIG_FUNC, ORIG_CALLEE), body(6, RECOMP_FUNC, RECOMP_CALLEE)
     )
     assert result.witness is None
-    assert result.agreeing_seeds > 0
+    assert result.skipped.get("truncated")
 
 
 def test_return_differing_only_above_al_is_not_a_witness():

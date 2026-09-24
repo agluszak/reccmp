@@ -260,7 +260,9 @@ def _compare(
             )
 
     if t_o.end != "return":
-        return None, None
+        # Both stopped at the same call: whatever follows was not observed,
+        # so this seed agrees on nothing beyond what it already compared.
+        return None, "truncated"
     if t_o.esp_after_return != t_r.esp_after_return:
         return (
             Witness(

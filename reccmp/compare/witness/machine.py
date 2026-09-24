@@ -17,6 +17,7 @@ The model, identical for the original and the recompiled side:
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import struct
 from dataclasses import dataclass, field
@@ -160,6 +161,8 @@ class Trace:
     calls: list[CallEvent] = field(default_factory=list)
     # (address, size) of every store outside the stack.
     writes: dict[int, int] = field(default_factory=dict)
+    # Calls whose stack cleanup was assumed from the pushes before them.
+    assumed_cleanup: int = 0
     # Instructions of the compared function that ran.
     executed: set[int] = field(default_factory=set)
     # For each byte outside the stack: the (address, size, value was an image
@@ -204,8 +207,10 @@ class SideMachine:
 
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, image: Image):
+    def __init__(self, image: Image, import_cleanup: dict[str, int] | None = None):
         self.image = image
+        # Argument bytes popped by imported callees, by import name.
+        self.import_cleanup = import_cleanup or {}
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
         self.cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self.cs.detail = True
@@ -277,6 +282,22 @@ class SideMachine:
             addr += insn.size
         self._pop_cache[target] = result
         return result
+
+    def _pushed_bytes(self, recent: collections.deque[int]) -> int:
+        """Bytes pushed on the executed path right before the current call."""
+        total = 0
+        history = list(recent)[:-1]  # the call itself is last
+        for addr in reversed(history):
+            insn = self.insn_at(addr)
+            if insn is None:
+                break
+            if insn.mnemonic == "push":
+                total += 4
+                continue
+            written = insn.op_str.split(",", 1)[0].strip()
+            if insn.mnemonic in _STACK_BARRIERS or written in ("esp", "ebp"):
+                break
+        return total
 
     def _caller_cleanup(self, after_call: int) -> int | None:
         """Bytes the caller removes right after the call (cdecl)."""
@@ -394,6 +415,7 @@ class SideMachine:
         lo = self.image_range.start
 
         written_stack: set[int] = set()
+        recent: collections.deque[int] = collections.deque(maxlen=64)
         uninitialized_read: list[int] = []
 
         def on_write(_uc, _access, addr, size, value, _data):
@@ -445,6 +467,7 @@ class SideMachine:
 
         def on_code(_uc, addr, _size, _data):
             trace.executed.add(addr)
+            recent.append(addr)
             insn = self.insn_at(addr)
             if insn is not None and insn.mnemonic in NONDETERMINISTIC:
                 stop("nondeterministic", insn.mnemonic)
@@ -464,9 +487,17 @@ class SideMachine:
             after = addr + insn.size
             pop = None
             if target is not None and target in self.image_range:
-                pop = self.callee_pop_bytes(target)
+                pop = self.callee_pop_bytes(self.resolve_code(target))
+            if pop is None and target in self.imports:
+                pop = self.import_cleanup.get(self.imports[target].split("!", 1)[1])
             if pop is None and self._caller_cleanup(after) is not None:
                 pop = 0
+            if pop is None:
+                # Unknown callee: assume it pops what was pushed just before
+                # the call. A wrong guess leaves esp wrong at return in
+                # frame-pointer-less code, which gives no verdict.
+                pop = self._pushed_bytes(recent)
+                trace.assumed_cleanup += 1
             cur_esp = uc.reg_read(UC_X86_REG_ESP)
             arg_bytes = pop if pop else (self._caller_cleanup(after) or 0)
             args = tuple(
@@ -578,6 +609,10 @@ class SideMachine:
 
 # Small integers used as pointers (including null-based arithmetic).
 LOW_PAGES = 0x100000
+# Instructions that end the run of argument pushes before a call.
+_STACK_BARRIERS = frozenset(
+    {"call", "pop", "leave", "ret", "pushal", "popal", "pushfd", "popfd", "enter"}
+)
 # fs:[0], the SEH exception list head: fs has base 0 in the emulator, so SEH
 # frame registration writes here. It is bookkeeping, not program output.
 SEH_CHAIN = range(0, 4)

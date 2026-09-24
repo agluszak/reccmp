@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+from reccmp.compare.call_cleanup import import_cleanup
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
@@ -55,8 +56,17 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             # pylint: disable-next=import-outside-toplevel
             from reccmp.compare.witness import SideMachine, Translator
 
+            # Import names are the same in both binaries; the recompiled PDB
+            # carries their decorations.
+            cleanup = import_cleanup(
+                node.decorated_name
+                for node in self.func_nodes.values()
+                if node.decorated_name is not None
+            )
             self._witness_translator = Translator(
-                self.db, SideMachine(self.orig_bin), SideMachine(self.recomp_bin)
+                self.db,
+                SideMachine(self.orig_bin, cleanup),
+                SideMachine(self.recomp_bin, cleanup),
             )
         return self._witness_translator
 
