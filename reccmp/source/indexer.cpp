@@ -1336,6 +1336,22 @@ class Indexer {
     };
   }
 
+  // The first empty line between a marker block and the code it annotates:
+  // block comments or preprocessor lines in between are not blank.
+  llvm::json::Value blankLineBetween(FileID file, const LineComment& last,
+                                     unsigned anchorOffset) const {
+    llvm::StringRef buffer = sources_.getBufferData(file);
+    if (anchorOffset <= last.endOffset || anchorOffset > buffer.size()) return nullptr;
+    // The slice starts at the end of the block's last line (its range
+    // excludes the newline) and ends where the anchor's line begins it.
+    llvm::SmallVector<llvm::StringRef, 8> lines;
+    buffer.slice(last.endOffset, anchorOffset).split(lines, '\n');
+    for (size_t index = 1; index + 1 < lines.size(); ++index) {
+      if (lines[index].trim().empty()) return static_cast<int64_t>(last.line + index);
+    }
+    return nullptr;
+  }
+
   static bool looksLikeMarker(llvm::StringRef text) {
     static const llvm::Regex pattern(
         "^//[[:space:]]*[[:alnum:]_]+:[[:space:]]*[[:alnum:]_]+[[:space:]]+0[xX][[:xdigit:]]+");
@@ -1388,6 +1404,7 @@ class Indexer {
           {"column", sources_.getColumnNumber(file, offset)},
           {"candidates", std::move(candidates)},
           {"string", lineString(file, token)},
+          {"blank_line", blankLineBetween(file, group.back(), offset)},
       };
     }
     emit(std::move(record));
