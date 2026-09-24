@@ -12,7 +12,7 @@ import pytest
 
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 from reccmp.formats.image import ImageSection, ImageSectionFlags

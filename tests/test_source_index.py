@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from reccmp.call_facts import CallFacts
 from reccmp.source import (
     DeclarationKey,
     SourceCollector,
@@ -494,6 +495,7 @@ def _member_use(function: str, name: str, unit: str) -> dict:
         "operations": ["read"],
         "array_indices": [],
         "conversions": [],
+        "base": {"kind": "parameter", "index": 0},
     }
 
 
@@ -584,3 +586,145 @@ def test_tu_local_functions_with_one_mangled_name_bind_by_location(
         key.unit_id: [use.name for use in uses]
         for key, uses in index.member_uses.items()
     } == {"huffman.cpp": ["bits"], "renderer.cpp": ["pixels"]}
+
+
+def test_function_facts_and_clang_call_facts(tmp_path: Path) -> None:
+    collector = SourceCollector(tmp_path)
+    run = "?Run@Widget@@UAEHH@Z"
+    collector.collect_record(
+        _declaration(
+            semantic_id=run,
+            qualified_name="Widget::Run",
+            semantic_kind="instance_method",
+            calling_convention="__thiscall",
+            source_file="w.cpp",
+            line=3,
+            call={
+                "uses_ecx": True,
+                "uses_edx": False,
+                "stack_cleanup": 4,
+                "return_kind": "i32",
+            },
+        ),
+        unit_id="w.cpp",
+    )
+    collector.collect_record(
+        {
+            "record": "member-use",
+            "owner_identity": "c:@S@Widget",
+            "owner_status": "resolved",
+            "owner": "Widget",
+            "field_identity": "c:@S@Widget::field@w.h:4:3:0",
+            "field_usr": "c:@S@Widget@FI@flags",
+            "name": "flags",
+            "declaration_file": "w.h",
+            "declaration_line": 4,
+            "declaration_column": 3,
+            "declaration_offset": 40,
+            "offset_bits": 32,
+            "extent_bits": 8,
+            "offset_bytes": 4,
+            "extent_bytes": 1,
+            "declared_type": "unsigned char",
+            "function_identity": run,
+            "function": "Widget::Run",
+            "function_file": "w.cpp",
+            "function_line": 3,
+            "use_file": "w.cpp",
+            "use_line": 4,
+            "use_column": 10,
+            "use_offset": 80,
+            "operations": ["read"],
+            "array_indices": [],
+            "conversions": [
+                {
+                    "kind": "IntegralCast",
+                    "source_type": "unsigned char",
+                    "destination_type": "int",
+                    "source_bits": 8,
+                    "source_signed": False,
+                    "destination_bits": 32,
+                }
+            ],
+            "base": {"kind": "this"},
+        },
+        unit_id="w.cpp",
+    )
+    collector.collect_record(
+        {
+            "record": "function-facts",
+            "function": run,
+            "calls": [
+                {
+                    "callee": "?Run@Base@@UAEHH@Z",
+                    "virtual": True,
+                    "slots": ["?Run@Base@@UAEHH@Z"],
+                    "object_class": "record:Base",
+                    "object": {"kind": "parameter", "index": 0},
+                    "field_arguments": ["c:@S@Widget::field@w.h:4:3:0", None],
+                    "line": 5,
+                    "offset": 120,
+                }
+            ],
+        },
+        unit_id="w.cpp",
+    )
+
+    derived = SourceIndex.from_collector("TEST", collector)
+    index = SourceIndex.from_dict(json.loads(json.dumps(derived.to_dict())))
+
+    key = DeclarationKey("TEST", run)
+    assert index.call_facts_for(key) == CallFacts(True, False, 4, "i32")
+    assert index.call_facts_named(run) == CallFacts(True, False, 4, "i32")
+    assert index.call_facts_for(DeclarationKey("TEST", "?Unknown@@YAXXZ")) is None
+    facts = index.function_facts_for(key)
+    assert facts is not None
+    assert facts.call == CallFacts(True, False, 4, "i32")
+    [access] = facts.accesses
+    assert (access.base.kind, access.offset_bytes, access.extent_bytes) == (
+        "this",
+        4,
+        1,
+    )
+    assert access.conversions[0].source_signed is False
+    [call] = facts.calls
+    assert call.virtual and call.slots == ("?Run@Base@@UAEHH@Z",)
+    assert call.object is not None and call.object.index == 0
+    assert call.field_arguments == ("c:@S@Widget::field@w.h:4:3:0", None)
+
+
+def test_a_targets_markers_come_from_its_own_source_files(tmp_path: Path) -> None:
+    """A header of another target's sources may carry this target's markers;
+    as with every other marker reader, they are not this target's markers."""
+    collector = SourceCollector(tmp_path)
+    for source_file, address in (("game/main.cpp", 0x1000), ("lib/math.h", 0x2000)):
+        collector.collect_record(
+            _declaration(
+                semantic_id=f"?f{address:x}@@YAXXZ",
+                qualified_name=f"f{address:x}",
+                source_file=source_file,
+                line=2,
+            ),
+            unit_id="game/main.cpp",
+        )
+        collector.collect_record(
+            _marker_block(
+                source_file,
+                1,
+                f"// FUNCTION: GAME 0x{address:x}",
+                candidates=(
+                    _function_candidate(f"?f{address:x}@@YAXXZ", f"f{address:x}", 2),
+                ),
+            ),
+            unit_id="game/main.cpp",
+        )
+    units = tuple(collector.units.values())
+
+    scoped = SourceIndex.from_units(
+        units, {"GAME": None}, target_files={"GAME": {"game/main.cpp"}}
+    )
+    assert [marker.address for marker in scoped.markers] == [0x1000]
+    assert [
+        marker.address
+        for marker in SourceIndex.from_units(units, {"GAME": None}).markers
+    ] == [0x1000, 0x2000]

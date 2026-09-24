@@ -1,74 +1,13 @@
-"""What a caller may assume about a callee: its register arguments, how
-many argument bytes it removes from the stack, and how it returns a value.
-
-One record serves the effective-match verifier and the witness model. Each
-field is filled from the strongest producer that knows it: PDB type records
-first, decorated names second. ``None`` means unknown.
-"""
+"""Call facts stated by MSVC decorated names."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Iterable
 
+from reccmp.call_facts import CallFacts, convention_facts
 from reccmp.cvdump.demangler import demangle_function, type_return_kind
-
-
-@dataclass(frozen=True)
-class CallFacts:
-    uses_ecx: bool | None = None
-    uses_edx: bool | None = None
-    stack_cleanup: int | None = None
-    return_kind: str = "unknown"
-
-    def merged(self, weaker: "CallFacts") -> "CallFacts":
-        """These facts, with unknown fields taken from a weaker producer."""
-        return CallFacts(
-            self.uses_ecx if self.uses_ecx is not None else weaker.uses_ecx,
-            self.uses_edx if self.uses_edx is not None else weaker.uses_edx,
-            (
-                self.stack_cleanup
-                if self.stack_cleanup is not None
-                else weaker.stack_cleanup
-            ),
-            (self.return_kind if self.return_kind != "unknown" else weaker.return_kind),
-        )
-
-    def agreed(self, other: "CallFacts") -> "CallFacts":
-        """The facts two callees sharing one name both have."""
-        return CallFacts(
-            self.uses_ecx if self.uses_ecx == other.uses_ecx else None,
-            self.uses_edx if self.uses_edx == other.uses_edx else None,
-            self.stack_cleanup if self.stack_cleanup == other.stack_cleanup else None,
-            self.return_kind if self.return_kind == other.return_kind else "unknown",
-        )
-
-
-# Register arguments by calling convention: cdecl and stdcall take every
-# argument on the stack; thiscall reads the receiver from ecx; fastcall reads
-# its first two register-sized arguments from ecx and edx. Keys are the PDB
-# spellings and the ones recovered from decorated names.
-_REGISTERS = {
-    "C Near": (False, False),
-    "STD Near": (False, False),
-    "ThisCall": (True, False),
-    "Fast Near": (True, True),
-    "cdecl": (False, False),
-    "stdcall": (False, False),
-    "thiscall": (True, False),
-    "fastcall": (True, True),
-}
-_CALLER_CLEANS = frozenset({"C Near", "cdecl"})
-
-
-def convention_facts(convention: str | None) -> CallFacts:
-    """Register usage (and cdecl's zero cleanup) implied by a convention."""
-    if convention is None or convention not in _REGISTERS:
-        return CallFacts()
-    uses_ecx, uses_edx = _REGISTERS[convention]
-    return CallFacts(uses_ecx, uses_edx, 0 if convention in _CALLER_CLEANS else None)
-
 
 _EIGHT_BYTES = frozenset({"double", "long double", "__int64", "unsigned __int64"})
 _TEMPLATE_ARGS = re.compile(r"<[^<>]*>")
@@ -107,6 +46,14 @@ def _c_decoration_facts(symbol: str) -> CallFacts:
     return CallFacts()
 
 
+def _is_record_value(type_name: str) -> bool:
+    """Whether a demangled type is a class, struct or union by value."""
+    name = " ".join(w for w in type_name.split() if w not in ("const", "volatile"))
+    return name.startswith(("class ", "struct ", "union ")) and not name.endswith(
+        ("*", "&")
+    )
+
+
 def mangled_facts(symbol: str) -> CallFacts:
     """Everything a decorated function name states about calling it."""
     if not symbol.startswith("?"):
@@ -117,7 +64,16 @@ def mangled_facts(symbol: str) -> CallFacts:
     facts = convention_facts(function.convention)
     if function.return_type is not None:
         facts = replace(facts, return_kind=type_return_kind(function.return_type))
-    if facts.stack_cleanup is None and function.convention != "fastcall":
+    returns_record = function.return_type is not None and _is_record_value(
+        function.return_type
+    )
+    # A record returned by value may come back through a hidden pointer
+    # argument the callee pops, depending on the record: unknown here.
+    if (
+        facts.stack_cleanup is None
+        and function.convention != "fastcall"
+        and not returns_record
+    ):
         sizes = [_parameter_bytes(parameter) for parameter in function.parameters]
         if all(size is not None for size in sizes):
             facts = replace(

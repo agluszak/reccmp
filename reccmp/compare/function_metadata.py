@@ -5,7 +5,8 @@ from dataclasses import replace
 
 from reccmp.compare.asm.replacement import canonical_callee_name
 from reccmp.compare.asm.verifier import FunctionMetadata
-from reccmp.compare.call_facts import CallFacts, convention_facts, mangled_facts
+from reccmp.call_facts import CallFacts, convention_facts
+from reccmp.compare.call_facts import mangled_facts
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
 from reccmp.cvdump.analysis import CvdumpNode
@@ -77,17 +78,25 @@ class FunctionMetadataMixin(ComparatorState):
             )
             if name is None:
                 continue
-            facts = self._call_facts_of_node(node)
+            facts = self._call_facts_of_node(node, entity.orig_addr)
             previous = result.get(name, facts)
             result[name] = None if previous is None else previous.agreed(facts)
         self._call_facts_cache = result
         return result
 
-    def _call_facts_of_node(self, node: CvdumpNode) -> CallFacts:
-        """Call facts of one function node. Each field prefers the PDB TYPES
-        record and falls back to the decorated name, which encodes the
-        convention, return type and parameters even when the PDB (like
-        Imperialism's) carries no type records at all."""
+    def _call_facts_of_node(
+        self, node: CvdumpNode, orig_addr: int | None = None
+    ) -> CallFacts:
+        """Call facts of one function node. Each field comes from the first
+        producer that knows it: the PDB TYPES record (what MSVC compiled),
+        then Clang's declaration from the source index (exact parameter
+        sizes, so the stack cleanup), then the decorated name, which encodes
+        the convention, return type and parameters even when the PDB (like
+        Imperialism's) carries no type records at all.
+
+        Clang's declaration is the one the function's marker binds (found by
+        its original address); failing that, the only facts every declaration
+        with its mangled name agrees on."""
         facts = CallFacts()
         if node.symbol_entry is not None:
             try:
@@ -100,18 +109,39 @@ class FunctionMetadataMixin(ComparatorState):
                     )
             except CvdumpKeyError:
                 pass
+        clang = self._clang_call_facts(node, orig_addr)
+        if clang is not None:
+            facts = facts.merged(clang)
         if node.decorated_name:
             facts = facts.merged(mangled_facts(node.decorated_name))
         return facts
 
-    def _call_facts_at(self, recomp_addr: int) -> CallFacts | None:
+    def _clang_call_facts(
+        self, node: CvdumpNode, orig_addr: int | None
+    ) -> CallFacts | None:
+        if self.source_index is None:
+            return None
+        key = (
+            self.source_index.declaration_key_at(orig_addr)
+            if orig_addr is not None
+            else None
+        )
+        if key is not None:
+            return self.source_index.call_facts_for(key)
+        if node.decorated_name:
+            return self.source_index.call_facts_named(node.decorated_name)
+        return None
+
+    def _call_facts_at(
+        self, recomp_addr: int, orig_addr: int | None = None
+    ) -> CallFacts | None:
         node = self.func_nodes.get(recomp_addr)
-        return self._call_facts_of_node(node) if node is not None else None
+        return self._call_facts_of_node(node, orig_addr) if node is not None else None
 
     def _function_metadata(self, match: ReccmpMatch) -> FunctionMetadata | None:
         if not self.func_nodes:
             return None
-        facts = self._call_facts_at(match.recomp_addr)
+        facts = self._call_facts_at(match.recomp_addr, match.orig_addr)
         return FunctionMetadata(
             return_kind=facts.return_kind if facts is not None else "unknown",
             call_facts=self._call_facts_map().get,

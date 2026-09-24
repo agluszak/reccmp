@@ -8,7 +8,7 @@ from dataclasses import (
 )
 from typing import Callable
 
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 
 from reccmp.compare.asm.model import (
     REGISTERS,

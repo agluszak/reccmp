@@ -589,6 +589,10 @@ def collect_compile_database(
                 target: {relative_unit_id(repository, path) for path in paths} & present
                 for target, paths in targets.items()
             },
+            target_files={
+                target: {relative_unit_id(repository, path) for path in paths}
+                for target, paths in targets.items()
+            },
             aliases=aliases,
             source_digests={
                 relative_unit_id(repository, path): digest

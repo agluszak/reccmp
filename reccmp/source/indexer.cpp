@@ -17,6 +17,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <system_error>
@@ -38,6 +39,9 @@
 #include "clang/Index/USRGeneration.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Version.h"
+#include "clang/CodeGen/CGFunctionInfo.h"
+#include "clang/CodeGen/CodeGenABITypes.h"
+#include "clang/CodeGen/ModuleBuilder.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -60,6 +64,9 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
@@ -73,6 +80,9 @@
 namespace {
 
 using namespace clang;
+using clang::CodeGen::ABIArgInfo;
+using clang::CodeGen::CGFunctionInfo;
+using clang::CodeGen::CGFunctionInfoArgInfo;
 
 // The collector supplies the physical compilation root, with a trailing slash.
 std::string repositoryPrefix;
@@ -205,8 +215,11 @@ class LineCommentCollector : public CommentHandler {
 class Indexer {
  public:
   Indexer(ASTContext& context, llvm::raw_ostream& out, Preprocessor& preprocessor,
-          const LineCommentCollector& comments, Profile& profile)
+          const LineCommentCollector& comments, Profile& profile,
+          CodeGen::CodeGenModule* codegen, const llvm::DataLayout* layout)
       : profile_(profile),
+        codegen_(codegen),
+        layout_(layout),
         context_(context),
         sources_(context.getSourceManager()),
         policy_(context.getPrintingPolicy()),
@@ -222,6 +235,10 @@ class Indexer {
   }
 
   Profile& profile_;
+  // Clang's IR generator, used only to ask for ABI arrangements; nothing is
+  // emitted.
+  CodeGen::CodeGenModule* codegen_;
+  const llvm::DataLayout* layout_;
 
  private:
   // One normalized absolute path and repository membership per FileID. System
@@ -463,6 +480,12 @@ class Indexer {
         .str();
   }
 
+  // A function's semantic id, as its declaration record states it.
+  std::string functionIdentity(const FunctionDecl* function) const {
+    return semanticId(
+        function, qualify(scopeOf(function->getDeclContext()), function->getNameAsString()));
+  }
+
   std::vector<std::string> parameterTypes(const FunctionDecl* function) const {
     std::vector<std::string> parameters;
     for (const ParmVarDecl* parameter : function->parameters()) {
@@ -476,19 +499,16 @@ class Indexer {
            semanticKind == "instance_method";
   }
 
-  // On the x86 MS ABI the convention is a consequence of the semantic kind
-  // unless the source spells one, and a spelled convention survives into the
-  // printed function type.
-  static std::string callingConvention(llvm::StringRef functionType,
-                                       llvm::StringRef semanticKind) {
-    std::string lowered = functionType.lower();
-    for (llvm::StringRef spelling :
-         {"thiscall", "stdcall", "fastcall", "vectorcall", "cdecl"}) {
-      if (lowered.find(spelling.str()) != std::string::npos) {
-        return ("__" + spelling).str();
-      }
+  // The convention Clang assigned: spelled, or the target default for the
+  // kind of function (a variadic member function is __cdecl).
+  static std::string callingConvention(const FunctionDecl* function) {
+    switch (function->getType()->castAs<FunctionType>()->getCallConv()) {
+      case CC_X86StdCall: return "__stdcall";
+      case CC_X86FastCall: return "__fastcall";
+      case CC_X86ThisCall: return "__thiscall";
+      case CC_X86VectorCall: return "__vectorcall";
+      default: return "__cdecl";
     }
-    return hasThis(semanticKind) ? "__thiscall" : "__cdecl";
   }
 
   // Linkage as computed by Clang, spelled for the index. Consumers that join
@@ -586,6 +606,171 @@ class Indexer {
     return signature;
   }
 
+  // The identity a field has in every unit: its owner's USR, declaration
+  // position and index.
+  std::string fieldIdentity(const FieldDecl* field) const {
+    const auto* owner = dyn_cast<CXXRecordDecl>(field->getParent());
+    if (owner) {
+      const auto* definition = dyn_cast_or_null<CXXRecordDecl>(owner->getDefinition());
+      owner = definition ? definition : owner->getCanonicalDecl();
+    }
+    std::string ownerIdentity = owner ? declarationUsr(owner) : "";
+    if (ownerIdentity.empty()) ownerIdentity = "unknown-owner";
+    Location location = locate(field);
+    return ownerIdentity + "::field@" + relative(location.file) + ":" +
+           std::to_string(location.line) + ":" + std::to_string(location.column) + ":" +
+           std::to_string(field->getFieldIndex());
+  }
+
+  // Width in bits and signedness of an integer, enumeration or pointer value.
+  std::optional<std::pair<int64_t, bool>> integerShape(QualType type) const {
+    if (type.isNull() || type->isDependentType() || type->isIncompleteType()) return {};
+    QualType canonical = type.getCanonicalType();
+    if (canonical->isIntegralOrEnumerationType()) {
+      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)),
+                            canonical->isSignedIntegerOrEnumerationType());
+    }
+    if (canonical->isPointerType()) {
+      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)), false);
+    }
+    return {};
+  }
+
+  // Register footprint of a returned value: void, i8/i16/i32/i64, float, or
+  // unknown (aggregates, whose return convention this does not decide).
+  std::string returnKind(QualType type) const {
+    if (type.isNull() || type->isDependentType()) return "unknown";
+    QualType canonical = type.getCanonicalType();
+    if (canonical->isVoidType()) return "void";
+    if (canonical->isRealFloatingType()) return "float";
+    if (auto shape = integerShape(canonical)) {
+      switch (shape->first) {
+        case 8: return "i8";
+        case 16: return "i16";
+        case 32: return "i32";
+        case 64: return "i64";
+        default: return "unknown";
+      }
+    }
+    if (canonical->isReferenceType()) return "i32";
+    return "unknown";
+  }
+
+  // What a caller may assume about calling `function`, read from Clang's own
+  // ABI lowering (CGFunctionInfo): register arguments, the argument bytes the
+  // callee removes, and the return kind. Anything this does not model
+  // exactly (other conventions, expanded aggregates, hidden constructor
+  // arguments, incomplete types) is unknown (null), never guessed.
+  llvm::json::Value callFacts(const FunctionDecl* function) const {
+    const CGFunctionInfo* info = arrange(function);
+    if (!info) return nullptr;
+    bool calleePops;
+    unsigned convention = info->getEffectiveCallingConvention();
+    switch (convention) {
+      case llvm::CallingConv::C: calleePops = false; break;
+      case llvm::CallingConv::X86_StdCall:
+      case llvm::CallingConv::X86_ThisCall:
+      case llvm::CallingConv::X86_FastCall: calleePops = !info->isVariadic(); break;
+      default: return nullptr;  // vectorcall, regcall, ...
+    }
+    const llvm::DataLayout& layout = *layout_;
+    auto slots = [](uint64_t bytes) -> int64_t { return static_cast<int64_t>((bytes + 3) / 4 * 4); };
+    int registers = 0;
+    int64_t stack = 0;
+    bool first = true;
+    for (const CGFunctionInfoArgInfo& argument : info->arguments()) {
+      const ABIArgInfo& abi = argument.info;
+      // x86_thiscallcc passes the first argument (`this`) in ecx by
+      // definition; Clang marks only fastcall's register arguments inreg.
+      bool thisInEcx = first && convention == llvm::CallingConv::X86_ThisCall;
+      first = false;
+      switch (abi.getKind()) {
+        case ABIArgInfo::Ignore:
+        case ABIArgInfo::InAlloca:  // counted with the argument struct
+          break;
+        case ABIArgInfo::Direct:
+        case ABIArgInfo::Extend:
+          if (abi.getInReg() || thisInEcx) ++registers;
+          else stack += slots(layout.getTypeAllocSize(abi.getCoerceToType()));
+          break;
+        case ABIArgInfo::Indirect:
+          if (abi.getInReg()) ++registers;
+          else if (abi.getIndirectByVal())
+            stack += slots(context_.getTypeSizeInChars(argument.type).getQuantity());
+          else stack += 4;
+          break;
+        default:  // Expand, CoerceAndExpand, IndirectAliased
+          return nullptr;
+      }
+    }
+    if (registers > 2) return nullptr;
+    const ABIArgInfo& returned = info->getReturnInfo();
+    std::string kind = returnKind(function->getReturnType());
+    if (returned.isIndirect() || returned.isInAlloca()) {
+      kind = "unknown";  // the value is returned through memory
+      if (returned.isIndirect() && !returned.getInReg()) stack += 4;
+    } else if (kind == "unknown" && (returned.isDirect() || returned.isExtend()) &&
+               returned.getCoerceToType()) {
+      // A small aggregate returned in eax or edx:eax.
+      switch (layout.getTypeAllocSize(returned.getCoerceToType())) {
+        case 1: kind = "i8"; break;
+        case 2: kind = "i16"; break;
+        case 4: kind = "i32"; break;
+        case 8: kind = "i64"; break;
+        default: break;
+      }
+    }
+    if (info->usesInAlloca()) {
+      // Every stack argument lives in one argument struct.
+      stack = slots(layout.getTypeAllocSize(info->getArgStruct()));
+    }
+    if (isa<CXXConstructorDecl>(function) || isa<CXXDestructorDecl>(function)) {
+      kind = "unknown";  // the Microsoft ABI returns `this` from structors
+    }
+    llvm::json::Value cleanup = nullptr;
+    cleanup = calleePops ? llvm::json::Value(stack) : llvm::json::Value(0);
+    return llvm::json::Object{
+        {"uses_ecx", registers >= 1},
+        {"uses_edx", registers >= 2},
+        {"stack_cleanup", std::move(cleanup)},
+        {"return_kind", kind},
+    };
+  }
+
+  // Clang's ABI arrangement of a concrete function, or null when it cannot
+  // be asked safely or its answer would miss hidden arguments.
+  const CGFunctionInfo* arrange(const FunctionDecl* function) const {
+    if (!codegen_ || function->isInvalidDecl() || function->isDependentContext() ||
+        function->getDescribedFunctionTemplate()) {
+      return nullptr;
+    }
+    auto complete = [&](QualType type) {
+      type = type.getCanonicalType();
+      return !type->isDependentType() && (type->isVoidType() || !type->isIncompleteType());
+    };
+    if (!complete(function->getReturnType())) return nullptr;
+    for (const ParmVarDecl* parameter : function->parameters()) {
+      if (!complete(parameter->getType())) return nullptr;
+    }
+    const auto* method = dyn_cast<CXXMethodDecl>(function);
+    if ((isa<CXXConstructorDecl>(function) || isa<CXXDestructorDecl>(function)) &&
+        method->getParent()->getNumVBases() > 0) {
+      return nullptr;  // hidden "most derived" argument
+    }
+    QualType type = function->getType();
+    if (method && method->isInstance()) {
+      return &CodeGen::arrangeCXXMethodType(*codegen_, method->getParent(),
+                                            type->castAs<FunctionProtoType>(), method);
+    }
+    CanQualType canonical = context_.getCanonicalType(type);
+    if (const auto* prototype = dyn_cast<FunctionProtoType>(canonical.getTypePtr())) {
+      return &CodeGen::arrangeFreeFunctionType(
+          *codegen_, CanQual<FunctionProtoType>::CreateUnsafe(QualType(prototype, 0)));
+    }
+    return &CodeGen::arrangeFreeFunctionType(
+        *codegen_, canonical.getAs<FunctionNoProtoType>());
+  }
+
   void emitDeclaration(const FunctionDecl* function, const Location& location) {
     const DeclContext* context = function->getDeclContext();
     bool isMember = isa<CXXRecordDecl>(context);
@@ -599,9 +784,9 @@ class Indexer {
     } else if (isa<CXXDestructorDecl>(function)) {
       semanticKind = "destructor";
     } else if (isMember) {
-      semanticKind = function->getCanonicalDecl()->getStorageClass() == SC_Static
-                         ? "static_method"
-                         : "instance_method";
+      // isStatic covers implicitly static members (operator new/delete).
+      const auto* method = dyn_cast<CXXMethodDecl>(function);
+      semanticKind = method && method->isStatic() ? "static_method" : "instance_method";
     } else {
       semanticKind = scope.empty() ? "free_function" : "namespace_function";
     }
@@ -646,7 +831,7 @@ class Indexer {
       });
     }
 
-    std::string convention = callingConvention(functionType, semanticKind);
+    std::string convention = callingConvention(function);
     llvm::json::Object record{
         {"record", "declaration"},
         {"semantic_id", functionIdentity},
@@ -673,6 +858,7 @@ class Indexer {
         // FUNCTION marker. Keep its marker-join row declaration-only; an emitted
         // specialization carries the concrete function identity and extent.
         {"is_definition", isEmittedDefinition(function)},
+        {"call", callFacts(function)},
     };
     emit(std::move(record));
     emitMemberUses(function, functionIdentity, qualifiedName, location);
@@ -748,7 +934,111 @@ class Indexer {
       return true;
     }
 
+    // Every call the body makes: the callee's identity (or, for a virtual
+    // call, the declaration that introduces the vtable slot), and which
+    // arguments are plain field reads.
+    bool VisitCallExpr(CallExpr* call) {
+      llvm::json::Object entry;
+      const FunctionDecl* callee = call->getDirectCallee();
+      entry["callee"] = callee ? llvm::json::Value(indexer_.functionIdentity(callee))
+                               : llvm::json::Value(nullptr);
+      const auto* member = dyn_cast<CXXMemberCallExpr>(call);
+      const CXXMethodDecl* method = member ? member->getMethodDecl() : nullptr;
+      const auto* access =
+          member ? dyn_cast<MemberExpr>(member->getCallee()->IgnoreParens()) : nullptr;
+      bool isVirtual = method && method->isVirtual() && !(access && access->hasQualifier());
+      entry["virtual"] = isVirtual;
+      if (isVirtual) {
+        // Every method that introduces a slot this call may use: under
+        // multiple inheritance one override can fill several.
+        std::set<std::string> roots;
+        std::vector<const CXXMethodDecl*> pending{method};
+        while (!pending.empty()) {
+          const CXXMethodDecl* current = pending.back();
+          pending.pop_back();
+          if (current->size_overridden_methods() == 0) {
+            roots.insert(indexer_.functionIdentity(current));
+          }
+          for (const CXXMethodDecl* overridden : current->overridden_methods()) {
+            pending.push_back(overridden);
+          }
+        }
+        llvm::json::Array slots;
+        for (const std::string& root : roots) slots.push_back(root);
+        entry["slots"] = std::move(slots);
+        entry["object_class"] = indexer_.recordSemanticId(
+            member->getImplicitObjectArgument()->getType());
+      }
+      if (member) {
+        entry["object"] = baseKind(member->getImplicitObjectArgument());
+      }
+      llvm::json::Array arguments;
+      for (const Expr* argument : call->arguments()) {
+        const auto* read = dyn_cast<MemberExpr>(argument->IgnoreParenImpCasts());
+        const auto* field = read ? dyn_cast<FieldDecl>(read->getMemberDecl()) : nullptr;
+        arguments.push_back(field ? llvm::json::Value(indexer_.fieldIdentity(field))
+                                  : llvm::json::Value(nullptr));
+      }
+      entry["field_arguments"] = std::move(arguments);
+      Location where = indexer_.locate(call->getBeginLoc());
+      entry["line"] = where.line;
+      entry["offset"] = where.offset >= 0 ? llvm::json::Value(where.offset)
+                                          : llvm::json::Value(nullptr);
+      calls_.push_back(std::move(entry));
+      return true;
+    }
+
+    llvm::json::Array takeCalls() { return std::move(calls_); }
+
    private:
+    // What the object of a member access or call is: this, a parameter
+    // (with its index), a local, a global, another member, or other.
+    // The object an access or call applies to: its root (this, parameter
+    // with index, local or global with identity, call, other) and the fields
+    // leading from the root to it; each step says whether it went through a
+    // pointer (->).
+    llvm::json::Object baseKind(const Expr* base) const {
+      llvm::json::Array path;
+      std::vector<llvm::json::Object> steps;
+      const Expr* current = base ? base->IgnoreParenImpCasts() : nullptr;
+      while (const auto* member = dyn_cast_or_null<MemberExpr>(current)) {
+        const auto* field = dyn_cast<FieldDecl>(member->getMemberDecl());
+        if (!field) break;
+        steps.push_back(llvm::json::Object{{"field", indexer_.fieldIdentity(field)},
+                                           {"arrow", member->isArrow()}});
+        current = member->getBase()->IgnoreParenImpCasts();
+      }
+      for (auto step = steps.rbegin(); step != steps.rend(); ++step) {
+        path.push_back(std::move(*step));
+      }
+      llvm::json::Object root = rootKind(current);
+      root["path"] = std::move(path);
+      return root;
+    }
+
+    llvm::json::Object rootKind(const Expr* root) const {
+      if (!root || isa<CXXThisExpr>(root)) return llvm::json::Object{{"kind", "this"}};
+      if (const auto* reference = dyn_cast<DeclRefExpr>(root)) {
+        if (const auto* parameter = dyn_cast<ParmVarDecl>(reference->getDecl())) {
+          return llvm::json::Object{
+              {"kind", "parameter"},
+              {"index", static_cast<int64_t>(parameter->getFunctionScopeIndex())}};
+        }
+        if (const auto* variable = dyn_cast<VarDecl>(reference->getDecl())) {
+          if (variable->hasLocalStorage()) {
+            return llvm::json::Object{{"kind", "local"},
+                                      {"identity", indexer_.declarationUsr(variable)}};
+          }
+          return llvm::json::Object{
+              {"kind", "global"},
+              {"identity",
+               indexer_.variableSemanticId(variable, variable->getQualifiedNameAsString())}};
+        }
+      }
+      if (isa<CallExpr>(root)) return llvm::json::Object{{"kind", "call"}};
+      return llvm::json::Object{{"kind", "other"}};
+    }
+
     static bool contains(const Stmt* root, const Stmt* sought) {
       if (!root) return false;
       if (root == sought) return true;
@@ -881,14 +1171,8 @@ class Indexer {
       Location useLocation = indexer_.locate(expression->getMemberLoc());
       const std::string ownerIdentity = owner ? indexer_.declarationUsr(owner) : "";
       const std::string fieldUsr = indexer_.declarationUsr(field);
-      const std::string identityOwner = ownerIdentity.empty() ? "unknown-owner" : ownerIdentity;
-      const std::string fieldIdentity =
-          identityOwner + "::field@" + relative(declarationLocation.file) + ":" +
-          std::to_string(declarationLocation.line) + ":" +
-          std::to_string(declarationLocation.column) + ":" +
-          std::to_string(field->getFieldIndex());
       emit(field, expression, useLocation, ownerName, field->getNameAsString(),
-           ownerIdentity, fieldUsr, &declarationLocation, fieldIdentity);
+           ownerIdentity, fieldUsr, &declarationLocation, indexer_.fieldIdentity(field));
     }
 
     void emit(const FieldDecl* field, const Expr* expression,
@@ -900,19 +1184,35 @@ class Indexer {
       std::set<std::string> operations;
       llvm::json::Array arrayIndices;
       llvm::json::Array conversions;
-      std::string conversionSource = field ? indexer_.canonicalName(expression->getType()) :
-                                             indexer_.canonicalName(expression->getType());
+      std::string conversionSource = indexer_.canonicalName(expression->getType());
+      QualType conversionSourceType = expression->getType();
+      // Conversions of the field's own value: the casts wrapping the use
+      // before it becomes an operand of anything else (arithmetic, a call,
+      // a conditional). A cast of that larger expression is not a
+      // conversion of the field.
+      bool ownValue = true;
       for (const Stmt* ancestor : ancestors) {
-        if (const auto* cast = dyn_cast<CastExpr>(ancestor)) {
+        ownValue = ownValue && transparent(ancestor);
+        const auto* cast = ownValue ? dyn_cast<CastExpr>(ancestor) : nullptr;
+        if (cast) {
           std::string destination = indexer_.canonicalName(cast->getType());
           if (destination != conversionSource) {
-            conversions.push_back(llvm::json::Object{
+            llvm::json::Object conversion{
                 {"kind", cast->getCastKindName()},
                 {"source_type", conversionSource},
                 {"destination_type", destination},
-            });
+            };
+            auto from = indexer_.integerShape(conversionSourceType);
+            auto to = indexer_.integerShape(cast->getType());
+            if (from && to) {
+              conversion["source_bits"] = from->first;
+              conversion["source_signed"] = from->second;
+              conversion["destination_bits"] = to->first;
+            }
+            conversions.push_back(std::move(conversion));
           }
           conversionSource = destination;
+          conversionSourceType = cast->getType();
         }
         if (const auto* subscript = dyn_cast<ArraySubscriptExpr>(ancestor)) {
           if (contains(subscript->getBase(), expression)) {
@@ -1054,14 +1354,33 @@ class Indexer {
           {"operations", std::move(operationList)},
           {"array_indices", std::move(arrayIndices)},
           {"conversions", std::move(conversions)},
+          {"base", baseKind(accessBase(expression))},
+          {"arrow", isArrow(expression)},
       };
       indexer_.emit(std::move(record));
+    }
+
+    static bool isArrow(const Expr* expression) {
+      if (const auto* member = dyn_cast<MemberExpr>(expression)) return member->isArrow();
+      if (const auto* dependent = dyn_cast<CXXDependentScopeMemberExpr>(expression)) {
+        return dependent->isArrow();
+      }
+      return false;
+    }
+
+    static const Expr* accessBase(const Expr* expression) {
+      if (const auto* member = dyn_cast<MemberExpr>(expression)) return member->getBase();
+      if (const auto* dependent = dyn_cast<CXXDependentScopeMemberExpr>(expression)) {
+        return dependent->isImplicitAccess() ? nullptr : dependent->getBase();
+      }
+      return nullptr;
     }
 
     Indexer& indexer_;
     llvm::StringRef functionIdentity_;
     llvm::StringRef functionName_;
     Location functionLocation_;
+    llvm::json::Array calls_;
   };
 
   void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
@@ -1070,6 +1389,14 @@ class Indexer {
     ScopedTimer timer(profile_.memberUseMs);
     MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
     visitor.TraverseStmt(function->getBody());
+    llvm::json::Array calls = visitor.takeCalls();
+    if (!calls.empty()) {
+      emit(llvm::json::Object{
+          {"record", "function-facts"},
+          {"function", functionIdentity.str()},
+          {"calls", std::move(calls)},
+      });
+    }
   }
 
   void emitClass(const CXXRecordDecl* record, llvm::StringRef qualifiedName,
@@ -1336,6 +1663,22 @@ class Indexer {
     };
   }
 
+  // The first empty line between a marker block and the code it annotates:
+  // block comments or preprocessor lines in between are not blank.
+  llvm::json::Value blankLineBetween(FileID file, const LineComment& last,
+                                     unsigned anchorOffset) const {
+    llvm::StringRef buffer = sources_.getBufferData(file);
+    if (anchorOffset <= last.endOffset || anchorOffset > buffer.size()) return nullptr;
+    // The slice starts at the end of the block's last line (its range
+    // excludes the newline) and ends where the anchor's line begins it.
+    llvm::SmallVector<llvm::StringRef, 8> lines;
+    buffer.slice(last.endOffset, anchorOffset).split(lines, '\n');
+    for (size_t index = 1; index + 1 < lines.size(); ++index) {
+      if (lines[index].trim().empty()) return static_cast<int64_t>(last.line + index);
+    }
+    return nullptr;
+  }
+
   static bool looksLikeMarker(llvm::StringRef text) {
     static const llvm::Regex pattern(
         "^//[[:space:]]*[[:alnum:]_]+:[[:space:]]*[[:alnum:]_]+[[:space:]]+0[xX][[:xdigit:]]+");
@@ -1388,6 +1731,7 @@ class Indexer {
           {"column", sources_.getColumnNumber(file, offset)},
           {"candidates", std::move(candidates)},
           {"string", lineString(file, token)},
+          {"blank_line", blankLineBetween(file, group.back(), offset)},
       };
     }
     emit(std::move(record));
@@ -1524,7 +1868,16 @@ class IndexConsumer : public ASTConsumer {
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";
-    Indexer(context, out_, instance_.getPreprocessor(), comments_, profile_).run();
+    llvm::LLVMContext llvmContext;
+    std::unique_ptr<CodeGenerator> codegen(CreateLLVMCodeGen(
+        instance_.getDiagnostics(), "reccmp-abi",
+        instance_.getFileManager().getVirtualFileSystemPtr(),
+        instance_.getHeaderSearchOpts(), instance_.getPreprocessorOpts(),
+        instance_.getCodeGenOpts(), llvmContext));
+    codegen->Initialize(context);
+    Indexer(context, out_, instance_.getPreprocessor(), comments_, profile_, &codegen->CGM(),
+            &codegen->GetModule()->getDataLayout())
+        .run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any
     // DetailedRecord / PreprocessingRecord.
