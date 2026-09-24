@@ -57,8 +57,8 @@ from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
 
 from reccmp.compare.body_equivalence import _is_bare_jmp_island
-from reccmp.compare.function_metadata import FunctionMetadataMixin
-from reccmp.compare.source_pins import SourcePinMixin
+from reccmp.compare.extent import discover_extent
+from reccmp.compare.refutation import RefutationMixin
 from reccmp.compare.inline_accounting import InlineAccountingMixin
 
 
@@ -153,7 +153,7 @@ def _stamp_instruction_ids(excerpt: AsmExcerpt) -> tuple:
 
 
 @dataclass
-class FunctionComparator(InlineAccountingMixin, FunctionMetadataMixin, SourcePinMixin):
+class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     # pylint: disable=too-many-instance-attributes
     db: EntityDb
     lines_db: LinesDb
@@ -171,6 +171,8 @@ class FunctionComparator(InlineAccountingMixin, FunctionMetadataMixin, SourcePin
     equivalence_groups: dict[int, int] = field(default_factory=dict)
     # Optional Clang-backed layout/ownership index for mismatch enrichment.
     source_index: SourceIndex | None = None
+    # Try to refute unproven results by differential execution (needs unicorn).
+    witness_search: bool = False
 
     def __post_init__(self):
         self._call_abi_cache: dict[str, CallAbi | None] | None = None
@@ -182,6 +184,7 @@ class FunctionComparator(InlineAccountingMixin, FunctionMetadataMixin, SourcePin
         # Exact call-identity → unique orig_addr (ambiguous keys omitted).
         self._helper_identity_index: dict[str, int] | None = None
         self._helper_identity_ambiguous: set[str] | None = None
+        self._witness_translator = None
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -291,6 +294,13 @@ class FunctionComparator(InlineAccountingMixin, FunctionMetadataMixin, SourcePin
                 orig_size = min(orig_max, recomp_size)
             else:
                 orig_size = recomp_size
+            discovered = discover_extent(
+                self.orig_bin, match.orig_addr, orig_max, is_32bit=self.is_32bit
+            )
+            # Much larger than the recompilation usually means the walk ran
+            # past a call that does not return into the next function.
+            if discovered is not None and discovered <= 2 * recomp_size + 64:
+                orig_size = discovered
         else:
             orig_size = annotated_orig_size
 
@@ -385,6 +395,10 @@ class FunctionComparator(InlineAccountingMixin, FunctionMetadataMixin, SourcePin
             ),
             extent_closed=orig_image.extent_closed and recomp_image.extent_closed,
         )
+        if orig_image.extent_closed and recomp_image.extent_closed:
+            # Emulation needs the real extents: with an open one it may run
+            # a different stretch of code than the comparison looked at.
+            analysis = self._refute(match, analysis, orig_size, recomp_size)
         if analysis is not result.analysis:
             result = dataclasses.replace(result, analysis=analysis)
         return result

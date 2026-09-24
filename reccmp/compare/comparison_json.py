@@ -1,12 +1,16 @@
 """JSON encoding of structured comparison results (analysis, differences,
 strategy attempts, stack and inline diagnostics) inside a report entity."""
 
+import dataclasses
+
 from .diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
     ComparisonStatus,
     DiagnosticNormalization,
     DifferenceSide,
+    ExecutionEvidence,
+    RefutationWitness,
     StackPermutationEntry,
     StrategyAttempt,
     derive_diagnostic_normalizations,
@@ -61,6 +65,10 @@ def analysis_json(analysis: ComparisonAnalysis) -> dict[str, object]:
         value["inconclusive_location"] = _side_json(analysis.inconclusive_location)
     if analysis.attempts:
         value["attempts"] = [_attempt_json(attempt) for attempt in analysis.attempts]
+    if analysis.witness is not None:
+        value["witness"] = dataclasses.asdict(analysis.witness)
+    if analysis.execution is not None:
+        value["execution"] = dataclasses.asdict(analysis.execution)
     return value
 
 
@@ -134,6 +142,16 @@ def parse_analysis(value: object) -> ComparisonAnalysis:
                 else None
             ),
             attempts=tuple(_parse_attempt(item) for item in value.get("attempts", ())),
+            witness=(
+                RefutationWitness(**value["witness"])
+                if value.get("witness") is not None
+                else None
+            ),
+            execution=(
+                ExecutionEvidence(**value["execution"])
+                if value.get("execution") is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as ex:
         raise ComparisonJsonError from ex

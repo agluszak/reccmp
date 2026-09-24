@@ -108,3 +108,44 @@ def test_targeted_analysis_reuses_cached_full_cvdump(tmp_path: Path):
     assert isinstance(result, CvdumpParser)
     assert fingerprint == "pdb-fingerprint"
     assert scope == "full"
+
+
+def test_targeted_analysis_of_unannotated_address_loads_full_symbols(tmp_path: Path):
+    """Without an annotation the function can only be paired by discovery,
+    which needs every symbol, not a module selection."""
+    cache = AnalysisCache(tmp_path / "cache", enabled=False)
+    target = RecCmpTarget(
+        target_id="TEST",
+        filename="TEST.exe",
+        sha256="",
+        encoding="utf-8",
+        source_paths=(),
+        ghidra_config=GhidraConfig(),
+        report_config=ReportConfig(),
+        original_path=tmp_path / "TEST.exe",
+        recompiled_path=tmp_path / "build" / "TEST.exe",
+        recompiled_pdb=tmp_path / "build" / "TEST.pdb",
+    )
+    full = CvdumpParser()
+    with (
+        patch("reccmp.compare.target_analysis.fingerprint_files", return_value=""),
+        patch("reccmp.compare.target_analysis._load_base_cvdump", return_value=full),
+        patch(
+            "reccmp.compare.target_analysis._load_full_cvdump", return_value=full
+        ) as load_full,
+        patch(
+            "reccmp.compare.target_analysis.select_modules",
+            side_effect=AssertionError("module selection needs annotations"),
+        ),
+    ):
+        _, _, scope = _load_cvdump(
+            target,
+            RawImage.from_memory(),
+            DecompCodebase([], "TEST"),
+            (0x401000,),
+            (),
+            cache,
+            use_cache=False,
+        )
+    assert scope == "full"
+    load_full.assert_called_once()

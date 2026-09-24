@@ -12,8 +12,9 @@ small stack of feature commits on top of `upstream/master`, one per area:
 6. Entity identity
 7. Diagnostics and reports
 8. Comparator and tools
-9. Ghidra
-10. This file
+9. Differential execution witnesses (`--witness`)
+10. Ghidra
+11. This file
 
 A change to the fork amends the commit for its area, not a new commit on
 top. `git commit --fixup=<commit>` followed by
@@ -27,11 +28,13 @@ them can conflict on the next rebase. So:
 - **Put new logic in new modules.** Upstream-owned files should only get
   hooks: an import, a call, a base class. For example, `FunctionComparator`
   gets its fork behaviour from mixins in `body_equivalence.py`,
-  `function_metadata.py`, `source_pins.py` and `inline_accounting.py`.
+  `function_metadata.py`, `source_pins.py`, `inline_accounting.py` and
+  `refutation.py` (which drives the `witness` package).
   Report JSON lives in `comparison_json.py`, CLI text rendering in
   `tools/asmcmp_text.py`, and SEH/FOLDED matching in `match_folded.py`.
 - **Use upstream's tooling.** Use `requirements-tests.txt` and upstream's
-  workflows. The only fork delta there is the Ghidra version pin.
+  workflows. The only fork deltas there are the Ghidra version pin and the
+  `unicorn` test dependency.
 - **Don't reformat or tidy upstream code** that the fork doesn't otherwise
   need to change.
 
