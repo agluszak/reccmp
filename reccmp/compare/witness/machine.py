@@ -126,6 +126,10 @@ def model_dword(seed: int, *key: int, pool: tuple[int, ...] = ()) -> int:
 
 
 def page_contents(seed: int, page: int, pool: tuple[int, ...] = ()) -> bytes:
+    if page < LOW_PAGES:
+        # Small integers used as pointers land here; like a null page it
+        # reads as zeros, so further dereferences stay in shared memory.
+        return bytes(PAGE)
     return b"".join(
         model_dword(seed, page, i, pool=pool).to_bytes(4, "little")
         for i in range(PAGE // 4)
@@ -183,8 +187,14 @@ class RunInput:
         regs = {name: model_dword(seed, 1, i, pool=pool) for i, name in enumerate(_GP)}
         # ``this`` for thiscall members: always a heap object.
         regs["ecx"] = HEAP_BASE + (seed % HEAP_OBJECTS) * OBJECT_STRIDE
+        # Arguments are often object pointers: make half of them heap objects.
         args = tuple(
-            model_dword(seed, 2, i, pool=pool) for i in range(STACK_ARG_DWORDS)
+            (
+                HEAP_BASE + (_prng(seed, 6, i) % HEAP_OBJECTS) * OBJECT_STRIDE
+                if _prng(seed, 7, i) & 1
+                else model_dword(seed, 2, i, pool=pool)
+            )
+            for i in range(STACK_ARG_DWORDS)
         )
         return cls(seed, regs, args, pool)
 
