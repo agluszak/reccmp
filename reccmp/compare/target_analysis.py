@@ -47,14 +47,10 @@ _MARKER_CACHE_INPUTS = (
     _PACKAGE_ROOT / "parser" / "node.py",
     _PACKAGE_ROOT / "parser" / "reader.py",
 )
-_COMPARE_CACHE_INPUTS = tuple(
-    sorted((_PACKAGE_ROOT / "compare").rglob("*.py"), key=str)
-) + (
-    _PACKAGE_ROOT / "analysis_cache.py",
-    _PACKAGE_ROOT / "formats" / "image.py",
-    _PACKAGE_ROOT / "formats" / "pe.py",
-    _PACKAGE_ROOT / "types.py",
-)
+# The prepared comparison depends on analyses throughout the package
+# (reccmp.analysis finds SEH data, reccmp.formats reads the images, ...):
+# any change to reccmp's code invalidates it.
+_COMPARE_CACHE_INPUTS = tuple(sorted(_PACKAGE_ROOT.rglob("*.py"), key=str))
 
 
 @dataclass
