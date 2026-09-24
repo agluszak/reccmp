@@ -22,7 +22,7 @@ import functools
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Callable, Mapping
 
 from capstone import CS_GRP_CALL, CsError, CsInsn  # type: ignore[import-untyped]
 from capstone.x86 import (  # type: ignore
@@ -31,6 +31,7 @@ from capstone.x86 import (  # type: ignore
     X86_INS_ENTER,
     X86_INS_IN,
     X86_INS_INSB,
+    X86_INS_INT3,
     X86_INS_JMP,
     X86_INS_OUT,
     X86_INS_OUTSB,
@@ -305,13 +306,17 @@ class SideMachine:
         image: Image,
         imports: Mapping[str, int] | None = None,
         import_facts: Mapping[str, CallFacts] | None = None,
+        function_size: Callable[[int], int | None] = lambda _address: None,
     ):
         """``imports`` maps import keys to modelled addresses and must be
         the same registry for both machines of a comparison; by default it
         covers this image only. ``import_facts`` gives call facts by import
-        name."""
+        name. ``function_size`` gives the extent of a function starting at an
+        address, when known; a callee's ``ret N`` is only looked for inside
+        it."""
         self.image = image
         self.import_facts = import_facts or {}
+        self.function_size = function_size
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
         lo = min(s.virtual_address for s in image.sections) & ~(PAGE - 1)
         hi = max(s.virtual_address + s.extent for s in image.sections)
@@ -359,11 +364,17 @@ class SideMachine:
         return decode_one(self._pristine[offset : offset + 16], addr)
 
     def _callee_pop_bytes(self, target: int) -> int | None:
-        """``ret N`` of a callee in the image, following ``jmp`` thunks."""
+        """``ret N`` of a callee in the image, following ``jmp`` thunks. The
+        scan stays inside the callee: its known extent, or else up to the
+        int3 padding after it. A callee that ends without ``ret`` (a tail
+        jump, a call that does not return) would otherwise lend it the next
+        function's ``ret N``."""
         addr, seen = target, 0
-        while addr in self.image_range and seen < 4000:
+        size = self.function_size(target)
+        end = target + size if size else self.image_range.stop
+        while addr in self.image_range and addr < end and seen < 4000:
             insn = self.insn_at(addr)
-            if insn is None:
+            if insn is None or insn.id == X86_INS_INT3:
                 break
             seen += 1
             if insn.id == X86_INS_RET:
@@ -373,6 +384,8 @@ class SideMachine:
                 if jump is None:
                     break
                 addr = jump
+                size = self.function_size(jump)
+                end = jump + size if size else self.image_range.stop
                 continue
             addr += insn.size
         return None
