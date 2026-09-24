@@ -310,13 +310,19 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert profile["records"]["declaration"] > 0
         assert profile["indexer_totals_ms"]["frontend_ms"] > 0
         assert "owner.h" in index.unit_dependencies["first.cpp"]
-        owners = [item for item in index.classes if item.qualified_name == "Owner"]
-        assert len(owners) == 2
-        assert {item.target for item in owners} == {"WIZ8", "SURRENDER"}
+        owner_keys = {
+            key: item
+            for key, item in index.classes.items()
+            if item.qualified_name == "Owner"
+        }
+        owners = list(owner_keys.values())
+        assert {key.target for key in owner_keys} == {"WIZ8", "SURRENDER"}
         assert all(item.asserted_size == 20 for item in owners)
         assert [field.pointer_depth for field in owners[0].fields] == [2, 1, 0, 0]
         dependent_records = [
-            item for item in index.classes if item.qualified_name == "DependentRecord"
+            item
+            for item in index.classes.values()
+            if item.qualified_name == "DependentRecord"
         ]
         assert len(dependent_records) == 2
         assert all(item.size is None for item in dependent_records)
@@ -326,20 +332,31 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
             index.functions_by_address(target="SURRENDER")[0x401000].name == "SURRENDER"
         )
         variables = {
-            (item.target, item.qualified_name): item for item in index.variables
+            (key.target, item.qualified_name): item
+            for key, item in index.variables.items()
         }
         assert variables[("WIZ8", "gWIZ8")].definition_kind == "definition"
         assert variables[("WIZ8", "gWIZ8")].is_external
         assert variables[("WIZ8", "gShared")].definition_kind == "declaration"
         assert variables[("WIZ8", "gShared")].is_external
         assert variables[("SURRENDER", "gSURRENDER")].is_external
-        assert not any(item.qualified_name == "gLocal" for item in index.variables)
+        assert not any(
+            item.qualified_name == "gLocal" for item in index.variables.values()
+        )
         assert not index.conflicts
         declaration = index.functions_by_address(target="WIZ8")[0x401000].declaration
         assert declaration is not None
         assert declaration.linkage == "external"
-        wiz8_uses = index.for_target("WIZ8").member_uses
-        surrender_uses = index.for_target("SURRENDER").member_uses
+        wiz8_uses = [
+            use
+            for uses in index.for_target("WIZ8").member_uses.values()
+            for use in uses
+        ]
+        surrender_uses = [
+            use
+            for uses in index.for_target("SURRENDER").member_uses.values()
+            for use in uses
+        ]
         first_uses = [
             item
             for item in wiz8_uses
@@ -431,7 +448,7 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         )
         assert all(
             item.fields[0].pointer_depth == 1
-            for item in refreshed.classes
+            for item in refreshed.classes.values()
             if item.qualified_name == "Owner"
         )
         header.write_text(
@@ -451,7 +468,8 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         renamed = collect()
         renamed_uses = [
             item
-            for item in renamed.for_target("WIZ8").member_uses
+            for uses in renamed.for_target("WIZ8").member_uses.values()
+            for item in uses
             if item.owner == "W8First"
             and item.name == "state"
             and item.function == "ReadW8Field"
