@@ -440,7 +440,9 @@ class BodyEquivalenceMixin(ComparatorState):
         ] = {}
         for canonical in matches:
             opposite_addr = canonical.addr(opposite_id)
-            opposite_size = canonical.size(opposite_id)
+            # An original entity from symbol data often has no size; the pair
+            # is compared over the recompiled extent, so its bodies are too.
+            opposite_size = canonical.size(opposite_id) or canonical.size(image_id)
             if opposite_addr is None or opposite_size is None or opposite_size <= 0:
                 continue
             fingerprint = self._alias_fingerprint(
