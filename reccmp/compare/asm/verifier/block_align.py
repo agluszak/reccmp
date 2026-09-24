@@ -32,7 +32,7 @@ _X87_MEM_WRITERS_DP = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbst
 
 
 @dataclass(frozen=True)
-class _DpLine:
+class DpLine:
     """Alignment view of one instruction, derived once from its structure."""
 
     display: str
@@ -92,7 +92,7 @@ def _dp_skeleton(ins: Instruction) -> tuple:
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 
-def dp_line(stream: ResolvedAsm, index: int) -> _DpLine:
+def dp_line(stream: ResolvedAsm, index: int) -> DpLine:
     display = stream.displays[index]
     try:
         ins = instruction_at(stream, index)
@@ -107,12 +107,12 @@ def dp_line(stream: ResolvedAsm, index: int) -> _DpLine:
             line_class = "store"
         else:
             line_class = "opaque"
-        return _DpLine(display, head, line_class, None)
+        return DpLine(display, head, line_class, None)
     head = ins.prefix or ins.mnemonic
-    return _DpLine(display, head, _dp_line_class(ins), _dp_skeleton(ins))
+    return DpLine(display, head, _dp_line_class(ins), _dp_skeleton(ins))
 
 
-def _dp_sub_cost(line_o: _DpLine, line_r: _DpLine) -> float | None:
+def _dp_sub_cost(line_o: DpLine, line_r: DpLine) -> float | None:
     if line_o.display == line_r.display:
         return _SUB_EXACT
     if line_o.line_class != line_r.line_class or line_o.line_class == "opaque":
@@ -127,7 +127,7 @@ def _dp_sub_cost(line_o: _DpLine, line_r: _DpLine) -> float | None:
 
 
 def align_block_lines(
-    lines_o: list[_DpLine], lines_r: list[_DpLine]
+    lines_o: list[DpLine], lines_r: list[DpLine]
 ) -> list[tuple[int | None, int | None]] | None:
     """Pair up two blocks' instructions with a cost-minimizing alignment.
     Returns block-local index pairs; None when the blocks cannot be aligned
