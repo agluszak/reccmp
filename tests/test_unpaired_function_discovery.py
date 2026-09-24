@@ -1,6 +1,7 @@
 # pylint: disable=protected-access
 from unittest.mock import Mock
 
+from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.db import EntityDb
 from reccmp.compare.functions import FunctionComparator
 from reccmp.types import EntityType, ImageId
@@ -218,3 +219,30 @@ def test_paired_callsite_discovery_selects_only_mutually_unique_edges():
     assert comparator.discover_unique_called_functions() == [(0x100, 0x200)]
     assert db.is_match(0x100, 0x200)
     assert not db.is_match(0x110, 0x210)
+
+
+def test_a_recomp_duplicate_of_a_pair_without_original_size_is_an_alias():
+    """The original of a pair often comes from symbol data without a size
+    (Wizardry's ILLength); the pair is compared over the recompiled extent,
+    and so is a recompiled duplicate (PLLength)."""
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x100, type=EntityType.FUNCTION)  # no size
+        batch.set(ImageId.RECOMP, 0x200, type=EntityType.FUNCTION, size=5)
+        batch.set(ImageId.RECOMP, 0x210, type=EntityType.FUNCTION, size=5)
+    db.bulk_match([(0x100, 0x200)])
+    shape = (("ret", ""),)
+    fingerprints = {
+        (ImageId.ORIG, 0x100): shape,
+        (ImageId.RECOMP, 0x200): shape,
+        (ImageId.RECOMP, 0x210): shape,
+    }
+    comparator = make_graph_comparator(db, fingerprints, {(0x100, 0x210)})
+
+    comparator.discover_unpaired_function_bodies()
+
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x210) == 0x100
+    # A call to the duplicate proves equal to a call to the original.
+    duplicate = db.get(ImageId.RECOMP, 0x210)
+    assert duplicate is not None
+    assert entity_proof_identity(db, ImageId.RECOMP, duplicate) == ("entity", 0x100, 0)
