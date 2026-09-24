@@ -18,6 +18,7 @@ from reccmp.compare.diagnosis import (
 )
 from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
+from reccmp.types import ImageId
 
 if TYPE_CHECKING:
     from reccmp.compare.asm.ir import FunctionImage
@@ -78,10 +79,19 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                         return self._call_facts_at(match.recomp_addr)
                 return None
 
+            def sizes(image_id: ImageId):
+                def size(address: int) -> int | None:
+                    entity = self.db.get(image_id, address)
+                    return entity.size(image_id) if entity is not None else None
+
+                return size
+
             self._witness_translator = Translator(
                 self.db,
-                SideMachine(self.orig_bin, registry, by_import),
-                SideMachine(self.recomp_bin, registry, by_import),
+                SideMachine(self.orig_bin, registry, by_import, sizes(ImageId.ORIG)),
+                SideMachine(
+                    self.recomp_bin, registry, by_import, sizes(ImageId.RECOMP)
+                ),
                 call_facts=callee_facts,
             )
         return self._witness_translator
