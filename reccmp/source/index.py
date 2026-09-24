@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence, TextIO
 
@@ -308,37 +308,24 @@ class TranslationUnitRecords:
         """Store one compiler observation from this unit."""
         values = dict(record)
         kind = values.pop("record")
+        if kind in _UNIT_RECORDS:
+            self._add_unit_record(kind, values)
+        else:
+            self._append(kind, self._fact(kind, values))
+
+    def _add_unit_record(self, kind: str, values: dict[str, Any]) -> None:
+        """A record about the unit itself, never shared with other units."""
         if kind == "profile":
             self.profile = values
-            return
-        if kind == "marker-block":
-            self.marker_blocks.append(MarkerBlock.from_dict(values))
-            return
-        if kind == "dependency":
+        elif kind == "dependency":
             self.dependencies = [str(path) for path in values.get("files") or ()]
-            return
-        if kind == "unit-abi":
+        elif kind == "unit-abi":
             self.abi = SourceAbi(
                 target_triple=str(values["target_triple"]),
                 pointer_width=int(values["pointer_width"]),
                 ms_abi=bool(values["ms_abi"]),
             )
-            return
-        if kind == "declaration":
-            self.declarations.append(
-                _declaration_from_dict({**values, "unit_id": self.unit_id})
-            )
-        elif kind == "variable":
-            variable = _variable_from_dict({**values, "unit_id": self.unit_id})
-            if variable.is_external:
-                self.variables.append(variable)
-        elif kind == "class":
-            self.classes.append(_class_from_dict({**values, "unit_id": self.unit_id}))
-        elif kind == "member-use":
-            self.member_uses.append(
-                _member_use_from_dict({**values, "unit_id": self.unit_id})
-            )
-        elif kind == "size-assertion":
+        else:
             self.size_assertions.append(
                 _SizeAssertion(
                     unit_id=self.unit_id,
@@ -346,23 +333,80 @@ class TranslationUnitRecords:
                     asserted_size=int(values["asserted_size"]),
                 )
             )
+
+    def _fact(self, kind: str, values: dict[str, Any]) -> Any:
+        """A record about source code: identical in every unit that sees it."""
+        if kind == "marker-block":
+            return MarkerBlock.from_dict(values)
+        if kind == "declaration":
+            return _declaration_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "variable":
+            return _variable_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "class":
+            return _class_from_dict({**values, "unit_id": self.unit_id})
+        if kind == "member-use":
+            return _member_use_from_dict({**values, "unit_id": self.unit_id})
+        raise SourceIndexError(
+            f"the source indexer emitted an unknown record: {kind!r}"
+        )
+
+    def _append(self, kind: str, fact: Any) -> None:
+        if kind == "marker-block":
+            self.marker_blocks.append(fact)
+        elif kind == "declaration":
+            self.declarations.append(fact)
+        elif kind == "variable":
+            if fact.is_external:
+                self.variables.append(fact)
+        elif kind == "class":
+            self.classes.append(fact)
         else:
-            raise SourceIndexError(
-                f"the source indexer emitted an unknown record: {kind!r}"
-            )
+            self.member_uses.append(fact)
 
     @classmethod
-    def load(cls, path: Path, unit_id: str) -> "TranslationUnitRecords":
-        """Stream one NDJSON artifact into a TU record set."""
+    def load(
+        cls, path: Path, unit_id: str, pool: RecordPool | None = None
+    ) -> "TranslationUnitRecords":
+        """Stream one NDJSON artifact into a TU record set. With a pool,
+        records already read from another unit are shared, not parsed again:
+        most of a unit's records describe headers many units include."""
         unit = cls(unit_id=unit_id)
-        with path.open(encoding="utf-8") as handle:
-            unit.extend_stream(handle)
+        with path.open("rb") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                shared = pool.facts.get(line) if pool is not None else None
+                if shared is not None:
+                    unit._append(*shared)
+                    continue
+                values = json.loads(line)
+                kind = values.pop("record")
+                if kind in _UNIT_RECORDS:
+                    unit._add_unit_record(kind, values)
+                    continue
+                fact = unit._fact(kind, values)
+                if pool is not None:
+                    pool.facts[line] = (kind, fact)
+                unit._append(kind, fact)
         return unit
 
     def extend_stream(self, handle: TextIO) -> None:
         for line in handle:
             if line.strip():
                 self.add(json.loads(line))
+
+
+# Records about a translation unit rather than about source code.
+_UNIT_RECORDS = frozenset({"profile", "dependency", "unit-abi", "size-assertion"})
+
+
+class RecordPool:
+    """Parsed source records by their exact artifact line, shared across
+    every unit loaded with the pool. A shared record keeps the unit id of
+    the first unit that read it."""
+
+    def __init__(self) -> None:
+        self.facts: dict[bytes, tuple[str, Any]] = {}
 
 
 def relative_unit_id(
@@ -393,10 +437,15 @@ def derive_namespace(
         return unit_ids is None or unit_id in unit_ids
 
     selected = [unit for unit in units if belongs(unit.unit_id)]
-    declarations = [item for unit in selected for item in unit.declarations]
-    variables = [item for unit in selected for item in unit.variables]
-    classes = [item for unit in selected for item in unit.classes]
-    member_uses = [item for unit in selected for item in unit.member_uses]
+
+    def distinct(items: Iterable[Any]) -> list[Any]:
+        """Each record once: units loaded with a RecordPool share them."""
+        return list({id(item): item for item in items}.values())
+
+    declarations = distinct(item for unit in selected for item in unit.declarations)
+    variables = distinct(item for unit in selected for item in unit.variables)
+    classes = distinct(item for unit in selected for item in unit.classes)
+    member_uses = distinct(item for unit in selected for item in unit.member_uses)
     assertions = [item for unit in selected for item in unit.size_assertions]
 
     derived_declarations, declaration_conflicts = _derive_entities(
@@ -440,16 +489,45 @@ def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...
     return tuple(merged[key] for key in sorted(merged))
 
 
-def _repository_files(paths: Iterable[str], repository: Path) -> tuple[str, ...]:
-    """The repository-relative paths among ``paths``."""
-    root = repository.resolve()
-    result = []
-    for raw in paths:
-        try:
-            result.append(Path(raw).resolve().relative_to(root).as_posix())
-        except ValueError:
-            continue
-    return tuple(sorted(set(result)))
+class _RepositoryPaths:
+    """Repository-relative spellings of absolute paths, each resolved once:
+    every unit lists the same headers."""
+
+    def __init__(self, repository: Path):
+        self.root = repository.resolve()
+        self._known: dict[str, str | None] = {}
+
+    def relative(self, raw: str) -> str | None:
+        if raw not in self._known:
+            try:
+                self._known[raw] = Path(raw).resolve().relative_to(self.root).as_posix()
+            except ValueError:
+                self._known[raw] = None
+        return self._known[raw]
+
+    def files(self, paths: Iterable[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted({path for raw in paths if (path := self.relative(raw)) is not None})
+        )
+
+
+def _with_target(item: Any, target: str) -> Any:
+    """A copy of a frozen record with ``target`` set, without re-running its
+    constructor (``dataclasses.replace`` does, which dominates deriving)."""
+    copy = object.__new__(type(item))
+    copy.__dict__.update(item.__dict__)
+    object.__setattr__(copy, "target", target)
+    return copy
+
+
+def _plain(value: Any) -> Any:
+    """JSON-ready form of a record (``dataclasses.asdict`` without its deep
+    copies, which dominate writing the index)."""
+    if hasattr(value, "__dataclass_fields__"):
+        return {key: _plain(item) for key, item in value.__dict__.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
 
 
 def source_digest(path: Path) -> str:
@@ -482,7 +560,7 @@ def _derive_member_uses(
     """Attach the target namespace and collapse identical repeated-TU rows."""
     unique: dict[tuple[Any, ...], SourceMemberUse] = {}
     for item in observations:
-        projected = replace(item, target=target) if target is not None else item
+        projected = _with_target(item, target) if target is not None else item
         unique.setdefault(_member_use_key(projected), projected)
     return tuple(unique[key] for key in sorted(unique))
 
@@ -542,7 +620,7 @@ def _derive_entities(
         for item in group[1:]:
             if rank(item) > rank(winner):
                 winner = item
-        winners.append(replace(winner, target=target) if target is not None else winner)
+        winners.append(_with_target(winner, target) if target is not None else winner)
 
         variants: dict[tuple[str, ...], list[str]] = {}
         for item in group:
@@ -1418,6 +1496,12 @@ class SourceIndex:
             if namespace.abi is not None:
                 abis[target] = namespace.abi
         distinct = set(abis.values())
+        dependencies = None
+        if repository is not None:
+            paths = _RepositoryPaths(repository)
+            dependencies = {
+                unit.unit_id: paths.files(unit.dependencies) for unit in units
+            }
         return cls(
             declarations=declarations,
             classes=classes,
@@ -1429,14 +1513,7 @@ class SourceIndex:
             target_abis=abis,
             marker_blocks=blocks,
             source_digests=source_digests,
-            unit_dependencies=(
-                {
-                    unit.unit_id: _repository_files(unit.dependencies, repository)
-                    for unit in units
-                }
-                if repository is not None
-                else None
-            ),
+            unit_dependencies=dependencies,
         )
 
     @classmethod
@@ -1568,11 +1645,11 @@ class SourceIndex:
         document: dict[str, Any] = {
             "schema": _SCHEMA,
             "markers": [_marker_projection(item) for item in self.markers],
-            "declarations": [asdict(item) for item in self.declarations],
-            "classes": [asdict(item) for item in self.classes],
-            "variables": [asdict(item) for item in self.variables],
-            "member_uses": [asdict(item) for item in self.member_uses],
-            "conflicts": [asdict(item) for item in self.conflicts],
+            "declarations": [_plain(item) for item in self.declarations],
+            "classes": [_plain(item) for item in self.classes],
+            "variables": [_plain(item) for item in self.variables],
+            "member_uses": [_plain(item) for item in self.member_uses],
+            "conflicts": [_plain(item) for item in self.conflicts],
             "marker_blocks": [item.to_dict() for item in self.marker_blocks],
             "source_digests": self.source_digests,
             "unit_dependencies": {
@@ -1580,10 +1657,10 @@ class SourceIndex:
             },
         }
         if self.abi is not None:
-            document["abi"] = asdict(self.abi)
+            document["abi"] = _plain(self.abi)
         if self.target_abis:
             document["target_abis"] = {
-                target: asdict(abi) for target, abi in sorted(self.target_abis.items())
+                target: _plain(abi) for target, abi in sorted(self.target_abis.items())
             }
         return document
 

@@ -23,6 +23,7 @@ import uuid
 
 from reccmp.parser.marker import ProjectAliases
 from .index import (
+    RecordPool,
     SourceIndex,
     SourceIndexError,
     TranslationUnitRecords,
@@ -437,9 +438,9 @@ class _TuCache:
         return "main_file_changed"
 
     def publish(
-        self, unit: _Unit, output: Path, indexer_digest: str
+        self, unit: _Unit, output: Path, indexer_digest: str, pool: RecordPool
     ) -> TranslationUnitRecords:
-        records = TranslationUnitRecords.load(output, unit.unit_id)
+        records = TranslationUnitRecords.load(output, unit.unit_id, pool)
         deps = {
             dependency: digest
             for dependency in sorted(set(records.dependencies))
@@ -564,17 +565,18 @@ def collect_compile_database(
             ]
             raise SourceIndexError("the source indexer failed on " + "\n".join(failed))
 
+    pool = RecordPool()
     with profile.phase("load"):
         for unit in fresh:
             unit.records = tu_cache.publish(
-                unit, outputs[unit.identity], indexer_digest
+                unit, outputs[unit.identity], indexer_digest, pool
             )
             if unit.records.profile:
                 profile.units[unit.unit_id] = unit.records.profile
         for unit in units:
             if unit.records is None:
                 unit.records = TranslationUnitRecords.load(
-                    tu_cache.paths(unit.identity)[0], unit.unit_id
+                    tu_cache.paths(unit.identity)[0], unit.unit_id, pool
                 )
     digests.save()
 

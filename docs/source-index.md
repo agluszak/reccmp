@@ -87,6 +87,11 @@ misses with reasons (`new`, `forced`, `indexer_changed`, `command_changed`,
 indexer's own phases (driver setup, frontend, our consumer, member-use
 traversal, marker blocks, serialization) plus records and bytes by kind.
 
+Most of a unit's records describe headers that many units include (on the
+Wizardry corpus a declaration line recurs 32 times on average, a class 56
+times). Units are loaded through a `RecordPool` that parses each distinct
+artifact line once and shares the record; derivation sees each record once.
+
 The index also lists, per unit, the repository files it includes
 (`unit_dependencies`).
 
