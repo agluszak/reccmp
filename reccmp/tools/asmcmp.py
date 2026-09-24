@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from dataclasses import asdict
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -51,12 +52,15 @@ from reccmp.project.detect import (
 )
 from reccmp.tools.asmcmp_text import (
     diagnostic_normalizations_text,
+    execution_text,
     inconclusive_diagnostic_text,
     inline_layout_text,
     mismatch_source_pin_text,
     stack_layout_text,
     strategy_attempts_text,
     triage_status_note,
+    verdict_summary_text,
+    witness_text,
 )
 
 logger = logging.getLogger()
@@ -130,6 +134,12 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
         attempts = strategy_attempts_text(match.analysis)
         if attempts is not None:
             print(attempts)
+        witness = witness_text(match.analysis)
+        if witness is not None:
+            print(witness)
+        execution = execution_text(match.analysis)
+        if execution is not None:
+            print(execution)
         if note is not None:
             print(note)
 
@@ -276,6 +286,14 @@ def parse_args() -> argparse.Namespace:
         help="Exclude LIBRARY annotations from the analysis",
     )
     parser.add_argument(
+        "--witness",
+        action="store_true",
+        help=(
+            "Execute unproven functions on both binaries to find inputs that "
+            "demonstrate a difference (needs the optional unicorn package)."
+        ),
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Do not read or write the local parsed-analysis cache.",
@@ -386,10 +404,15 @@ def compare_object(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # pylint: disable=too-many-return-statements
     args = parse_args()
 
     if args.object is not None:
         return compare_object(args)
+
+    if args.witness and importlib.util.find_spec("unicorn") is None:
+        logger.error("--witness needs unicorn: pip install 'reccmp[witness]'")
+        return 1
 
     try:
         target = argparse_parse_project_target(args)
@@ -409,6 +432,7 @@ def main() -> int:
         recomp_addrs=args.recomp_address,
         use_cache=not args.no_cache,
     )
+    compare.function_comparator.witness_search = args.witness
 
     print()
 
@@ -539,6 +563,7 @@ def main() -> int:
     )
     print(f"Accuracy:     {effective_accuracy:.2f}%")
     print(f"Progress:     {progress:.2f}%")
+    print(verdict_summary_text(report.entities.values()))
 
     if functions_aligned_count > 0:
         print(

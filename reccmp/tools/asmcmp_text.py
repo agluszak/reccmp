@@ -1,5 +1,8 @@
 """Text rendering of structured comparison results for reccmp-reccmp."""
 
+from collections import Counter
+from typing import Iterable
+
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
@@ -144,3 +147,70 @@ def diagnostic_normalizations_text(match: ReccmpComparedEntity) -> str | None:
         tag.value.replace("_", " ") for tag in match.diagnostic_normalizations
     )
     return f"diagnostic normalizations: {joined}"
+
+
+def witness_text(analysis: ComparisonAnalysis) -> str | None:
+    """The concrete difference behind a refuted mismatch."""
+    witness = analysis.witness
+    if witness is None:
+        return None
+    where = witness.location
+    if witness.orig_address is not None and witness.recomp_address is not None:
+        where += (
+            f" (orig {format_address(witness.orig_address)},"
+            f" recomp {format_address(witness.recomp_address)})"
+        )
+    return (
+        f"refuted by execution (seed {witness.seed}): "
+        f"{witness.kind.replace('_', ' ')} at {where}: "
+        f"orig {witness.orig_value}, recomp {witness.recomp_value}\n"
+        "  callees modelled, input not checked for reachability"
+    )
+
+
+def execution_text(analysis: ComparisonAnalysis) -> str | None:
+    """Differential execution that ran without finding a witness."""
+    evidence = analysis.execution
+    if evidence is None:
+        return None
+    text = f"execution: {evidence.agreeing} of {evidence.runs} runs agreed"
+    if evidence.reached_location:
+        what = "difference" if analysis.difference is not None else "blocker"
+        text += (
+            f"; {evidence.reached_location} reached the reported {what} "
+            "without an observable divergence"
+        )
+    if evidence.no_verdict:
+        reasons = ", ".join(
+            f"{reason.replace('_', ' ')} {count}"
+            for reason, count in sorted(
+                evidence.no_verdict.items(), key=lambda item: -item[1]
+            )
+        )
+        text += f"\n  no verdict: {reasons}"
+    return text
+
+
+def verdict_summary_text(entities: Iterable[ReccmpComparedEntity]) -> str:
+    counts: Counter[str] = Counter()
+    for entity in entities:
+        if not entity.is_function() or not entity.is_matched() or entity.is_stub:
+            continue
+        status = entity.analysis.status
+        if status == ComparisonStatus.MISMATCH:
+            counts["refuted" if entity.analysis.is_refuted else "candidate"] += 1
+            execution = entity.analysis.execution
+            if execution is not None and execution.reached_location:
+                counts["reached"] += 1
+        else:
+            counts[status.value] += 1
+    return (
+        f"Verdicts:     {counts['exact']} exact, {counts['effective']} effective, "
+        f"{counts['refuted']} refuted, {counts['candidate']} candidate mismatch, "
+        f"{counts['inconclusive']} inconclusive"
+    ) + (
+        f"\n              ({counts['reached']} candidate mismatches were executed "
+        "through the difference without diverging)"
+        if counts["reached"]
+        else ""
+    )
