@@ -11,12 +11,14 @@ from reccmp.compare.call_cleanup import import_cleanup, mangled_cleanup
         ("?getChildCount@srNode@@QBEJXZ", 0),  # thiscall, no parameters
         ("?setPos@srNode@@QAEXMMM@Z", 12),  # thiscall, three floats
         ("?postProcess@srMaterial@@UAEXAAVsrVertexPipe@@@Z", 4),  # class &
-        ("?foo@@YGXHPAD0@Z", 12),  # stdcall int, char *, back-ref to int
+        ("?foo@@YGXHPAD0@Z", 12),  # stdcall int, char *, back-ref to char *
         ("?make@A@@SGPAV1@HN@Z", 12),  # static stdcall int, double
         ("?f@@YGXPAUtagRECT@@H@Z", 8),  # struct pointer, int
         ("?bar@@YAXH@Z", 0),  # cdecl: the caller cleans up
         ("?g@@YGXVValue@@@Z", None),  # class by value: size unknown
-        ("?t@?$List@H@@QAEXH@Z", None),  # template: not handled
+        ("?t@?$List@H@@QAEXH@Z", 4),  # member of a template class
+        ("?d@@YGXN_J@Z", 16),  # double, __int64
+        ("?v@@YGXHZZ", None),  # varargs
     ],
 )
 def test_mangled_cleanup(symbol: str, cleanup: int | None):
