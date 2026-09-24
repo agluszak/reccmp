@@ -57,6 +57,7 @@ from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
 
 from reccmp.compare.body_equivalence import _is_bare_jmp_island
+from reccmp.compare.extent import discover_extent
 from reccmp.compare.refutation import RefutationMixin
 from reccmp.compare.inline_accounting import InlineAccountingMixin
 
@@ -293,6 +294,13 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 orig_size = min(orig_max, recomp_size)
             else:
                 orig_size = recomp_size
+            discovered = discover_extent(
+                self.orig_bin, match.orig_addr, orig_max, is_32bit=self.is_32bit
+            )
+            # Much larger than the recompilation usually means the walk ran
+            # past a call that does not return into the next function.
+            if discovered is not None and discovered <= 2 * recomp_size + 64:
+                orig_size = discovered
         else:
             orig_size = annotated_orig_size
 

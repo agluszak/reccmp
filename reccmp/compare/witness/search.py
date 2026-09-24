@@ -281,7 +281,8 @@ def _compare(
             v_o, v_r = ("abs", t_o.eax & mask), ("abs", t_r.eax & mask)
         if UNRESOLVED not in (v_o, v_r) and v_o != v_r:
             differing = t_o.eax ^ t_r.eax
-            if mask != 0xFF and v_o[0] == v_r[0] == "abs" and not differing & 0xFF:
+            both_plain = all(isinstance(v, tuple) and v[0] == "abs" for v in (v_o, v_r))
+            if mask != 0xFF and both_plain and not differing & 0xFF:
                 # Only the bits above al differ. The return width comes from
                 # the reconstruction's declaration; retail may return a bool
                 # in al with garbage above it.
