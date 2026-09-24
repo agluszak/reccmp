@@ -8,6 +8,8 @@ from dataclasses import (
 )
 from typing import Callable
 
+from reccmp.call_facts import CallFacts
+
 from reccmp.compare.asm.model import (
     REGISTERS,
     Reject,
@@ -185,16 +187,6 @@ WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10}
 
 
 @dataclass(frozen=True)
-class CallAbi:
-    """Which registers a callee reads as arguments. Derived from the PDB
-    calling convention: cdecl/stdcall use neither, thiscall reads ecx,
-    fastcall reads ecx and edx."""
-
-    uses_ecx: bool
-    uses_edx: bool
-
-
-@dataclass(frozen=True)
 class FunctionMetadata:
     """Optional PDB-derived facts that widen what the verifier can prove.
 
@@ -202,11 +194,20 @@ class FunctionMetadata:
     "void" (eax is dead at ret), "i8"/"i16" (only al/ax matter),
     "i32", "i64" (edx:eax), "float" (st0), or "unknown" (exact eax).
 
-    call_abi: resolves a sanitized call-target name to the callee's
-    register-argument usage; None means unknown (compare ecx and edx)."""
+    call_facts: resolves a sanitized call-target name to what is known about
+    calling it; an unknown register usage means ecx/edx are compared."""
 
     return_kind: str = "unknown"
-    call_abi: Callable[[str], CallAbi | None] | None = None
+    call_facts: Callable[[str], CallFacts | None] | None = None
+    # Accept observed values z3 proves equal (project `verifier` config).
+    algebraic_identities: bool = True
+
+
+def register_arguments(facts: CallFacts | None) -> tuple[bool, bool]:
+    """Whether ecx and edx must be treated as arguments of a call."""
+    if facts is None:
+        return (True, True)
+    return (facts.uses_ecx is not False, facts.uses_edx is not False)
 
 
 @dataclass

@@ -5,6 +5,7 @@ from reccmp.cvdump.demangler import (
     parse_encoded_number,
     InvalidEncodedNumberError,
     get_vtordisp_name,
+    demangle_function,
 )
 
 string_demangle_cases = [
@@ -82,3 +83,9 @@ def test_vtordisp():
 
     # A function called vtordisp
     assert get_vtordisp_name("?vtordisp@LegoExtraActor@@UBEPBDXZ") is None
+
+
+def test_demangle_function_splits_nested_parameters():
+    function = demangle_function("?f@@YANPAP6AHH@Z@Z")
+    assert function is not None
+    assert function.parameters == ("int (__cdecl **)(int)",)

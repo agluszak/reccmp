@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Hashable
+
 from reccmp.compare.asm.model import (
     REGISTERS,
     Instruction,
@@ -28,6 +30,7 @@ from reccmp.compare.asm.verifier.state import (
     ZERO_FLAGS,
     Context,
     SideState,
+    register_arguments,
     X87Stack,
     commutative_result,
     memory_load_tag,
@@ -231,6 +234,72 @@ def esp_add(value: Value, delta: int) -> Value:
 CF_CONDITIONS = frozenset({"b", "ae", "a", "be"})
 
 
+def _import_call(target: Value) -> Value:
+    """The callee of a call through an import slot: `call [__imp_X]` loads
+    the slot, `call thunk` runs the thunk's `jmp [__imp_X]`, which loads it
+    at the same point; both run X with the same return address. Only the
+    call target is unified: the thunk's address and the slot's content are
+    different pointer values."""
+    if not isinstance(target, tuple) or len(target) < 2:
+        return target
+    if target[0] == "sym" and isinstance(target[1], tuple):
+        if target[1][:1] == ("jmp_through",):
+            return ("call_through", target[1][1])
+    if target[0] == "load" and len(target) >= 3 and target[2] == "dword":
+        slot = _absolute_symbol(target[1])
+        if slot is not None:
+            return ("call_through", slot)
+    return target
+
+
+def _absolute_symbol(address: Value) -> Hashable | None:
+    """The identity of `[symbol]`: an address with no registers, no
+    displacement and one symbol."""
+    if not isinstance(address, tuple) or not address:
+        return None
+    if address[0] == "sym" and len(address) == 2:
+        return address[1]
+    if address[0] != "mem" or len(address) != 5:
+        return None
+    _, _, registers, displacement, symbols = address
+    if registers or displacement != 0 or len(symbols) != 1 or symbols[0][0] != 1:
+        return None
+    return operand_identity(symbols[0][1])
+
+
+def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
+    """One spelling of an order against a constant: `x < c` is `x <= c-1`
+    and `c < x` is `c+1 <= x`, except at the ends of the range, and the
+    constant is written in the comparison's signedness. A compiler picks
+    either spelling (`cmp eax, 0x41; jb` / `cmp eax, 0x40; jbe`)."""
+    if not isinstance(width, int):
+        return (pred, a, b)  # the range, and so the rewrite, is unknown
+    bits = 8 * width
+    mask = (1 << bits) - 1
+    signed = pred.endswith("_s")
+
+    def value(constant: int) -> int:
+        constant &= mask
+        if signed and constant >> (bits - 1):
+            constant -= 1 << bits
+        return constant
+
+    low, high = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, mask)
+    strict = pred.startswith("lt_")
+    kind = "le_s" if signed else "le_u"
+    if isinstance(b, tuple) and b[:1] == ("imm",) and isinstance(b[1], int):
+        constant = value(b[1])
+        if strict and constant > low:
+            return (kind, a, ("imm", constant - 1))
+        return (pred, a, ("imm", constant))
+    if isinstance(a, tuple) and a[:1] == ("imm",) and isinstance(a[1], int):
+        constant = value(a[1])
+        if strict and constant < high:
+            return (kind, ("imm", constant + 1), b)
+        return (pred, ("imm", constant), b)
+    return (pred, a, b)
+
+
 def canon_condition(cc: str, state: SideState) -> Value:
     """Canonical predicate for a condition code applied to a flag state, so
     that `cmp a, b` + jg equals `cmp b, a` + jl."""
@@ -244,7 +313,7 @@ def canon_condition(cc: str, state: SideState) -> Value:
         if pred in ("eq", "ne"):
             base = (pred, vsort(a, b))
         else:
-            base = (pred, b, a) if swap else (pred, a, b)
+            base = _constant_order(*((pred, b, a) if swap else (pred, a, b)), width)
         return base if width is None else (*base, width)
     if (
         cc in ("o", "no")
@@ -463,11 +532,12 @@ def execute(
         # (fastcall). When per-callsite convention data from the PDB is
         # available and says a register is unused, its (dead) value need
         # not match; otherwise it must match exactly.
-        abi = None
-        if ctx.metadata is not None and ctx.metadata.call_abi is not None:
+        facts = None
+        if ctx.metadata is not None and ctx.metadata.call_facts is not None:
             if ops[0][0] == "sym":
-                abi = ctx.metadata.call_abi(operand_display(ops[0][1]))
-        target = read_operand(state, ctx, ops[0])
+                facts = ctx.metadata.call_facts(operand_display(ops[0][1]))
+        ecx_argument, edx_argument = register_arguments(facts)
+        target = _import_call(read_operand(state, ctx, ops[0]))
         virtual_target = _canonical_virtual_target(target, ctx)
         entry = ["call", virtual_target or target]
         # A known virtual target is not proof that arguments agree. Always
@@ -476,12 +546,12 @@ def execute(
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
             entry.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
-            if abi is not None and abi.uses_edx:
+            if facts is not None and facts.uses_edx:
                 entry.append(state.read_reg("edx"))
         else:
-            if abi is None or abi.uses_ecx:
+            if ecx_argument:
                 entry.append(state.read_reg("ecx"))
-            if abi is None or abi.uses_edx:
+            if edx_argument:
                 entry.append(state.read_reg("edx"))
         obs.append(tuple(entry))
         incoming_esp = state.read_reg("esp")

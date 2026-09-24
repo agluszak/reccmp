@@ -7,7 +7,7 @@ formatting remain in their existing layers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Literal, TypeAlias
 
@@ -164,6 +164,10 @@ class ComparisonDifference:
     kind: str
     orig: DifferenceSide
     recomp: DifferenceSide
+    # The verifier's symbolic values behind a value difference: (value_orig,
+    # value_recomp, bits, "value" or "predicate"). In memory only (for the
+    # witness to ask a solver for a distinguishing input), never reported.
+    values: tuple | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.kind not in MISMATCH_KINDS:
@@ -203,8 +207,57 @@ class StrategyAttempt:
         return self.strategy in TRUSTED_ALIGNMENT_STRATEGIES
 
 
+WITNESS_KINDS = {
+    "memory_value": "memory_value",
+    "return_value": "return_value",
+    "call_argument": "call_argument",
+    "stack_cleanup": "preserved_state",
+}
+
+
+@dataclass(frozen=True)
+class RefutationWitness:
+    """Concrete inputs under which the two functions observably differ.
+
+    Found by executing both bodies from the same state (see
+    reccmp.compare.witness). Callees are modelled, not run, and the input
+    need not be reachable from the program's real callers.
+    """
+
+    seed: int
+    kind: str  # key of WITNESS_KINDS
+    location: str
+    orig_value: str
+    recomp_value: str
+    orig_address: int | None = None
+    recomp_address: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in WITNESS_KINDS:
+            raise ValueError(f"Unknown witness kind: {self.kind}")
+
+
+@dataclass(frozen=True)
+class ExecutionEvidence:
+    """What differential execution saw when it found no witness.
+
+    Not a proof: agreeing runs only cover the inputs tried. Runs that reached
+    the reported difference or blocker and still agreed suggest the verifier
+    is missing an equivalence there.
+    """
+
+    runs: int
+    agreeing: int
+    # Agreeing runs that executed the reported location on both sides; None
+    # when the result has no location.
+    reached_location: int | None = None
+    # Why the other runs gave no verdict, e.g. {"foreign_access": 3}.
+    no_verdict: dict[str, int] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class ComparisonAnalysis:
+    # pylint: disable=too-many-instance-attributes
     status: ComparisonStatus
     effective_reasons: tuple[str, ...] = ()
     difference: ComparisonDifference | None = None
@@ -213,8 +266,17 @@ class ComparisonAnalysis:
     # Every strategy that ran, in execution order. The primary difference or
     # reason above is chosen from these; the rest show what else blocked.
     attempts: tuple[StrategyAttempt, ...] = ()
+    # Only on mismatches: a demonstrated difference. A mismatch without one
+    # is a candidate located by the verifier, not a refutation.
+    witness: RefutationWitness | None = None
+    # Differential execution that found no witness (mismatch/inconclusive).
+    execution: ExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
+        if self.witness is not None and self.status != ComparisonStatus.MISMATCH:
+            raise ValueError("Only mismatch results carry a witness")
+        if self.execution is not None and self.is_effective:
+            raise ValueError("Proven results do not carry execution evidence")
         normalized = normalize_effective_reasons(self.effective_reasons)
         object.__setattr__(self, "effective_reasons", normalized)
         if self.status != ComparisonStatus.EFFECTIVE and normalized:
@@ -237,6 +299,39 @@ class ComparisonAnalysis:
             raise ValueError("Only inconclusive results carry an analysis location")
         if self.is_effective and self.attempts:
             raise ValueError("Proven results do not carry failed attempts")
+
+    @property
+    def is_refuted(self) -> bool:
+        return self.witness is not None
+
+    def with_witness(self, witness: RefutationWitness) -> "ComparisonAnalysis":
+        """Attach a witness; an inconclusive result becomes a mismatch."""
+        if self.status == ComparisonStatus.MISMATCH:
+            return replace(self, witness=witness)
+        if self.status != ComparisonStatus.INCONCLUSIVE:
+            raise ValueError("Proven results cannot be refuted")
+        facts: dict[str, FactValue] = {"location": witness.location}
+        difference = ComparisonDifference(
+            WITNESS_KINDS[witness.kind],
+            DifferenceSide(
+                None,
+                witness.orig_address,
+                {**facts, "value": witness.orig_value},
+                "orig",
+            ),
+            DifferenceSide(
+                None,
+                witness.recomp_address,
+                {**facts, "value": witness.recomp_value},
+                "recomp",
+            ),
+        )
+        return ComparisonAnalysis(
+            ComparisonStatus.MISMATCH,
+            difference=difference,
+            attempts=self.attempts,
+            witness=witness,
+        )
 
     @property
     def is_effective(self) -> bool:
@@ -305,11 +400,14 @@ class AnalysisRecorder:
         recomp_facts: dict[str, FactValue],
         *,
         candidate: bool = False,
+        values: tuple | None = None,
     ) -> None:
+        # pylint: disable=too-many-arguments
         difference = ComparisonDifference(
             kind,
             self.side("orig", orig_index, orig_facts),
             self.side("recomp", recomp_index, recomp_facts),
+            values,
         )
         if candidate:
             if self.candidate_difference is None:

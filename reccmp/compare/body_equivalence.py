@@ -4,6 +4,7 @@ COMDAT aliases, stale jmp islands and uniquely discoverable pairs."""
 import re
 
 from reccmp.compare.asm.const import JUMP_MNEMONICS
+from reccmp.compare.asm.decode import decode_one, direct_branch_target
 from reccmp.compare.asm.instgen import InstructGen, SectionType
 from reccmp.compare.asm.ir import local_destination_keys
 from reccmp.compare.comparator_state import ComparatorState
@@ -30,6 +31,40 @@ def _code_instructions(
             return None
         instructions.extend(section.contents)
     return instructions
+
+
+def _code_shape(raw: bytes, start: int) -> tuple | None:
+    """The instructions of ``raw`` at ``start``, with direct branches inside
+    the body as offsets and every other operand as spelled; None when it
+    does not decode exactly."""
+    shape: list[tuple] = []
+    offset = 0
+    while offset < len(raw):
+        insn = decode_one(raw[offset : offset + 16], start + offset)
+        if insn is None:
+            return None
+        target = direct_branch_target(insn)
+        if target is None:
+            shape.append((insn.mnemonic, insn.op_str))
+        elif start <= target < start + len(raw):
+            shape.append((insn.mnemonic, "local", target - start))
+        else:
+            shape.append((insn.mnemonic, "far", target))
+        offset += insn.size
+    return tuple(shape) if offset == len(raw) else None
+
+
+def _identical_code(image, first: int, second: int, size: int) -> bool:
+    """Two bodies in one image that run the same instructions: calling
+    either behaves identically. Anything that differs, including the
+    address of a jump table either one indexes, keeps them apart."""
+    try:
+        a = bytes(image.read(first, size))
+        b = bytes(image.read(second, size))
+    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+        return False
+    shape = _code_shape(a, first)
+    return shape is not None and shape == _code_shape(b, second)
 
 
 def _is_bare_jmp_island(raw: bytes) -> bool:
@@ -294,12 +329,8 @@ class BodyEquivalenceMixin(ComparatorState):
             # Alias identities can themselves unlock mutually unique callers,
             # so interleave symmetric classification with pair discovery.
             matches = list(self.db.get_functions())
-            orig_added = self._classify_function_aliases(
-                ImageId.ORIG, ImageId.RECOMP, matches
-            )
-            recomp_added = self._classify_function_aliases(
-                ImageId.RECOMP, ImageId.ORIG, matches
-            )
+            orig_added = self._classify_function_aliases(ImageId.ORIG, matches)
+            recomp_added = self._classify_function_aliases(ImageId.RECOMP, matches)
             if not orig_added and not recomp_added:
                 break
             self.rebuild_lookups()
@@ -430,26 +461,29 @@ class BodyEquivalenceMixin(ComparatorState):
             memo[cache_key] = fingerprint
         return fingerprint
 
+    def recomp_code_identical(self, first: int, second: int, size: int) -> bool:
+        return _identical_code(self.recomp_bin, first, second, size)
+
     def _classify_function_aliases(
-        self, image_id: ImageId, opposite_id: ImageId, matches: list[ReccmpMatch]
+        self, image_id: ImageId, matches: list[ReccmpMatch]
     ) -> bool:
         """Classify one image's remaining bodies against canonical pairs."""
         added = False
         canonical_groups: dict[
             tuple[int, tuple[tuple[str, str], ...]], list[ReccmpMatch]
         ] = {}
+        # Every duplicate is proven against the pair's recompiled body, whose
+        # extent the PDB states: an original duplicate across the images, a
+        # recompiled one within the recompiled image (retail ICF folded
+        # PLLength into ILLength; recomp PLLength is ILLength's code).
         for canonical in matches:
-            opposite_addr = canonical.addr(opposite_id)
-            # An original entity from symbol data often has no size; the pair
-            # is compared over the recompiled extent, so its bodies are too.
-            opposite_size = canonical.size(opposite_id) or canonical.size(image_id)
-            if opposite_addr is None or opposite_size is None or opposite_size <= 0:
+            body_addr = canonical.recomp_addr
+            body_size = canonical.size(ImageId.RECOMP)
+            if body_addr is None or body_size is None or body_size <= 0:
                 continue
-            fingerprint = self._alias_fingerprint(
-                opposite_id, opposite_addr, opposite_size
-            )
+            fingerprint = self._alias_fingerprint(ImageId.RECOMP, body_addr, body_size)
             if fingerprint is not None:
-                canonical_groups.setdefault((opposite_size, fingerprint), []).append(
+                canonical_groups.setdefault((body_size, fingerprint), []).append(
                     canonical
                 )
 
@@ -458,11 +492,14 @@ class BodyEquivalenceMixin(ComparatorState):
             for addr in addrs:
                 identities: set[int] = set()
                 for canonical in canonical_groups.get((size, fingerprint), []):
-                    opposite_addr = canonical.addr(opposite_id)
-                    assert opposite_addr is not None
-                    orig_addr = addr if image_id == ImageId.ORIG else opposite_addr
-                    recomp_addr = opposite_addr if image_id == ImageId.ORIG else addr
-                    if self.raw_pair_alias_equivalent(orig_addr, recomp_addr, size):
+                    body_addr = canonical.recomp_addr
+                    assert body_addr is not None
+                    proved = (
+                        self.raw_pair_alias_equivalent(addr, body_addr, size)
+                        if image_id == ImageId.ORIG
+                        else self.recomp_code_identical(addr, body_addr, size)
+                    )
+                    if proved:
                         identities.add(canonical.orig_addr)
                 if len(identities) == 1:
                     added |= self.db.set_alias(image_id, addr, identities.pop())
