@@ -82,6 +82,8 @@ class MarkerAnchor:
     column: int
     candidates: tuple[AnchorCandidate, ...] = ()
     string: MarkerString | None = None
+    # The first empty line between the marker block and this code, if any.
+    blank_line: int | None = None
 
     def of_kind(self, kind: str) -> list[AnchorCandidate]:
         return [item for item in self.candidates if item.kind == kind]
@@ -114,6 +116,7 @@ class MarkerBlock:
                 self.anchor.column,
                 tuple(candidates),
                 self.anchor.string or other.anchor.string,
+                self.anchor.blank_line,
             ),
         )
 
@@ -140,6 +143,7 @@ class MarkerBlock:
                             int(anchor["string"]["char_width"]),
                         )
                     ),
+                    blank_line=anchor.get("blank_line"),
                 )
             ),
         )
@@ -159,6 +163,7 @@ class MarkerBlock:
                         "char_width": self.anchor.string.char_width,
                     }
                 ),
+                "blank_line": self.anchor.blank_line,
             }
         return {
             "source_file": self.source_file,
@@ -321,7 +326,7 @@ class _FileReader:
             pending.markers[marker.key] = marker
             pending.last_line = comment.line
         if pending.markers:
-            self._complete_by_anchor(pending, block.anchor, block.comments[-1].line)
+            self._complete_by_anchor(pending, block.anchor)
 
     # -- completion by a name comment ---------------------------------------
 
@@ -354,11 +359,11 @@ class _FileReader:
     # -- completion by the declaration that follows --------------------------
 
     def _complete_by_anchor(
-        self, pending: _Pending, anchor: MarkerAnchor | None, block_end: int
+        self, pending: _Pending, anchor: MarkerAnchor | None
     ) -> None:
         line = anchor.line if anchor is not None else pending.last_line
-        if anchor is not None and anchor.line > block_end + 1:
-            self.alert(AlertCode.UNEXPECTED_BLANK_LINE, block_end + 1)
+        if anchor is not None and anchor.blank_line is not None:
+            self.alert(AlertCode.UNEXPECTED_BLANK_LINE, anchor.blank_line)
         for marker in pending.markers.values():
             if marker.type in _NAMEREF_TYPES:
                 self.alert(AlertCode.BAD_NAMEREF, pending.last_line)

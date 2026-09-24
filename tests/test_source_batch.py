@@ -79,6 +79,15 @@ void Lines() {
   // LINE: TEST 0x6000
   Exported();
 }
+// GLOBAL: TEST 0x3020
+/* a block comment and a pragma are not blank lines */
+#pragma bss_seg(".data")
+int g_pragma = 0;
+#pragma bss_seg()
+
+// GLOBAL: TEST 0x3030
+
+int g_spaced = 0;
 """
 
 _MARKED_HEADER = """\
@@ -194,6 +203,11 @@ def test_markers_come_from_the_compiler(tmp_path: Path) -> None:
         for alert in alerts
         if alert.code == AlertCode.MARKER_NOT_COMPILED
     ) == [("orphan.h", 1), ("widget.cpp", 35)]
+    assert [
+        (alert.path.name, alert.line_number)
+        for alert in alerts
+        if alert.code == AlertCode.UNEXPECTED_BLANK_LINE
+    ] == [("widget.cpp", 50)]
 
 
 def _write(index: SourceIndex, directory: Path) -> Path:

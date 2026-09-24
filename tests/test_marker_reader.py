@@ -33,16 +33,25 @@ def _block(
     *comments: str,
     first_line: int = 1,
     gap: int = 0,
+    blank: bool = True,
     candidates: tuple[AnchorCandidate, ...] = (),
     string: MarkerString | None = None,
     anchored: bool = True,
 ) -> MarkerBlock:
+    """``gap`` lines separate the block from its code; ``blank`` says
+    whether the first of them is empty (else a block comment or pragma)."""
     lines = tuple(
         MarkerComment(text, first_line + index, 1, (first_line + index) * 100)
         for index, text in enumerate(comments)
     )
     anchor = (
-        MarkerAnchor(first_line + len(comments) + gap, 1, candidates, string)
+        MarkerAnchor(
+            first_line + len(comments) + gap,
+            1,
+            candidates,
+            string,
+            first_line + len(comments) if gap and blank else None,
+        )
         if anchored
         else None
     )
@@ -150,6 +159,17 @@ def test_blank_line_before_the_declaration_warns():
     )
     assert len(symbols) == 1
     assert alerts == [(AlertCode.UNEXPECTED_BLANK_LINE, 2)]
+
+
+def test_comments_and_pragmas_before_the_declaration_are_not_blank_lines():
+    # // GLOBAL: ...  then  #pragma bss_seg(".data")  then the definition
+    symbols, alerts = _read(
+        _block(
+            "// FUNCTION: TEST 0x1000", gap=2, blank=False, candidates=(_function(),)
+        )
+    )
+    assert len(symbols) == 1
+    assert not alerts
 
 
 def test_function_named_by_a_comment_is_looked_up_by_name():
