@@ -382,8 +382,6 @@ def test_marker_blocks_and_source_digests_survive_a_round_trip(tmp_path: Path) -
     other = tmp_path / "b.cpp"
     other.write_text("", encoding="utf-8")
     assert revived.stale_sources([source, other]) == [source, other]
-    with pytest.raises(SourceIndexError, match="schema"):
-        SourceIndex.from_dict({**index.to_dict(), "schema": "reccmp-source-index-v6"})
 
 
 def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None:

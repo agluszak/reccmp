@@ -32,7 +32,6 @@ from reccmp.parser.reader import MarkerBlock, local_paths, read_marker_blocks
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 _VARIABLE_RANK = {"declaration": 0, "tentative": 1, "definition": 2}
-_SCHEMA = "reccmp-source-index-v8"
 
 
 class SourceIndexError(ValueError):
@@ -1219,7 +1218,7 @@ class SourceIndex:
         """Return a view restricted to one link-namespace / reccmp target."""
         abi = self.target_abis.get(target)
         if abi is None and self.abi is not None:
-            # Single-ABI indexes (and legacy JSON) may only carry ``abi``.
+            # An index built directly (not per target) may only carry ``abi``.
             targets_present = {
                 item.target for item in self.classes if item.target is not None
             }
@@ -1532,12 +1531,9 @@ class SourceIndex:
 
     @classmethod
     def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
-        """Read the public JSON projection back into its canonical records."""
-        if document.get("schema") != _SCHEMA:
-            raise SourceIndexError(
-                f"source index schema {document.get('schema')!r} is not {_SCHEMA!r}; "
-                "collect the index again"
-            )
+        """Read the public JSON projection back into its canonical records.
+        A document of another shape raises (usually KeyError); collect the
+        index again."""
         declarations = tuple(
             _declaration_from_dict(item) for item in document["declarations"]
         )
@@ -1545,15 +1541,8 @@ class SourceIndex:
         markers: list[SourceMarker] = []
         for item in document["markers"]:
             values = dict(item)
-            if "declaration_key" in values:
-                key = values.pop("declaration_key")
-                values.pop("declaration", None)
-                declaration = by_key.get(tuple(key)) if key else None
-            elif values.get("declaration"):
-                declaration = _declaration_from_dict(values.pop("declaration"))
-            else:
-                values.pop("declaration", None)
-                declaration = None
+            key = values.pop("declaration_key")
+            declaration = by_key[tuple(key)] if key else None
             markers.append(SourceMarker(**values, declaration=declaration))
         return cls(
             declarations=declarations,
@@ -1564,15 +1553,10 @@ class SourceIndex:
                 _member_use_from_dict(item) for item in document["member_uses"]
             ),
             conflicts=(_conflict_from_dict(item) for item in document["conflicts"]),
-            abi=(
-                SourceAbi(**document["abi"])
-                if isinstance(document.get("abi"), Mapping)
-                else None
-            ),
+            abi=SourceAbi(**document["abi"]) if document["abi"] is not None else None,
             target_abis={
-                str(target): SourceAbi(**values)
-                for target, values in (document.get("target_abis") or {}).items()
-                if isinstance(values, Mapping)
+                target: SourceAbi(**values)
+                for target, values in document["target_abis"].items()
             },
             marker_blocks=(
                 MarkerBlock.from_dict(item) for item in document["marker_blocks"]
@@ -1642,8 +1626,7 @@ class SourceIndex:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        document: dict[str, Any] = {
-            "schema": _SCHEMA,
+        return {
             "markers": [_marker_projection(item) for item in self.markers],
             "declarations": [_plain(item) for item in self.declarations],
             "classes": [_plain(item) for item in self.classes],
@@ -1655,14 +1638,11 @@ class SourceIndex:
             "unit_dependencies": {
                 unit: list(paths) for unit, paths in self.unit_dependencies.items()
             },
-        }
-        if self.abi is not None:
-            document["abi"] = _plain(self.abi)
-        if self.target_abis:
-            document["target_abis"] = {
+            "abi": _plain(self.abi),
+            "target_abis": {
                 target: _plain(abi) for target, abi in sorted(self.target_abis.items())
-            }
-        return document
+            },
+        }
 
     @classmethod
     def read(cls, path: Path) -> "SourceIndex":
