@@ -280,6 +280,12 @@ def _compare(
         else:
             v_o, v_r = ("abs", t_o.eax & mask), ("abs", t_r.eax & mask)
         if UNRESOLVED not in (v_o, v_r) and v_o != v_r:
+            differing = t_o.eax ^ t_r.eax
+            if mask != 0xFF and v_o[0] == v_r[0] == "abs" and not differing & 0xFF:
+                # Only the bits above al differ. The return width comes from
+                # the reconstruction's declaration; retail may return a bool
+                # in al with garbage above it.
+                return None, "return_upper_bits"
             return Witness(seed, "return_value", "eax", _fmt(v_o), _fmt(v_r)), None
     if return_kind == "i64" and (t_o.eax, t_o.edx) != (t_r.eax, t_r.edx):
         return (

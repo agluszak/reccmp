@@ -236,3 +236,13 @@ def test_store_before_a_tail_call_is_not_settled():
     )
     assert result.witness is None
     assert result.agreeing_seeds > 0
+
+
+def test_return_differing_only_above_al_is_not_a_witness():
+    """Retail may return a bool in al; the declared width is the reconstruction's."""
+    result = _search(
+        bytes.fromhex("b800530000") + RET,  # mov eax, 0x5300
+        bytes.fromhex("31c0") + RET,  # xor eax, eax
+    )
+    assert result.witness is None
+    assert result.skipped.get("return_upper_bits")
