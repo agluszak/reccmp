@@ -1460,13 +1460,16 @@ class SourceIndex:
         units: Sequence[TranslationUnitRecords],
         targets: Mapping[str, set[str] | None],
         *,
+        target_files: Mapping[str, set[str]] | None = None,
         aliases: ProjectAliases | None = None,
         source_digests: Mapping[str, str] | None = None,
         repository: Path | None = None,
     ) -> "SourceIndex":
         """Derive every target's link namespace from TU observations in one
         pass, then join markers. ``targets`` maps each target to the units
-        compiled into it (None: all of them).
+        compiled into it (None: all of them). ``target_files`` gives each
+        target's source files: its markers are read only from those, as a
+        target's markers always have been (None: from every file).
 
         Marker blocks come from every unit and are merged once: a header's
         markers for one target may only be compiled by another target's
@@ -1483,8 +1486,16 @@ class SourceIndex:
         abis: dict[str, SourceAbi] = {}
         for target, unit_ids in targets.items():
             namespace = derive_namespace(units, target=target, unit_ids=unit_ids)
+            files = target_files.get(target) if target_files is not None else None
             target_classes, target_markers = _join_markers(
-                target, namespace, blocks, aliases=aliases
+                target,
+                namespace,
+                (
+                    blocks
+                    if files is None
+                    else [block for block in blocks if block.source_file in files]
+                ),
+                aliases=aliases,
             )
             declarations.extend(namespace.declarations)
             classes.extend(target_classes)
