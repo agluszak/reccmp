@@ -28,6 +28,7 @@ from reccmp.compare.asm.verifier.state import (
     ZERO_FLAGS,
     Context,
     SideState,
+    register_arguments,
     X87Stack,
     commutative_result,
     memory_load_tag,
@@ -463,10 +464,11 @@ def execute(
         # (fastcall). When per-callsite convention data from the PDB is
         # available and says a register is unused, its (dead) value need
         # not match; otherwise it must match exactly.
-        abi = None
-        if ctx.metadata is not None and ctx.metadata.call_abi is not None:
+        facts = None
+        if ctx.metadata is not None and ctx.metadata.call_facts is not None:
             if ops[0][0] == "sym":
-                abi = ctx.metadata.call_abi(operand_display(ops[0][1]))
+                facts = ctx.metadata.call_facts(operand_display(ops[0][1]))
+        ecx_argument, edx_argument = register_arguments(facts)
         target = read_operand(state, ctx, ops[0])
         virtual_target = _canonical_virtual_target(target, ctx)
         entry = ["call", virtual_target or target]
@@ -476,12 +478,12 @@ def execute(
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
             entry.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
-            if abi is not None and abi.uses_edx:
+            if facts is not None and facts.uses_edx:
                 entry.append(state.read_reg("edx"))
         else:
-            if abi is None or abi.uses_ecx:
+            if ecx_argument:
                 entry.append(state.read_reg("ecx"))
-            if abi is None or abi.uses_edx:
+            if edx_argument:
                 entry.append(state.read_reg("edx"))
         obs.append(tuple(entry))
         incoming_esp = state.read_reg("esp")

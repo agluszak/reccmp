@@ -8,10 +8,8 @@ from typing import Callable, Iterator
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
-from reccmp.compare.asm.verifier import (
-    CallAbi,
-    FunctionMetadata,
-)
+from reccmp.compare.asm.verifier import FunctionMetadata
+from reccmp.compare.call_facts import CallFacts
 from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.parse import assert_fixup
 from reccmp.compare.asm.instgen import (
@@ -175,7 +173,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     witness_search: bool = False
 
     def __post_init__(self):
-        self._call_abi_cache: dict[str, CallAbi | None] | None = None
+        self._call_facts_cache: dict[str, CallFacts | None] | None = None
         self._fp_cache: dict[
             tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
         ] = {}
@@ -398,7 +396,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         if orig_image.extent_closed and recomp_image.extent_closed:
             # Emulation needs the real extents: with an open one it may run
             # a different stretch of code than the comparison looked at.
-            analysis = self._refute(match, analysis, orig_size, recomp_size)
+            analysis = self._refute(match, analysis, orig_image, recomp_image)
         if analysis is not result.analysis:
             result = dataclasses.replace(result, analysis=analysis)
         return result

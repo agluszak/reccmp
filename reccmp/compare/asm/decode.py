@@ -62,11 +62,6 @@ def decode_one(code: bytes, address: int, is_32: bool = True) -> CsInsn | None:
     return next(get_detail_disassembler(is_32).disasm(code, address, 1), None)
 
 
-def transfers_control(insn: CsInsn) -> bool:
-    """Call, jump (including ``loop``/``jecxz``) or return."""
-    return any(insn.group(group) for group in (CS_GRP_CALL, CS_GRP_JUMP, CS_GRP_RET))
-
-
 def direct_branch_target(insn: CsInsn) -> int | None:
     """Destination of a relative ``call``/``jmp``/``jcc``, else None."""
     operands = insn.operands

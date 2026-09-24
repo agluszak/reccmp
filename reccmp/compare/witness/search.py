@@ -2,10 +2,12 @@
 
 A witness is a seed whose run shows a different observable effect on the
 two sides: a different final value in some non-stack memory location, a
-different argument to the same call, a different return value, or a
+different argument (on the stack, or in ecx/edx when the callee's call
+facts say it reads them) to the same call, a different return value, or a
 different stack cleanup. It is reported only when both runs made the same
 sequence of calls (by paired identity) up to that point, so callee
-behaviour is modelled identically on both sides.
+behaviour is modelled identically on both sides, and only while every
+callee's stack cleanup came from evidence rather than a guess.
 
 A witness refutes equivalence under the model described in ``machine``:
 callees return seeded values and do not touch memory, reads never fault,
@@ -15,9 +17,11 @@ and the input may not be reachable from the program's real callers.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Hashable
 from dataclasses import dataclass, field
+from typing import Callable
 
+from reccmp.compare.asm.ir import FunctionImage
+from reccmp.compare.call_facts import CallFacts
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import RefutationWitness as Witness
 from reccmp.types import ImageId
@@ -27,13 +31,14 @@ from .machine import (
     NEAR_IMAGE,
     SEH_CHAIN,
     STACK_TOP,
+    AccessSpan,
+    CallEvent,
     RunInput,
     SideMachine,
     Trace,
-    model_dword,
 )
 
-Identity = Hashable
+Identity = tuple
 UNRESOLVED = ("unresolved",)
 STACK = ("stack",)
 
@@ -43,9 +48,18 @@ _RETURN_MASKS = {"i8": 0xFF, "i16": 0xFFFF, "i32": 0xFFFFFFFF}
 class Translator:
     """Map side addresses to identities that are equal across the sides."""
 
-    def __init__(self, db: EntityDb, orig: SideMachine, recomp: SideMachine):
+    def __init__(
+        self,
+        db: EntityDb,
+        orig: SideMachine,
+        recomp: SideMachine,
+        call_facts: Callable[[Identity], CallFacts | None] | None = None,
+    ):
+        """``call_facts`` gives what is known about calling a paired callee
+        (``("entity", ...)`` or ``("import", key)`` identity)."""
         self.db = db
         self.machines = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
+        self.call_facts = call_facts or (lambda _identity: None)
 
     def identity(self, side: ImageId, addr: int) -> Identity:
         # pylint: disable=too-many-return-statements
@@ -69,6 +83,26 @@ class Translator:
             # function comes from arithmetic or an over-estimated extent.
             return UNRESOLVED
         return ("entity", canonical, addr - base)
+
+    def identity_span(self, side: ImageId, span: AccessSpan) -> Identity:
+        """Identity of an access, when all its bytes belong to one object
+        (or all lie outside the image): the identity of its first byte."""
+        first = self.identity(side, span.address)
+        if span.size <= 1:
+            return first
+        last = self.identity(side, span.last)
+        if first == STACK and last == STACK:
+            return STACK
+        if first[0] == "abs" and last[0] == "abs":
+            return first
+        if (
+            first[0] == "entity"
+            and last[0] == "entity"
+            and first[1] == last[1]
+            and last[2] - first[2] == span.last - span.address
+        ):
+            return first
+        return UNRESOLVED
 
     def address(self, side: ImageId, ident: Identity) -> int | None:
         """Inverse of ``identity`` for memory locations."""
@@ -141,6 +175,42 @@ def _fmt(ident: Identity) -> str:
     return str(ident)
 
 
+def _argument_witness(
+    translator: Translator,
+    index: int,
+    call_o: CallEvent,
+    call_r: CallEvent,
+    target: Identity,
+    *,
+    seed: int,
+) -> Witness | None:
+    """A difference in what the index-th call receives: its stack arguments,
+    and ecx/edx when the callee's facts say it reads them."""
+    orig, recomp = ImageId.ORIG, ImageId.RECOMP
+    facts = translator.call_facts(target)
+    arguments = [
+        (f"argument {arg}", a_o, a_r)
+        for arg, (a_o, a_r) in enumerate(zip(call_o.stack_args, call_r.stack_args))
+    ]
+    if facts is not None and facts.uses_ecx:
+        arguments.append(("ecx", call_o.ecx, call_r.ecx))
+    if facts is not None and facts.uses_edx:
+        arguments.append(("edx", call_o.edx, call_r.edx))
+    for name, a_o, a_r in arguments:
+        v_o, v_r = translator.value(orig, a_o), translator.value(recomp, a_r)
+        if UNRESOLVED not in (v_o, v_r) and v_o != v_r:
+            return Witness(
+                seed,
+                "call_argument",
+                f"call #{index} {name}",
+                _fmt(v_o),
+                _fmt(v_r),
+                call_o.call_site,
+                call_r.call_site,
+            )
+    return None
+
+
 def _compare(
     t_o: Trace,
     t_r: Trace,
@@ -156,11 +226,12 @@ def _compare(
     orig, recomp = ImageId.ORIG, ImageId.RECOMP
     for side, trace in ((orig, t_o), (recomp, t_r)):
         machine = translator.machines[side]
-        for addr in trace.image_reads:
-            if addr in machine.import_slots:
+        for span in trace.image_reads:
+            if machine.in_import_slot(span):
                 continue
-            if translator.identity(side, addr) == UNRESOLVED:
+            if translator.identity_span(side, span) == UNRESOLVED:
                 return None, "unknown_image_read"
+    targets: list[Identity] = []
     for call_o, call_r in zip(t_o.calls, t_r.calls):
         target_o = translator.call_target(orig, call_o.target, call_o.target_slot)
         target_r = translator.call_target(recomp, call_r.target, call_r.target_slot)
@@ -171,6 +242,7 @@ def _compare(
             return None, "unresolved_call"
         if target_o != target_r:
             return None, "call_structure"
+        targets.append(target_o)
     if len(t_o.calls) != len(t_r.calls) and "truncated" not in ends:
         return None, "call_structure"
     if t_o.end != t_r.end:
@@ -179,32 +251,26 @@ def _compare(
         return None, "call_structure"
 
     for index, (call_o, call_r) in enumerate(zip(t_o.calls, t_r.calls)):
+        if call_o.assumed_cleanup or call_r.assumed_cleanup:
+            # The guessed cleanup may be wrong: the pushes it counted may not
+            # be arguments, and esp (with everything read through it) may be
+            # off from here on. Nothing after this point is evidence.
+            return None, "assumed_call_cleanup"
         if len(call_o.stack_args) != len(call_r.stack_args):
             return None, "call_arity"
-        for arg, (a_o, a_r) in enumerate(zip(call_o.stack_args, call_r.stack_args)):
-            v_o, v_r = translator.value(orig, a_o), translator.value(recomp, a_r)
-            if UNRESOLVED in (v_o, v_r):
-                continue
-            if v_o != v_r:
-                return (
-                    Witness(
-                        seed,
-                        "call_argument",
-                        f"call #{index} argument {arg}",
-                        _fmt(v_o),
-                        _fmt(v_r),
-                        call_o.call_site,
-                        call_r.call_site,
-                    ),
-                    None,
-                )
+        witness = _argument_witness(
+            translator, index, call_o, call_r, targets[index], seed=seed
+        )
+        if witness is not None:
+            return witness, None
 
     locations: dict[Identity, int] = {}
     for side, trace in ((orig, t_o), (recomp, t_r)):
         for addr, size in trace.writes.items():
-            if addr in SEH_CHAIN:
+            span = AccessSpan(addr, size)
+            if span.within(SEH_CHAIN):
                 continue
-            ident = translator.identity(side, addr)
+            ident = translator.identity_span(side, span)
             if ident in (UNRESOLVED, STACK):
                 continue
             locations[ident] = max(size, locations.get(ident, 0))
@@ -289,10 +355,26 @@ def _compare(
     return None, None
 
 
+def _excerpt_constants(image: FunctionImage, machine: SideMachine) -> set[int]:
+    """Immediates of the canonical decode that are not addresses. Branch
+    targets and ``ret N`` are not data; table rows are not instructions."""
+    return {
+        value & 0xFFFFFFFF
+        for row in image.excerpt
+        if row.is_code and not (row.is_call or row.is_jump or row.is_ret)
+        for operand in row.operands
+        if isinstance(operand, tuple)
+        and len(operand) == 2
+        and operand[0] == "imm"
+        and isinstance(value := operand[1], int)
+        and value & 0xFFFFFFFF not in machine.image_range
+    }
+
+
 def find_witness(
     translator: Translator,
-    orig_range: range,
-    recomp_range: range,
+    orig_image: FunctionImage,
+    recomp_image: FunctionImage,
     *,
     return_kind: str = "unknown",
     seeds: int = 8,
@@ -301,8 +383,12 @@ def find_witness(
     result = SearchResult()
     orig = translator.machines[ImageId.ORIG]
     recomp = translator.machines[ImageId.RECOMP]
+    orig_range = range(orig_image.start_addr, orig_image.start_addr + orig_image.extent)
+    recomp_range = range(
+        recomp_image.start_addr, recomp_image.start_addr + recomp_image.extent
+    )
     constants = sorted(
-        orig.code_constants(orig_range) | recomp.code_constants(recomp_range)
+        _excerpt_constants(orig_image, orig) | _excerpt_constants(recomp_image, recomp)
     )
     # Plain seeds first, then one seed focused on each code constant, so a
     # comparison against it is exercised on both sides of the boundary.
@@ -313,17 +399,8 @@ def find_witness(
     ]
     for seed, seed_pool in plans:
         run_input = RunInput.from_seed(seed, seed_pool)
-
-        def call_result(
-            index: int, seed: int = seed, seed_pool: tuple[int, ...] = seed_pool
-        ) -> tuple[int, int]:
-            return (
-                model_dword(seed, 3, index, pool=seed_pool),
-                model_dword(seed, 4, index, pool=seed_pool),
-            )
-
-        t_o = orig.run(orig_range, run_input, call_result)
-        t_r = recomp.run(recomp_range, run_input, call_result)
+        t_o = orig.run(orig_range, run_input)
+        t_r = recomp.run(recomp_range, run_input)
         witness, reason = _compare(t_o, t_r, translator, return_kind, seed)
         result.runs += 1
         if witness is not None:

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from reccmp.compare.asm.parse import ParseAsm
-    from reccmp.compare.asm.verifier import CallAbi
+    from reccmp.compare.call_facts import CallFacts
     from reccmp.compare.db import EntityDb
     from reccmp.compare.inlines import HelperCatalogEntry
     from reccmp.compare.lines import LinesDb
@@ -33,7 +33,7 @@ class ComparatorState:
     is_32bit: bool
     orig_sanitize: ParseAsm
     recomp_sanitize: ParseAsm
-    _call_abi_cache: dict[str, CallAbi | None] | None
+    _call_facts_cache: dict[str, CallFacts | None] | None
     _fp_cache: dict
     _helper_catalog: list[HelperCatalogEntry] | None
     _helper_by_orig: dict[int, HelperCatalogEntry | None]

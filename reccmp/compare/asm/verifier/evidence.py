@@ -14,6 +14,7 @@ from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     JCC_MNEMONICS,
     Context,
+    register_arguments,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
 
@@ -144,16 +145,16 @@ def _target_index(
 
 
 def _checked_call_registers(ctx: Context, ins: Instruction) -> list[str]:
-    abi = None
-    if ctx.metadata is not None and ctx.metadata.call_abi is not None:
+    facts = None
+    if ctx.metadata is not None and ctx.metadata.call_facts is not None:
         if ins.operands and ins.operands[0][0] == "sym":
-            abi = ctx.metadata.call_abi(operand_display(ins.operands[0][1]))
-    registers = []
-    if abi is None or abi.uses_ecx:
-        registers.append("ecx")
-    if abi is None or abi.uses_edx:
-        registers.append("edx")
-    return registers
+            facts = ctx.metadata.call_facts(operand_display(ins.operands[0][1]))
+    ecx_argument, edx_argument = register_arguments(facts)
+    return [
+        register
+        for register, used in (("ecx", ecx_argument), ("edx", edx_argument))
+        if used
+    ]
 
 
 def record_operand_candidate(

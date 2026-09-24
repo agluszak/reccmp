@@ -22,26 +22,19 @@ import functools
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Mapping
 
-from capstone import CS_GRP_CALL, CsInsn  # type: ignore[import-untyped]
+from capstone import CS_GRP_CALL, CsError, CsInsn  # type: ignore[import-untyped]
 from capstone.x86 import (  # type: ignore
     X86_INS_ADD,
-    X86_INS_CALL,
     X86_INS_CPUID,
     X86_INS_ENTER,
     X86_INS_IN,
     X86_INS_INSB,
     X86_INS_JMP,
-    X86_INS_LEAVE,
     X86_INS_OUT,
     X86_INS_OUTSB,
-    X86_INS_POP,
-    X86_INS_POPAL,
-    X86_INS_POPFD,
     X86_INS_PUSH,
-    X86_INS_PUSHAL,
-    X86_INS_PUSHFD,
     X86_INS_RDRAND,
     X86_INS_RDSEED,
     X86_INS_RDTSC,
@@ -50,6 +43,7 @@ from capstone.x86 import (  # type: ignore
     X86_OP_IMM,
     X86_OP_MEM,
     X86_OP_REG,
+    X86_REG_BP,
     X86_REG_EAX,
     X86_REG_EBP,
     X86_REG_EBX,
@@ -58,6 +52,7 @@ from capstone.x86 import (  # type: ignore
     X86_REG_EDX,
     X86_REG_ESI,
     X86_REG_ESP,
+    X86_REG_SP,
 )
 from unicorn import (  # type: ignore[import-untyped]
     UC_ARCH_X86,
@@ -83,11 +78,8 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
     UC_X86_REG_ESP,
 )
 
-from reccmp.compare.asm.decode import (
-    decode_one,
-    direct_branch_target,
-    transfers_control,
-)
+from reccmp.compare.asm.decode import decode_one, direct_branch_target
+from reccmp.compare.call_facts import CallFacts
 from reccmp.formats import Image
 from reccmp.formats.image import ImageSectionFlags
 
@@ -102,10 +94,11 @@ HEAP_BASE = 0x20000000
 HEAP_OBJECTS = 256
 OBJECT_STRIDE = 0x10000
 OBJECT_SIZE = 0x4000
-# Imports are bound to addresses derived from their names, so the same
-# import has the same address in both binaries.
+# Imports are bound to addresses from one registry shared by both machines,
+# so the same import has the same address in both binaries.
 IMPORT_BASE = 0x60000000
 IMPORT_SPAN = 0x01000000
+IMPORT_STRIDE = 0x10
 STACK_ARG_DWORDS = 16
 INSTRUCTION_LIMIT = 200_000
 # Bounds for one run; exceeding either ends it without a verdict.
@@ -133,19 +126,33 @@ def _prng(seed: int, *key: int) -> int:
     return int.from_bytes(digest, "little")
 
 
-def import_address(module: str, name: str) -> int:
-    digest = hashlib.blake2b(f"{module.lower()}!{name}".encode(), digest_size=4)
-    return IMPORT_BASE + (
-        int.from_bytes(digest.digest(), "little") % IMPORT_SPAN & ~0xF
-    )
+def import_key(module: str, name: str) -> str:
+    """One import's identity: module names are case-insensitive."""
+    return f"{module.lower()}!{name}"
 
 
-def model_dword(seed: int, *key: int, pool: tuple[int, ...] = ()) -> int:
-    """An input value: small integers, 16-bit values and pointers into the
-    heap, so loops terminate and dereferences land on shared memory. With a
-    pool (one constant of the compared code and its neighbours), half the
-    values come from it, so comparisons against it see both outcomes."""
-    r = _prng(seed, *key)
+def _image_imports(image: Image) -> list[tuple[str, int]]:
+    """(key, import table slot) of each import of an image."""
+    return [
+        (import_key(imp.module, imp.name or f"#{imp.ordinal}"), imp.addr)
+        for imp in getattr(image, "get_imports", lambda: ())()
+    ]
+
+
+def import_registry(*images: Image) -> dict[str, int]:
+    """A distinct modelled address for every import of the given images."""
+    keys = sorted({key for image in images for key, _ in _image_imports(image)})
+    if len(keys) * IMPORT_STRIDE > IMPORT_SPAN:
+        raise ValueError("too many imports for the modelled import region")
+    return {key: IMPORT_BASE + IMPORT_STRIDE * index for index, key in enumerate(keys)}
+
+
+def _model_value(r: int, pool: tuple[int, ...]) -> int:
+    """An input value from 32 random bits: small integers, 16-bit values and
+    pointers into the heap, so loops terminate and dereferences land on
+    shared memory. With a pool (one constant of the compared code and its
+    neighbours), half the values come from it, so comparisons against it see
+    both outcomes."""
     if pool and r >> 31:
         return pool[(r >> 8) % len(pool)]
     kind = r & 3
@@ -160,15 +167,55 @@ def model_dword(seed: int, *key: int, pool: tuple[int, ...] = ()) -> int:
     return (r >> 8) & 0xFFFF
 
 
+def model_dword(seed: int, *key: int, pool: tuple[int, ...] = ()) -> int:
+    return _model_value(_prng(seed, *key), pool)
+
+
+# Both machines ask for the same pages in turn; the second gets them free.
+@functools.lru_cache(maxsize=1024)
 def page_contents(seed: int, page: int, pool: tuple[int, ...] = ()) -> bytes:
     if page < LOW_PAGES:
         # Small integers used as pointers land here; like a null page it
         # reads as zeros, so further dereferences stay in shared memory.
         return bytes(PAGE)
+    words = hashlib.shake_128(struct.pack("<QQ", seed, page)).digest(PAGE)
     return struct.pack(
         f"<{PAGE // 4}I",
-        *(model_dword(seed, page, i, pool=pool) for i in range(PAGE // 4)),
+        *(_model_value(r, pool) for r in struct.unpack(f"<{PAGE // 4}I", words)),
     )
+
+
+def call_outputs(seed: int, index: int, pool: tuple[int, ...]) -> tuple[int, ...]:
+    """eax, ecx, edx and eflags after the index-th call. The callee may
+    clobber every caller-saved register and the flags; both sides see the
+    same values, so nothing the function does with them afterwards can
+    differ because of the model."""
+    eax, ecx, edx = (model_dword(seed, 3, index, reg, pool=pool) for reg in range(3))
+    # CF PF AF ZF SF OF from the seed; IF and the reserved bit set.
+    eflags = 0x202 | (_prng(seed, 4, index) & 0x8D5)
+    return eax, ecx, edx, eflags
+
+
+def pages_touched(addr: int, size: int) -> range:
+    """Every page an access of ``size`` bytes at ``addr`` touches."""
+    first = addr & ~(PAGE - 1)
+    last = (addr + max(size, 1) - 1) & ~(PAGE - 1)
+    return range(first, last + PAGE, PAGE)
+
+
+@dataclass(frozen=True)
+class AccessSpan:
+    """The bytes one memory access touched."""
+
+    address: int
+    size: int
+
+    @property
+    def last(self) -> int:
+        return self.address + max(self.size, 1) - 1
+
+    def within(self, region: range) -> bool:
+        return self.address in region and self.last in region
 
 
 @dataclass(frozen=True)
@@ -181,6 +228,9 @@ class CallEvent:
     ecx: int
     edx: int
     stack_args: tuple[int, ...]
+    # The callee's stack cleanup was guessed from the pushes before the
+    # call: esp, and everything computed from it, may be wrong afterwards.
+    assumed_cleanup: bool = False
 
 
 @dataclass
@@ -190,21 +240,19 @@ class Trace:
     # pylint: disable=too-many-instance-attributes
 
     # return, truncated, limit, fault, foreign_access, uninitialized_read,
-    # pointer_bytes_read, nondeterministic, bad_stack
+    # pointer_bytes_read, nondeterministic, bad_stack, code_write
     end: str
     calls: list[CallEvent] = field(default_factory=list)
-    # (address, size) of every store outside the stack.
+    # Widest store outside the stack at each address.
     writes: dict[int, int] = field(default_factory=dict)
-    # Calls whose stack cleanup was assumed from the pushes before them.
-    assumed_cleanup: int = 0
     # Instructions of the compared function that ran.
     executed: set[int] = field(default_factory=set)
     # For each byte outside the stack: the (address, size, value was an image
     # address, calls made before it) of the store that wrote it last.
     last_writer: dict[int, tuple[int, int, bool, int]] = field(default_factory=dict)
-    # Data reads inside the image; each must hit a known object for the run
-    # to be layout-independent.
-    image_reads: set[int] = field(default_factory=set)
+    # Data reads inside the image; each must lie within one known object for
+    # the run to be layout-independent.
+    image_reads: set[AccessSpan] = field(default_factory=set)
     eax: int = 0
     edx: int = 0
     esp_after_return: int = 0
@@ -252,10 +300,18 @@ class SideMachine:
 
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, image: Image, import_cleanup: dict[str, int] | None = None):
+    def __init__(
+        self,
+        image: Image,
+        imports: Mapping[str, int] | None = None,
+        import_facts: Mapping[str, CallFacts] | None = None,
+    ):
+        """``imports`` maps import keys to modelled addresses and must be
+        the same registry for both machines of a comparison; by default it
+        covers this image only. ``import_facts`` gives call facts by import
+        name."""
         self.image = image
-        # Argument bytes popped by imported callees, by import name.
-        self.import_cleanup = import_cleanup or {}
+        self.import_facts = import_facts or {}
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
         lo = min(s.virtual_address for s in image.sections) & ~(PAGE - 1)
         hi = max(s.virtual_address + s.extent for s in image.sections)
@@ -265,14 +321,14 @@ class SideMachine:
         for section in image.sections:
             data = bytes(section.view[: section.size_of_raw_data])
             self.uc.mem_write(section.virtual_address, data)
+        registry = imports if imports is not None else import_registry(image)
+        # Modelled import address -> import key, and each import table slot.
         self.imports: dict[int, str] = {}
-        self.import_slots: set[int] = set()
-        for imp in getattr(image, "get_imports", lambda: ())():
-            name = imp.name or f"#{imp.ordinal}"
-            fake = import_address(imp.module, name)
-            self.imports[fake] = f"{imp.module}!{name}"
-            self.import_slots.update(range(imp.addr, imp.addr + 4))
-            self.uc.mem_write(imp.addr, fake.to_bytes(4, "little"))
+        self.import_slots: list[range] = []
+        for key, slot in _image_imports(image):
+            self.imports[registry[key]] = key
+            self.import_slots.append(range(slot, slot + 4))
+            self.uc.mem_write(slot, registry[key].to_bytes(4, "little"))
         self._pristine = bytes(self.uc.mem_read(lo, hi - lo))
         self.code_ranges = tuple(
             section.virtual_range
@@ -322,7 +378,9 @@ class SideMachine:
         return None
 
     def _pushed_bytes(self, recent: collections.deque[int]) -> int:
-        """Bytes pushed on the executed path right before the current call."""
+        """Bytes pushed on the executed path right before the current call:
+        the pushes back to the first earlier instruction that changes esp or
+        ebp any other way."""
         total = 0
         history = list(recent)[:-1]  # the call itself is last
         for addr in reversed(history):
@@ -330,9 +388,15 @@ class SideMachine:
             if insn is None:
                 break
             if insn.id == X86_INS_PUSH:
-                total += 4
+                total += insn.operands[0].size if insn.operands else 4
                 continue
-            if insn.id in _STACK_BARRIERS or _is_reg(insn, 0, X86_REG_ESP, X86_REG_EBP):
+            if insn.id == X86_INS_ENTER:  # Capstone reports no register writes
+                break
+            try:
+                written = set(insn.regs_access()[1])
+            except CsError:
+                break
+            if written & _FRAME_REGISTERS:
                 break
         return total
 
@@ -372,9 +436,7 @@ class SideMachine:
         self.foreign_access = None
 
     def _on_unmapped(self, uc, _access, addr, size, _value, _data) -> bool:
-        first = addr & ~(PAGE - 1)
-        last = (addr + max(size, 1) - 1) & ~(PAGE - 1)
-        for page in range(first, last + PAGE, PAGE):
+        for page in pages_touched(addr, size):
             if page in self._lazy_pages:
                 continue
             if len(self._lazy_pages) >= LAZY_PAGE_LIMIT:
@@ -393,24 +455,6 @@ class SideMachine:
             uc.mem_write(page, page_contents(self._seed, page, self._pool))
             self._lazy_pages.add(page)
         return True
-
-    def code_constants(self, func_range: range) -> set[int]:
-        """Immediates in a function body that are not addresses."""
-        found: set[int] = set()
-        addr = func_range.start
-        while addr < func_range.stop:
-            insn = self.insn_at(addr)
-            if insn is None:
-                break
-            if not transfers_control(insn):
-                found.update(
-                    op.imm & 0xFFFFFFFF
-                    for op in insn.operands
-                    if op.type == X86_OP_IMM
-                    and op.imm & 0xFFFFFFFF not in self.image_range
-                )
-            addr += insn.size
-        return found
 
     def resolve_code(self, target: int) -> int:
         """Follow ``jmp rel32`` and ``jmp [slot]`` thunks from ``target``."""
@@ -432,17 +476,34 @@ class SideMachine:
     def in_code(self, addr: int) -> bool:
         return any(addr in r for r in self.code_ranges)
 
+    def in_import_slot(self, span: AccessSpan) -> bool:
+        return any(span.within(slot) for slot in self.import_slots)
+
+    def stack_cleanup(self, target: int | None, after_call: int) -> int | None:
+        """Argument bytes the callee removes, from evidence about this
+        binary: the callee's own ``ret N`` (through ``jmp`` thunks), the
+        import's call facts, or the caller removing them itself."""
+        if target is not None:
+            resolved = self.resolve_code(target)
+            if resolved in self.image_range:
+                pop = self.callee_pop_bytes(resolved)
+                if pop is not None:
+                    return pop
+            if resolved in self.imports:
+                name = self.imports[resolved].split("!", 1)[1]
+                facts = self.import_facts.get(name)
+                if facts is not None and facts.stack_cleanup is not None:
+                    return facts.stack_cleanup
+        if self._caller_cleanup(after_call) is not None:
+            return 0
+        return None
+
     def in_stack(self, addr: int) -> bool:
         return STACK_BASE <= addr < STACK_BASE + STACK_SIZE
 
     # -- running ---------------------------------------------------------
 
-    def run(
-        self,
-        func_range: range,
-        run_input: RunInput,
-        call_result: Callable[[int], tuple[int, int]],
-    ) -> Trace:
+    def run(self, func_range: range, run_input: RunInput) -> Trace:
         # pylint: disable=too-many-locals,too-many-statements
         uc = self.uc
         self._reset(run_input.seed, run_input.pool)
@@ -454,7 +515,6 @@ class SideMachine:
         frame = (RETURN_SENTINEL, *run_input.stack_args)
         uc.mem_write(esp, struct.pack(f"<{len(frame)}I", *frame))
         uc.reg_write(UC_X86_REG_ESP, esp)
-        lo = self.image_range.start
         written_stack = self._written_stack
 
         def mark_stack_written(addr: int, size: int) -> None:
@@ -468,6 +528,15 @@ class SideMachine:
             if self.in_stack(addr):
                 mark_stack_written(addr, size)
                 return
+            span = AccessSpan(addr, size)
+            if any(
+                span.address <= code.stop - 1 and code.start <= span.last
+                for code in self.code_ranges
+            ):
+                # Decoding reads the pristine image; code that changes
+                # itself is not modelled.
+                stop("code_write", f"{addr:#x}")
+                return
             trace.writes[addr] = max(size, trace.writes.get(addr, 0))
             writer = (
                 addr,
@@ -477,11 +546,12 @@ class SideMachine:
             )
             for byte in range(addr, addr + size):
                 trace.last_writer[byte] = writer
-            if addr in self.image_range:
-                self._dirty_image_pages.add(lo + ((addr - lo) & ~(PAGE - 1)))
+            self._dirty_image_pages.update(
+                page for page in pages_touched(addr, size) if page in self.image_range
+            )
 
-        def on_read(_uc, _access, addr, _size, _value, _data):
-            trace.image_reads.add(addr)
+        def on_read(_uc, _access, addr, size, _value, _data):
+            trace.image_reads.add(AccessSpan(addr, size))
 
         pointer_bytes_read: list[int] = []
 
@@ -522,19 +592,13 @@ class SideMachine:
                 slot = _effective_address(uc, op)
                 target = int.from_bytes(uc.mem_read(slot, 4), "little")
             after = addr + insn.size
-            pop = None
-            if target is not None and target in self.image_range:
-                pop = self.callee_pop_bytes(self.resolve_code(target))
-            if pop is None and target in self.imports:
-                pop = self.import_cleanup.get(self.imports[target].split("!", 1)[1])
-            if pop is None and self._caller_cleanup(after) is not None:
-                pop = 0
+            pop = self.stack_cleanup(target, after)
+            assumed = pop is None
             if pop is None:
                 # Unknown callee: assume it pops what was pushed just before
-                # the call. A wrong guess leaves esp wrong at return in
-                # frame-pointer-less code, which gives no verdict.
+                # the call, and keep running for coverage. The comparison
+                # gives no verdict on anything after such a call.
                 pop = self._pushed_bytes(recent)
-                trace.assumed_cleanup += 1
             cur_esp = uc.reg_read(UC_X86_REG_ESP)
             arg_bytes = pop if pop else (self._caller_cleanup(after) or 0)
             args = tuple(
@@ -549,11 +613,9 @@ class SideMachine:
                     uc.reg_read(UC_X86_REG_ECX),
                     uc.reg_read(UC_X86_REG_EDX),
                     args,
+                    assumed,
                 )
             )
-            if pop is None:
-                stop("truncated", f"unknown stack cleanup at {addr:#x}")
-                return
             index = len(trace.calls) - 1
             # Out-parameters: the callee writes a seeded dword through each
             # argument pointing into the caller's frame, independent of where
@@ -563,9 +625,11 @@ class SideMachine:
                     fill = model_dword(self._seed, 5, index, arg_index, pool=self._pool)
                     uc.mem_write(value, fill.to_bytes(4, "little"))
                     mark_stack_written(value, 4)
-            eax, edx = call_result(index)
+            eax, ecx, edx, eflags = call_outputs(self._seed, index, self._pool)
             uc.reg_write(UC_X86_REG_EAX, eax)
+            uc.reg_write(UC_X86_REG_ECX, ecx)
             uc.reg_write(UC_X86_REG_EDX, edx)
+            uc.reg_write(UC_X86_REG_EFLAGS, eflags)
             uc.reg_write(UC_X86_REG_ESP, cur_esp + pop)
             uc.reg_write(UC_X86_REG_EIP, after)
 
@@ -646,20 +710,8 @@ class SideMachine:
 
 # Small integers used as pointers (including null-based arithmetic).
 LOW_PAGES = 0x100000
-# Instructions that end the run of argument pushes before a call.
-_STACK_BARRIERS = frozenset(
-    {
-        X86_INS_CALL,
-        X86_INS_POP,
-        X86_INS_LEAVE,
-        X86_INS_RET,
-        X86_INS_PUSHAL,
-        X86_INS_POPAL,
-        X86_INS_PUSHFD,
-        X86_INS_POPFD,
-        X86_INS_ENTER,
-    }
-)
+# An instruction writing one of these ends the run of argument pushes.
+_FRAME_REGISTERS = frozenset({X86_REG_ESP, X86_REG_SP, X86_REG_EBP, X86_REG_BP})
 # fs:[0], the SEH exception list head: fs has base 0 in the emulator, so SEH
 # frame registration writes here. It is bookkeeping, not program output.
 SEH_CHAIN = range(0, 4)
