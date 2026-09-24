@@ -691,3 +691,40 @@ def test_function_facts_and_clang_call_facts(tmp_path: Path) -> None:
     assert call.virtual and call.slots == ("?Run@Base@@UAEHH@Z",)
     assert call.object is not None and call.object.index == 0
     assert call.field_arguments == ("c:@S@Widget::field@w.h:4:3:0", None)
+
+
+def test_a_targets_markers_come_from_its_own_source_files(tmp_path: Path) -> None:
+    """A header of another target's sources may carry this target's markers;
+    as with every other marker reader, they are not this target's markers."""
+    collector = SourceCollector(tmp_path)
+    for source_file, address in (("game/main.cpp", 0x1000), ("lib/math.h", 0x2000)):
+        collector.collect_record(
+            _declaration(
+                semantic_id=f"?f{address:x}@@YAXXZ",
+                qualified_name=f"f{address:x}",
+                source_file=source_file,
+                line=2,
+            ),
+            unit_id="game/main.cpp",
+        )
+        collector.collect_record(
+            _marker_block(
+                source_file,
+                1,
+                f"// FUNCTION: GAME 0x{address:x}",
+                candidates=(
+                    _function_candidate(f"?f{address:x}@@YAXXZ", f"f{address:x}", 2),
+                ),
+            ),
+            unit_id="game/main.cpp",
+        )
+    units = tuple(collector.units.values())
+
+    scoped = SourceIndex.from_units(
+        units, {"GAME": None}, target_files={"GAME": {"game/main.cpp"}}
+    )
+    assert [marker.address for marker in scoped.markers] == [0x1000]
+    assert [
+        marker.address
+        for marker in SourceIndex.from_units(units, {"GAME": None}).markers
+    ] == [0x1000, 0x2000]
