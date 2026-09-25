@@ -12,7 +12,27 @@ from reccmp.compare.diagnosis import (
     FactValue,
     StrategyAttempt,
 )
-from reccmp.source.index import SourceIndexError
+from reccmp.source.index import (
+    SourceComparison,
+    SourceComparisonOperand,
+    SourceIndexError,
+)
+
+
+def _describe_operand(operand: SourceComparisonOperand) -> str:
+    if operand.constant is not None:
+        return str(operand.constant)
+    return f"{operand.type} field" if operand.field else operand.type
+
+
+def _describe_comparison(comparison: SourceComparison) -> str:
+    """`short field < 65 as int, signed`"""
+    left, right = (_describe_operand(item) for item in comparison.operands)
+    if comparison.signed is not None:
+        how = "signed" if comparison.signed else "unsigned"
+    else:
+        how = "floating" if comparison.floating else "other"
+    return f"{left} {comparison.operator} {right} as {comparison.type}, {how}"
 
 
 class SourcePinMixin(ComparatorState):
@@ -36,6 +56,8 @@ class SourcePinMixin(ComparatorState):
             diff = analysis.difference
             orig_side = diff.orig
             recomp_side = self._enrich_side_with_source(diff.recomp, recomp=True)
+            if diff.kind == "branch_condition":
+                recomp_side = self._with_source_comparisons(recomp_side, match)
             if diff.kind == "memory_address":
                 class_name = self._owning_class_for_match(match)
                 orig_layout = self._layout_facts_for_displacement(
@@ -125,6 +147,42 @@ class SourcePinMixin(ComparatorState):
             "source_path": path_line_pair[0].name,
             "source_line": path_line_pair[1],
         }
+
+    def _with_source_comparisons(
+        self, side: DifferenceSide, match: ReccmpMatch | None
+    ) -> DifferenceSide:
+        """The comparisons the recompiled source makes on the differing
+        branch's line, with the type each compares in: whether the source asks
+        for a signed or an unsigned comparison, and at what width."""
+        if (
+            self.source_index is None
+            or match is None
+            or match.recomp_addr is None
+            or not isinstance(side.address, int)
+        ):
+            return side
+        # A branch rarely starts a statement: it belongs to the line entry
+        # before it in its function.
+        located = self.lines_db.find_line_containing_recomp_address(
+            side.address, match.recomp_addr
+        )
+        if located is None:
+            return side
+        line = located[1]
+        key = self.source_index.declaration_key_at(match.orig_addr)
+        facts = self.source_index.function_facts_for(key) if key else None
+        comparisons = facts.comparisons_on_line(line) if facts else ()
+        if not comparisons:
+            return side
+        return dataclasses.replace(
+            side,
+            facts={
+                **side.facts,
+                "source_comparisons": "; ".join(
+                    _describe_comparison(item) for item in comparisons
+                ),
+            },
+        )
 
     def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
         """Resolve the class that owns ``this`` for layout enrichment."""

@@ -149,8 +149,17 @@ constructors, destructors or other implicit calls, so not a call graph): the
 callee's semantic id; for virtual calls every declaration introducing a slot
 the call may use (more than one under multiple inheritance) and the object's
 static class; the call's object; which arguments are plain field reads.
+They also list the body's built-in comparisons (overloaded comparison
+operators are calls): the operator, the type compared in after the usual
+arithmetic conversions, with its width and signedness, and each operand as
+written, with its type, field identity and constant value. A
+`branch_condition` mismatch shows the comparisons on the recompiled
+instruction's source line (`source_comparisons`): whether the source asks for
+a signed or an unsigned comparison, and at what width, is usually what a
+`jl`/`jb` difference comes down to.
+
 `SourceIndex.function_facts_for(key)` assembles one function's call facts,
-accesses and calls into `FunctionFacts`.
+accesses, calls and comparisons into `FunctionFacts`.
 
 These facts describe the reconstruction. They may explain or constrain the
 recompiled side of a comparison; they never prove the original equivalent.
