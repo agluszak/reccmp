@@ -44,7 +44,8 @@ def find_funcinfo_offsets_in_buffer(buf: Buffer) -> Iterator[int]:
 
 def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
     """Parse the FuncInfo struct and return its location. A magic number
-    whose unwind map does not lie in the same buffer is not a FuncInfo."""
+    without unwind states, or whose unwind map does not lie in the same
+    buffer, is not a FuncInfo."""
     size = len(memoryview(buf))
     for ofs in find_funcinfo_offsets_in_buffer(buf):
         if ofs + 12 > size:
@@ -55,7 +56,8 @@ def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
 
         # Unwind offset is an absolute address.
         unwind_map_ofs = unwind_map_addr - base_addr
-        if max_state and not 0 <= unwind_map_ofs <= size - 8 * max_state:
+        # A function with EH has at least one unwind state.
+        if not max_state or not 0 <= unwind_map_ofs <= size - 8 * max_state:
             continue
         unwinds = tuple(
             UnwindMapEntry(

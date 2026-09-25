@@ -96,7 +96,9 @@ def test_funcinfo_in_a_writable_data_section():
     funcinfo = struct.pack("<4I", 0x19930520, 1, base + 0x10, 0)
     unwind_map = struct.pack("<iI", -1, 0x401234)
     noise = struct.pack("<3I", 0x19930520, 3, 0x7FFF0000)
-    data = funcinfo + unwind_map + b"\0" * 8 + noise
+    # LEGO1.DLL's .data has the magic followed by zeros: no states
+    empty = struct.pack("<3I", 0x19930520, 0, 0)
+    data = funcinfo + unwind_map + b"\0" * 8 + noise + empty
     image = Mock(spec=PEImage)
     image.get_data_regions.return_value = [ImageRegion(base, data, len(data))]
 
