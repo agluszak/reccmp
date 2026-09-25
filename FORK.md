@@ -34,7 +34,8 @@ them can conflict on the next rebase. So:
   `tools/asmcmp_text.py`, and SEH/FOLDED matching in `match_folded.py`.
 - **Use upstream's tooling.** Use `requirements-tests.txt` and upstream's
   workflows. The only fork deltas there are the Ghidra version pin and the
-  `unicorn` test dependency.
+  `unicorn` and `z3-solver` test dependencies (the optional `witness` and
+  `equivalence` extras).
 - **Don't reformat or tidy upstream code** that the fork doesn't otherwise
   need to change.
 

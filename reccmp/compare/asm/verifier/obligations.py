@@ -13,6 +13,7 @@ from reccmp.compare.asm.model import (
     Reject,
     parse_instruction,
 )
+from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     Value,
     mem_disjoint,
@@ -102,6 +103,24 @@ def _contained(value: Value, ctx: Context) -> bool:
 
 def _dead_or_contained(value: Value, ctx: Context) -> bool:
     return _is_scratch(value) or _contained(value, ctx)
+
+
+def _assembled(value: Value, ctx: Context) -> bool:
+    """A partial-register insert whose pieces are both accounted for
+    (`and al, 1` on a loaded value: the load and the new byte were observed;
+    or a constant under the new byte), so the register holds nothing
+    unobserved."""
+    if not (
+        isinstance(value, tuple)
+        and len(value) == 3
+        and str(value[0]).startswith("ins_")
+    ):
+        return False
+    old = value[1]
+    old_ok = (isinstance(old, tuple) and old[:1] == ("imm",)) or _dead_or_contained(
+        old, ctx
+    )
+    return old_ok and _dead_or_contained(value[2], ctx)
 
 
 def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
@@ -529,7 +548,7 @@ def discharge_run_obligations(
             if _is_scratch(value):
                 dead_register_difference = True
                 continue
-            if not _contained(value, ctx):
+            if not (_contained(value, ctx) or _assembled(value, ctx)):
                 if recorder is not None:
                     recorder.mark_inconclusive("analysis_limit")
                 return False
@@ -829,6 +848,20 @@ def record_pair_categories(
         ctx.categories.add("condition_inversion")
 
 
+def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
+    """Equal observations, or (with z3-solver installed) observations whose
+    values are proven equal as bit-vectors. Such a proof is recorded as an
+    algebraic identity, and both sides' values become matched evidence."""
+    if obs_o == obs_r:
+        return True
+    if not bitvector.observations_equal(obs_o, obs_r):
+        return False
+    ctx.categories.add("algebraic_identity")
+    for entry in obs_r:
+        ctx.add_matched(entry)
+    return True
+
+
 def accept_agreeing_pair(
     ctx: Context,
     index_o: int,
@@ -844,7 +877,7 @@ def accept_agreeing_pair(
     returns False otherwise."""
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     obs_o, obs_r = obs
-    if obs_o != obs_r:
+    if not observations_agree(ctx, obs_o, obs_r):
         record_observable_difference(
             ctx, index_o, index_r, ins[0], ins[1], obs_o, obs_r, meta[0], meta[1]
         )
