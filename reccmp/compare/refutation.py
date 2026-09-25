@@ -72,6 +72,8 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             registry = import_registry(self.orig_bin, self.recomp_bin)
 
             def callee_facts(identity) -> CallFacts | None:
+                if identity[0] == "jmp_through":
+                    return callee_facts(identity[1])
                 if identity[0] == "import":
                     return by_import.get(identity[1].split("!", 1)[1])
                 if identity[0] == "entity" and identity[2] == 0:
