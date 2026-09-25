@@ -85,6 +85,8 @@ EFFECTIVE_REASON_ORDER = (
     "condition_inversion",
     "load_folding",
     "dead_operation",
+    # Values proven equal as bit-vectors (z3) though computed differently.
+    "algebraic_identity",
     "padding",
     # The original function is a stale incremental-link jmp island whose fold
     # chain lands on a proven-equivalent shared body (configured via the
