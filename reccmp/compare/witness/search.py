@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from reccmp.compare.asm.ir import FunctionImage
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import RefutationWitness as Witness
 from reccmp.types import ImageId

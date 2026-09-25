@@ -99,15 +99,67 @@ The index also lists, per unit, the repository files it includes
 
 Records retain compiler-owned source signatures, parameter reference forms, and
 field pointer depth. Declarations carry linkage, storage class, and variadic
-status; only external-linkage variables are indexed. Markers store a
-`(target, semantic_id)` declaration key in the JSON projection rather than a
-nested copy of the declaration. Conflicting size assertions are errors inside
-one link namespace.
+status; only external-linkage variables are indexed. Conflicting size
+assertions are errors inside one link namespace.
+
+Records are compiler facts: they say nothing about which target or unit they
+belong to, so units loaded through the `RecordPool` share them. That context
+is the record's `DeclarationKey`: `(target, semantic_id)` for external
+entities, plus the defining `unit_id` for TU-local ones, since TU-local
+functions of different units can share a mangled name. The index keys
+declarations, classes and variables by it, and member uses by the key of the
+function making them. Markers carry the key of their declaration. The JSON
+projection writes each record with its key's `target` and `unit_id` (member
+uses: `function_unit_id`), and markers a `[target, semantic_id, unit_id]`
+`declaration_key`. A marker on a TU-local function defined in a header binds
+the first including unit's copy: the copies are identical, and nothing states
+which one the marker's address is.
+
+### Function facts
+
+Every function declaration carries `call`, what a caller may assume: whether
+ecx and edx carry arguments, the argument bytes the callee removes, and the
+return kind. It is read from Clang's own ABI lowering (`CGFunctionInfo`, from
+a `CodeGenModule` that emits nothing), so hidden return pointers, `inalloca`
+argument blocks and small records returned in registers are Clang's decision,
+not ours. Anything not modelled exactly is `null`, never guessed: conventions
+other than cdecl/stdcall/thiscall/fastcall, expanded or coerced aggregates,
+constructors with a hidden virtual-base argument, incomplete types. The
+calling convention is the one Clang assigned. On the Wizardry corpus the stack
+cleanup agrees with the `ret N` MSVC emitted for every recompiled function
+checked (7,595).
+
+`SourceIndex.call_facts_for(key)` returns a declaration's facts;
+`call_facts_named(semantic_id)` answers by mangled name only when every
+declaration with that name agrees. The comparator takes each field from the
+PDB type record first, then from Clang (the declaration the function's marker
+binds, else the name lookup), then from the decorated name.
+
+Member uses state the object of the access (`base`): its root (`this`,
+`parameter` with its index, `local` or `global` with the declaration's
+identity, `call`, `other`) and the fields leading from the root to it, each
+step saying whether it went through a pointer; `arrow` says whether the access
+itself dereferences its base. `this->a.b.c` has root `this` and path `a, b`.
+A use's `conversions` are those of the field's own value: the casts wrapping
+the use before it becomes an operand of anything else. For integer,
+enumeration and pointer values they state widths and source signedness.
+
+`function-facts` records list a body's explicit calls (`CallExpr` nodes, not
+constructors, destructors or other implicit calls, so not a call graph): the
+callee's semantic id; for virtual calls every declaration introducing a slot
+the call may use (more than one under multiple inheritance) and the object's
+static class; the call's object; which arguments are plain field reads.
+`SourceIndex.function_facts_for(key)` assembles one function's call facts,
+accesses and calls into `FunctionFacts`.
+
+These facts describe the reconstruction. They may explain or constrain the
+recompiled side of a comparison; they never prove the original equivalent.
+
+### Derivation
 
 `TranslationUnitRecords` holds one unit's observations. `derive_namespace()` /
-`SourceIndex.from_units()` partition by target, group external entities by
-`semantic_id` and non-external functions by `(unit_id, semantic_id)`, then
-derive winners and conflicts. Compile-database entries that are not owned by any
+`SourceIndex.from_units()` partition by target, group observations by key,
+then derive winners and conflicts. Compile-database entries that are not owned by any
 requested target are skipped before cache lookup or Clang.
 
 Run the collector integration tests inside the pinned image. The image's

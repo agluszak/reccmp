@@ -9,7 +9,7 @@ from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.asm.verifier import FunctionMetadata
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.parse import assert_fixup
 from reccmp.compare.asm.instgen import (

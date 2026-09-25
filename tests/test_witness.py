@@ -12,7 +12,7 @@ import pytest
 
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
-from reccmp.compare.call_facts import CallFacts
+from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 from reccmp.formats.image import ImageSection, ImageSectionFlags
@@ -446,3 +446,21 @@ def test_generated_pages_are_deterministic_and_shared():
     assert page_contents(3, page) is first  # the other side reuses it
     assert page_contents(4, page) != first
     assert page_contents(3, 0x1000) == bytes(PAGE)
+
+
+def test_a_callee_without_ret_does_not_lend_the_next_functions():
+    # callee: mov eax, ecx; jmp eax (never returns here); next function: ret 8
+    tail_jump = bytes.fromhex("8bc1ffe0")
+    padded = tail_jump + b"\xcc" * 14 + bytes.fromhex("c20800")
+    machine = SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE, padded))  # type: ignore[arg-type]
+    assert machine.callee_pop_bytes(ORIG_CALLEE) is None
+    # Without padding in between, the callee's known extent bounds the scan.
+    adjacent = tail_jump + bytes.fromhex("c20800")
+    sized = SideMachine(
+        _image(ORIG_FUNC, RET, ORIG_TABLE, adjacent),  # type: ignore[arg-type]
+        function_size=lambda address: 4 if address == ORIG_CALLEE else None,
+    )
+    assert sized.callee_pop_bytes(ORIG_CALLEE) is None
+    # Neither known: the scan cannot tell where the callee ends.
+    unsized = SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE, adjacent))  # type: ignore[arg-type]
+    assert unsized.callee_pop_bytes(ORIG_CALLEE) == 8

@@ -75,8 +75,8 @@ def fixture_project(tmp_path: Path) -> tuple[Path, Path]:
         ),
     ]
     document = SourceIndex(
-        declarations=(),
-        classes=(),
+        declarations={},
+        classes={},
         markers=(),
         source_digests={"src/game.cpp": source_digest(source)},
     ).to_dict()

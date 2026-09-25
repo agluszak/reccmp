@@ -112,6 +112,15 @@ def entity_proof_identity(
     canonical original address. Unmatched data, strings, and locals stay
     side-local so identical names cannot prove correspondence.
     """
+    if entity.entity_type == EntityType.IMPORT_THUNK:
+        # `jmp [__imp_X]`: calling it is calling through that slot.
+        ref = entity.get("ref_orig" if image_id == ImageId.ORIG else "ref_recomp")
+        slot = db.get(image_id, ref) if ref is not None else None
+        if slot is not None and slot.entity_type == EntityType.IMPORT:
+            return (
+                "jmp_through",
+                entity_proof_identity(db, image_id, slot, 0, equivalence_groups),
+            )
     if entity.entity_type in _CALLABLE_TYPES:
         entity_addr = entity.addr(image_id)
         discovered_orig = (
@@ -130,7 +139,10 @@ def entity_proof_identity(
                 configured_orig if configured_orig is not None else canonical_orig
             )
         symbol = entity.get("symbol")
-        if canonical_orig is not None and (configured_alias or entity.matched):
+        # alias_canonical_orig covers real pairs and proven aliases alike.
+        if canonical_orig is not None and (
+            configured_alias or entity.matched or discovered_orig is not None
+        ):
             return ("entity", canonical_orig, offset)
         if entity.entity_type == EntityType.IMPORT:
             return ("import", entity.best_name() or entity.get("symbol"))
@@ -156,7 +168,9 @@ def entity_proof_identity(
         canonical_orig = (
             configured_orig if configured_orig is not None else canonical_orig
         )
-    if canonical_orig is not None and (configured_alias or entity.matched):
+    if canonical_orig is not None and (
+        configured_alias or entity.matched or discovered_orig is not None
+    ):
         return ("entity", canonical_orig, offset)
     addr = entity.addr(image_id)
     assert addr is not None

@@ -10,7 +10,8 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from reccmp.compare.call_facts import CallFacts, import_facts
+from reccmp.call_facts import CallFacts
+from reccmp.compare.call_facts import import_facts
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
@@ -18,6 +19,7 @@ from reccmp.compare.diagnosis import (
 )
 from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
+from reccmp.types import ImageId
 
 if TYPE_CHECKING:
     from reccmp.compare.asm.ir import FunctionImage
@@ -70,18 +72,29 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             registry = import_registry(self.orig_bin, self.recomp_bin)
 
             def callee_facts(identity) -> CallFacts | None:
+                if identity[0] == "jmp_through":
+                    return callee_facts(identity[1])
                 if identity[0] == "import":
                     return by_import.get(identity[1].split("!", 1)[1])
                 if identity[0] == "entity" and identity[2] == 0:
                     match = self.db.get_one_match(identity[1])
                     if match is not None and match.recomp_addr is not None:
-                        return self._call_facts_at(match.recomp_addr)
+                        return self._call_facts_at(match.recomp_addr, match.orig_addr)
                 return None
+
+            def sizes(image_id: ImageId):
+                def size(address: int) -> int | None:
+                    entity = self.db.get(image_id, address)
+                    return entity.size(image_id) if entity is not None else None
+
+                return size
 
             self._witness_translator = Translator(
                 self.db,
-                SideMachine(self.orig_bin, registry, by_import),
-                SideMachine(self.recomp_bin, registry, by_import),
+                SideMachine(self.orig_bin, registry, by_import, sizes(ImageId.ORIG)),
+                SideMachine(
+                    self.recomp_bin, registry, by_import, sizes(ImageId.RECOMP)
+                ),
                 call_facts=callee_facts,
             )
         return self._witness_translator
@@ -101,7 +114,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
         # pylint: disable-next=import-outside-toplevel
         from reccmp.compare.witness import find_witness
 
-        facts = self._call_facts_at(match.recomp_addr)
+        facts = self._call_facts_at(match.recomp_addr, match.orig_addr)
         result = find_witness(
             self._witness_machines(),
             orig_image,

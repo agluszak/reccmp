@@ -4,6 +4,7 @@ from .index import (
     SourceAbi,
     SourceBaseOffset,
     SourceBaseVtable,
+    DeclarationKey,
     SourceClass,
     SourceCollector,
     SourceDeclaration,
@@ -16,11 +17,14 @@ from .index import (
     SourceMarker,
     ResolvedField,
     TranslationUnitRecords,
+    keyed,
     record_command,
 )
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [
+    "DeclarationKey",
+    "keyed",
     "SourceAbi",
     "SourceBaseOffset",
     "SourceBaseVtable",

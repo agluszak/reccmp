@@ -2,7 +2,11 @@ from pathlib import PureWindowsPath
 from typing import Callable
 from unittest.mock import Mock
 import pytest
+from reccmp.call_facts import CallFacts
+from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.types import CvdumpTypesParser
+from reccmp.source import DeclarationKey, SourceIndex, SourceMarker, keyed
+from reccmp.source.index import SourceDeclaration
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 from reccmp.compare.functions import (
@@ -689,3 +693,118 @@ def test_addr_test_entity_range_check_exclusive(db: EntityDb):
     assert addr_test(0x1000) is True
     assert addr_test(0x1001) is True
     assert addr_test(0x1002) is False
+
+
+def test_call_facts_take_each_field_from_the_strongest_producer(
+    db: EntityDb, lines_db: LinesDb, report: ReccmpReportProtocol
+):
+    """A stdcall function taking a class by value: its decorated name states
+    the convention but not the argument bytes; Clang's declaration knows the
+    class's size."""
+    symbol = "?g@@YGXVValue@@@Z"
+    index = SourceIndex(
+        declarations=keyed(
+            (
+                SourceDeclaration(
+                    semantic_id=symbol,
+                    qualified_name="g",
+                    semantic_kind="free_function",
+                    calling_convention="__stdcall",
+                    return_type="void",
+                    parameter_types=("class Value",),
+                    owning_class=None,
+                    has_this=False,
+                    is_virtual=False,
+                    source_file="g.cpp",
+                    line=1,
+                    end_line=1,
+                    is_definition=True,
+                    call=CallFacts(False, False, 12, "void"),
+                ),
+            )
+        ),
+        classes={},
+        markers=(),
+    )
+    comp = FunctionComparator(
+        db,
+        lines_db,
+        RawImage.from_memory(b""),
+        RawImage.from_memory(b""),
+        report,
+        CvdumpTypesParser(),
+        source_index=index,
+    )
+    node = CvdumpNode(0, 0)
+    node.decorated_name = symbol
+    # pylint: disable-next=protected-access
+    assert comp._call_facts_of_node(node) == CallFacts(False, False, 12, "void")
+    comp.source_index = None
+    # pylint: disable-next=protected-access
+    assert comp._call_facts_of_node(node).stack_cleanup is None
+
+
+def test_clang_call_facts_come_from_the_marked_declaration(
+    db: EntityDb, lines_db: LinesDb, report: ReccmpReportProtocol
+):
+    """Two TU-local functions share a mangled name but not their facts: the
+    marker at the original address says which one is being compared; the
+    name alone says nothing."""
+    # stdcall taking a class by value: the name states no argument bytes
+    symbol = "?copyMemory@@YGXVValue@@@Z"
+
+    def declaration(source_file: str, cleanup: int) -> SourceDeclaration:
+        return SourceDeclaration(
+            semantic_id=symbol,
+            qualified_name="copyMemory",
+            semantic_kind="free_function",
+            calling_convention="__stdcall",
+            return_type="void *",
+            parameter_types=(),
+            owning_class=None,
+            has_this=False,
+            is_virtual=False,
+            source_file=source_file,
+            line=1,
+            end_line=2,
+            is_definition=True,
+            linkage="internal",
+            call=CallFacts(False, False, cleanup, "i32"),
+        )
+
+    huffman = DeclarationKey("TEST", symbol, "huffman.cpp")
+    renderer = DeclarationKey("TEST", symbol, "renderer.cpp")
+    index = SourceIndex(
+        declarations={
+            huffman: declaration("huffman.cpp", 12),
+            renderer: declaration("renderer.cpp", 8),
+        },
+        classes={},
+        markers=(
+            SourceMarker(
+                address=0x1000,
+                marker_kind="FUNCTION",
+                source_file="renderer.cpp",
+                line=1,
+                declaration=declaration("renderer.cpp", 8),
+                target="TEST",
+                declaration_key=renderer,
+            ),
+        ),
+    )
+    comp = FunctionComparator(
+        db,
+        lines_db,
+        RawImage.from_memory(b""),
+        RawImage.from_memory(b""),
+        report,
+        CvdumpTypesParser(),
+        source_index=index,
+    )
+    node = CvdumpNode(0, 0)
+    node.decorated_name = symbol
+    # pylint: disable=protected-access
+    assert comp._call_facts_of_node(node, 0x1000).stack_cleanup == 8
+    assert index.call_facts_named(symbol) is None
+    # By name alone only the decorated name's own facts remain.
+    assert comp._call_facts_of_node(node).stack_cleanup is None

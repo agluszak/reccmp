@@ -27,8 +27,8 @@ def fixture_source_dir(tmp_path_factory) -> Path:
 def _index_of(source_dir: Path) -> SourceIndex:
     """An empty but current source index of every file under the root."""
     return SourceIndex(
-        declarations=(),
-        classes=(),
+        declarations={},
+        classes={},
         markers=(),
         source_digests={
             path.relative_to(source_dir).as_posix(): source_digest(path)

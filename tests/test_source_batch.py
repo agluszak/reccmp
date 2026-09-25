@@ -7,10 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from reccmp.call_facts import CallFacts
 from reccmp.parser import DecompCodebase
 from reccmp.parser.error import AlertCode
 from reccmp.parser.marker import MarkerType
-from reccmp.source import SourceIndex, SourceIndexError
+from reccmp.source import DeclarationKey, SourceIndex, SourceIndexError
 from reccmp.tools.decomplint import DecomplintTarget, lint_all_targets
 
 
@@ -78,6 +79,15 @@ void Lines() {
   // LINE: TEST 0x6000
   Exported();
 }
+// GLOBAL: TEST 0x3020
+/* a block comment and a pragma are not blank lines */
+#pragma bss_seg(".data")
+int g_pragma = 0;
+#pragma bss_seg()
+
+// GLOBAL: TEST 0x3030
+
+int g_spaced = 0;
 """
 
 _MARKED_HEADER = """\
@@ -193,6 +203,11 @@ def test_markers_come_from_the_compiler(tmp_path: Path) -> None:
         for alert in alerts
         if alert.code == AlertCode.MARKER_NOT_COMPILED
     ) == [("orphan.h", 1), ("widget.cpp", 35)]
+    assert [
+        (alert.path.name, alert.line_number)
+        for alert in alerts
+        if alert.code == AlertCode.UNEXPECTED_BLANK_LINE
+    ] == [("widget.cpp", 50)]
 
 
 def _write(index: SourceIndex, directory: Path) -> Path:
@@ -310,13 +325,19 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert profile["records"]["declaration"] > 0
         assert profile["indexer_totals_ms"]["frontend_ms"] > 0
         assert "owner.h" in index.unit_dependencies["first.cpp"]
-        owners = [item for item in index.classes if item.qualified_name == "Owner"]
-        assert len(owners) == 2
-        assert {item.target for item in owners} == {"WIZ8", "SURRENDER"}
+        owner_keys = {
+            key: item
+            for key, item in index.classes.items()
+            if item.qualified_name == "Owner"
+        }
+        owners = list(owner_keys.values())
+        assert {key.target for key in owner_keys} == {"WIZ8", "SURRENDER"}
         assert all(item.asserted_size == 20 for item in owners)
         assert [field.pointer_depth for field in owners[0].fields] == [2, 1, 0, 0]
         dependent_records = [
-            item for item in index.classes if item.qualified_name == "DependentRecord"
+            item
+            for item in index.classes.values()
+            if item.qualified_name == "DependentRecord"
         ]
         assert len(dependent_records) == 2
         assert all(item.size is None for item in dependent_records)
@@ -326,20 +347,31 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
             index.functions_by_address(target="SURRENDER")[0x401000].name == "SURRENDER"
         )
         variables = {
-            (item.target, item.qualified_name): item for item in index.variables
+            (key.target, item.qualified_name): item
+            for key, item in index.variables.items()
         }
         assert variables[("WIZ8", "gWIZ8")].definition_kind == "definition"
         assert variables[("WIZ8", "gWIZ8")].is_external
         assert variables[("WIZ8", "gShared")].definition_kind == "declaration"
         assert variables[("WIZ8", "gShared")].is_external
         assert variables[("SURRENDER", "gSURRENDER")].is_external
-        assert not any(item.qualified_name == "gLocal" for item in index.variables)
+        assert not any(
+            item.qualified_name == "gLocal" for item in index.variables.values()
+        )
         assert not index.conflicts
         declaration = index.functions_by_address(target="WIZ8")[0x401000].declaration
         assert declaration is not None
         assert declaration.linkage == "external"
-        wiz8_uses = index.for_target("WIZ8").member_uses
-        surrender_uses = index.for_target("SURRENDER").member_uses
+        wiz8_uses = [
+            use
+            for uses in index.for_target("WIZ8").member_uses.values()
+            for use in uses
+        ]
+        surrender_uses = [
+            use
+            for uses in index.for_target("SURRENDER").member_uses.values()
+            for use in uses
+        ]
         first_uses = [
             item
             for item in wiz8_uses
@@ -431,7 +463,7 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         )
         assert all(
             item.fields[0].pointer_depth == 1
-            for item in refreshed.classes
+            for item in refreshed.classes.values()
             if item.qualified_name == "Owner"
         )
         header.write_text(
@@ -451,7 +483,8 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         renamed = collect()
         renamed_uses = [
             item
-            for item in renamed.for_target("WIZ8").member_uses
+            for uses in renamed.for_target("WIZ8").member_uses.values()
+            for item in uses
             if item.owner == "W8First"
             and item.name == "state"
             and item.function == "ReadW8Field"
@@ -466,3 +499,177 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
             os.environ.pop("RECCMP_SOURCE_ROOT", None)
         else:
             os.environ["RECCMP_SOURCE_ROOT"] = previous_root
+
+
+_FACTS_SOURCE = """\
+struct Point { int x; short y; unsigned char flags; };
+struct Big { int a, b, c; };
+class Base { public: virtual int Run(int value); int field; };
+class Widget : public Base {
+public:
+  int Run(int value) override;
+  static int __stdcall Stat(Point p, double d, char c);
+  int __fastcall Fast(double d, int a, int b);
+  int Vararg(int n, ...);
+  Big MakeBig();
+  void operator delete(void* block);
+  Point point;
+  int count;
+};
+int Helper(int);
+int __fastcall One(int a);
+int Widget::Run(int value) {
+  int wide = point.flags;
+  int sign = point.y;
+  Helper(count);
+  Base::Run(value);
+  Base* self = this;
+  return self->Run(wide + sign) + Fast(1.0, 2, 3);
+}
+int Use(Widget& w) { return w.count; }
+struct Small { short a; short b; };
+Small MakeSmall(int);
+struct NonTrivial { NonTrivial(const NonTrivial&); int v; };
+int __stdcall TakesNonTrivial(NonTrivial n, int x);
+Big __stdcall MakeBigStd(int x);
+int __vectorcall Vec(int a, double b);
+struct VBase { int v; };
+struct Derived : virtual VBase { Derived(int x); };
+struct A { virtual void f(); };
+struct B { virtual void f(); };
+struct C : A, B { void f() override; };
+void CallF(C* c) { c->f(); }
+struct Inner { int x; short s; };
+struct Outer { Inner inner; Inner* ptr; void M(); };
+Outer g_outer;
+void Outer::M() {
+  inner.x = 1;
+  ptr->x = 2;
+  g_outer.inner.x = 3;
+  unsigned char narrowed = (unsigned char)(inner.s + 1);
+  int picked = narrowed ? inner.s : inner.x;
+  Helper(inner.s);
+}
+"""
+
+
+def test_function_facts_come_from_the_compiler(tmp_path: Path) -> None:
+    _require_collector()
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    source = repository / "facts.cpp"
+    source.write_text(_FACTS_SOURCE, encoding="utf-8")
+    database = repository / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(repository),
+                    "file": str(source),
+                    "arguments": [
+                        _clang_cl(repository),
+                        "--target=i686-pc-windows-msvc",
+                        "/c",
+                        str(source),
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    index = SourceIndex.from_compile_database(
+        repository, database, {"TEST": [source]}, cache_dir=tmp_path / "cache", jobs=1
+    )
+
+    def facts(name: str) -> CallFacts | None:
+        return next(
+            item.call
+            for item in index.declarations.values()
+            if item.qualified_name == name
+        )
+
+    # Microsoft x86 conventions, from the parameter types.
+    assert facts("Widget::Stat") == CallFacts(False, False, 8 + 8 + 4, "i32")
+    # fastcall member: this in ecx, the double on the stack, a in edx, b on the stack
+    assert facts("Widget::Fast") == CallFacts(True, True, 12, "i32")
+    # variadic member: __cdecl with this on the stack
+    assert facts("Widget::Vararg") == CallFacts(False, False, 0, "i32")
+    # Clang's ABI lowering decides record returns and arguments:
+    # a 12-byte record comes back through a hidden pointer the callee pops,
+    assert facts("Widget::MakeBig") == CallFacts(True, False, 4, "unknown")
+    assert facts("MakeBigStd") == CallFacts(False, False, 4 + 4, "unknown")
+    # a 4-byte one in eax,
+    assert facts("MakeSmall") == CallFacts(False, False, 0, "i32")
+    # a non-trivial one is passed by value in the argument block (inalloca).
+    assert facts("TakesNonTrivial") == CallFacts(False, False, 4 + 4, "i32")
+    # Not modelled: unknown rather than guessed.
+    assert facts("Vec") is None  # __vectorcall
+    assert facts("Derived::Derived") is None  # hidden virtual-base argument
+    assert facts("Widget::Run") == CallFacts(True, False, 4, "i32")
+    # operator delete is implicitly static: no this, the default convention
+    assert facts("Widget::operator delete") == CallFacts(False, False, 0, "void")
+    # a fastcall function with one argument leaves edx dead
+    assert facts("One") == CallFacts(True, False, 0, "i32")
+
+    run = index.function_facts_for(DeclarationKey("TEST", "?Run@Widget@@UAEHH@Z"))
+    assert run is not None
+    assert run.call == CallFacts(True, False, 4, "i32")
+    extensions = {
+        use.name: use.conversions[-1]
+        for use in run.accesses
+        if use.name in ("flags", "y") and use.conversions
+    }
+    assert (extensions["flags"].source_bits, extensions["flags"].source_signed) == (
+        8,
+        False,
+    )
+    assert (extensions["y"].source_bits, extensions["y"].source_signed) == (16, True)
+    assert {use.base.kind for use in run.accesses if use.name == "count"} == {"this"}
+    calls = {(call.callee, call.virtual) for call in run.calls}
+    assert ("?Helper@@YAHH@Z", False) in calls
+    assert ("?Run@Base@@UAEHH@Z", False) in calls  # Base::Run(value): qualified
+    (virtual,) = [call for call in run.calls if call.virtual]
+    assert virtual.slots == ("?Run@Base@@UAEHH@Z",)
+    assert virtual.object_class == "record:Base"
+    helper = next(call for call in run.calls if call.callee == "?Helper@@YAHH@Z")
+    assert helper.field_arguments[0] is not None  # Helper(count)
+    use = index.function_facts_for(DeclarationKey("TEST", "?Use@@YAHAAVWidget@@@Z"))
+    assert use is not None and use.accesses[0].base.kind == "parameter"
+    assert use.accesses[0].base.index == 0
+
+    # One override can fill a slot of each base.
+    call_f = index.function_facts_for(DeclarationKey("TEST", "?CallF@@YAXPAUC@@@Z"))
+    assert call_f is not None
+    (call,) = call_f.calls
+    assert call.slots == ("?f@A@@UAEXXZ", "?f@B@@UAEXXZ")
+
+    method = index.function_facts_for(DeclarationKey("TEST", "?M@Outer@@QAEXXZ"))
+    assert method is not None
+    leaves = [use for use in method.accesses if use.name in ("x", "s")]
+
+    def line_of(text: str) -> int:
+        return next(
+            number
+            for number, line in enumerate(_FACTS_SOURCE.splitlines(), 1)
+            if text in line
+        )
+
+    lines = [line_of(text) for text in ("inner.x = 1", "ptr->x", "g_outer.inner")]
+    # Roots and field paths: inner.x, ptr->x, g_outer.inner.x
+    assert {
+        (use.use_line, use.base.kind, use.base.identity, len(use.base.path), use.arrow)
+        for use in leaves
+        if use.name == "x" and use.use_line in lines
+    } == {
+        (lines[0], "this", None, 1, False),
+        (lines[1], "this", None, 1, True),
+        (lines[2], "global", "?g_outer@@3UOuter@@A", 1, False),
+    }
+    # A field's conversions are its own value's: the promotion of inner.s to
+    # int, not the cast of (inner.s + 1) to unsigned char; the same inside a
+    # conditional and as a call argument.
+    assert {
+        tuple(f"{c.source_type}->{c.destination_type}" for c in use.conversions)
+        for use in leaves
+        if use.name == "s"
+    } == {("short->int",)}

@@ -2,12 +2,8 @@
 
 import pytest
 
-from reccmp.compare.call_facts import (
-    CallFacts,
-    convention_facts,
-    import_facts,
-    mangled_facts,
-)
+from reccmp.call_facts import CallFacts, convention_facts
+from reccmp.compare.call_facts import import_facts, mangled_facts
 
 
 @pytest.mark.parametrize(
@@ -27,6 +23,9 @@ from reccmp.compare.call_facts import (
         ("_RegOpenKeyExA@20", 20),  # stdcall C decoration
         ("__wtoi", 0),  # cdecl C decoration
         ("@Fast@8", None),  # fastcall: registers carry part of it
+        # returns a class by value: a hidden return pointer may be popped too
+        ("?getLocation@srNode@@QBE?AV?$srVector3T@N@@XZ", None),
+        ("?make@@YGPAVValue@@H@Z", 4),  # returns a pointer: no hidden argument
     ],
 )
 def test_mangled_cleanup(symbol: str, cleanup: int | None):
@@ -38,7 +37,8 @@ def test_mangled_registers_and_return_kind():
         True, False, 12, "void"
     )
     assert mangled_facts("?count@@YGJXZ") == CallFacts(False, False, 0, "i32")
-    assert mangled_facts("@Fast@8") == CallFacts(True, True, None, "unknown")
+    # fastcall: which registers carry arguments depends on the parameters
+    assert mangled_facts("@Fast@8") == CallFacts(None, None, None, "unknown")
     assert mangled_facts("plain") == CallFacts()
 
 

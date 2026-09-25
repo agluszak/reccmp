@@ -552,7 +552,9 @@ def local_destination_keys(
 
 
 _NO_FALLTHROUGH = frozenset({"ret", "jmp", "int3"})
-_MODELED_EXTERNAL = frozenset({"entity", "import", "unmatched", "symbol"})
+_MODELED_EXTERNAL = frozenset(
+    {"entity", "import", "jmp_through", "unmatched", "symbol"}
+)
 
 
 def _is_modeled_external_target(row: DecodedInstruction) -> bool:

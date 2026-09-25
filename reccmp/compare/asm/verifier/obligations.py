@@ -107,7 +107,8 @@ def _dead_or_contained(value: Value, ctx: Context) -> bool:
 def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
     """A 16/8-bit result inserted into dead upper bits on both sides:
     the inserted part must be identical; the surrounding old bits are
-    garbage as long as they came from consumed computations."""
+    garbage as long as they came from consumed computations or are a
+    constant (`xor eax, eax` before `setcc al`)."""
     return (
         isinstance(value_o, tuple)
         and isinstance(value_r, tuple)
@@ -116,9 +117,14 @@ def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
         and value_o[0] == value_r[0]
         and str(value_o[0]).startswith("ins_")
         and value_o[2] == value_r[2]
-        and _dead_or_contained(value_o[1], ctx)
-        and _dead_or_contained(value_r[1], ctx)
+        and _old_bits_ok(value_o[1], ctx)
+        and _old_bits_ok(value_r[1], ctx)
     )
+
+
+def _old_bits_ok(value: Value, ctx: Context) -> bool:
+    is_constant = isinstance(value, tuple) and value[:1] == ("imm",)
+    return is_constant or _dead_or_contained(value, ctx)
 
 
 # Caller-saved register families: dead at function end (eax is separately
