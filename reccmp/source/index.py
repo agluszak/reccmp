@@ -248,6 +248,32 @@ class SourceCall:
 
 
 @dataclass(frozen=True)
+class SourceComparisonOperand:
+    """One side of a comparison, as written (before conversions)."""
+
+    type: str
+    field: str | None = None  # field identity, for a plain field read
+    constant: int | None = None  # its value, when it is an integer constant
+
+
+@dataclass(frozen=True)
+class SourceComparison:
+    """One built-in comparison in a source function body."""
+
+    # pylint: disable=too-many-instance-attributes
+    operator: str  # <, <=, >, >=, ==, !=
+    # The type compared in, after the usual arithmetic conversions: this is
+    # what decides a signed or an unsigned machine comparison.
+    type: str
+    operands: tuple[SourceComparisonOperand, SourceComparisonOperand]
+    line: int
+    offset: int | None
+    bits: int | None = None  # integers, enumerations and pointers
+    signed: bool | None = None
+    floating: bool = False
+
+
+@dataclass(frozen=True)
 class SourceFunctionFacts:
     """Facts about one function body beyond its field uses."""
 
@@ -255,6 +281,8 @@ class SourceFunctionFacts:
     # The explicit calls (CallExpr nodes) in the body: not constructors,
     # destructors or other implicit calls, so not a complete call graph.
     calls: tuple[SourceCall, ...]
+    # Built-in comparisons; overloaded comparison operators are calls.
+    comparisons: tuple[SourceComparison, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -267,6 +295,10 @@ class FunctionFacts:
     call: CallFacts | None
     accesses: tuple[SourceMemberUse, ...]
     calls: tuple[SourceCall, ...]  # explicit calls only
+    comparisons: tuple[SourceComparison, ...] = ()
+
+    def comparisons_on_line(self, line: int) -> tuple[SourceComparison, ...]:
+        return tuple(item for item in self.comparisons if item.line == line)
 
 
 @dataclass(frozen=True)
@@ -985,6 +1017,18 @@ def _function_facts_from_dict(values: Mapping[str, Any]) -> SourceFunctionFacts:
         )
         for call in data["calls"]
     )
+    data["comparisons"] = tuple(
+        SourceComparison(
+            **{
+                **comparison,
+                "operands": tuple(
+                    SourceComparisonOperand(**operand)
+                    for operand in comparison["operands"]
+                ),
+            }
+        )
+        for comparison in data.get("comparisons") or ()
+    )
     return SourceFunctionFacts(**data)
 
 
@@ -1449,6 +1493,7 @@ class SourceIndex:
             self.call_facts_for(key),
             accesses,
             facts.calls if facts is not None else (),
+            facts.comparisons if facts is not None else (),
         )
 
     def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:

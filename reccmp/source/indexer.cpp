@@ -988,7 +988,49 @@ class Indexer {
       return true;
     }
 
+    // Every built-in comparison the body makes (overloaded operators are
+    // calls): the operator, the type it compares in after the usual
+    // conversions (so its width and signedness), and each operand as written.
+    bool VisitBinaryOperator(BinaryOperator* binary) {
+      if (!binary->isComparisonOp() || binary->isValueDependent()) return true;
+      QualType compared = binary->getLHS()->getType();
+      llvm::json::Object entry{
+          {"operator", binary->getOpcodeStr().str()},
+          {"type", indexer_.canonicalName(compared)},
+      };
+      if (auto shape = indexer_.integerShape(compared)) {
+        entry["bits"] = shape->first;
+        entry["signed"] = shape->second;
+      }
+      entry["floating"] = compared->isRealFloatingType();
+      llvm::json::Array operands;
+      for (const Expr* side : {binary->getLHS(), binary->getRHS()}) {
+        const Expr* written = side->IgnoreParenImpCasts();
+        llvm::json::Object operand{{"type", indexer_.canonicalName(written->getType())}};
+        const auto* read = dyn_cast<MemberExpr>(written);
+        const auto* field = read ? dyn_cast<FieldDecl>(read->getMemberDecl()) : nullptr;
+        if (field) operand["field"] = indexer_.fieldIdentity(field);
+        Expr::EvalResult value;
+        if (!written->isValueDependent() &&
+            written->EvaluateAsInt(value, indexer_.context_) && value.Val.isInt()) {
+          const llvm::APSInt& constant = value.Val.getInt();
+          operand["constant"] = constant.isSigned()
+                                    ? constant.getSExtValue()
+                                    : static_cast<int64_t>(constant.getZExtValue());
+        }
+        operands.push_back(std::move(operand));
+      }
+      entry["operands"] = std::move(operands);
+      Location where = indexer_.locate(binary->getOperatorLoc());
+      entry["line"] = where.line;
+      entry["offset"] = where.offset >= 0 ? llvm::json::Value(where.offset)
+                                          : llvm::json::Value(nullptr);
+      comparisons_.push_back(std::move(entry));
+      return true;
+    }
+
     llvm::json::Array takeCalls() { return std::move(calls_); }
+    llvm::json::Array takeComparisons() { return std::move(comparisons_); }
 
    private:
     // What the object of a member access or call is: this, a parameter
@@ -1381,6 +1423,7 @@ class Indexer {
     llvm::StringRef functionName_;
     Location functionLocation_;
     llvm::json::Array calls_;
+    llvm::json::Array comparisons_;
   };
 
   void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
@@ -1390,11 +1433,13 @@ class Indexer {
     MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
     visitor.TraverseStmt(function->getBody());
     llvm::json::Array calls = visitor.takeCalls();
-    if (!calls.empty()) {
+    llvm::json::Array comparisons = visitor.takeComparisons();
+    if (!calls.empty() || !comparisons.empty()) {
       emit(llvm::json::Object{
           {"record", "function-facts"},
           {"function", functionIdentity.str()},
           {"calls", std::move(calls)},
+          {"comparisons", std::move(comparisons)},
       });
     }
   }

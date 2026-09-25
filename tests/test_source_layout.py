@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -21,6 +23,14 @@ from reccmp.source import (
     SourceIndex,
 )
 from reccmp.source import SourceAbi, keyed
+from reccmp.source.index import (
+    DeclarationKey,
+    SourceComparison,
+    SourceComparisonOperand,
+    SourceDeclaration,
+    SourceFunctionFacts,
+    SourceMarker,
+)
 
 
 def _index_with_layout() -> SourceIndex:
@@ -771,3 +781,90 @@ def test_enrich_memory_address_with_layout_facts():
     assert enriched.difference.orig.facts["field_name"] == "flag"
     assert enriched.difference.orig.facts["field_offset"] == 8
     assert enriched.difference.recomp.facts["field_name"] == "tail"
+
+
+def test_branch_condition_shows_the_source_comparisons_on_its_line():
+    """A signedness or predicate difference is explained by the type the
+    recompiled source compares in."""
+    key = DeclarationKey("TEST", "?f@@YAHF@Z")
+    comparison = SourceComparison(
+        operator="<",
+        type="int",
+        operands=(
+            SourceComparisonOperand("short", field="c:@S@Foo@FI@s"),
+            SourceComparisonOperand("int", constant=65),
+        ),
+        line=12,
+        offset=None,
+        bits=32,
+        signed=True,
+    )
+    other_line = dataclasses.replace(comparison, line=13, operator="==")
+    index = SourceIndex(
+        declarations={},
+        classes={},
+        markers=[
+            SourceMarker(
+                address=0x401000,
+                marker_kind="FUNCTION",
+                source_file="f.cpp",
+                line=10,
+                declaration=SourceDeclaration(
+                    key.semantic_id,
+                    "f",
+                    "free_function",
+                    "__cdecl",
+                    "int",
+                    ("short",),
+                    None,
+                    False,
+                    False,
+                    "f.cpp",
+                    11,
+                    14,
+                    True,
+                ),
+                target="TEST",
+                declaration_key=key,
+            )
+        ],
+        function_facts={
+            key: SourceFunctionFacts(key.semantic_id, (), (comparison, other_line))
+        },
+    )
+    lines_db = MagicMock()
+    lines_db.find_line_of_recomp_address.return_value = None
+    lines_db.find_line_containing_recomp_address.return_value = (Path("f.cpp"), 12)
+    comparator = FunctionComparator(
+        db=MagicMock(),
+        lines_db=lines_db,
+        orig_bin=MagicMock(),
+        recomp_bin=MagicMock(),
+        report=MagicMock(),
+        types=MagicMock(),
+        source_index=index,
+    )
+    match = MagicMock()
+    match.orig_addr = 0x401000
+    match.recomp_addr = 0x501000
+    analysis = ComparisonAnalysis.mismatch(
+        ComparisonDifference(
+            "branch_condition",
+            DifferenceSide(0, 0x401010, {"predicate": "lt_u:..."}),
+            DifferenceSide(0, 0x501010, {"predicate": "lt_s:..."}),
+        )
+    )
+
+    enriched = (
+        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
+            analysis, match=match
+        )
+    )
+
+    assert enriched.difference is not None
+    assert (
+        enriched.difference.recomp.facts["source_comparisons"]
+        == "short field < 65 as int, signed"
+    )
+    assert "source_comparisons" not in enriched.difference.orig.facts
+    lines_db.find_line_containing_recomp_address.assert_called_with(0x501010, 0x501000)

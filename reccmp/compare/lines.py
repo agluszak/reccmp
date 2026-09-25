@@ -1,6 +1,7 @@
 """Database used to match (filename, line_number) pairs
 between FUNCTION markers and PDB analysis."""
 
+import bisect
 import logging
 from functools import cache
 from pathlib import Path, PurePath, PureWindowsPath
@@ -30,6 +31,7 @@ class LinesDb:
 
         # Addresses for the first line for a function
         self._function_starts: set[int] = set()
+        self._sorted_addresses: list[int] | None = None
 
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
@@ -87,6 +89,7 @@ class LinesDb:
         self._path_to_lines_and_addresses.setdefault(sourcepath, []).extend(list(lines))
         for line_number, address in lines:
             self._address_to_path_and_line[address] = (sourcepath, line_number)
+        self._sorted_addresses = None
 
         return True
 
@@ -153,3 +156,17 @@ class LinesDb:
 
     def find_line_of_recomp_address(self, address: int) -> tuple[PurePath, int] | None:
         return self._address_to_path_and_line.get(address, None)
+
+    def find_line_containing_recomp_address(
+        self, address: int, not_before: int
+    ) -> tuple[PurePath, int] | None:
+        """The line of the statement an instruction belongs to: the nearest
+        line entry at or before ``address``, but not before ``not_before``
+        (the function's start), so the search stays in its function."""
+        addresses = getattr(self, "_sorted_addresses", None)
+        if addresses is None:
+            addresses = self._sorted_addresses = sorted(self._address_to_path_and_line)
+        position = bisect.bisect_right(addresses, address) - 1
+        if position < 0 or addresses[position] < not_before:
+            return None
+        return self._address_to_path_and_line[addresses[position]]
