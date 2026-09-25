@@ -112,6 +112,7 @@ def entity_proof_identity(
     canonical original address. Unmatched data, strings, and locals stay
     side-local so identical names cannot prove correspondence.
     """
+    # pylint: disable=too-many-return-statements
     if entity.entity_type == EntityType.IMPORT_THUNK:
         # `jmp [__imp_X]`: calling it is calling through that slot.
         ref = entity.get("ref_orig" if image_id == ImageId.ORIG else "ref_recomp")
