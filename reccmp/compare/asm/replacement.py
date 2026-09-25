@@ -112,6 +112,15 @@ def entity_proof_identity(
     canonical original address. Unmatched data, strings, and locals stay
     side-local so identical names cannot prove correspondence.
     """
+    if entity.entity_type == EntityType.IMPORT_THUNK:
+        # `jmp [__imp_X]`: calling it is calling through that slot.
+        ref = entity.get("ref_orig" if image_id == ImageId.ORIG else "ref_recomp")
+        slot = db.get(image_id, ref) if ref is not None else None
+        if slot is not None and slot.entity_type == EntityType.IMPORT:
+            return (
+                "jmp_through",
+                entity_proof_identity(db, image_id, slot, 0, equivalence_groups),
+            )
     if entity.entity_type in _CALLABLE_TYPES:
         entity_addr = entity.addr(image_id)
         discovered_orig = (

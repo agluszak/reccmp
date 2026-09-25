@@ -302,6 +302,36 @@ def test_reject_swapped_cmp_same_jump():
     assert verify_effective_match(orig, recomp) is False
 
 
+def test_strict_and_non_strict_orders_against_a_constant():
+    """`x < 0x41` is `x <= 0x40`: compilers pick either spelling."""
+    assert verify_effective_match(
+        ["cmp eax, 0x41", "jb 0x10"], ["cmp eax, 0x40", "jbe 0x10"]
+    )
+    # c < x is c+1 <= x (ja against a constant on the right: 0x40 < x)
+    assert verify_effective_match(
+        ["cmp eax, 0x40", "ja 0x10"], ["cmp eax, 0x41", "jae 0x10"]
+    )
+    # signed, with a negative constant
+    assert verify_effective_match(
+        ["cmp eax, -5", "jl 0x10"], ["cmp eax, -6", "jle 0x10"]
+    )
+
+
+def test_order_normalization_keeps_real_differences_apart():
+    # off by one
+    assert not verify_effective_match(
+        ["cmp eax, 0x41", "jb 0x10"], ["cmp eax, 0x41", "jbe 0x10"]
+    )
+    # signedness: 0xffffffff is -1 for jl but the largest value for jb
+    assert not verify_effective_match(
+        ["cmp eax, -1", "jl 0x10"], ["cmp eax, -2", "jbe 0x10"]
+    )
+    # x < 0 (unsigned) is never true; x <= -1 is x <= 0xffffffff, always
+    assert not verify_effective_match(
+        ["cmp eax, 0", "jb 0x10"], ["cmp eax, -1", "jbe 0x10"]
+    )
+
+
 def test_swapped_cmp_with_rename():
     """Condition normalization composes with register renaming, but the
     divergent eax at ret is rejected until return-type metadata can prove
