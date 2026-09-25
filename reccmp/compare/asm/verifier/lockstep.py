@@ -22,6 +22,7 @@ from reccmp.compare.asm.verifier.obligations import (
     discharge_run_obligations,
     divergences_justified,
     invalidate_save_slots,
+    observations_agree,
     one_sided_ok,
     record_pair_categories,
     rewrite_control_observables,
@@ -191,7 +192,7 @@ def verify_effective_match(
                 commit_memory(ctx, obs_o, idx)
                 continue
 
-            if obs_o != obs_r:
+            if not observations_agree(ctx, obs_o, obs_r):
                 meta_o = (
                     orig_meta[index_o]
                     if orig_meta is not None and index_o is not None
