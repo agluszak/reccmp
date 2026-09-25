@@ -550,6 +550,13 @@ void Outer::M() {
   int picked = narrowed ? inner.s : inner.x;
   Helper(inner.s);
 }
+int Compares(Outer* o, unsigned int n, int k) {
+  if (o->inner.s < 65) return 1;
+  if (n <= 64u) return 2;
+  if (k < n) return 3;
+  if (n == 0xffffffffu) return 4;
+  return 0;
+}
 """
 
 
@@ -673,3 +680,32 @@ def test_function_facts_come_from_the_compiler(tmp_path: Path) -> None:
         for use in leaves
         if use.name == "s"
     } == {("short->int",)}
+
+    # Comparisons: the type compared in (after the usual conversions) and the
+    # operands as written.
+    compares = index.function_facts_for(
+        DeclarationKey("TEST", "?Compares@@YAHPAUOuter@@IH@Z")
+    )
+    assert compares is not None
+    short_field, unsigned, mixed, all_ones = sorted(
+        compares.comparisons, key=lambda c: c.line
+    )
+    # an unsigned constant keeps its unsigned value
+    assert all_ones.operands[1].constant == 0xFFFFFFFF
+    assert (short_field.operator, short_field.type, short_field.bits) == (
+        "<",
+        "int",
+        32,
+    )
+    assert short_field.signed is True
+    assert short_field.operands[0].type == "short" and short_field.operands[0].field
+    assert short_field.operands[1].constant == 65
+    assert (unsigned.operator, unsigned.signed, unsigned.operands[1].constant) == (
+        "<=",
+        False,
+        64,
+    )
+    # int < unsigned int compares unsigned: the source of a jb, not a jl
+    assert (mixed.type, mixed.signed) == ("unsigned int", False)
+    assert [operand.type for operand in mixed.operands] == ["int", "unsigned int"]
+    assert compares.comparisons_on_line(short_field.line) == (short_field,)

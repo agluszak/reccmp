@@ -207,3 +207,27 @@ def test_pickle_round_trip_rebuilds_path_resolver():
     restored = pickle.loads(pickle.dumps(lines))
 
     assert restored.find_function(LOCAL_PATHS[1], 2) == 0x1234
+
+
+@pytest.mark.parametrize("local_path", LOCAL_PATHS)
+def test_line_containing_an_instruction(local_path: PureWindowsPath | PurePosixPath):
+    """An instruction inside a statement belongs to the nearest line entry
+    before it, within its function; the cache follows added lines and
+    survives pickling."""
+    lines = LinesDb()
+    lines.add_local_paths([local_path])
+    lines.add_lines(PDB_PATH, [(10, 0x1000), (12, 0x1010), (20, 0x2000)])
+
+    assert lines.find_line_containing_recomp_address(0x1010, 0x1000) == (local_path, 12)
+    assert lines.find_line_containing_recomp_address(0x101F, 0x1000) == (local_path, 12)
+    assert lines.find_line_containing_recomp_address(0x0FFF, 0x0F00) is None
+    # a function starting at 0x1800 has no line entry of its own before 0x1900
+    assert lines.find_line_containing_recomp_address(0x1900, 0x1800) is None
+
+    lines.add_line(PDB_PATH, 14, 0x1018)
+    assert lines.find_line_containing_recomp_address(0x101F, 0x1000) == (local_path, 14)
+    restored = pickle.loads(pickle.dumps(lines))
+    assert restored.find_line_containing_recomp_address(0x2004, 0x2000) == (
+        local_path,
+        20,
+    )
