@@ -43,14 +43,22 @@ def find_funcinfo_offsets_in_buffer(buf: Buffer) -> Iterator[int]:
 
 
 def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
-    """Parse the FuncInfo struct and return its location."""
+    """Parse the FuncInfo struct and return its location. A magic number
+    without unwind states, or whose unwind map does not lie in the same
+    buffer, is not a FuncInfo."""
+    size = len(memoryview(buf))
     for ofs in find_funcinfo_offsets_in_buffer(buf):
+        if ofs + 12 > size:
+            continue
         # TODO: The structure may vary depending on the magic string.
         # We support format 19930520 to start.
         max_state, unwind_map_addr = struct.unpack_from("<4x2I", buf, offset=ofs)
 
         # Unwind offset is an absolute address.
         unwind_map_ofs = unwind_map_addr - base_addr
+        # A function with EH has at least one unwind state.
+        if not max_state or not 0 <= unwind_map_ofs <= size - 8 * max_state:
+            continue
         unwinds = tuple(
             UnwindMapEntry(
                 *struct.unpack_from("<iI", buf, offset=unwind_map_ofs + 8 * i)
@@ -62,8 +70,9 @@ def find_funcinfo_in_buffer(buf: Buffer, base_addr: int) -> Iterator[FuncInfo]:
 
 
 def find_funcinfo(image: PEImage) -> Iterator[FuncInfo]:
-    """Find all FuncInfo structs in the image."""
-    for region in image.get_const_regions():
+    """Find all FuncInfo structs in the image: in any readable, non-executable
+    section, since not every linker (or later tool) leaves .rdata read-only."""
+    for region in image.get_data_regions():
         yield from find_funcinfo_in_buffer(region.data, region.addr)
 
 

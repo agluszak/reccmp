@@ -259,16 +259,12 @@ def _absolute_symbol(address: Value) -> Hashable | None:
         return None
     if address[0] == "sym" and len(address) == 2:
         return address[1]
-    if (
-        address[0] == "mem"
-        and len(address) == 5
-        and not address[2]
-        and address[3] == 0
-        and len(address[4]) == 1
-        and address[4][0][0] == 1
-    ):
-        return operand_identity(address[4][0][1])
-    return None
+    if address[0] != "mem" or len(address) != 5:
+        return None
+    _, _, registers, displacement, symbols = address
+    if registers or displacement != 0 or len(symbols) != 1 or symbols[0][0] != 1:
+        return None
+    return operand_identity(symbols[0][1])
 
 
 def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
