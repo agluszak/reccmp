@@ -13,7 +13,8 @@ import pytest
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
 from reccmp.call_facts import CallFacts
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, ReccmpEntity
+from reccmp.compare.refutation import RefutationMixin
 from reccmp.compare.asm.verifier import verify_effective_match
 from reccmp.compare.diagnosis import (
     AnalysisRecorder,
@@ -624,3 +625,23 @@ def test_the_start_of_a_paired_entity_needs_no_extent():
         UNRESOLVED,
         "unknown_extent",
     )
+
+
+def test_a_paired_object_borrows_only_an_exactly_fitting_extent():
+    """Without an original size, the recompiled size is used only when it is
+    exactly the gap to the next known original entity."""
+
+    def extent(orig_gap: int, *, matched: bool = True) -> int | None:
+        entity = ReccmpEntity(
+            DATA,
+            DATA + 0x100 if matched else None,
+            {"type": EntityType.DATA, "recomp_size": 8, "orig_max_size": orig_gap},
+        )
+        comparator = SimpleNamespace(_witness_extents={})
+        # pylint: disable-next=protected-access
+        return RefutationMixin._witness_extent(comparator, ImageId.ORIG, entity)  # type: ignore[arg-type]
+
+    assert extent(8) == 8
+    assert extent(12) is None  # room for an unknown object after it
+    assert extent(4) is None  # does not fit
+    assert extent(8, matched=False) is None

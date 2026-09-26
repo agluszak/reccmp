@@ -24,7 +24,7 @@ from capstone.x86 import X86_OP_REG  # type: ignore
 
 from reccmp.compare.asm.ir import FunctionImage
 from reccmp.call_facts import CallFacts
-from reccmp.compare.db import EntityDb, EntityTypeLookup
+from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.compare.diagnosis import RefutationWitness as Witness
 from reccmp.types import ImageId
 
@@ -56,12 +56,15 @@ class Translator:
         orig: SideMachine,
         recomp: SideMachine,
         call_facts: Callable[[Identity], CallFacts | None] | None = None,
+        extent: Callable[[ImageId, ReccmpEntity], int | None] | None = None,
     ):
         """``call_facts`` gives what is known about calling a paired callee
-        (``("entity", ...)`` or ``("import", key)`` identity)."""
+        (``("entity", ...)`` or ``("import", key)`` identity). ``extent``
+        gives an entity's size on one side, by default the recorded one."""
         self.db = db
         self.machines = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
         self.call_facts = call_facts or (lambda _identity: None)
+        self.extent = extent or (lambda side, entity: entity.size(side))
 
     def identity(self, side: ImageId, addr: int) -> Identity:
         return self.classify(side, addr)[0]
@@ -80,7 +83,7 @@ class Translator:
         if entity is None:
             return UNRESOLVED, "no_entity"
         base = entity.addr(side)
-        size = entity.size(side)
+        size = self.extent(side, entity) if base is not None else None
         if base is None or (size is None and addr != base):
             # Only an address past the start needs the extent to say that
             # it still belongs to the entity.
@@ -115,7 +118,7 @@ class Translator:
             else None
         )
         if entity is not None and (base := entity.addr(side)) is not None:
-            size = entity.size(side)
+            size = self.extent(side, entity)
             info["entity"] = {
                 "address": f"{base:#x}",
                 "size": size,

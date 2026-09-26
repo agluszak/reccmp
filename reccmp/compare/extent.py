@@ -155,3 +155,21 @@ def discover_extent(
         if position > table:
             end = max(end, position)
     return end - start
+
+
+def plausible_discovered_extent(
+    image: Image,
+    start: int,
+    limit: int | None,
+    counterpart_size: int,
+    *,
+    is_32bit: bool = True,
+) -> int | None:
+    """``discover_extent`` for a function whose size is not recorded,
+    rejected when much larger than its counterpart in the other binary: the
+    walk then usually ran past a call that does not return into the next
+    function."""
+    discovered = discover_extent(image, start, limit, is_32bit=is_32bit)
+    if discovered is None or discovered > 2 * counterpart_size + 64:
+        return None
+    return discovered

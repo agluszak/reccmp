@@ -20,11 +20,14 @@ from reccmp.compare.diagnosis import (
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
-from reccmp.types import ImageId
+from reccmp.compare.extent import plausible_discovered_extent
+from reccmp.types import EntityType, ImageId
+
+_CODE_TYPES = (EntityType.FUNCTION, EntityType.THUNK, EntityType.VTORDISP)
 
 if TYPE_CHECKING:
     from reccmp.compare.asm.ir import FunctionImage
-    from reccmp.compare.db import ReccmpMatch
+    from reccmp.compare.db import ReccmpEntity, ReccmpMatch
     from reccmp.compare.witness import SearchResult, Translator
     from reccmp.compare.witness.machine import RunInput
 
@@ -73,6 +76,8 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
 
     witness_search: bool
     _witness_translator: Translator | None
+    # (side, address) -> extent from _witness_extent; filled on demand.
+    _witness_extents: dict[tuple[ImageId, int], int | None]
 
     def _witness_machines(self) -> Translator:
         if self._witness_translator is None:
@@ -106,7 +111,9 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             def sizes(image_id: ImageId):
                 def size(address: int) -> int | None:
                     entity = self.db.get(image_id, address)
-                    return entity.size(image_id) if entity is not None else None
+                    if entity is None:
+                        return None
+                    return self._witness_extent(image_id, entity)
 
                 return size
 
@@ -117,8 +124,42 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                     self.recomp_bin, registry, by_import, sizes(ImageId.RECOMP)
                 ),
                 call_facts=callee_facts,
+                extent=self._witness_extent,
             )
         return self._witness_translator
+
+    def _witness_extent(self, image_id: ImageId, entity: ReccmpEntity) -> int | None:
+        """An entity's size on one side, for the witness: the recorded one,
+        else one backed by evidence from this binary.
+
+        - A function's extent from its control flow (as the comparator
+          estimates unannotated original functions).
+        - Other entities of a pair: the other side's size, only when it is
+          exactly the gap to the next known entity on this side, so no
+          unknown object can sit inside the borrowed extent.
+        """
+        size = entity.size(image_id)
+        base = entity.addr(image_id)
+        if size is not None or base is None or not entity.matched:
+            return size
+        key = (image_id, base)
+        if key not in self._witness_extents:
+            other = ImageId.RECOMP if image_id == ImageId.ORIG else ImageId.ORIG
+            other_size = entity.size(other)
+            gap = entity.max_size(image_id)
+            extent = None
+            if other_size is not None and entity.get("type") in _CODE_TYPES:
+                extent = plausible_discovered_extent(
+                    self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin,
+                    base,
+                    gap,
+                    other_size,
+                    is_32bit=self.is_32bit,
+                )
+            elif other_size is not None and gap == other_size:
+                extent = other_size
+            self._witness_extents[key] = extent
+        return self._witness_extents[key]
 
     def _refute(
         self,

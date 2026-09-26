@@ -55,7 +55,7 @@ from reccmp.formats import Image, PEImage
 from reccmp.types import ImageId
 
 from reccmp.compare.body_equivalence import _is_bare_jmp_island
-from reccmp.compare.extent import discover_extent
+from reccmp.compare.extent import plausible_discovered_extent
 from reccmp.compare.refutation import RefutationMixin
 from reccmp.compare.inline_accounting import InlineAccountingMixin
 
@@ -185,6 +185,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         self._helper_identity_index: dict[str, int] | None = None
         self._helper_identity_ambiguous: set[str] | None = None
         self._witness_translator = None
+        self._witness_extents = {}
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(
@@ -294,12 +295,14 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 orig_size = min(orig_max, recomp_size)
             else:
                 orig_size = recomp_size
-            discovered = discover_extent(
-                self.orig_bin, match.orig_addr, orig_max, is_32bit=self.is_32bit
+            discovered = plausible_discovered_extent(
+                self.orig_bin,
+                match.orig_addr,
+                orig_max,
+                recomp_size,
+                is_32bit=self.is_32bit,
             )
-            # Much larger than the recompilation usually means the walk ran
-            # past a call that does not return into the next function.
-            if discovered is not None and discovered <= 2 * recomp_size + 64:
+            if discovered is not None:
                 orig_size = discovered
         else:
             orig_size = annotated_orig_size
