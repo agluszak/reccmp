@@ -333,6 +333,10 @@ def load_target_analysis(
                     str(source.path) for source in equivalence_sources
                 ],
                 "symbols": symbol_scope,
+                # Declaration binding, keys, ownership and ABI facts are
+                # inputs too, and change with the collector, not only with
+                # the sources.
+                "source_index": source_index.identity(),
             },
             sort_keys=True,
         )
