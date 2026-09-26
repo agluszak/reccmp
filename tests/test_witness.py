@@ -98,13 +98,23 @@ def _search(
         batch.match(ORIG_FUNC, RECOMP_FUNC)
         batch.match(ORIG_TABLE, RECOMP_TABLE)
         batch.match(ORIG_CALLEE, RECOMP_CALLEE)
+
+    def sizes(image_id: ImageId):
+        def size(address: int) -> int | None:
+            entity = db.get(image_id, address)
+            return entity.size(image_id) if entity is not None else None
+
+        return size
+
     translator = Translator(
         db,
         SideMachine(
-            _image(ORIG_FUNC, orig_code, ORIG_TABLE, callee_body)  # type: ignore[arg-type]
+            _image(ORIG_FUNC, orig_code, ORIG_TABLE, callee_body),  # type: ignore[arg-type]
+            function_size=sizes(ImageId.ORIG),
         ),
         SideMachine(
-            _image(RECOMP_FUNC, recomp_code, RECOMP_TABLE, callee_body)  # type: ignore[arg-type]
+            _image(RECOMP_FUNC, recomp_code, RECOMP_TABLE, callee_body),  # type: ignore[arg-type]
+            function_size=sizes(ImageId.RECOMP),
         ),
         call_facts=call_facts,
     )
@@ -278,7 +288,10 @@ def test_instruction_facts_come_from_capstone_detail():
     # A jmp thunk at +0x40 to a callee ending in ``ret 8``.
     thunk = b"\xe9" + _abs32((0x50 - 0x45) & 0xFFFFFFFF)
     code = body.ljust(0x40, b"\x90") + thunk.ljust(0x10, b"\x90") + b"\xc2\x08\x00"
-    machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+    machine = SideMachine(
+        _image(ORIG_FUNC, code, ORIG_TABLE),  # type: ignore[arg-type]
+        function_size=lambda address: 3 if address == ORIG_FUNC + 0x50 else None,
+    )
 
     # Branch targets and the ``ret`` immediate are not constants.
     image = _function_image(ORIG_FUNC, body)
@@ -461,6 +474,19 @@ def test_a_callee_without_ret_does_not_lend_the_next_functions():
         function_size=lambda address: 4 if address == ORIG_CALLEE else None,
     )
     assert sized.callee_pop_bytes(ORIG_CALLEE) is None
-    # Neither known: the scan cannot tell where the callee ends.
+    # No known extent: unknown, never a scan into the next function.
     unsized = SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE, adjacent))  # type: ignore[arg-type]
-    assert unsized.callee_pop_bytes(ORIG_CALLEE) == 8
+    assert unsized.callee_pop_bytes(ORIG_CALLEE) is None
+    # A thunk is followed, and its destination needs a known extent too.
+    thunk = b"\xe9" + _abs32(0x10 - 5)  # jmp +0x10
+    body = thunk.ljust(0x10, b"\x90") + bytes.fromhex("c20800")
+    for known, expected in ((False, None), (True, 8)):
+
+        def destination_size(address: int, known: bool = known) -> int | None:
+            return 3 if known and address == ORIG_CALLEE + 0x10 else None
+
+        machine = SideMachine(
+            _image(ORIG_FUNC, RET, ORIG_TABLE, body),  # type: ignore[arg-type]
+            function_size=destination_size,
+        )
+        assert machine.callee_pop_bytes(ORIG_CALLEE) == expected

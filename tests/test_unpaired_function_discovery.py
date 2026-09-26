@@ -2,12 +2,13 @@
 from unittest.mock import Mock
 
 from reccmp.compare.asm.replacement import entity_proof_identity
+from reccmp.compare.body_equivalence import _identical_code
 from reccmp.compare.db import EntityDb
 from reccmp.compare.functions import FunctionComparator
 from reccmp.types import EntityType, ImageId
 
 
-def make_graph_comparator(db: EntityDb, fingerprints, edges):
+def make_graph_comparator(db: EntityDb, fingerprints, edges, identical=frozenset()):
     comparator = object.__new__(FunctionComparator)
     comparator.db = db
     comparator.equivalence_groups = {}
@@ -17,6 +18,10 @@ def make_graph_comparator(db: EntityDb, fingerprints, edges):
     )
     comparator.raw_pair_alias_equivalent = Mock(  # type: ignore[method-assign]
         side_effect=lambda orig, recomp, size: (orig, recomp) in edges
+    )
+    # Recompiled duplicates are proven against the pair's recompiled body.
+    comparator.recomp_code_identical = Mock(  # type: ignore[method-assign]
+        side_effect=lambda duplicate, body, size: (duplicate, body) in identical
     )
     return comparator
 
@@ -115,7 +120,7 @@ def test_aliases_are_symmetric_and_do_not_create_fake_pairs():
     # Cross-unmatched equivalence is deliberately absent: each duplicate is
     # independently proven against the existing canonical body.
     comparator = make_graph_comparator(
-        db, fingerprints, {(0x110, 0x200), (0x100, 0x210)}
+        db, fingerprints, {(0x110, 0x200)}, identical={(0x210, 0x200)}
     )
 
     assert not comparator.discover_unpaired_function_bodies()
@@ -221,10 +226,11 @@ def test_paired_callsite_discovery_selects_only_mutually_unique_edges():
     assert not db.is_match(0x110, 0x210)
 
 
-def test_a_recomp_duplicate_of_a_pair_without_original_size_is_an_alias():
+def test_a_recomp_duplicate_is_proven_against_the_pairs_recompiled_body():
     """The original of a pair often comes from symbol data without a size
-    (Wizardry's ILLength); the pair is compared over the recompiled extent,
-    and so is a recompiled duplicate (PLLength)."""
+    (Wizardry's ILLength). A recompiled duplicate (PLLength) is proven
+    identical to the pair's recompiled body, whose extent is known, so no
+    retail extent is ever guessed."""
     db = EntityDb()
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 0x100, type=EntityType.FUNCTION)  # no size
@@ -237,12 +243,37 @@ def test_a_recomp_duplicate_of_a_pair_without_original_size_is_an_alias():
         (ImageId.RECOMP, 0x200): shape,
         (ImageId.RECOMP, 0x210): shape,
     }
+    # Even a cross-image proof over a guessed retail extent is not used.
     comparator = make_graph_comparator(db, fingerprints, {(0x100, 0x210)})
-
     comparator.discover_unpaired_function_bodies()
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x210) is None
 
+    comparator = make_graph_comparator(
+        db, fingerprints, set(), identical={(0x210, 0x200)}
+    )
+    comparator.discover_unpaired_function_bodies()
     assert db.alias_canonical_orig(ImageId.RECOMP, 0x210) == 0x100
     # A call to the duplicate proves equal to a call to the original.
     duplicate = db.get(ImageId.RECOMP, 0x210)
     assert duplicate is not None
     assert entity_proof_identity(db, ImageId.RECOMP, duplicate) == ("entity", 0x100, 0)
+
+
+def test_identical_code_within_one_image():
+    """Same instructions; branches inside each body at the same offsets,
+    calls and absolute operands to the same targets."""
+
+    def body(at: int, callee: int) -> bytes:
+        # test ecx, ecx; je +1; ret; call callee; ret
+        call = (callee - (at + 10)).to_bytes(4, "little", signed=True)
+        return bytes.fromhex("85c97401c3") + b"\xe8" + call + b"\xc3"
+
+    memory = {0x1000: body(0x1000, 0x5000), 0x1040: body(0x1040, 0x5000)}
+    memory[0x1080] = body(0x1080, 0x6000)
+    image = Mock()
+    image.read.side_effect = lambda address, size: memory[address][:size]
+    size = len(memory[0x1000])
+
+    assert _identical_code(image, 0x1000, 0x1040, size)
+    # the same bytes would be a call elsewhere: not the same code
+    assert not _identical_code(image, 0x1000, 0x1080, size)
