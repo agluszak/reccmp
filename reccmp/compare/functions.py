@@ -171,6 +171,8 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     source_index: SourceIndex | None = None
     # Try to refute unproven results by differential execution (needs unicorn).
     witness_search: bool = False
+    # From the target's `verifier` configuration.
+    algebraic_identities: bool = True
 
     def __post_init__(self):
         self._call_facts_cache: dict[str, CallFacts | None] | None = None

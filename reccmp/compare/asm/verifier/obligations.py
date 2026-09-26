@@ -849,11 +849,14 @@ def record_pair_categories(
 
 
 def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
-    """Equal observations, or (with z3-solver installed) observations whose
-    values are proven equal as bit-vectors. Such a proof is recorded as an
-    algebraic identity, and both sides' values become matched evidence."""
+    """Equal observations, or, where the configuration allows algebraic
+    identities, observations whose values z3 proves equal as bit-vectors.
+    Such a proof is recorded as an algebraic identity, and both sides'
+    values become matched evidence."""
     if obs_o == obs_r:
         return True
+    if ctx.metadata is not None and not ctx.metadata.algebraic_identities:
+        return False
     if not bitvector.observations_equal(obs_o, obs_r):
         return False
     ctx.categories.add("algebraic_identity")

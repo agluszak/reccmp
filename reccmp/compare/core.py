@@ -365,6 +365,7 @@ class Compare:
             equivalence_sources=loaded.equivalence_sources,
             source_index=loaded.source_index,
         )
+        compare.function_comparator.algebraic_identities = target.algebraic_identities
         prepared = loaded.load_prepared()
         if prepared is not None:
             compare._restore_prepared_analysis(prepared)

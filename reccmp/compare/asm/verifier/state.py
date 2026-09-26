@@ -199,6 +199,8 @@ class FunctionMetadata:
 
     return_kind: str = "unknown"
     call_facts: Callable[[str], CallFacts | None] | None = None
+    # Accept observed values z3 proves equal (project `verifier` config).
+    algebraic_identities: bool = True
 
 
 def register_arguments(facts: CallFacts | None) -> tuple[bool, bool]:
