@@ -151,6 +151,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                     agreeing=result.agreeing_seeds,
                     reached_location=_reached(result, analysis),
                     no_verdict=dict(result.skipped),
+                    no_verdict_details=result.skipped_details,
                 ),
             )
         refuted = analysis.with_witness(result.witness)

@@ -20,9 +20,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
+from capstone.x86 import X86_OP_REG  # type: ignore
+
 from reccmp.compare.asm.ir import FunctionImage
 from reccmp.call_facts import CallFacts
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, EntityTypeLookup
 from reccmp.compare.diagnosis import RefutationWitness as Witness
 from reccmp.types import ImageId
 
@@ -62,27 +64,70 @@ class Translator:
         self.call_facts = call_facts or (lambda _identity: None)
 
     def identity(self, side: ImageId, addr: int) -> Identity:
+        return self.classify(side, addr)[0]
+
+    def classify(self, side: ImageId, addr: int) -> tuple[Identity, str]:
+        """``identity`` and why it is what it is: ``stack``, ``outside_image``,
+        ``entity``, or for UNRESOLVED ``no_entity``, ``unknown_extent``,
+        ``outside_extent``, ``unpaired`` or ``inside_code``."""
         # pylint: disable=too-many-return-statements
         machine = self.machines[side]
         if machine.in_stack(addr):
-            return STACK
+            return STACK, "stack"
         if addr not in machine.image_range:
-            return ("abs", addr)
+            return ("abs", addr), "outside_image"
         entity = self.db.get(side, addr, exact=False)
         if entity is None:
-            return UNRESOLVED
+            return UNRESOLVED, "no_entity"
         base = entity.addr(side)
         size = entity.size(side)
-        if base is None or size is None or not base <= addr < base + max(size, 1):
-            return UNRESOLVED
+        if base is None or size is None:
+            return UNRESOLVED, "unknown_extent"
+        if not base <= addr < base + max(size, 1):
+            return UNRESOLVED, "outside_extent"
         canonical = self.db.alias_canonical_orig(side, base)
         if canonical is None:
-            return UNRESOLVED
+            return UNRESOLVED, "unpaired"
         if addr != base and machine.in_code(addr):
             # Code is only referenced at function starts; an address inside a
             # function comes from arithmetic or an over-estimated extent.
-            return UNRESOLVED
-        return ("entity", canonical, addr - base)
+            return UNRESOLVED, "inside_code"
+        return ("entity", canonical, addr - base), "entity"
+
+    def explain(self, side: ImageId, addr: int) -> dict[str, object]:
+        """What the database knows about ``addr``, for no-verdict
+        diagnostics: its section, why it has its identity, and the entity at
+        or before it."""
+        machine = self.machines[side]
+        ident, why = self.classify(side, addr)
+        info: dict[str, object] = {
+            "address": f"{addr:#x}",
+            "section": machine.section_name(addr),
+            "why": why,
+        }
+        if ident != UNRESOLVED:
+            info["identity"] = _fmt(ident)
+        entity = (
+            self.db.get(side, addr, exact=False)
+            if addr in machine.image_range
+            else None
+        )
+        if entity is not None and (base := entity.addr(side)) is not None:
+            size = entity.size(side)
+            info["entity"] = {
+                "address": f"{base:#x}",
+                "size": size,
+                "type": EntityTypeLookup.get(entity.entity_type or -1, "UNK"),
+                "name": entity.best_name(),
+                "matched": entity.matched,
+                # The paired original address, for a pair or an alias.
+                "canonical": (
+                    None
+                    if (canonical := self.db.alias_canonical_orig(side, base)) is None
+                    else f"{canonical:#x}"
+                ),
+            }
+        return info
 
     def identity_span(self, side: ImageId, span: AccessSpan) -> Identity:
         """Identity of an access, when all its bytes belong to one object
@@ -152,6 +197,8 @@ class SearchResult:
     witness: Witness | None = None
     # Why seeds produced no verdict, e.g. {"call_structure": 3, "limit": 1}.
     skipped: Counter[str] = field(default_factory=Counter)
+    # For some of those reasons, what the first such run could not identify.
+    skipped_details: dict[str, dict[str, object]] = field(default_factory=dict)
     agreeing_seeds: int = 0
     runs: int = 0
     # Instructions executed by the seeds on which both sides agreed.
@@ -173,6 +220,81 @@ def _fmt(ident: Identity) -> str:
     if isinstance(ident, tuple) and ident and ident[0] == "entity":
         return f"<{ident[1]:#x}+{ident[2]:#x}>"
     return str(ident)
+
+
+def _resolved(ident: Identity) -> bool:
+    return ident not in (UNRESOLVED, ("via", UNRESOLVED))
+
+
+def _image_read_detail(
+    translator: Translator,
+    side: ImageId,
+    span: AccessSpan,
+    trace: Trace,
+    counterpart: Trace,
+) -> dict[str, object]:
+    """An image read without an object identity, and what the other side
+    read from its image in the same run."""
+    other = ImageId.RECOMP if side == ImageId.ORIG else ImageId.ORIG
+    image = translator.machines[side].image
+    detail: dict[str, object] = {
+        "side": side.name.lower(),
+        "size": span.size,
+        "instruction": f"{trace.image_reads[span]:#x}",
+        # A relocated dword overlaps the bytes read: the value is a pointer.
+        "relocated": any(
+            image.is_relocated_addr(a) for a in range(span.address - 3, span.last + 1)
+        ),
+        "first": translator.explain(side, span.address),
+    }
+    if span.size > 1 and translator.classify(side, span.last)[0] != (
+        translator.classify(side, span.address)[0]
+    ):
+        detail["last"] = translator.explain(side, span.last)
+    other_machine = translator.machines[other]
+    detail["counterpart_reads"] = [
+        {
+            "address": f"{read.address:#x}",
+            "size": read.size,
+            "instruction": f"{site:#x}",
+            "identity": _fmt(translator.identity_span(other, read)),
+        }
+        for read, site in sorted(counterpart.image_reads.items(), key=lambda r: r[1])
+        if not other_machine.in_import_slot(read)
+    ][:8]
+    return detail
+
+
+def _call_detail(
+    translator: Translator, side: ImageId, call: CallEvent, target: Identity
+) -> dict[str, object]:
+    """How one side's call was made and what its target and slot are."""
+    machine = translator.machines[side]
+    insn = machine.insn_at(call.call_site)
+    if call.target == call.call_site:
+        kind = "left_function"  # control left the function other than by call
+    elif call.target_slot is not None:
+        kind = "memory"
+    elif insn is not None and insn.operands and insn.operands[0].type == X86_OP_REG:
+        kind = "register"
+    else:
+        kind = "direct"
+    detail: dict[str, object] = {
+        "resolved": _resolved(target),
+        "kind": kind,
+        "call_site": f"{call.call_site:#x}",
+        "identity": _fmt(target),
+    }
+    if call.target is not None:
+        resolved = machine.resolve_code(call.target)
+        detail["target"] = translator.explain(side, call.target)
+        if resolved != call.target:
+            detail["thunk_destination"] = translator.explain(side, resolved)
+        if resolved in machine.imports:
+            detail["import"] = machine.imports[resolved]
+    if call.target_slot is not None:
+        detail["slot"] = translator.explain(side, call.target_slot)
+    return detail
 
 
 def _argument_witness(
@@ -217,9 +339,13 @@ def _compare(
     translator: Translator,
     return_kind: str,
     seed: int,
+    details: dict[str, dict[str, object]] | None = None,
 ) -> tuple[Witness | None, str | None]:
-    """Return a witness, or the reason this seed gives no verdict."""
+    """Return a witness, or the reason this seed gives no verdict. For
+    ``unknown_image_read`` and ``unresolved_call``, ``details`` gets what
+    was not identified (first occurrence per reason)."""
     # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     ends = {t_o.end, t_r.end}
     if not ends <= {"return", "truncated"}:
         return None, sorted(ends - {"return", "truncated"})[0]
@@ -230,15 +356,25 @@ def _compare(
             if machine.in_import_slot(span):
                 continue
             if translator.identity_span(side, span) == UNRESOLVED:
+                if details is not None and "unknown_image_read" not in details:
+                    details["unknown_image_read"] = _image_read_detail(
+                        translator, side, span, trace, t_r if side == orig else t_o
+                    )
                 return None, "unknown_image_read"
     targets: list[Identity] = []
-    for call_o, call_r in zip(t_o.calls, t_r.calls):
+    for index, (call_o, call_r) in enumerate(zip(t_o.calls, t_r.calls)):
         target_o = translator.call_target(orig, call_o.target, call_o.target_slot)
         target_r = translator.call_target(recomp, call_r.target, call_r.target_slot)
         if UNRESOLVED in (target_o, target_r) or ("via", UNRESOLVED) in (
             target_o,
             target_r,
         ):
+            if details is not None and "unresolved_call" not in details:
+                details["unresolved_call"] = {
+                    "index": index,
+                    "orig": _call_detail(translator, orig, call_o, target_o),
+                    "recomp": _call_detail(translator, recomp, call_r, target_r),
+                }
             return None, "unresolved_call"
         if target_o != target_r:
             return None, "call_structure"
@@ -412,7 +548,9 @@ def find_witness(
         seed = run_input.seed
         t_o = orig.run(orig_range, run_input)
         t_r = recomp.run(recomp_range, run_input)
-        witness, reason = _compare(t_o, t_r, translator, return_kind, seed)
+        witness, reason = _compare(
+            t_o, t_r, translator, return_kind, seed, result.skipped_details
+        )
         result.runs += 1
         if witness is not None:
             result.witness = witness

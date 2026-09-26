@@ -253,6 +253,9 @@ class ExecutionEvidence:
     reached_location: int | None = None
     # Why the other runs gave no verdict, e.g. {"foreign_access": 3}.
     no_verdict: dict[str, int] = field(default_factory=dict)
+    # For unknown_image_read and unresolved_call: the first unidentified
+    # read or call (addresses, sections, database entities on each side).
+    no_verdict_details: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

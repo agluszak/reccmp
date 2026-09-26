@@ -250,9 +250,10 @@ class Trace:
     # For each byte outside the stack: the (address, size, value was an image
     # address, calls made before it) of the store that wrote it last.
     last_writer: dict[int, tuple[int, int, bool, int]] = field(default_factory=dict)
-    # Data reads inside the image; each must lie within one known object for
-    # the run to be layout-independent.
-    image_reads: set[AccessSpan] = field(default_factory=set)
+    # Data reads inside the image, each with the first instruction that made
+    # it; each must lie within one known object for the run to be
+    # layout-independent.
+    image_reads: dict[AccessSpan, int] = field(default_factory=dict)
     eax: int = 0
     edx: int = 0
     esp_after_return: int = 0
@@ -497,6 +498,12 @@ class SideMachine:
                 break
         return target
 
+    def section_name(self, addr: int) -> str | None:
+        for section in self.image.sections:
+            if addr in section.virtual_range:
+                return section.name
+        return None
+
     def in_code(self, addr: int) -> bool:
         return any(addr in r for r in self.code_ranges)
 
@@ -576,7 +583,9 @@ class SideMachine:
             )
 
         def on_read(_uc, _access, addr, size, _value, _data):
-            trace.image_reads.add(AccessSpan(addr, size))
+            trace.image_reads.setdefault(
+                AccessSpan(addr, size), uc.reg_read(UC_X86_REG_EIP)
+            )
 
         pointer_bytes_read: list[int] = []
 

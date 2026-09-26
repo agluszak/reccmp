@@ -71,7 +71,8 @@ def _image(code_at: int, code: bytes, table_at: int, callee_body: bytes = RET_BY
         sections=[
             section(CODE, code_page, ImageSectionFlags.EXECUTE),
             section(DATA, data_page, ImageSectionFlags.READ),
-        ]
+        ],
+        is_relocated_addr=lambda _addr: False,
     )
 
 
@@ -408,6 +409,39 @@ def test_a_read_straddling_the_end_of_an_object_is_not_known():
     result = _search(body(ORIG_TABLE), body(RECOMP_TABLE))
     assert result.witness is None
     assert result.skipped.get("unknown_image_read") == result.runs
+    # The diagnostics name the read, its instruction and the object it overran.
+    detail = result.skipped_details["unknown_image_read"]
+    assert detail["side"] == "orig" and detail["size"] == 4
+    assert detail["instruction"] == f"{ORIG_FUNC:#x}"
+    assert detail["first"]["why"] == "entity"
+    assert detail["last"]["why"] == "outside_extent"
+    assert detail["last"]["entity"]["address"] == f"{ORIG_TABLE:#x}"
+    assert detail["counterpart_reads"] == [
+        {
+            "address": f"{RECOMP_TABLE + len(TABLE) - 1:#x}",
+            "size": 4,
+            "instruction": f"{RECOMP_FUNC:#x}",
+            "identity": "('unresolved',)",
+        }
+    ]
+
+
+def test_an_unresolved_call_is_described():
+    """A call into the image where the database knows no function."""
+    unknown = CODE + 0x600
+    # mov eax, unknown; call eax; ret
+    code = b"\xb8" + _abs32(unknown) + b"\xff\xd0" + RET
+    result = _search(code, code)
+    assert result.witness is None
+    assert result.skipped.get("unresolved_call") == result.runs
+    detail = result.skipped_details["unresolved_call"]
+    assert detail["index"] == 0
+    orig = detail["orig"]
+    assert orig["kind"] == "register" and not orig["resolved"]
+    assert orig["call_site"] == f"{ORIG_FUNC + 5:#x}"
+    assert orig["target"]["why"] == "outside_extent"
+    assert orig["target"]["entity"]["address"] == f"{ORIG_FUNC:#x}"
+    assert orig["target"]["entity"]["canonical"] == f"{ORIG_FUNC:#x}"
 
 
 def test_a_write_across_a_page_boundary_is_undone():
