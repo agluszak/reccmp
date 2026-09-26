@@ -133,7 +133,8 @@ def _evaluate(value, registers: list[int]) -> int | None:
         return None
     substitutions = []
     for key, variable in lowering.variables.items():
-        term, bits = key  # type: ignore[misc]
+        term: Any = key[0]  # type: ignore[index]
+        bits: Any = key[1]  # type: ignore[index]
         if bits == "bool" or term[:1] != ("init",) or term[1] not in FAMILIES:
             return None
         concrete = registers[FAMILIES.index(term[1])]
