@@ -8,13 +8,18 @@ import re
 from reccmp.compare.asm.instgen import InstructionMeta
 from reccmp.compare.asm.model import (
     Instruction,
+    Reject,
     operand_display,
+    operand_identity,
 )
+from reccmp.compare.asm.verifier.semantics import mem_address
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     JCC_MNEMONICS,
     WIDTHS,
     Context,
+    SideState,
+    clone_state,
     register_arguments,
 )
 from reccmp.compare.asm.verifier import bitvector
@@ -93,6 +98,24 @@ def diagnostic_summaries(value_o, value_r) -> tuple[str, str]:
     return summary_o, summary_r
 
 
+def identity_facts(prefix: str, token) -> dict[str, str | int | bool | None]:
+    """What a reference resolved to, from its proof identity (see
+    asm.replacement.entity_proof_identity): its kind (``entity`` for a
+    paired one, ``unresolved`` for an address nothing names, ...) and, for
+    an entity, its original address and the offset into it."""
+    match operand_identity(token):
+        case ("entity", int() as address, int() as offset):
+            return {
+                f"{prefix}_kind": "entity",
+                f"{prefix}_entity": address,
+                f"{prefix}_offset": offset,
+            }
+        case (kind, *_):
+            return {f"{prefix}_kind": str(kind)}
+        case _:
+            return {}
+
+
 def _memory_facts(op) -> dict[str, str | int | bool | None]:
     """Primitive address components from one parsed memory operand."""
     if op[0] != "mem":
@@ -114,13 +137,16 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
             ("-" if sign < 0 else "") + _clean_symbol(str(name))
             for sign, name in symbols
         )
-    return {
+    facts: dict[str, str | int | bool | None] = {
         "base_register": base,
         "index_register": index,
         "scale": index_scale,
         "displacement": op[4],
         "symbol": symbol,
     }
+    if len(symbols) == 1 and symbols[0][0] == 1:
+        facts.update(identity_facts("symbol", symbols[0][1]))
+    return facts
 
 
 def target_facts(
@@ -131,11 +157,14 @@ def target_facts(
         raw = ins.raw_operands[0]
         if not raw.startswith(("0x", "-0x")):
             target_name = _clean_symbol(raw)
-    return {
+    facts: dict[str, str | int | bool | None] = {
         "target": meta.branch_target if meta is not None else None,
         "target_name": target_name,
         "target_instruction_index": target_index,
     }
+    if ins.operands and ins.operands[0][0] == "sym":
+        facts.update(identity_facts("target", ins.operands[0][1]))
+    return facts
 
 
 def _target_index(
@@ -167,15 +196,52 @@ def _checked_call_registers(ctx: Context, ins: Instruction) -> list[str]:
     ]
 
 
+def _operand_addresses(
+    states: tuple[SideState, SideState] | None, op_o, op_r
+) -> tuple | None:
+    """The two memory operands' addresses as values, in the two states
+    before their instructions; None when they cannot be computed."""
+    if states is None:
+        return None
+    try:
+        # mem_address records frame-slot uses; work on copies.
+        return (
+            ("addr", mem_address(clone_state(states[0]), op_o)),
+            ("addr", mem_address(clone_state(states[1]), op_r)),
+            32,
+            "value",
+        )
+    except (Reject, IndexError, KeyError, ValueError, TypeError):
+        return None
+
+
+def _stack_adjustment(ins: Instruction) -> bool:
+    """`add/sub esp, N`: a frame size or an argument cleanup, which the
+    stack pointer's own value accounts for."""
+    return (
+        ins.mnemonic in ("add", "sub")
+        and len(ins.operands) == 2
+        and ins.operands[0] == ("reg", "esp")
+    )
+
+
 def record_operand_candidate(
     ctx: Context,
     index_o: int,
     index_r: int,
     ins_o: Instruction,
     ins_r: Instruction,
+    states: tuple[SideState, SideState] | None = None,
 ) -> None:
+    """Record a candidate difference between two paired instructions'
+    operands, for when no observable says more. ``states`` (before the
+    instructions) let operands that denote the same address pass."""
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    # pylint: disable=too-many-return-statements
     recorder = ctx.recorder
     if recorder is None or ins_o.mnemonic != ins_r.mnemonic:
+        return
+    if _stack_adjustment(ins_o) and _stack_adjustment(ins_r):
         return
     if ins_o.mnemonic in JCC_MNEMONICS or ins_o.mnemonic.startswith("loop"):
         return
@@ -189,6 +255,13 @@ def record_operand_candidate(
         if op_o == op_r:
             continue
         if op_o[0] == op_r[0] == "mem":
+            addresses = _operand_addresses(states, op_o, op_r)
+            if addresses is not None and (
+                addresses[0] == addresses[1]
+                or bitvector.compare(addresses).result == "proved"
+            ):
+                # Registers renamed, or one address spelled two ways.
+                continue
             facts_o, facts_r = _memory_facts(op_o), _memory_facts(op_r)
             if facts_o != facts_r:
                 recorder.record_difference(
@@ -198,6 +271,7 @@ def record_operand_candidate(
                     facts_o,
                     facts_r,
                     candidate=True,
+                    **_symbolic_values(addresses),
                 )
                 return
         if op_o[0] == op_r[0] == "imm":
@@ -234,7 +308,7 @@ def record_observable_difference(
     meta_r: InstructionMeta | None,
 ) -> None:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
-    # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-return-statements,too-many-locals
     """Classify the first differing observable at a trusted paired point."""
     recorder = ctx.recorder
     if recorder is None or recorder.difference is not None:
@@ -295,7 +369,14 @@ def record_observable_difference(
             facts_o = _memory_facts(ins_o.operands[0]) if ins_o.operands else {}
             facts_r = _memory_facts(ins_r.operands[0]) if ins_r.operands else {}
             recorder.record_difference(
-                "memory_address", index_o, index_r, facts_o, facts_r
+                "memory_address",
+                index_o,
+                index_r,
+                facts_o,
+                facts_r,
+                **_symbolic_values(
+                    (("addr", first_o[1]), ("addr", first_r[1]), 32, "value")
+                ),
             )
             return
         if first_o[3] != first_r[3]:

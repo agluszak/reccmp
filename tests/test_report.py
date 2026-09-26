@@ -245,7 +245,17 @@ def test_structured_comparison_schema_round_trip():
         "effective_reasons": ["register_allocation", "padding"],
     }
     assert value["data"][0]["comparison"] == {"status": "exact"}
-    assert set(value["data"][2]["comparison"]) == {"status", "difference"}
+    assert set(value["data"][2]["comparison"]) == {
+        "status",
+        "difference",
+        "explanation",
+    }
+    assert value["data"][2]["comparison"]["explanation"]["group"] in (
+        "logic",
+        "annotation",
+        "tooling",
+        "unexplained",
+    )
     assert value["data"][3]["comparison"]["attempts"] == [
         {
             "strategy": "lockstep",

@@ -382,7 +382,9 @@ def _verify_product(
             try:
                 ins_o = instruction_at(orig_stream, index_o)
                 ins_r = instruction_at(recomp_stream, index_r)
-                record_operand_candidate(ctx, index_o, index_r, ins_o, ins_r)
+                record_operand_candidate(
+                    ctx, index_o, index_r, ins_o, ins_r, (orig_state, recomp_state)
+                )
                 obs_o: list = []
                 obs_r: list = []
                 state_before_o = clone_state(orig_state)

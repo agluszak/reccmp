@@ -27,6 +27,7 @@ from typing import Any
 
 import z3  # type: ignore[import-untyped]
 
+from reccmp.compare.asm.model import operand_identity
 from reccmp.compare.asm.verifier.state import WIDTHS
 
 # Resource units per query (see SolverOutcome.rlimit), and a wall-clock
@@ -65,12 +66,33 @@ class SolverOutcome:
         return {"result": self.result, "reason": self.reason, "rlimit": self.rlimit}
 
 
+# Proof identities that end in a byte offset into their entity (see
+# asm.replacement.entity_proof_identity).
+_OFFSET_IDENTITIES = frozenset({"entity", "symbol", "unmatched"})
+
+
+def _symbol_base(token: Any) -> tuple[Hashable, int]:
+    """(base identity, byte offset) of a symbol in an address, from the
+    sanitizer's proof identity: `x+163` is x's identity at offset 163. A
+    token without such an identity is its own base."""
+    match operand_identity(token):
+        case (kind, *base, int() as offset) if kind in _OFFSET_IDENTITIES and base:
+            return (("symbol", kind, *base), offset)
+        case identity:
+            return (("symbol", identity), 0)
+
+
 class _Lowering:
     """One comparison's translation: identical opaque terms on either side
-    share one variable."""
+    share one variable. Memory is one byte array per generation, read at
+    each load's address value, so the same address spelled two ways reads
+    the same bytes, and a narrower load reads part of a wider one."""
 
     def __init__(self) -> None:
         self.variables: dict[Hashable, Any] = {}
+        self.memories: dict[Hashable, Any] = {}
+        # Each lowered load's value, to report it in an assignment.
+        self.loads: dict[Hashable, Any] = {}
 
     def opaque(self, value: Hashable, bits: int = 32):
         key = (value, bits)
@@ -94,10 +116,12 @@ class _Lowering:
         if tag == "imm" and isinstance(value[1], int):
             return value[1]
         if tag == "load":
-            bits = _LOAD_BITS.get(value[2]) if len(value) > 2 else None
-            if bits is None:
-                raise _Unsupported(f"load width {value[2] if len(value) > 2 else None}")
-            return self.opaque(value, bits)
+            return self.load(value)
+        if tag == "addr" and len(value) == 2:
+            return self.address(value[1])
+        if tag == "sym" and len(value) == 2:
+            base, offset = _symbol_base(value[1])
+            return self.opaque(base) + offset
         if tag in _PART_BITS and len(value) == 2:
             whole = self.sized(value[1], 32)
             low = 8 if tag == "h8" else 0
@@ -145,6 +169,52 @@ class _Lowering:
         if tag == "cwde" and len(value) == 2:
             return z3.SignExt(16, self.sized(value[1], 16))
         return self.opaque(value)
+
+    def address(self, mem: Any):
+        """The 32-bit value of an address: a ``("mem", ...)`` operand's
+        registers, displacement and symbol bases, or a plain value."""
+        match mem:
+            case ("mem", _, terms, int() as displacement, symbols):
+                total = z3.BitVecVal(displacement, 32)
+                for term, scale in terms:
+                    total = total + self.sized(term, 32) * scale
+                for sign, token in symbols:
+                    base, offset = _symbol_base(token)
+                    total = total + sign * (self.opaque(base) + offset)
+                return total
+            case ("mem", *_):
+                raise _Unsupported(f"address {mem!r:.40}")
+            case _:
+                return self.sized(mem, 32)
+
+    def load(self, value: tuple):
+        """A load: its bytes in its generation's memory, little-endian."""
+        match value:
+            case ("load", ("mem", segment, *_) as where, size, generation):
+                pass
+            case ("load", where, size, generation):
+                segment = ""
+            case _:
+                raise _Unsupported(f"load {value!r:.40}")
+        bits = 32 if size == "stack" else _LOAD_BITS.get(size)
+        if bits is None:
+            raise _Unsupported(f"load width {size}")
+        try:
+            address = self.address(where)
+        except _Unsupported:
+            # An address it cannot lower: the load is its own unknown.
+            return self.opaque(value, bits)
+        key = (segment, generation)
+        if key not in self.memories:
+            self.memories[key] = z3.Array(
+                f"m{len(self.memories)}", z3.BitVecSort(32), z3.BitVecSort(8)
+            )
+        memory = self.memories[key]
+        loaded = z3.Select(memory, address)
+        for offset in range(1, bits // 8):
+            loaded = z3.Concat(z3.Select(memory, address + offset), loaded)
+        self.loads.setdefault(value, loaded)
+        return loaded
 
     def sized(self, value: Any, bits: int):
         """``value`` at exactly ``bits``: constants take the width; a wider
@@ -272,14 +342,31 @@ def _query(lowering: _Lowering, differ) -> SolverOutcome:
     if answer != z3.sat:
         return SolverOutcome("unknown", solver.reason_unknown(), used)
     model = solver.model()
+    return SolverOutcome(
+        "differs", rlimit=used, assignment=_assignment(lowering, model)
+    )
+
+
+def _assignment(lowering: _Lowering, model) -> tuple[tuple[Hashable, int], ...]:
+    """The model's value of each leaf term: the opaque ones, and each load
+    (read from the model's memory), as the witness sets inputs by them."""
     assignment = []
     for key, variable in lowering.variables.items():
         if key[1] == "bool":  # type: ignore[index]
             continue
-        value = model[variable]
-        if value is not None:
-            assignment.append((key[0], value.as_long()))  # type: ignore[index]
-    return SolverOutcome("differs", rlimit=used, assignment=tuple(assignment))
+        match key[0]:  # type: ignore[index]
+            case ("symbol", *_) | ("init", "sp"):
+                # A symbol's address is the image's, and the stack pointer
+                # the run's: neither is an input.
+                continue
+        assignment.append(
+            (key[0], model.eval(variable, model_completion=True).as_long())  # type: ignore[index]
+        )
+    for load, expression in lowering.loads.items():
+        assignment.append(
+            (load, model.eval(expression, model_completion=True).as_long())
+        )
+    return tuple(assignment)
 
 
 @lru_cache(maxsize=8192)
@@ -356,3 +443,59 @@ def distinguishing_assignment(values: tuple) -> dict[Hashable, int] | None:
     are absent. None when they cannot differ, or the solver cannot tell."""
     outcome = compare(values)
     return dict(outcome.assignment) if outcome.result == "differs" else None
+
+
+@dataclass(frozen=True)
+class Counterexample:
+    """Leaf values under which two symbolic values differ, in the verifier's
+    abstraction (unlowered terms and loads are free), and what each side
+    computes from them. An illustration, not a refutation."""
+
+    assignment: tuple[tuple[Hashable, int], ...]
+    orig: int | bool
+    recomp: int | bool
+
+
+def counterexample(values: tuple) -> Counterexample | None:
+    """A Counterexample for ``values`` (as in compare), when Z3 finds one."""
+    value_o, value_r, bits, kind = values
+    if value_o == value_r:
+        return None
+    lowering = _Lowering()
+    try:
+        if kind == "predicate":
+            left, right = lowering.predicate(value_o), lowering.predicate(value_r)
+        elif bits is None:
+            left, right = lowering.operands(value_o, value_r, None)
+        else:
+            left, right = lowering.sized(value_o, bits), lowering.sized(value_r, bits)
+    except _Unsupported:
+        return None
+    solver = z3.Solver()
+    solver.set("rlimit", _RLIMIT)
+    solver.set("timeout", _TIMEOUT_MS)
+    solver.add(left != right)
+    if solver.check() != z3.sat:
+        return None
+    model = solver.model()
+
+    def concrete(expression) -> int | bool:
+        result = model.eval(expression, model_completion=True)
+        return bool(z3.is_true(result)) if z3.is_bool(result) else result.as_long()
+
+    return Counterexample(_assignment(lowering, model), concrete(left), concrete(right))
+
+
+def value_width(value_o: Any, value_r: Any) -> int | None:
+    """The width, in bits, two symbolic values are compared at when no
+    width is given: that of the wider one; None when it cannot be lowered."""
+    lowering = _Lowering()
+    try:
+        widths = [
+            lowered.size()
+            for lowered in (lowering.value(value_o), lowering.value(value_r))
+            if not isinstance(lowered, int)
+        ]
+    except _Unsupported:
+        return None
+    return max(widths) if widths else None

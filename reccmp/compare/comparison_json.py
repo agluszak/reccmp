@@ -15,6 +15,7 @@ from .diagnosis import (
     StrategyAttempt,
     derive_diagnostic_normalizations,
 )
+from .explain import explanation
 from .inlines import InlineExpansionEvidence
 
 
@@ -62,6 +63,9 @@ def analysis_json(analysis: ComparisonAnalysis) -> dict[str, object]:
         value["effective_reasons"] = list(analysis.effective_reasons)
     if analysis.difference is not None:
         value["difference"] = _difference_json(analysis.difference)
+        found = explanation(analysis)
+        if found is not None:
+            value["explanation"] = found.json()
     if analysis.inconclusive_reason is not None:
         value["inconclusive_reason"] = analysis.inconclusive_reason
     if analysis.inconclusive_location is not None:

@@ -104,3 +104,28 @@ def test_the_verifier_accepts_an_algebraic_identity():
     assert not verify_effective_match(
         orig, recomp, metadata=FunctionMetadata(return_kind="i32")
     )
+
+
+def _at(displacement: int, size: str, generation=0):
+    return ("load", ("mem", "", ((ECX, 1),), displacement, ()), size, generation)
+
+
+def test_a_narrower_load_is_the_bytes_of_a_wider_one():
+    """The low byte of the dword at p is the byte at p (little-endian)."""
+    dword, byte = _at(4, "dword"), _at(4, "byte")
+    assert bitvector.values_equal(("l8", dword), byte)
+    assert bitvector.values_equal(("h8", dword), _at(5, "byte"))
+    assert bitvector.values_equal(("r16", dword), _at(4, "word"))
+    # Bit 4 of the low byte, read either way (GetLevelDataFlag4).
+    assert bitvector.values_equal(
+        ("and", imm(1), ("shr", ("l8", dword), imm(4))),
+        ("l8", ("and", imm(1), ("shr", ("ins_l8", EAX, byte), imm(4)))),
+    )
+
+
+def test_bytes_outside_the_wider_load_stay_unknown():
+    dword = _at(4, "dword")
+    assert not bitvector.values_equal(("l8", dword), _at(5, "byte"))
+    assert not bitvector.values_equal(("h8", dword), _at(8, "byte"))
+    # Another memory generation is another read.
+    assert not bitvector.values_equal(("l8", dword), _at(4, "byte", generation=1))

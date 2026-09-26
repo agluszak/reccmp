@@ -242,7 +242,9 @@ def verify_cfg_effective_match(
             try:
                 ins_o = instruction_at(orig_stream, i)
                 ins_r = instruction_at(recomp_stream, i)
-                record_operand_candidate(ctx, i, i, ins_o, ins_r)
+                record_operand_candidate(
+                    ctx, i, i, ins_o, ins_r, (orig_state, recomp_state)
+                )
                 obs_o: list = []
                 obs_r: list = []
                 state_before_o = clone_state(orig_state)

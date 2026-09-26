@@ -143,9 +143,21 @@ def write_html_report(
         htmlfile.write(output_data)
 
 
-def print_combined_diff(udiff, plain: bool = False, show_both: bool = False):
+def print_combined_diff(
+    udiff,
+    plain: bool = False,
+    show_both: bool = False,
+    marked: frozenset[str] = frozenset(),
+):
+    """Print a combined diff. Lines at an address in ``marked`` (the first
+    divergence) are flagged with ``>>``."""
     if udiff is None:
         return
+
+    def lead(*addrs: str) -> str:
+        if not marked:
+            return ""
+        return ">> " if any(addr in marked for addr in addrs) else "   "
 
     # We don't know how long the address string will be ahead of time.
     # Set this value for each address to try to line things up.
@@ -169,9 +181,11 @@ def print_combined_diff(udiff, plain: bool = False, show_both: bool = False):
                 for orig_addr, line, recomp_addr in subgroup["both"]:
                     padding_size = max(padding_size, len(orig_addr))
                     if show_both:
-                        print(f"{orig_addr} / {recomp_addr} : {line}")
+                        print(
+                            f"{lead(orig_addr, recomp_addr)}{orig_addr} / {recomp_addr} : {line}"
+                        )
                     else:
-                        print(f"{orig_addr} : {line}")
+                        print(f"{lead(orig_addr, recomp_addr)}{orig_addr} : {line}")
             else:
                 for orig_addr, line in subgroup["orig"]:
                     padding_size = max(padding_size, len(orig_addr))
@@ -180,10 +194,10 @@ def print_combined_diff(udiff, plain: bool = False, show_both: bool = False):
                     )
 
                     if plain:
-                        print(f"{addr_prefix} : -{line}")
+                        print(f"{lead(orig_addr)}{addr_prefix} : -{line}")
                     else:
                         print(
-                            f"{addr_prefix} : {reccmp.color.Fore.RED}-{line}{reccmp.color.Style.RESET_ALL}"
+                            f"{lead(orig_addr)}{addr_prefix} : {reccmp.color.Fore.RED}-{line}{reccmp.color.Style.RESET_ALL}"
                         )
 
                 for recomp_addr, line in subgroup["recomp"]:
@@ -195,10 +209,10 @@ def print_combined_diff(udiff, plain: bool = False, show_both: bool = False):
                     )
 
                     if plain:
-                        print(f"{addr_prefix} : +{line}")
+                        print(f"{lead(recomp_addr)}{addr_prefix} : +{line}")
                     else:
                         print(
-                            f"{addr_prefix} : {reccmp.color.Fore.GREEN}+{line}{reccmp.color.Style.RESET_ALL}"
+                            f"{lead(recomp_addr)}{addr_prefix} : {reccmp.color.Fore.GREEN}+{line}{reccmp.color.Style.RESET_ALL}"
                         )
 
         # Newline between each diff subgroup.

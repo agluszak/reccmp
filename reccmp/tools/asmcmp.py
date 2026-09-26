@@ -30,6 +30,7 @@ from reccmp.compare.diagnosis import (
 )
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.diff import raw_diff_to_udiff
+from reccmp.compare.explain import divergence_addresses, explain
 from reccmp.compare.report import (
     ReccmpStatusReport,
     ReccmpComparedEntity,
@@ -90,13 +91,14 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
     udiff = raw_diff_to_udiff(match.rdiff, grouped=grouped_diff)
 
     note = triage_status_note(match.analysis)
+    marked = divergence_addresses(match.analysis)
 
     if match.is_proven_match:
         ok_text = reccmp.color.Fore.GREEN + "✨ OK! ✨" + reccmp.color.Style.RESET_ALL
         if match.analysis.status == ComparisonStatus.EXACT:
             print(f"{addrs}: {match.name} 100% match.\n\n{ok_text}\n\n")
         else:
-            print_combined_diff(udiff, show_both_addrs)
+            print_combined_diff(udiff, show_both=show_both_addrs)
 
             print(
                 f"\n{addrs}: {match.name} 100% effective match (differs, but only in ways that don't affect behavior)."
@@ -113,10 +115,12 @@ def print_match_verbose(match: ReccmpComparedEntity, show_both_addrs: bool = Fal
                 print(level)
 
     else:
-        print_combined_diff(udiff, show_both_addrs)
+        print_combined_diff(udiff, show_both=show_both_addrs, marked=marked)
         print(
             f"\n{match.name} is only {percenttext} similar to the original, diff above"
         )
+        for line in explain(match.analysis):
+            print(line)
         stack = stack_layout_text(match)
         if stack is not None:
             print(stack)

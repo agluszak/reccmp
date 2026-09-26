@@ -256,13 +256,26 @@ def analyze_effective_match(  # pylint: disable=too-many-arguments
         )
 
     # Only positional lockstep and the two CFG strategies establish trusted
-    # program points. Diff alignment and relocation are proof-only.
-    if cfg_attempted and cfg.best_difference is not None:
-        return failed(cfg)
-    if lockstep.best_difference is not None:
-        return failed(lockstep)
-    if iso_attempted and iso.best_difference is not None:
-        return failed(iso)
+    # program points. Diff alignment and relocation are proof-only. Of
+    # those, report an observed difference (a value, store or control
+    # transfer that differs) before an operand candidate, and the product
+    # pairing's, which follows both layouts, before the positional ones',
+    # which also stop at a mere layout difference.
+    trusted = [
+        recorder
+        for recorder, attempted in (
+            (iso, iso_attempted),
+            (lockstep, True),
+            (cfg, cfg_attempted),
+        )
+        if attempted
+    ]
+    for recorder in trusted:
+        if recorder.difference is not None:
+            return failed(recorder)
+    for recorder in trusted:
+        if recorder.best_difference is not None:
+            return failed(recorder)
     for candidate in (iso, cfg, lockstep):
         if candidate.inconclusive_reason is not None:
             inconclusive = candidate
