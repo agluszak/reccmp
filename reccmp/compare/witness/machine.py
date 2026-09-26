@@ -31,7 +31,6 @@ from capstone.x86 import (  # type: ignore
     X86_INS_ENTER,
     X86_INS_IN,
     X86_INS_INSB,
-    X86_INS_INT3,
     X86_INS_JMP,
     X86_INS_OUT,
     X86_INS_OUTSB,
@@ -364,29 +363,33 @@ class SideMachine:
         return decode_one(self._pristine[offset : offset + 16], addr)
 
     def _callee_pop_bytes(self, target: int) -> int | None:
-        """``ret N`` of a callee in the image, following ``jmp`` thunks. The
-        scan stays inside the callee: its known extent, or else up to the
-        int3 padding after it. A callee that ends without ``ret`` (a tail
-        jump, a call that does not return) would otherwise lend it the next
-        function's ``ret N``."""
-        addr, seen = target, 0
-        size = self.function_size(target)
-        end = target + size if size else self.image_range.stop
-        while addr in self.image_range and addr < end and seen < 4000:
-            insn = self.insn_at(addr)
-            if insn is None or insn.id == X86_INS_INT3:
+        """``ret N`` of a callee in the image, read only inside its known
+        extent. A callee that starts with a direct ``jmp`` (a thunk) is
+        followed, and its destination needs a known extent too. Anything
+        else is unknown: scanning past an unknown end would lend a callee
+        that ends without ``ret`` (a tail jump, a call that does not return)
+        the next function's ``ret N``. An unknown cleanup is guessed for
+        exploration and makes the run give no verdict."""
+        for _ in range(8):  # thunk chains are short
+            first = self.insn_at(target)
+            jump = (
+                direct_branch_target(first)
+                if first is not None and first.id == X86_INS_JMP
+                else None
+            )
+            if jump is None:
                 break
-            seen += 1
+            target = jump
+        size = self.function_size(target)
+        if not size:
+            return None
+        addr = target
+        while target <= addr < target + size:
+            insn = self.insn_at(addr)
+            if insn is None:
+                return None
             if insn.id == X86_INS_RET:
                 return insn.operands[0].imm if insn.operands else 0
-            if insn.id == X86_INS_JMP and seen == 1:
-                jump = direct_branch_target(insn)
-                if jump is None:
-                    break
-                addr = jump
-                size = self.function_size(jump)
-                end = jump + size if size else self.image_range.stop
-                continue
             addr += insn.size
         return None
 
