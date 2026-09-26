@@ -17,6 +17,7 @@ from reccmp.compare.diagnosis import (
     ComparisonStatus,
     ExecutionEvidence,
 )
+from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
 from reccmp.types import ImageId
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from reccmp.compare.asm.ir import FunctionImage
     from reccmp.compare.db import ReccmpMatch
     from reccmp.compare.witness import SearchResult, Translator
+    from reccmp.compare.witness.machine import RunInput
 
 
 def _reached(result: SearchResult, analysis: ComparisonAnalysis) -> int | None:
@@ -45,6 +47,25 @@ def _reached(result: SearchResult, analysis: ComparisonAnalysis) -> int | None:
     if orig is None and recomp is None:
         return None
     return result.agreeing_runs_through(orig, recomp)
+
+
+def _solver_hints(analysis: ComparisonAnalysis) -> list[RunInput]:
+    """An input under which the reported values differ, when Z3 finds one
+    over leaves a run input can set (see witness.hints)."""
+    # The witness package needs unicorn, an optional extra.
+    # pylint: disable=import-outside-toplevel
+    from reccmp.compare.witness.hints import input_from_assignment
+    from reccmp.compare.witness.machine import RunInput
+    from reccmp.compare.witness.search import HINT_SEED
+
+    difference = analysis.difference
+    if difference is None or difference.values is None:
+        return []
+    assignment = bitvector.distinguishing_assignment(difference.values)
+    if not assignment:
+        return []
+    hint = input_from_assignment(assignment, RunInput.from_seed(HINT_SEED))
+    return [hint] if hint is not None else []
 
 
 class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
@@ -120,6 +141,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             orig_image,
             recomp_image,
             return_kind=facts.return_kind if facts is not None else "unknown",
+            hints=_solver_hints(analysis),
         )
         if result.witness is None:
             return dataclasses.replace(

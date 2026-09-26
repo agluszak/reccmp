@@ -13,6 +13,7 @@ from reccmp.compare.asm.model import (
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     JCC_MNEMONICS,
+    WIDTHS,
     Context,
     register_arguments,
 )
@@ -275,12 +276,18 @@ def record_observable_difference(
             return
         if first_o[3] != first_r[3]:
             value_o, value_r = diagnostic_summaries(first_o[3], first_r[3])
+            width = WIDTHS.get(first_o[2])
             recorder.record_difference(
                 "memory_value",
                 index_o,
                 index_r,
                 {"value": value_o},
                 {"value": value_r},
+                values=(
+                    (first_o[3], first_r[3], 8 * width, "value")
+                    if width is not None and first_o[2] == first_r[2]
+                    else None
+                ),
             )
             return
 
@@ -296,6 +303,11 @@ def record_observable_difference(
                 index_r,
                 {"predicate": value_o},
                 {"predicate": value_r},
+                values=(
+                    (predicate_o, predicate_r, None, "predicate")
+                    if predicate_o is not None and predicate_r is not None
+                    else None
+                ),
             )
             return
         target_o = _target_index(recorder, "orig", meta_o)
@@ -321,6 +333,11 @@ def record_observable_difference(
                     index_r,
                     {"value": value_o},
                     {"value": value_r},
+                    values=(
+                        (entry_o[1], entry_r[1], None, "value")
+                        if entry_o[0] == "retval" and len(entry_o) == len(entry_r) == 2
+                        else None
+                    ),
                 )
                 return
             if entry_o[0] in ("retsaved", "retstack"):

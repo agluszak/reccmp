@@ -164,6 +164,10 @@ class ComparisonDifference:
     kind: str
     orig: DifferenceSide
     recomp: DifferenceSide
+    # The verifier's symbolic values behind a value difference: (value_orig,
+    # value_recomp, bits, "value" or "predicate"). In memory only (for the
+    # witness to ask a solver for a distinguishing input), never reported.
+    values: tuple | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.kind not in MISMATCH_KINDS:
@@ -396,11 +400,14 @@ class AnalysisRecorder:
         recomp_facts: dict[str, FactValue],
         *,
         candidate: bool = False,
+        values: tuple | None = None,
     ) -> None:
+        # pylint: disable=too-many-arguments
         difference = ComparisonDifference(
             kind,
             self.side("orig", orig_index, orig_facts),
             self.side("recomp", recomp_index, recomp_facts),
+            values,
         )
         if candidate:
             if self.candidate_difference is None:

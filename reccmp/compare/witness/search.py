@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Sequence
 
 from reccmp.compare.asm.ir import FunctionImage
 from reccmp.call_facts import CallFacts
@@ -371,6 +371,10 @@ def _excerpt_constants(image: FunctionImage, machine: SideMachine) -> set[int]:
     }
 
 
+# Seeds of solver-suggested inputs (witness.hints): far above the plans'.
+HINT_SEED = 10_000
+
+
 def find_witness(
     translator: Translator,
     orig_image: FunctionImage,
@@ -379,7 +383,13 @@ def find_witness(
     return_kind: str = "unknown",
     seeds: int = 8,
     focused_seeds: int = 24,
+    hints: Sequence[RunInput] = (),
 ) -> SearchResult:
+    # pylint: disable=too-many-arguments
+    """Run both functions on the same inputs until their observables
+    diverge: ``hints`` first (inputs a solver suggested; their seeds are
+    HINT_SEED and up), then plain seeds, then seeds focused on each code
+    constant."""
     result = SearchResult()
     orig = translator.machines[ImageId.ORIG]
     recomp = translator.machines[ImageId.RECOMP]
@@ -397,8 +407,9 @@ def find_witness(
         (seeds + i, tuple((c + d) & 0xFFFFFFFF for d in (-1, 0, 1)))
         for i, c in enumerate(constants[:focused_seeds])
     ]
-    for seed, seed_pool in plans:
-        run_input = RunInput.from_seed(seed, seed_pool)
+    inputs = [*hints, *(RunInput.from_seed(seed, pool) for seed, pool in plans)]
+    for run_input in inputs:
+        seed = run_input.seed
         t_o = orig.run(orig_range, run_input)
         t_r = recomp.run(recomp_range, run_input)
         witness, reason = _compare(t_o, t_r, translator, return_kind, seed)

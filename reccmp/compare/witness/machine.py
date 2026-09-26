@@ -277,6 +277,9 @@ class RunInput:
     stack_args: tuple[int, ...]
     # Constants the modelled memory and call results may draw from.
     pool: tuple[int, ...] = ()
+    # (address, size, value): bytes of modelled memory set when its page is
+    # first mapped, on both machines alike (solver hints, witness.hints).
+    memory: tuple[tuple[int, int, int], ...] = ()
 
     @classmethod
     def from_seed(cls, seed: int, pool: tuple[int, ...] = ()) -> "RunInput":
@@ -342,6 +345,7 @@ class SideMachine:
         self.uc.mem_map(STACK_BASE, STACK_SIZE)
         self.uc.mem_map(RETURN_SENTINEL, PAGE)
         self._lazy_pages: set[int] = set()
+        self._memory: tuple[tuple[int, int, int], ...] = ()
         self._dirty_image_pages: set[int] = set()
         # One flag per stack byte: nonzero once the current run wrote it.
         self._written_stack = bytearray(STACK_SIZE)
@@ -469,6 +473,10 @@ class SideMachine:
             except UcError:
                 return False
             uc.mem_write(page, page_contents(self._seed, page, self._pool))
+            for address, width, value in self._memory:
+                if page <= address and address + width <= page + PAGE:
+                    data = (value & ((1 << 8 * width) - 1)).to_bytes(width, "little")
+                    uc.mem_write(address, data)
             self._lazy_pages.add(page)
         return True
 
@@ -523,6 +531,7 @@ class SideMachine:
         # pylint: disable=too-many-locals,too-many-statements
         uc = self.uc
         self._reset(run_input.seed, run_input.pool)
+        self._memory = run_input.memory
         trace = Trace(end="return")
         for name, value in run_input.registers.items():
             uc.reg_write(_GP[name], value)
