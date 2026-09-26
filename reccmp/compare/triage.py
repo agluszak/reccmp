@@ -145,6 +145,9 @@ def _detail(comparison: Mapping[str, Any]) -> str:
         details.append("field facts")
     if "source_comparisons" in recomp:
         details.append("source comparisons")
+    location = (comparison.get("inconclusive_location") or {}).get("facts") or {}
+    if "product_stop" in location:
+        details.append(f"product: {location['product_stop']}")
     return ", ".join(details)
 
 

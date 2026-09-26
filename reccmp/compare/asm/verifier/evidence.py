@@ -256,6 +256,8 @@ def record_observable_difference(
             return
         registers = _checked_call_registers(ctx, ins_o)
         for position, register in enumerate(registers, start=2):
+            if position >= min(len(first_o), len(first_r)):
+                break
             if first_o[position] != first_r[position]:
                 value_o, value_r = diagnostic_summaries(
                     first_o[position], first_r[position]
@@ -274,6 +276,19 @@ def record_observable_difference(
                     },
                 )
                 return
+        # With the frame promoted, the arguments the callee reads from each
+        # side's stack follow the call (see iso_cfg._pass_frame).
+        passed_o = next((e for e in obs_o if e[0] == "frame_args"), None)
+        passed_r = next((e for e in obs_r if e[0] == "frame_args"), None)
+        if passed_o != passed_r:
+            recorder.record_difference(
+                "call_argument",
+                index_o,
+                index_r,
+                {"register": "stack", "value": repr(passed_o)[:200]},
+                {"register": "stack", "value": repr(passed_r)[:200]},
+            )
+            return
 
     if tag_o == tag_r == "store":
         if first_o[1] != first_r[1]:

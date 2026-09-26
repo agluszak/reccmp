@@ -81,6 +81,37 @@ def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
     assert "e.g. 0x1 f0x1" in triage.triage_text(clusters)
 
 
+def test_non_isomorphic_graphs_cluster_by_where_the_product_stopped():
+    def blocked(address, stop):
+        location = {
+            "address": 0x401000,
+            "image": "orig",
+            "facts": {"failure": "edge_roles", "product_stop": stop},
+        }
+        return {
+            "address": address,
+            "name": f"f{address}",
+            "comparison": {
+                "status": "inconclusive",
+                "inconclusive_reason": "non_isomorphic_cfg",
+                "inconclusive_location": location,
+                "attempts": [{"strategy": "isomorphic_cfg", "location": location}],
+            },
+        }
+
+    clusters = triage.triage(
+        [
+            blocked("0x1", "alignment_failure/block_alignment"),
+            blocked("0x2", "alignment_failure/block_alignment"),
+            blocked("0x3", "memory_address"),
+        ]
+    )
+    assert [(cluster.key.detail, cluster.count) for cluster in clusters] == [
+        ("product: alignment_failure/block_alignment", 2),
+        ("product: memory_address", 1),
+    ]
+
+
 def test_instruction_shape():
     assert triage.instruction_shape(bytes.fromhex("83f841"), 0x1000) == "cmp reg, imm"
     assert triage.instruction_shape(bytes.fromhex("894104"), 0x1000) == "mov mem, reg"

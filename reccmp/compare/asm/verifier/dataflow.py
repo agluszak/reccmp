@@ -10,6 +10,7 @@ from dataclasses import (
 from typing import Callable
 
 from reccmp.compare.asm.verifier.addresses import Value
+from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.state import (
     FAMILIES,
     Context,
@@ -225,6 +226,11 @@ def join_states(
     def slot_setter(state: SideState, index: int) -> Callable[[Value], None]:
         return lambda value: state.x87.known.__setitem__(index, value)
 
+    def frame_setter(
+        frame: dict[int, tuple[int, Value | None]], offset: int, width: int
+    ) -> Callable[[Value], None]:
+        return lambda value: frame.__setitem__(offset, (width, value))
+
     for entry_state, in_state, out_state in (
         (entry_o, in_o, out_o),
         (entry_r, in_r, out_r),
@@ -253,12 +259,33 @@ def join_states(
                     slot_setter(out_state, index),
                 )
             )
+        if out_state.frame is not None:
+            # Promoted slots join like registers; one that does not hold a
+            # value of the same width on both edges can no longer be read.
+            assert entry_state.frame is not None and in_state.frame is not None
+            for offset in set(entry_state.frame) | set(in_state.frame):
+                old = entry_state.frame.get(offset)
+                new = in_state.frame.get(offset)
+                if old is None or new is None or old[0] != new[0]:
+                    width = max(entry[0] for entry in (old, new) if entry is not None)
+                    out_state.frame[offset] = (width, None)
+                elif old[1] is None or new[1] is None:
+                    out_state.frame[offset] = (old[0], None)
+                else:
+                    nodes.append(
+                        (old[1], new[1], frame_setter(out_state.frame, offset, old[0]))
+                    )
 
     classes: dict[tuple[Value, Value], int] = {}
     for n, (entry_value, in_value, setter) in enumerate(nodes):
         if entry_value == in_value:
             setter(entry_value)
             continue
+        if out_o.frame is not None and (
+            maybe_frame_pointer(entry_value) or maybe_frame_pointer(in_value)
+        ):
+            # A phi would hide which slot a pointer into the frame reaches.
+            return None
         class_id = classes.setdefault((entry_value, in_value), n)
         setter(("phi", block, class_id))
 
@@ -348,6 +375,7 @@ def states_equal(a: CfgState, b: CfgState) -> bool:
             and x.fpu_flags == y.fpu_flags
             and x.x87.state_key() == y.x87.state_key()
             and x.load_log == y.load_log
+            and x.frame == y.frame
             for x, y in ((a.orig, b.orig), (a.recomp, b.recomp))
         )
     )

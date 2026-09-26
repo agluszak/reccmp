@@ -26,7 +26,7 @@ from reccmp.compare.asm.verifier.obligations import (
     JUMP_TABLE_ENTRY_RE,
 )
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 
 # ---------------------------------------------------------------------------
 # Isomorphic-CFG verification (structure-matched, alignment-free)
@@ -658,11 +658,12 @@ def pair_cfg_blocks(
     cfg_o: _SideCfg,
     cfg_r: _SideCfg,
     recorder: AnalysisRecorder | None = None,
+    facts: dict[str, FactValue] | None = None,
 ) -> list[tuple[int, int]] | None:
     """Match the two sides' reachable blocks into a structural bijection,
     starting from the entry blocks and following same-role edges. Returns
     the matched pairs in discovery order, or None if the reachable graphs
-    are not isomorphic."""
+    are not isomorphic; ``facts`` join the ones recorded then."""
     map_o: dict[int, int] = {}
     map_r: dict[int, int] = {}
     order: list[tuple[int, int]] = []
@@ -679,6 +680,7 @@ def pair_cfg_blocks(
                         orig_index=cfg_o.starts[block_o],
                         recomp_index=cfg_r.starts[block_r],
                         facts={
+                            **(facts or {}),
                             "failure": "block_mapping_conflict",
                             "orig_block_count": len(cfg_o.starts),
                             "recomp_block_count": len(cfg_r.starts),
@@ -700,6 +702,7 @@ def pair_cfg_blocks(
                     orig_index=cfg_o.starts[block_o],
                     recomp_index=cfg_r.starts[block_r],
                     facts={
+                        **(facts or {}),
                         "failure": "edge_roles",
                         "orig_block_count": len(cfg_o.starts),
                         "recomp_block_count": len(cfg_r.starts),
@@ -717,6 +720,7 @@ def pair_cfg_blocks(
                         orig_index=cfg_o.starts[block_o],
                         recomp_index=cfg_r.starts[block_r],
                         facts={
+                            **(facts or {}),
                             "failure": "external_edge",
                             "edge_role": role,
                             "orig_external": to_o == "external",

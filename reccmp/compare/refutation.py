@@ -11,7 +11,6 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 from reccmp.call_facts import CallFacts
-from reccmp.compare.call_facts import import_facts
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
@@ -109,13 +108,7 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
             # pylint: disable-next=import-outside-toplevel
             from reccmp.compare.witness.machine import import_registry
 
-            # Import names are the same in both binaries; the recompiled PDB
-            # carries their decorations.
-            by_import = import_facts(
-                node.decorated_name
-                for node in self.func_nodes.values()
-                if node.decorated_name is not None
-            )
+            by_import = self._import_call_facts()
             registry = import_registry(self.orig_bin, self.recomp_bin)
 
             def callee_facts(identity) -> CallFacts | None:
@@ -129,26 +122,19 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                         return self._call_facts_at(match.recomp_addr, match.orig_addr)
                 return None
 
-            def windows(image_id: ImageId):
-                def window(address: int) -> EntityExtent | None:
-                    """Bytes a function at ``address`` may occupy: its
-                    recorded size, else the gap to the next known entity."""
-                    entity = self.db.get(image_id, address)
-                    if entity is None:
-                        return None
-                    if (size := entity.size(image_id)) is not None:
-                        return EntityExtent(size)
-                    if (gap := entity.max_size(image_id)) is not None:
-                        return EntityExtent(gap, recorded=False)
-                    return None
-
-                return window
-
             self._witness_translator = Translator(
                 self.db,
-                SideMachine(self.orig_bin, registry, by_import, windows(ImageId.ORIG)),
                 SideMachine(
-                    self.recomp_bin, registry, by_import, windows(ImageId.RECOMP)
+                    self.orig_bin,
+                    registry,
+                    by_import,
+                    self._function_window(ImageId.ORIG),
+                ),
+                SideMachine(
+                    self.recomp_bin,
+                    registry,
+                    by_import,
+                    self._function_window(ImageId.RECOMP),
                 ),
                 call_facts=callee_facts,
                 extent=self._witness_extent,

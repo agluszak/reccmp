@@ -6,7 +6,7 @@ from dataclasses import (
     dataclass,
     field,
 )
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from reccmp.call_facts import CallFacts
 
@@ -17,12 +17,16 @@ from reccmp.compare.asm.model import (
 from reccmp.compare.asm.verifier.addresses import (
     Value,
     abs_stack_offset,
+    constant_offset,
     flatten_mem,
     mem_disjoint,
     stack_rooted,
     unwind_spadd,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder
+
+if TYPE_CHECKING:
+    from reccmp.compare.callee_cleanup import CallStackEffect
 
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
 
@@ -144,6 +148,10 @@ class SideState:
     slot_accesses: list[tuple[int, int | None]] = field(default_factory=list)
     slots_escaped: bool = False
     rename_slots: bool = True
+    # Promotion mode (see verifier.frame): this side's private frame, as
+    # entry-sp offset -> (width, value), the value None where the slot can
+    # no longer be read. None when promotion is off.
+    frame: dict[int, tuple[int, Value | None]] | None = None
 
     def slot_ref(self, disp: int, size: str, write: bool) -> Value | int:
         """Canonical key for a frame-local access. A slot becomes renamable
@@ -174,6 +182,12 @@ class SideState:
     def write_reg(self, name: str, value: Value) -> None:
         family, part = REGISTERS[name]
         if part == "r32":
+            if self.frame is not None and family in ("sp", "bp"):
+                # Promotion places slots by offset from the entry stack
+                # pointer: keep stack pointers in one form.
+                root, offset = constant_offset(value)
+                if root == ("init", "sp"):
+                    value = ("spadd", root, offset) if offset else root
             self.regs[family] = value
             return
         old = self.regs[family]
@@ -201,6 +215,15 @@ class FunctionMetadata:
     call_facts: Callable[[str], CallFacts | None] | None = None
     # Accept observed values z3 proves equal (project `verifier` config).
     algebraic_identities: bool = True
+    # The stack effect of the call instruction at an address, from each
+    # side's own binary (orig, recomp): see callee_cleanup.StaticCode.
+    stack_effects: (
+        tuple[
+            Callable[[int], CallStackEffect | None],
+            Callable[[int], CallStackEffect | None],
+        ]
+        | None
+    ) = None
 
 
 def register_arguments(facts: CallFacts | None) -> tuple[bool, bool]:
@@ -473,5 +496,6 @@ def clone_state(state: SideState) -> SideState:
     clone.slot_map = dict(state.slot_map)
     clone.slot_accesses = list(state.slot_accesses)
     clone.slots_escaped = state.slots_escaped
+    clone.frame = dict(state.frame) if state.frame is not None else None
     clone.load_log = set(state.load_log)
     return clone

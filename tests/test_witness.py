@@ -45,7 +45,7 @@ from reccmp.compare.witness import (
     find_witness,
     replay,
 )
-from reccmp.compare.witness.cleanup import Cleanup
+from reccmp.compare.callee_cleanup import Cleanup
 from reccmp.compare.witness.machine import (
     WITNESS_MODEL,
     HEAP_BASE,

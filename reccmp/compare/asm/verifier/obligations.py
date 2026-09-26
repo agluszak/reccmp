@@ -467,9 +467,10 @@ def one_sided_ok(
     if ins.mnemonic.startswith("f"):
         return False
     try:
-        if ins.mnemonic == "push" and len(ins.operands) == 1:
+        # With the frame promoted, a push or pop is a slot like any other.
+        if state.frame is None and ins.mnemonic == "push" and len(ins.operands) == 1:
             return _one_sided_push_ok(state, ctx, ins, idx)
-        if ins.mnemonic == "pop" and len(ins.operands) == 1:
+        if state.frame is None and ins.mnemonic == "pop" and len(ins.operands) == 1:
             return _one_sided_pop_ok(state, ctx, ins)
     except (Reject, IndexError, KeyError, ValueError, TypeError):
         return False

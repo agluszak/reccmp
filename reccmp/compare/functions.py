@@ -186,6 +186,8 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         self._helper_identity_ambiguous: set[str] | None = None
         self._witness_translator = None
         self._witness_extents = {}
+        self._import_facts_cache = None
+        self._static_code_cache = {}
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
             name_lookup=create_name_lookup(

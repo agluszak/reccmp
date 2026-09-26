@@ -73,6 +73,40 @@ def unwind_spadd(value: Value, offset: int = 0) -> tuple[Value, int]:
     return (value, offset)
 
 
+def _signed32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    return value - (1 << 32) if value >> 31 else value
+
+
+def constant_offset(value: Value) -> tuple[Value, int]:
+    """(root, offset) of a value that is a root plus a constant, whether
+    built by push/pop (``spadd``) or by ``add``/``sub`` of an immediate."""
+    offset = 0
+    while isinstance(value, tuple) and value:
+        if value[0] == "spadd":
+            offset += value[2]
+            value = value[1]
+        elif (
+            value[0] == "sub"
+            and len(value) == 3
+            and isinstance(value[2], tuple)
+            and value[2][:1] == ("imm",)
+        ):
+            offset -= _signed32(value[2][1])
+            value = value[1]
+        elif value[0] == "add":
+            terms = [
+                t for t in value[1:] if not (isinstance(t, tuple) and t[:1] == ("imm",))
+            ]
+            if len(terms) != 1:
+                break
+            offset += sum(_signed32(t[1]) for t in value[1:] if t is not terms[0])
+            value = terms[0]
+        else:
+            break
+    return (value, offset)
+
+
 def abs_stack_offset(addr: Value, is_slot) -> tuple[Value, int] | None:
     """Resolve an access to (root value, byte offset) when its address is a
     plain chain of constant adjustments over one root — a push/pop slot, or

@@ -79,14 +79,13 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
 )
 
 from reccmp.compare.asm.decode import decode_one, direct_branch_target
+from reccmp.compare.callee_cleanup import CalleeCleanupMixin, image_imports
 from reccmp.call_facts import CallFacts
 from reccmp.compare.diagnosis import WitnessInput
 from reccmp.compare.extent import EntityExtent
 
 from reccmp.formats import Image
 from reccmp.formats.image import ImageSectionFlags
-
-from .cleanup import CalleeCleanupMixin
 
 # Version of the execution model. Bump it whenever the same RunInput could
 # run differently (memory generation, call modelling, what a run records),
@@ -135,22 +134,9 @@ def _prng(seed: int, *key: int) -> int:
     return int.from_bytes(digest, "little")
 
 
-def import_key(module: str, name: str) -> str:
-    """One import's identity: module names are case-insensitive."""
-    return f"{module.lower()}!{name}"
-
-
-def _image_imports(image: Image) -> list[tuple[str, int]]:
-    """(key, import table slot) of each import of an image."""
-    return [
-        (import_key(imp.module, imp.name or f"#{imp.ordinal}"), imp.addr)
-        for imp in getattr(image, "get_imports", lambda: ())()
-    ]
-
-
 def import_registry(*images: Image) -> dict[str, int]:
     """A distinct modelled address for every import of the given images."""
-    keys = sorted({key for image in images for key, _ in _image_imports(image)})
+    keys = sorted({key for image in images for key, _ in image_imports(image)})
     if len(keys) * IMPORT_STRIDE > IMPORT_SPAN:
         raise ValueError("too many imports for the modelled import region")
     return {key: IMPORT_BASE + IMPORT_STRIDE * index for index, key in enumerate(keys)}
@@ -372,7 +358,7 @@ class SideMachine(CalleeCleanupMixin):
         # Modelled import address -> import key, and each import table slot.
         self.imports: dict[int, str] = {}
         self.import_slots: list[range] = []
-        for key, slot in _image_imports(image):
+        for key, slot in image_imports(image):
             self.imports[registry[key]] = key
             self.import_slots.append(range(slot, slot + 4))
             self.uc.mem_write(slot, registry[key].to_bytes(4, "little"))

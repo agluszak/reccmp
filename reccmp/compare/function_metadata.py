@@ -2,13 +2,16 @@
 recompiled functions, from PDB types first and decorated names second."""
 
 from dataclasses import replace
+from typing import Callable
 
 from reccmp.compare.asm.replacement import canonical_callee_name
 from reccmp.compare.asm.verifier import FunctionMetadata
 from reccmp.call_facts import CallFacts, convention_facts
-from reccmp.compare.call_facts import mangled_facts
+from reccmp.compare.call_facts import import_facts, mangled_facts
+from reccmp.compare.callee_cleanup import StaticCode
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
+from reccmp.compare.extent import EntityExtent
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.cvinfo import CvdumpTypeKey, CvdumpTypeMap
 from reccmp.cvdump.symbols import SymbolsEntry
@@ -22,6 +25,46 @@ class FunctionMetadataMixin(ComparatorState):
     """Part of FunctionComparator; relies on its attributes."""
 
     algebraic_identities: bool
+    _import_facts_cache: dict[str, CallFacts] | None
+    _static_code_cache: dict[ImageId, StaticCode]
+
+    def _import_call_facts(self) -> dict[str, CallFacts]:
+        """Call facts per import name. Import names are the same in both
+        binaries; the recompiled PDB carries their decorations."""
+        if self._import_facts_cache is None:
+            self._import_facts_cache = import_facts(
+                node.decorated_name
+                for node in self.func_nodes.values()
+                if node.decorated_name is not None
+            )
+        return self._import_facts_cache
+
+    def _function_window(
+        self, image_id: ImageId
+    ) -> Callable[[int], EntityExtent | None]:
+        def window(address: int) -> EntityExtent | None:
+            """Bytes a function at ``address`` may occupy: its recorded
+            size, else the gap to the next known entity."""
+            entity = self.db.get(image_id, address)
+            if entity is None:
+                return None
+            if (size := entity.size(image_id)) is not None:
+                return EntityExtent(size)
+            if (gap := entity.max_size(image_id)) is not None:
+                return EntityExtent(gap, recorded=False)
+            return None
+
+        return window
+
+    def _static_code(self, image_id: ImageId) -> StaticCode:
+        """One side's code, for the stack effects of its calls."""
+        if image_id not in self._static_code_cache:
+            self._static_code_cache[image_id] = StaticCode(
+                self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin,
+                self._import_call_facts(),
+                self._function_window(image_id),
+            )
+        return self._static_code_cache[image_id]
 
     def _return_kind_of_type(self, type_key: CvdumpTypeKey) -> str:
         # pylint: disable=too-many-return-statements
@@ -148,6 +191,10 @@ class FunctionMetadataMixin(ComparatorState):
             return_kind=facts.return_kind if facts is not None else "unknown",
             call_facts=self._call_facts_map().get,
             algebraic_identities=self.algebraic_identities,
+            stack_effects=(
+                self._static_code(ImageId.ORIG).call_effect,
+                self._static_code(ImageId.RECOMP).call_effect,
+            ),
         )
 
     def _fn_symbol_entry(self, match: ReccmpMatch | None) -> SymbolsEntry | None:

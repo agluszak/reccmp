@@ -52,7 +52,11 @@ def derive_diagnostic_normalizations(
             tags.add(DiagnosticNormalization.CFG_LAYOUT)
         if reasons & {"instruction_reorder", "commutative_order", "load_folding"}:
             tags.add(DiagnosticNormalization.INSTRUCTION_SCHEDULING)
-        if reasons & {"register_allocation", "callee_save_substitution"}:
+        if reasons & {
+            "register_allocation",
+            "callee_save_substitution",
+            "frame_slot_promotion",
+        }:
             tags.add(DiagnosticNormalization.REGISTER_ALLOCATION)
         if "frame_slot_layout" in reasons:
             tags.add(DiagnosticNormalization.STACK_LAYOUT)
@@ -79,6 +83,9 @@ def derive_diagnostic_normalizations(
 EFFECTIVE_REASON_ORDER = (
     "register_allocation",
     "frame_slot_layout",
+    # A local kept in a stack slot on one side and in a register (or
+    # another slot) on the other, each side's private frame held apart.
+    "frame_slot_promotion",
     "callee_save_substitution",
     "instruction_reorder",
     "commutative_order",

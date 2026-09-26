@@ -17,6 +17,12 @@ from reccmp.compare.asm.verifier.addresses import (
     stack_rooted,
     unwind_spadd,
 )
+from reccmp.compare.asm.verifier.frame import (
+    frame_offset,
+    maybe_frame_pointer,
+    read_slot,
+    write_slot,
+)
 from reccmp.compare.asm.verifier.state import (
     CARRY_BINOPS,
     CC_CANON,
@@ -97,6 +103,10 @@ def read_operand(state: SideState, ctx: Context, op) -> Value:
     if kind == "mem":
         address = mem_address(state, op)
         width = WIDTHS.get(op[1])
+        offset = frame_offset(state, ctx, address, width, slot=False)
+        if offset is not None:
+            assert width is not None
+            return read_slot(state, offset, width)
         if ctx.trace is not None:
             ctx.trace.append(("r", address, width, False))
         tag = memory_load_tag(ctx, address, width, False)
@@ -203,6 +213,12 @@ def write_operand(state: SideState, ctx: Context, op, value: Value, obs: list) -
         state.write_reg(op[1], value)
     elif kind == "mem":
         address = mem_address(state, op, write=True)
+        width = WIDTHS.get(op[1])
+        offset = frame_offset(state, ctx, address, width, slot=False)
+        if offset is not None:
+            assert width is not None
+            write_slot(state, offset, width, value)
+            return
         if ctx.trace is not None:
             ctx.trace.append(("w", address, WIDTHS.get(op[1]), False))
         obs.append(("store", address, op[1], value))
@@ -504,28 +520,35 @@ def execute(
         value = read_operand(state, ctx, ops[0])
         new_esp = esp_add(state.read_reg("esp"), -4)
         state.write_reg("esp", new_esp)
-        if ctx.trace is not None:
-            ctx.trace.append(("w", new_esp, 4, "push"))
-        obs.append(("store", new_esp, "stack", value))
+        offset = frame_offset(state, ctx, new_esp, 4, slot=True)
+        if offset is not None:
+            write_slot(state, offset, 4, value)
+        else:
+            if ctx.trace is not None:
+                ctx.trace.append(("w", new_esp, 4, "push"))
+            obs.append(("store", new_esp, "stack", value))
     elif mnemonic == "pop" and len(ops) == 1:
         esp = state.read_reg("esp")
-        if ctx.trace is not None:
-            ctx.trace.append(("r", esp, 4, "pop"))
-        write_operand(
-            state,
-            ctx,
-            ops[0],
-            ("load", esp, "stack", memory_load_tag(ctx, esp, 4, "pop")),
-            obs,
-        )
+        offset = frame_offset(state, ctx, esp, 4, slot=True)
+        if offset is not None:
+            popped = read_slot(state, offset, 4)
+        else:
+            if ctx.trace is not None:
+                ctx.trace.append(("r", esp, 4, "pop"))
+            popped = ("load", esp, "stack", memory_load_tag(ctx, esp, 4, "pop"))
+        write_operand(state, ctx, ops[0], popped, obs)
         state.write_reg("esp", esp_add(esp, 4))
     elif mnemonic == "leave":
         ebp = state.read_reg("ebp")
-        if ctx.trace is not None:
-            ctx.trace.append(("r", ebp, 4, "pop"))
-        state.write_reg(
-            "ebp", ("load", ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
-        )
+        offset = frame_offset(state, ctx, ebp, 4, slot=True)
+        if offset is not None:
+            state.write_reg("ebp", read_slot(state, offset, 4))
+        else:
+            if ctx.trace is not None:
+                ctx.trace.append(("r", ebp, 4, "pop"))
+            state.write_reg(
+                "ebp", ("load", ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
+            )
         state.write_reg("esp", esp_add(ebp, 4))
     elif mnemonic == "call" and len(ops) == 1:
         # The callee may take arguments in ecx (thiscall) or ecx+edx
@@ -619,6 +642,10 @@ def execute(
         write_operand(state, ctx, ops[0], value, obs)
     elif mnemonic in STRING_OPS:
         reads, writes, _writes_memory = STRING_OPS[mnemonic]
+        if state.frame and any(
+            maybe_frame_pointer(state.regs[family]) for family in ("si", "di")
+        ):
+            raise Reject  # it may read or write a promoted slot
         key = (mnemonic, ins.prefix)
         observed = [key]
         for family in reads.split():

@@ -306,7 +306,9 @@ def test_reject_different_store_value_after_join():
 
 
 def test_reject_divergent_branch_structure():
-    """Different reachable block graphs are not comparable."""
+    """Different reachable block graphs are not comparable: the product
+    pairs them, but a difference found under a pairing that is not one to
+    one is not reported as one."""
     orig = [
         "test eax, eax",
         "je 0x2",
@@ -337,6 +339,157 @@ def test_reject_divergent_branch_structure():
     assert location.facts["failure"] == "edge_roles"
     assert location.facts["orig_block_count"] == 3
     assert location.facts["recomp_block_count"] == 2
+    # What the product found says where to look, without being the verdict.
+    assert location.facts["product_stop"] == "branch_condition"
+    assert location.facts["product_orig_address"] == 0x1002
+    assert location.facts["product_recomp_address"] == 0x2003
+
+
+def test_a_branch_against_none_cannot_pair():
+    """A branch on one side where the other has none cannot pair."""
+    orig = [
+        "test eax, eax",
+        "je 0x2",
+        "inc ebx",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "inc ebx",
+        "ret",
+    ]
+    recorder = AnalysisRecorder(
+        orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
+        recomp_addrs=[0x2000, 0x2002, 0x2003],
+    )
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        [None, 3, None, None],
+        [None, None, None],
+        recorder=recorder,
+    )
+    analysis = recorder.failure_analysis()
+    assert analysis.inconclusive_reason == "non_isomorphic_cfg"
+    location = require_inconclusive_location(analysis)
+    assert location.address == 0x1000
+    assert location.facts["failure"] == "edge_roles"
+    assert location.facts["orig_block_count"] == 3
+    assert location.facts["recomp_block_count"] == 1
+
+
+def test_a_branch_inverted_with_its_successors_swapped():
+    """`jne A; B` against `je B; A`: the complement of one condition is the
+    other's, so the taken edge of one pairs with the fall-through of the
+    other."""
+    orig = [
+        "test eax, eax",
+        "jne 0x3",
+        "xor eax, eax",
+        "ret",
+        "mov eax, 1",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "je 0x6",
+        "mov eax, 1",
+        "ret",
+        "xor eax, eax",
+        "ret",
+    ]
+    assert verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        [None, 4, None, None, None, None],
+        [None, 4, None, None, None, None],
+    )
+
+
+def test_an_inverted_branch_must_test_the_complement():
+    """Swapped successors under `jl` against `jg` (not its complement `jge`)
+    differ when the operands are equal."""
+    orig = [
+        "cmp eax, ecx",
+        "jl 0x3",
+        "xor eax, eax",
+        "ret",
+        "mov eax, 1",
+        "ret",
+    ]
+    recomp = [
+        "cmp eax, ecx",
+        "jg 0x6",
+        "mov eax, 1",
+        "ret",
+        "xor eax, eax",
+        "ret",
+    ]
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        [None, 4, None, None, None, None],
+        [None, 4, None, None, None, None],
+    )
+
+
+def test_a_shared_tail_against_its_copies():
+    """One side joins both arms in a shared tail; the other repeats the tail
+    in each arm. Each copy pairs with the shared block on its own path."""
+    orig = [
+        "test eax, eax",
+        "je 0x5",
+        "mov ecx, 1",
+        "jmp 0x2",
+        "xor ecx, ecx",
+        "lea eax, [ecx + edx]",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "je 0x6",
+        "mov ecx, 1",
+        "lea eax, [ecx + edx]",
+        "ret",
+        "xor ecx, ecx",
+        "lea eax, [ecx + edx]",
+        "ret",
+    ]
+    assert verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        [None, 4, None, 5, None, None, None],
+        [None, 5, None, None, None, None, None, None],
+    )
+
+
+def test_a_shared_tail_must_match_each_copy():
+    """The same shape, with one copy of the tail computing something else."""
+    orig = [
+        "test eax, eax",
+        "je 0x5",
+        "mov ecx, 1",
+        "jmp 0x2",
+        "xor ecx, ecx",
+        "lea eax, [ecx + edx]",
+        "ret",
+    ]
+    recomp = [
+        "test eax, eax",
+        "je 0x6",
+        "mov ecx, 1",
+        "lea eax, [ecx + edx]",
+        "ret",
+        "xor ecx, ecx",
+        "lea eax, [ecx + ebx]",
+        "ret",
+    ]
+    assert not verify_isomorphic_cfg_effective_match(
+        orig,
+        recomp,
+        [None, 4, None, 5, None, None, None],
+        [None, 5, None, None, None, None, None, None],
+    )
 
 
 def test_jump_table_data_reports_side_location_and_count():
