@@ -1,4 +1,4 @@
-"""Bit-vector equivalence of symbolic values (optional, needs z3-solver).
+"""Bit-vector equivalence of symbolic values (z3).
 
 The verifier compares the values two instruction streams observe
 structurally: the same computation spelled differently (`and al, 1` on the
@@ -17,10 +17,7 @@ from collections.abc import Hashable, Sequence
 from functools import lru_cache
 from typing import Any
 
-try:
-    import z3  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover - exercised when z3 is absent
-    z3 = None
+import z3  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.verifier.state import WIDTHS
 
@@ -29,10 +26,6 @@ _PART_BITS = {"l8": 8, "h8": 8, "r16": 16}
 _EXTEND_BITS = {"byte": 8, "l8": 8, "h8": 8, "word": 16, "r16": 16}
 _LOAD_BITS = {"byte": 8, "word": 16, "dword": 32}
 _PREDICATES = {"eq", "ne", "lt_u", "le_u", "lt_s", "le_s"}
-
-
-def available() -> bool:
-    return z3 is not None
 
 
 class _Unsupported(Exception):
@@ -233,8 +226,6 @@ def values_equal(a: Any, b: Any, bits: int | None = None) -> bool:
     their natural width when None). False unless proven."""
     if a == b:
         return True
-    if z3 is None:
-        return False
     lowering = _Lowering()
     try:
         if bits is None:
@@ -251,8 +242,6 @@ def predicates_equal(a: Any, b: Any) -> bool:
     """Whether two branch predicates decide the same way for every input."""
     if a == b:
         return True
-    if z3 is None:
-        return False
     lowering = _Lowering()
     try:
         left, right = lowering.predicate(a), lowering.predicate(b)
@@ -267,7 +256,7 @@ def entries_equal(entry_o: Any, entry_r: Any) -> bool:
     Every other part (tags, addresses, widths, destinations) must be equal."""
     if entry_o == entry_r:
         return True
-    if z3 is None or not isinstance(entry_o, tuple) or not isinstance(entry_r, tuple):
+    if not isinstance(entry_o, tuple) or not isinstance(entry_r, tuple):
         return False
     if not entry_o or len(entry_o) != len(entry_r) or entry_o[0] != entry_r[0]:
         return False

@@ -1,11 +1,7 @@
 """Bit-vector equivalence of the verifier's symbolic values (z3)."""
 
-import pytest
-
 from reccmp.compare.asm.verifier import bitvector, verify_effective_match
 from reccmp.compare.asm.verifier.state import FunctionMetadata
-
-pytestmark = pytest.mark.skipif(not bitvector.available(), reason="needs z3-solver")
 
 EAX = ("init", "a")
 ECX = ("init", "c")
@@ -101,6 +97,9 @@ def test_the_verifier_accepts_an_algebraic_identity():
     recomp = ["mov eax, dword ptr [ecx + 4]", "and eax, 1", "ret"]
     byte_return = FunctionMetadata(return_kind="i8")
     assert verify_effective_match(orig, recomp, metadata=byte_return)
+    # a project may turn algebraic identities off
+    no_algebra = FunctionMetadata(return_kind="i8", algebraic_identities=False)
+    assert not verify_effective_match(orig, recomp, metadata=no_algebra)
     # the whole of eax is returned: the upper bits differ
     assert not verify_effective_match(
         orig, recomp, metadata=FunctionMetadata(return_kind="i32")

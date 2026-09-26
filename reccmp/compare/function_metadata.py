@@ -21,6 +21,8 @@ _RETURN_KIND_BY_SIZE = {1: "i8", 2: "i16", 4: "i32", 8: "i64"}
 class FunctionMetadataMixin(ComparatorState):
     """Part of FunctionComparator; relies on its attributes."""
 
+    algebraic_identities: bool
+
     def _return_kind_of_type(self, type_key: CvdumpTypeKey) -> str:
         # pylint: disable=too-many-return-statements
         """Reduce a PDB return type to the register footprint of the
@@ -138,13 +140,14 @@ class FunctionMetadataMixin(ComparatorState):
         node = self.func_nodes.get(recomp_addr)
         return self._call_facts_of_node(node, orig_addr) if node is not None else None
 
-    def _function_metadata(self, match: ReccmpMatch) -> FunctionMetadata | None:
+    def _function_metadata(self, match: ReccmpMatch) -> FunctionMetadata:
         if not self.func_nodes:
-            return None
+            return FunctionMetadata(algebraic_identities=self.algebraic_identities)
         facts = self._call_facts_at(match.recomp_addr, match.orig_addr)
         return FunctionMetadata(
             return_kind=facts.return_kind if facts is not None else "unknown",
             call_facts=self._call_facts_map().get,
+            algebraic_identities=self.algebraic_identities,
         )
 
     def _fn_symbol_entry(self, match: ReccmpMatch | None) -> SymbolsEntry | None:
