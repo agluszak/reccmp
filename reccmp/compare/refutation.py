@@ -20,7 +20,7 @@ from reccmp.compare.diagnosis import (
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.function_metadata import FunctionMetadataMixin
 from reccmp.compare.source_pins import SourcePinMixin
-from reccmp.compare.extent import plausible_discovered_extent
+from reccmp.compare.extent import EntityExtent
 from reccmp.types import EntityType, ImageId
 
 _CODE_TYPES = (EntityType.FUNCTION, EntityType.THUNK, EntityType.VTORDISP)
@@ -52,9 +52,10 @@ def _reached(result: SearchResult, analysis: ComparisonAnalysis) -> int | None:
     return result.agreeing_runs_through(orig, recomp)
 
 
-def _solver_hints(analysis: ComparisonAnalysis) -> list[RunInput]:
+def _solver_hints(analysis: ComparisonAnalysis) -> tuple[list[RunInput], str | None]:
     """An input under which the reported values differ, when Z3 finds one
-    over leaves a run input can set (see witness.hints)."""
+    over leaves a run input can set (see witness.hints), and, when there is
+    none, why: the solver's answer, or why its assignment is no input."""
     # The witness package needs unicorn, an optional extra.
     # pylint: disable=import-outside-toplevel
     from reccmp.compare.witness.hints import input_from_assignment
@@ -63,12 +64,28 @@ def _solver_hints(analysis: ComparisonAnalysis) -> list[RunInput]:
 
     difference = analysis.difference
     if difference is None or difference.values is None:
-        return []
-    assignment = bitvector.distinguishing_assignment(difference.values)
-    if not assignment:
-        return []
-    hint = input_from_assignment(assignment, RunInput.from_seed(HINT_SEED))
-    return [hint] if hint is not None else []
+        return [], None
+    outcome = bitvector.compare(difference.values)
+    if outcome.result != "differs":
+        detail = f": {outcome.reason}" if outcome.reason else ""
+        return [], f"solver {outcome.result}{detail}"
+    hint = input_from_assignment(
+        dict(outcome.assignment), RunInput.from_seed(HINT_SEED)
+    )
+    if not isinstance(hint, RunInput):
+        return [], f"rejected: {hint.reason}"
+    return [hint], None
+
+
+def _hint_fate(result: SearchResult, analysis: ComparisonAnalysis) -> str:
+    """What the solver-suggested run did, when it refuted nothing."""
+    reason, executed_o, executed_r = result.hint_runs[0]
+    difference = analysis.difference
+    assert difference is not None
+    reached = (
+        difference.orig.address is None or difference.orig.address in executed_o
+    ) and (difference.recomp.address is None or difference.recomp.address in executed_r)
+    return f"run {reason}" if reached else f"run {reason}, did not reach the difference"
 
 
 class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
@@ -77,7 +94,11 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
     witness_search: bool
     _witness_translator: Translator | None
     # (side, address) -> extent from _witness_extent; filled on demand.
-    _witness_extents: dict[tuple[ImageId, int], int | None]
+    _witness_extents: dict[tuple[ImageId, int], EntityExtent | None]
+
+    def witness_translator(self) -> Translator:
+        """The witness machines of this comparison, e.g. for replay."""
+        return self._witness_machines()
 
     def _witness_machines(self) -> Translator:
         if self._witness_translator is None:
@@ -108,56 +129,61 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                         return self._call_facts_at(match.recomp_addr, match.orig_addr)
                 return None
 
-            def sizes(image_id: ImageId):
-                def size(address: int) -> int | None:
+            def windows(image_id: ImageId):
+                def window(address: int) -> EntityExtent | None:
+                    """Bytes a function at ``address`` may occupy: its
+                    recorded size, else the gap to the next known entity."""
                     entity = self.db.get(image_id, address)
                     if entity is None:
                         return None
-                    return self._witness_extent(image_id, entity)
+                    if (size := entity.size(image_id)) is not None:
+                        return EntityExtent(size)
+                    if (gap := entity.max_size(image_id)) is not None:
+                        return EntityExtent(gap, recorded=False)
+                    return None
 
-                return size
+                return window
 
             self._witness_translator = Translator(
                 self.db,
-                SideMachine(self.orig_bin, registry, by_import, sizes(ImageId.ORIG)),
+                SideMachine(self.orig_bin, registry, by_import, windows(ImageId.ORIG)),
                 SideMachine(
-                    self.recomp_bin, registry, by_import, sizes(ImageId.RECOMP)
+                    self.recomp_bin, registry, by_import, windows(ImageId.RECOMP)
                 ),
                 call_facts=callee_facts,
                 extent=self._witness_extent,
             )
         return self._witness_translator
 
-    def _witness_extent(self, image_id: ImageId, entity: ReccmpEntity) -> int | None:
+    def _witness_extent(
+        self, image_id: ImageId, entity: ReccmpEntity
+    ) -> EntityExtent | None:
         """An entity's size on one side, for the witness: the recorded one,
-        else one backed by evidence from this binary.
+        else, for data of a pair, an estimate: the other side's size when it
+        is exactly the gap to the next known entity on this side. The gap
+        bounds the object without showing it owns every byte (there may be
+        padding or an unrecorded object), so no witness may depend on it.
 
-        - A function's extent from its control flow (as the comparator
-          estimates unannotated original functions).
-        - Other entities of a pair: the other side's size, only when it is
-          exactly the gap to the next known entity on this side, so no
-          unknown object can sit inside the borrowed extent.
-        """
+        A function's size is not needed: calls and pointers reach functions
+        at their start, and callee cleanup comes from control flow."""
         size = entity.size(image_id)
         base = entity.addr(image_id)
-        if size is not None or base is None or not entity.matched:
-            return size
+        if size is not None:
+            return EntityExtent(size)
+        if base is None or not entity.matched:
+            return None
         key = (image_id, base)
         if key not in self._witness_extents:
             other = ImageId.RECOMP if image_id == ImageId.ORIG else ImageId.ORIG
             other_size = entity.size(other)
             gap = entity.max_size(image_id)
-            extent = None
-            if other_size is not None and entity.get("type") in _CODE_TYPES:
-                extent = plausible_discovered_extent(
-                    self.orig_bin if image_id == ImageId.ORIG else self.recomp_bin,
-                    base,
-                    gap,
-                    other_size,
-                    is_32bit=self.is_32bit,
-                )
-            elif other_size is not None and gap == other_size:
-                extent = other_size
+            extent: EntityExtent | None = None
+            if (
+                other_size is not None
+                and gap == other_size
+                and entity.get("type") not in _CODE_TYPES
+            ):
+                extent = EntityExtent(other_size, recorded=False)
             self._witness_extents[key] = extent
         return self._witness_extents[key]
 
@@ -177,12 +203,13 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
         from reccmp.compare.witness import find_witness
 
         facts = self._call_facts_at(match.recomp_addr, match.orig_addr)
+        hints, hint_failure = _solver_hints(analysis)
         result = find_witness(
             self._witness_machines(),
             orig_image,
             recomp_image,
             return_kind=facts.return_kind if facts is not None else "unknown",
-            hints=_solver_hints(analysis),
+            hints=hints,
         )
         if result.witness is None:
             return dataclasses.replace(
@@ -193,6 +220,9 @@ class RefutationMixin(FunctionMetadataMixin, SourcePinMixin):
                     reached_location=_reached(result, analysis),
                     no_verdict=dict(result.skipped),
                     no_verdict_details=result.skipped_details,
+                    solver_hint=(
+                        _hint_fate(result, analysis) if hints else hint_failure
+                    ),
                 ),
             )
         refuted = analysis.with_witness(result.witness)

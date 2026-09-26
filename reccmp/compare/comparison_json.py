@@ -35,11 +35,14 @@ def _side_json(side: DifferenceSide) -> dict[str, object]:
 
 
 def _difference_json(difference: ComparisonDifference) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "kind": difference.kind,
         "orig": _side_json(difference.orig),
         "recomp": _side_json(difference.recomp),
     }
+    if difference.solver is not None:
+        value["solver"] = difference.solver
+    return value
 
 
 def _attempt_json(attempt: StrategyAttempt) -> dict[str, object]:
@@ -100,6 +103,7 @@ def _parse_difference(value: dict) -> ComparisonDifference:
         kind=value["kind"],
         orig=_parse_side(value["orig"]),
         recomp=_parse_side(value["recomp"]),
+        solver=value.get("solver"),
     )
 
 
@@ -143,7 +147,7 @@ def parse_analysis(value: object) -> ComparisonAnalysis:
             ),
             attempts=tuple(_parse_attempt(item) for item in value.get("attempts", ())),
             witness=(
-                RefutationWitness(**value["witness"])
+                RefutationWitness.from_json(value["witness"])
                 if value.get("witness") is not None
                 else None
             ),

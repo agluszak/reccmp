@@ -5,7 +5,14 @@ addresses, the way a recompiled image differs from the original, and checks
 that a witness is found only for a real observable difference.
 """
 
+# pylint: disable=too-many-lines
+
+import dataclasses
+import json
+import subprocess
+import sys
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,20 +23,32 @@ from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.refutation import RefutationMixin
 from reccmp.compare.asm.verifier import verify_effective_match
+from reccmp.compare.comparison_json import analysis_json, parse_analysis
+from reccmp.compare.extent import EntityExtent
 from reccmp.compare.diagnosis import (
     AnalysisRecorder,
+    RefutationWitness,
     ComparisonAnalysis,
     ComparisonStatus,
 )
-from reccmp.compare.refutation import _solver_hints
+from reccmp.compare.refutation import _hint_fate, _solver_hints
 from reccmp.formats.image import ImageSection, ImageSectionFlags
 from reccmp.types import EntityType, ImageId
 
 pytest.importorskip("unicorn")
 
 # pylint: disable=wrong-import-position
-from reccmp.compare.witness import SideMachine, Translator, find_witness
+from reccmp.compare.witness import (
+    SearchResult,
+    SideMachine,
+    Translator,
+    find_witness,
+    replay,
+)
+from reccmp.compare.witness.cleanup import Cleanup
 from reccmp.compare.witness.machine import (
+    WITNESS_MODEL,
+    HEAP_BASE,
     PAGE,
     STACK_BASE,
     STACK_TOP,
@@ -37,7 +56,7 @@ from reccmp.compare.witness.machine import (
     import_registry,
     page_contents,
 )
-from reccmp.compare.witness.hints import input_from_assignment
+from reccmp.compare.witness.hints import Rejection, input_from_assignment
 from reccmp.compare.witness.search import HINT_SEED, UNRESOLVED, _excerpt_constants
 
 CODE = 0x401000
@@ -51,7 +70,13 @@ ORIG_CALLEE, RECOMP_CALLEE = CODE + 0x800, CODE + 0x900
 RET_BYTE = b"\xc3"
 
 
-def _image(code_at: int, code: bytes, table_at: int, callee_body: bytes = RET_BYTE):
+def _image(
+    code_at: int,
+    code: bytes,
+    table_at: int,
+    callee_body: bytes = RET_BYTE,
+    relocated: range = range(0),
+):
     code_page = bytearray(0x1000)
     code_page[code_at - CODE : code_at - CODE + len(code)] = code
     callee = ORIG_CALLEE if code_at == ORIG_FUNC else RECOMP_CALLEE
@@ -73,7 +98,7 @@ def _image(code_at: int, code: bytes, table_at: int, callee_body: bytes = RET_BY
             section(CODE, code_page, ImageSectionFlags.EXECUTE),
             section(DATA, data_page, ImageSectionFlags.READ),
         ],
-        is_relocated_addr=lambda _addr: False,
+        is_relocated_addr=lambda addr: addr in relocated,
     )
 
 
@@ -86,15 +111,21 @@ def _function_image(start: int, code: bytes) -> FunctionImage:
     )
 
 
-def _search(
+def _translator(
     orig_code: bytes,
     recomp_code: bytes,
-    return_kind: str = "i32",
     *,
     callee_body: bytes = RET_BYTE,
     call_facts=None,
-    hints=(),
-):
+    orig_table_size: int | None = len(TABLE),
+    extent=None,
+    objects: tuple[tuple[int, int, int], ...] = (),
+    pair_table: bool = True,
+    relocated_table: bool = False,
+) -> Translator:
+    """``objects``: more paired data, (original address, recompiled
+    address, size)."""
+    # pylint: disable=too-many-arguments
     db = EntityDb()
     with db.batch() as batch:
         for image_id, func, table in (
@@ -102,34 +133,56 @@ def _search(
             (ImageId.RECOMP, RECOMP_FUNC, RECOMP_TABLE),
         ):
             batch.set(image_id, func, type=EntityType.FUNCTION, size=0x100)
-            batch.set(image_id, table, type=EntityType.DATA, size=len(TABLE))
+            table_size = orig_table_size if image_id == ImageId.ORIG else len(TABLE)
+            batch.set(image_id, table, type=EntityType.DATA, size=table_size)
             callee = ORIG_CALLEE if image_id == ImageId.ORIG else RECOMP_CALLEE
-            batch.set(image_id, callee, type=EntityType.FUNCTION, size=1)
+            batch.set(image_id, callee, type=EntityType.FUNCTION, size=len(callee_body))
         batch.match(ORIG_FUNC, RECOMP_FUNC)
-        batch.match(ORIG_TABLE, RECOMP_TABLE)
+        if pair_table:
+            batch.match(ORIG_TABLE, RECOMP_TABLE)
         batch.match(ORIG_CALLEE, RECOMP_CALLEE)
+        for orig, recomp, size in objects:
+            batch.set(ImageId.ORIG, orig, type=EntityType.DATA, size=size)
+            batch.set(ImageId.RECOMP, recomp, type=EntityType.DATA, size=size)
+            batch.match(orig, recomp)
 
     def sizes(image_id: ImageId):
-        def size(address: int) -> int | None:
+        def size(address: int) -> EntityExtent | None:
             entity = db.get(image_id, address)
-            return entity.size(image_id) if entity is not None else None
+            if entity is None or entity.size(image_id) is None:
+                return None
+            return EntityExtent(entity.size(image_id))
 
         return size
 
-    translator = Translator(
+    def relocations(table: int) -> range:
+        return range(table, table + len(TABLE)) if relocated_table else range(0)
+
+    return Translator(
         db,
         SideMachine(
-            _image(ORIG_FUNC, orig_code, ORIG_TABLE, callee_body),  # type: ignore[arg-type]
-            function_size=sizes(ImageId.ORIG),
+            _image(ORIG_FUNC, orig_code, ORIG_TABLE, callee_body, relocations(ORIG_TABLE)),  # type: ignore[arg-type]
+            function_window=sizes(ImageId.ORIG),
         ),
         SideMachine(
-            _image(RECOMP_FUNC, recomp_code, RECOMP_TABLE, callee_body),  # type: ignore[arg-type]
-            function_size=sizes(ImageId.RECOMP),
+            _image(RECOMP_FUNC, recomp_code, RECOMP_TABLE, callee_body, relocations(RECOMP_TABLE)),  # type: ignore[arg-type]
+            function_window=sizes(ImageId.RECOMP),
         ),
         call_facts=call_facts,
+        extent=extent,
     )
+
+
+def _search(
+    orig_code: bytes,
+    recomp_code: bytes,
+    return_kind: str = "i32",
+    *,
+    hints=(),
+    **setup,
+):
     return find_witness(
-        translator,
+        _translator(orig_code, recomp_code, **setup),
         _function_image(ORIG_FUNC, orig_code),
         _function_image(RECOMP_FUNC, recomp_code),
         return_kind=return_kind,
@@ -301,13 +354,12 @@ def test_instruction_facts_come_from_capstone_detail():
     code = body.ljust(0x40, b"\x90") + thunk.ljust(0x10, b"\x90") + b"\xc2\x08\x00"
     machine = SideMachine(
         _image(ORIG_FUNC, code, ORIG_TABLE),  # type: ignore[arg-type]
-        function_size=lambda address: 3 if address == ORIG_FUNC + 0x50 else None,
     )
 
     # Branch targets and the ``ret`` immediate are not constants.
     image = _function_image(ORIG_FUNC, body)
     assert _excerpt_constants(image, machine) == {4, 7, 0x1234}
-    assert machine.callee_pop_bytes(ORIG_FUNC + 0x40) == 8
+    assert machine.callee_pop_bytes(ORIG_FUNC + 0x40) == Cleanup(8, True)
     # pylint: disable-next=protected-access
     assert machine._caller_cleanup(ORIG_FUNC + 7) == 4
 
@@ -460,10 +512,17 @@ def test_a_write_across_a_page_boundary_is_undone():
 
 def test_code_that_writes_code_gives_no_verdict():
     # mov byte ptr [ORIG_CALLEE], 0x90; ret
-    code = b"\xc6\x05" + _abs32(ORIG_CALLEE) + b"\x90" + RET
+    write = b"\xc6\x05" + _abs32(ORIG_CALLEE) + b"\x90" + RET
+    # mov eax, ORIG_CALLEE; mov al, [eax]; ret: the callee's first byte
+    probe = b"\xb8" + _abs32(ORIG_CALLEE) + b"\x8a\x00" + RET
+    code = write.ljust(0x40, b"\x90") + probe
     machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
-    trace = machine.run(range(ORIG_FUNC, ORIG_FUNC + len(code)), RunInput.from_seed(0))
+    trace = machine.run(range(ORIG_FUNC, ORIG_FUNC + len(write)), RunInput.from_seed(0))
     assert trace.end == "code_write"
+    # The stopped write still happened; the next run sees the code again.
+    probe_range = range(ORIG_FUNC + 0x40, ORIG_FUNC + 0x40 + len(probe))
+    after = machine.run(probe_range, RunInput.from_seed(0))
+    assert after.end == "return" and after.eax & 0xFF == RET_BYTE[0]
 
 
 def test_pushed_bytes_stop_at_any_other_stack_pointer_write():
@@ -505,35 +564,107 @@ def test_generated_pages_are_deterministic_and_shared():
     assert page_contents(3, 0x1000) == bytes(PAGE)
 
 
+def _callee_pop(
+    body: bytes, window: int | None = None, *, recorded: bool = True
+) -> Cleanup | None:
+    extent = EntityExtent(window, recorded) if window is not None else None
+    machine = SideMachine(
+        _image(ORIG_FUNC, RET, ORIG_TABLE, body),  # type: ignore[arg-type]
+        function_window=lambda address: extent if address == ORIG_CALLEE else None,
+    )
+    return machine.callee_pop_bytes(ORIG_CALLEE)
+
+
 def test_a_callee_without_ret_does_not_lend_the_next_functions():
     # callee: mov eax, ecx; jmp eax (never returns here); next function: ret 8
     tail_jump = bytes.fromhex("8bc1ffe0")
-    padded = tail_jump + b"\xcc" * 14 + bytes.fromhex("c20800")
-    machine = SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE, padded))  # type: ignore[arg-type]
-    assert machine.callee_pop_bytes(ORIG_CALLEE) is None
-    # Without padding in between, the callee's known extent bounds the scan.
-    adjacent = tail_jump + bytes.fromhex("c20800")
-    sized = SideMachine(
-        _image(ORIG_FUNC, RET, ORIG_TABLE, adjacent),  # type: ignore[arg-type]
-        function_size=lambda address: 4 if address == ORIG_CALLEE else None,
-    )
-    assert sized.callee_pop_bytes(ORIG_CALLEE) is None
-    # No known extent: unknown, never a scan into the next function.
-    unsized = SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE, adjacent))  # type: ignore[arg-type]
-    assert unsized.callee_pop_bytes(ORIG_CALLEE) is None
-    # A thunk is followed, and its destination needs a known extent too.
+    assert _callee_pop(tail_jump + b"\xcc" * 14 + bytes.fromhex("c20800")) is None
+    assert _callee_pop(tail_jump + bytes.fromhex("c20800")) is None
+    assert _callee_pop(tail_jump + bytes.fromhex("c20800"), window=4) is None
+
+
+def test_callee_cleanup_comes_from_the_returns_control_flow_reaches():
+    # nop; jmp +3; ret 8 (unreachable); ret 4
+    assert _callee_pop(bytes.fromhex("90eb03c20800c20400")) == Cleanup(4, True)
+    # A thunk is followed wherever it leads; no extent is needed.
     thunk = b"\xe9" + _abs32(0x10 - 5)  # jmp +0x10
-    body = thunk.ljust(0x10, b"\x90") + bytes.fromhex("c20800")
-    for known, expected in ((False, None), (True, 8)):
+    thunked = thunk.ljust(0x10, b"\x90") + bytes.fromhex("c20800")
+    assert _callee_pop(thunked) == Cleanup(8, True)
+    # Every instruction must lie whole inside the window.
+    assert _callee_pop(bytes.fromhex("c20800"), window=2) is None
 
-        def destination_size(address: int, known: bool = known) -> int | None:
-            return 3 if known and address == ORIG_CALLEE + 0x10 else None
 
-        machine = SideMachine(
-            _image(ORIG_FUNC, RET, ORIG_TABLE, body),  # type: ignore[arg-type]
-            function_size=destination_size,
+def test_a_return_reached_only_past_a_call_is_not_certain():
+    """A call may not return: without a recorded size, the bytes after it
+    may be the next function. With one, they are the callee's own."""
+    call = _call(ORIG_CALLEE, ORIG_CALLEE + 0x40)
+    # call; ret 8
+    assert _callee_pop(call + bytes.fromhex("c20800")) == Cleanup(8, False)
+    assert _callee_pop(call + bytes.fromhex("c20800"), window=8) == Cleanup(8, True)
+    assert _callee_pop(
+        call + bytes.fromhex("c20800"), window=8, recorded=False
+    ) == Cleanup(8, False)
+    # test ecx, ecx; jz +8; call; ret 8; ...; ret 4: they disagree.
+    body = bytes.fromhex("85c97408") + call + bytes.fromhex("c20800c20400")
+    assert _callee_pop(body) is None
+    # The same return past the call and on a certain path agrees.
+    body = bytes.fromhex("85c97408") + call + bytes.fromhex("c20800c20800")
+    assert _callee_pop(body) == Cleanup(8, True)
+
+
+def test_an_uncertain_cleanup_needs_the_paired_callees_to_agree():
+    """The original callee's size is not recorded and its return lies past
+    a call: its cleanup counts only when the recompiled callee's own,
+    certain, cleanup is the same."""
+    call = _call(ORIG_CALLEE, ORIG_CALLEE + 0x40)
+    orig_callee = call + bytes.fromhex("c20400")  # call; ret 4
+
+    # push 7; call callee; ret
+    def caller(at: int, callee: int) -> bytes:
+        return bytes.fromhex("6a07") + _call(at + 2, callee) + RET
+
+    def translator(recomp_callee: bytes) -> Translator:
+        translator = _translator(
+            caller(ORIG_FUNC, ORIG_CALLEE), caller(RECOMP_FUNC, RECOMP_CALLEE)
         )
-        assert machine.callee_pop_bytes(ORIG_CALLEE) == expected
+        for side, body, callee in (
+            (ImageId.ORIG, orig_callee, ORIG_CALLEE),
+            (ImageId.RECOMP, recomp_callee, RECOMP_CALLEE),
+        ):
+            machine = translator.machines[side]
+            machine.uc.mem_write(callee, body)
+            # pylint: disable-next=protected-access
+            machine._pristine = bytes(
+                machine.uc.mem_read(machine.image_range.start, len(machine.image_range))
+            )
+            machine.function_window = (
+                (lambda _a: None)
+                if side == ImageId.ORIG
+                else (lambda _a, n=len(body): EntityExtent(n))
+            )
+            machine.insn_at.cache_clear()
+            machine.callee_pop_bytes.cache_clear()
+        return translator
+
+    agreeing = translator(bytes.fromhex("c20400"))  # ret 4
+    orig = agreeing.machines[ImageId.ORIG]
+    assert orig.stack_cleanup(ORIG_CALLEE, ORIG_FUNC + 7) == 4
+    differing = translator(bytes.fromhex("c20800"))  # ret 8
+    orig = differing.machines[ImageId.ORIG]
+    assert orig.stack_cleanup(ORIG_CALLEE, ORIG_FUNC + 7) is None
+
+
+def test_jump_table_cases_must_agree_with_the_certain_returns():
+    def switch(case_return: bytes) -> bytes:
+        # cmp eax, 1; ja default; jmp [eax*4 + table]; case 0; case 1;
+        # default: ret 8; table
+        table = ORIG_CALLEE + 21
+        head = bytes.fromhex("83f801770dff2485") + _abs32(table)
+        cases = case_return + case_return + bytes.fromhex("c20800")
+        return head + cases + _abs32(ORIG_CALLEE + 12) + _abs32(ORIG_CALLEE + 15)
+
+    assert _callee_pop(switch(bytes.fromhex("c20800"))) == Cleanup(8, True)
+    assert _callee_pop(switch(bytes.fromhex("c20400"))) is None
 
 
 def test_the_solver_suggests_the_input_the_seeds_miss():
@@ -554,7 +685,7 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
     )
     difference = recorder.difference or recorder.candidate_difference
     assert difference is not None and difference.kind == "branch_condition"
-    hints = _solver_hints(ComparisonAnalysis.mismatch(difference))
+    hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
     assert [hint.stack_args[0] for hint in hints] == [0x122F]
 
     assert _search(orig, recomp).witness is None  # the seeds miss it
@@ -563,33 +694,74 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
     assert (witness.seed, witness.kind) == (HINT_SEED, "return_value")
 
 
+def _field(offset: int, size: str = "word", register: str = "c") -> tuple:
+    """A load of `[register + offset]` as memory was at entry."""
+    return ("load", ("mem", "", (((("init", register)), 1),), offset, ()), size, 0)
+
+
 def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     base = RunInput.from_seed(1)
     argument = ("load", ("mem", "", ((("init", "sp"), 1),), 8, ()), "dword", 0)
     hint = input_from_assignment({("init", "c"): 7, argument: 9}, base)
-    assert hint is not None
+    assert isinstance(hint, RunInput)
     assert hint.registers["ecx"] == 7 and hint.stack_args[1] == 9
-    # this->field at entry: modelled memory, set when its page is mapped
-    field = ("load", ("mem", "", ((("init", "c"), 1),), 4, ()), "word", 0)
-    hint = input_from_assignment({("init", "c"): 0x20000000, field: 0xBEEF}, base)
-    assert hint is not None and hint.memory == ((0x20000004, 2, 0xBEEF),)
+    # this->field at entry: modelled memory, set byte by byte when its page
+    # is mapped
+    hint = input_from_assignment({("init", "c"): 0x20000000, _field(4): 0xBEEF}, base)
+    assert isinstance(hint, RunInput)
+    assert hint.memory == ((0x20000004, 0xEF), (0x20000005, 0xBE))
     # an argument after a store cannot be set; a symbol's address is ignored
     stored = ("load", argument[1], "dword", 3)
-    assert input_from_assignment({stored: 1}, base) is None
+    assert input_from_assignment({stored: 1}, base) == Rejection(
+        "uncontrollable_leaf", repr(stored)
+    )
     symbol = input_from_assignment({("sym", ("entity", 0x5000, 0)): 1}, base)
-    assert symbol is not None and symbol.registers == base.registers
+    assert isinstance(symbol, RunInput) and symbol.registers == base.registers
+
+
+def test_overlapping_solver_loads_must_agree_on_every_byte():
+    base = RunInput.from_seed(1)
+    this = {("init", "c"): 0x20000000}
+    # a dword at +4 and a word at +5 share bytes 5 and 6
+    agree = input_from_assignment(
+        {**this, _field(4, "dword"): 0x11223344, _field(5): 0x2233}, base
+    )
+    assert isinstance(agree, RunInput) and len(agree.memory) == 4
+    disagree = input_from_assignment(
+        {**this, _field(4, "dword"): 0x11223344, _field(5): 0x9999}, base
+    )
+    assert isinstance(disagree, Rejection)
+    assert disagree.reason == "conflicting_memory"
+    # memory an input cannot preset: the stack is mapped from the start
+    stack = input_from_assignment({("init", "c"): STACK_BASE, _field(4): 1}, base)
+    assert isinstance(stack, Rejection) and stack.reason == "invalid_destination"
+
+
+def test_a_preset_dword_across_a_page_boundary_is_written_whole():
+    # mov eax, [ecx + 0xffe]; ret
+    code = bytes.fromhex("8b81fe0f0000") + RET
+    machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+    hint = input_from_assignment(
+        {("init", "c"): 0x20000000, _field(0xFFE, "dword"): 0x11223344},
+        RunInput.from_seed(1),
+    )
+    assert isinstance(hint, RunInput)
+    trace = machine.run(range(ORIG_FUNC, ORIG_FUNC + len(code)), hint)
+    assert trace.end == "return" and trace.eax == 0x11223344
+
+
+# mov eax, [ecx + 8]; add eax, 5; cmp eax, 0x1234; jb/jbe +6;
+# mov eax, 1; ret; xor eax, eax; ret
+_FIELD_COMPARE = bytes.fromhex("8b410883c0053d34120000")
+_FIELD_TAIL = bytes.fromhex("06b801000000c331c0c3")
+FIELD_BELOW = _FIELD_COMPARE + b"\x72" + _FIELD_TAIL
+FIELD_BELOW_OR_EQUAL = _FIELD_COMPARE + b"\x76" + _FIELD_TAIL
 
 
 def test_a_solver_input_can_set_this_fields():
     """`this->count + 5 < 0x1234` against `<=`: differs only when the field
     holds 0x122f, which the input sets in modelled memory."""
-    # mov eax, [ecx + 8]; add eax, 5; cmp eax, 0x1234; jb/jbe +6;
-    # mov eax, 1; ret; xor eax, eax; ret
-    head = (
-        bytes.fromhex("8b4108") + bytes.fromhex("83c005") + bytes.fromhex("3d34120000")
-    )
-    tail = bytes.fromhex("06") + bytes.fromhex("b801000000c3") + bytes.fromhex("31c0c3")
-    orig, recomp = head + b"\x72" + tail, head + b"\x76" + tail
+    orig, recomp = FIELD_BELOW, FIELD_BELOW_OR_EQUAL
     recorder = AnalysisRecorder()
     verify_effective_match(
         list(disasm_detail(orig, ORIG_FUNC)),
@@ -598,11 +770,136 @@ def test_a_solver_input_can_set_this_fields():
     )
     difference = recorder.difference or recorder.candidate_difference
     assert difference is not None
-    hints = _solver_hints(ComparisonAnalysis.mismatch(difference))
+    hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
     assert hints and hints[0].memory
     assert _search(orig, recomp).witness is None
     witness = _search(orig, recomp, hints=hints).witness
     assert witness is not None and witness.seed == HINT_SEED
+
+
+_REPLAY_IN_A_FRESH_PROCESS = """
+import json, sys
+from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.diagnosis import RefutationWitness
+from reccmp.compare.witness import replay
+from tests.test_witness import FIELD_BELOW, FIELD_BELOW_OR_EQUAL, _translator
+
+def no_solver(*_args, **_kwargs):
+    raise AssertionError("replay ran the solver")
+
+bitvector.distinguishing_assignment = no_solver
+bitvector._query = no_solver
+witness = RefutationWitness.from_json(json.loads(sys.stdin.read()))
+result = replay(_translator(FIELD_BELOW, FIELD_BELOW_OR_EQUAL), witness)
+print(json.dumps([result.reproduced, list(result.problems)]))
+"""
+
+
+def test_a_solver_witness_replays_in_a_fresh_process():
+    """The record is the whole witness: another process reproduces the
+    divergence from it, with no solver and no search."""
+    recorder = AnalysisRecorder()
+    verify_effective_match(
+        list(disasm_detail(FIELD_BELOW, ORIG_FUNC)),
+        list(disasm_detail(FIELD_BELOW_OR_EQUAL, RECOMP_FUNC)),
+        recorder=recorder,
+    )
+    difference = recorder.difference or recorder.candidate_difference
+    assert difference is not None
+    hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
+    witness = _search(FIELD_BELOW, FIELD_BELOW_OR_EQUAL, hints=hints).witness
+    assert witness is not None and witness.replay is not None
+    assert witness.seed == HINT_SEED and witness.replay.input.memory
+    serialized = json.dumps(dataclasses.asdict(witness))
+    assert RefutationWitness.from_json(json.loads(serialized)) == witness
+    refuted = ComparisonAnalysis.mismatch(difference).with_witness(witness)
+    in_report = json.loads(json.dumps(analysis_json(refuted)))
+    assert parse_analysis(in_report).witness == witness
+    process = subprocess.run(
+        [sys.executable, "-c", _REPLAY_IN_A_FRESH_PROCESS],
+        input=serialized,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert json.loads(process.stdout) == [True, []]
+
+
+def test_a_replay_says_why_it_does_not_reproduce():
+    witness = _search(
+        LOAD_ARG + bytes.fromhex("83c001") + RET,
+        LOAD_ARG + bytes.fromhex("83c002") + RET,
+    ).witness
+    assert witness is not None and witness.replay is not None
+    same = _translator(
+        LOAD_ARG + bytes.fromhex("83c001") + RET,
+        LOAD_ARG + bytes.fromhex("83c001") + RET,
+    )
+    result = replay(same, witness)
+    assert not result.reproduced and result.problems == ("agreed",)
+    stale = dataclasses.replace(
+        witness, replay=dataclasses.replace(witness.replay, model=WITNESS_MODEL + 1)
+    )
+    assert replay(same, stale).problems == ("model",)
+
+
+def _difference(orig: bytes, recomp: bytes):
+    recorder = AnalysisRecorder()
+    verify_effective_match(
+        list(disasm_detail(orig, ORIG_FUNC)),
+        list(disasm_detail(recomp, RECOMP_FUNC)),
+        recorder=recorder,
+    )
+    difference = recorder.difference or recorder.candidate_difference
+    assert difference is not None
+    return difference
+
+
+def test_a_value_difference_says_what_the_solver_found():
+    difference = _difference(FIELD_BELOW, FIELD_BELOW_OR_EQUAL)
+    assert difference.solver is not None
+    assert difference.solver["result"] == "differs"
+    assert isinstance(difference.solver["rlimit"], int)
+    in_report = json.loads(
+        json.dumps(analysis_json(ComparisonAnalysis.mismatch(difference)))
+    )
+    assert parse_analysis(in_report).difference.solver == difference.solver  # type: ignore[union-attr]
+
+
+def test_the_fate_of_a_solver_hint_is_recorded():
+    """Why a solver answer led to no run: the assignment constrains a leaf
+    no input sets (memory after a store), or a term could not be lowered;
+    and what a run from it did."""
+    difference = _difference(FIELD_BELOW, FIELD_BELOW_OR_EQUAL)
+    analysis = ComparisonAnalysis.mismatch(difference)
+    hints, failure = _solver_hints(analysis)
+    assert hints and failure is None
+    stored = ("load", ("mem", "", (((("init", "c")), 1),), 8, ()), "dword", 3)
+    rejected = dataclasses.replace(difference, values=(stored, ("imm", 1), 32, "value"))
+    assert _solver_hints(ComparisonAnalysis.mismatch(rejected)) == (
+        [],
+        "rejected: uncontrollable_leaf",
+    )
+    unsupported = dataclasses.replace(
+        difference, values=(("imm", 1), ("imm", 2), None, "value")
+    )
+    assert _solver_hints(ComparisonAnalysis.mismatch(unsupported)) == (
+        [],
+        "solver unsupported: constant operands",
+    )
+    located = ComparisonAnalysis.mismatch(
+        dataclasses.replace(
+            difference,
+            orig=dataclasses.replace(difference.orig, address=ORIG_FUNC + 11),
+            recomp=dataclasses.replace(difference.recomp, address=RECOMP_FUNC + 11),
+        )
+    )
+    both = (frozenset({ORIG_FUNC + 11}), frozenset({RECOMP_FUNC + 11}))
+    ran = SearchResult(hint_runs=[("call_structure", *both)])
+    assert _hint_fate(ran, located) == "run call_structure"
+    missed = SearchResult(hint_runs=[("agreed", frozenset(), frozenset())])
+    assert _hint_fate(missed, located) == "run agreed, did not reach the difference"
 
 
 def test_the_start_of_a_paired_entity_needs_no_extent():
@@ -641,7 +938,158 @@ def test_a_paired_object_borrows_only_an_exactly_fitting_extent():
         # pylint: disable-next=protected-access
         return RefutationMixin._witness_extent(comparator, ImageId.ORIG, entity)  # type: ignore[arg-type]
 
-    assert extent(8) == 8
+    assert extent(8) == EntityExtent(8, recorded=False)
     assert extent(12) is None  # room for an unknown object after it
     assert extent(4) is None  # does not fit
     assert extent(8, matched=False) is None
+
+
+def _store_to_table(offset: int, value: int, table: int) -> bytes:
+    # mov dword ptr [table + offset], imm32; ret
+    return b"\xc7\x05" + _abs32(table + offset) + _abs32(value) + RET
+
+
+def test_a_difference_through_an_estimated_extent_is_not_a_witness():
+    """The original table has no recorded size, only an estimate: its bytes
+    past the start may be padding or an unrecorded object."""
+
+    def estimated(side: ImageId, entity: ReccmpEntity) -> EntityExtent | None:
+        if side == ImageId.ORIG and entity.orig_addr == ORIG_TABLE:
+            return EntityExtent(len(TABLE), recorded=False)
+        size = entity.size(side)
+        return EntityExtent(size) if size is not None else None
+
+    result = _search(
+        _store_to_table(4, 5, ORIG_TABLE),
+        _store_to_table(4, 6, RECOMP_TABLE),
+        orig_table_size=None,
+        extent=estimated,
+    )
+    assert result.witness is None
+    assert result.skipped["estimated_extent"] == result.runs
+    assert result.skipped_details["estimated_extent"]["kind"] == "memory_value"
+    # With the size recorded, the same difference refutes.
+    result = _search(
+        _store_to_table(4, 5, ORIG_TABLE), _store_to_table(4, 6, RECOMP_TABLE)
+    )
+    assert result.witness is not None
+
+
+def test_a_location_one_side_cannot_identify_is_not_compared():
+    """Only the recompiled store identifies <table+4>; without an original
+    size, nothing shows the original's table+4 is the same object."""
+    result = _search(
+        _store_to_table(4, 5, ORIG_TABLE),
+        _store_to_table(4, 6, RECOMP_TABLE),
+        orig_table_size=None,
+    )
+    assert result.witness is None
+
+
+def test_an_index_past_the_table_into_another_object_is_not_a_witness():
+    """Index 17 of a 16-dword table stores into whatever each binary laid
+    out after the table: another paired object on each side, but not the
+    same one."""
+
+    # mov eax, [esp+4]; mov dword ptr [eax*4 + table], 1; ret
+    def body(table: int) -> bytes:
+        return LOAD_ARG + b"\xc7\x04\x85" + _abs32(table) + _abs32(1) + RET
+
+    after = len(TABLE)
+    objects = (
+        (ORIG_TABLE + after, RECOMP_TABLE + 0x200, 0x40),
+        (ORIG_TABLE + 0x200, RECOMP_TABLE + after, 0x40),
+    )
+    base = RunInput.from_seed(HINT_SEED)
+    past = dataclasses.replace(base, stack_args=(17, *base.stack_args[1:]))
+    result = _search(
+        body(ORIG_TABLE), body(RECOMP_TABLE), hints=[past], objects=objects
+    )
+    assert result.witness is None
+    assert result.skipped["out_of_object_access"] >= 1
+    detail = result.skipped_details["out_of_object_access"]
+    assert detail["access"] == "write" and detail["meant"] == f"<{ORIG_TABLE:#x}+0x0>"
+
+
+def test_an_index_that_wraps_out_of_the_image_is_not_a_witness():
+    """A huge index wraps `table + 8 * index` around into modelled memory,
+    a different spot on each side since the tables differ."""
+
+    # mov eax, [esp+4]; mov eax, [eax*8 + table]; ret
+    def body(table: int) -> bytes:
+        return LOAD_ARG + b"\x8b\x04\xc5" + _abs32(table) + RET
+
+    index = ((HEAP_BASE - ORIG_TABLE) % (1 << 32)) // 8
+    base = RunInput.from_seed(HINT_SEED)
+    wraps = dataclasses.replace(base, stack_args=(index, *base.stack_args[1:]))
+    result = _search(body(ORIG_TABLE), body(RECOMP_TABLE), hints=[wraps])
+    assert result.witness is None
+    assert result.skipped["out_of_object_access"] >= 1
+
+
+def _load_table(offset: int, table: int) -> bytes:
+    # mov eax, dword ptr [table + offset]; ret
+    return b"\xa1" + _abs32(table + offset) + RET
+
+
+def test_unpaired_read_only_constants_are_read_as_what_they_hold():
+    """No pair identifies the table, but its bytes are the same wherever
+    each binary put it: the same element agrees, another one refutes."""
+    same = _search(
+        _load_table(4, ORIG_TABLE), _load_table(4, RECOMP_TABLE), pair_table=False
+    )
+    assert same.witness is None and same.agreeing_seeds > 0
+    other = _search(
+        _load_table(4, ORIG_TABLE), _load_table(8, RECOMP_TABLE), pair_table=False
+    )
+    assert other.witness is not None and other.witness.kind == "return_value"
+    # Relocated bytes are pointers, whose values depend on the layout.
+    relocated = _search(
+        _load_table(4, ORIG_TABLE),
+        _load_table(8, RECOMP_TABLE),
+        pair_table=False,
+        relocated_table=True,
+    )
+    assert relocated.witness is None
+    assert relocated.skipped["unknown_image_read"] == relocated.runs
+
+
+def test_an_index_past_an_unpaired_table_is_not_a_constant_read():
+    # mov eax, [esp+4]; mov eax, [eax*4 + table]; ret
+    def body(table: int) -> bytes:
+        return LOAD_ARG + b"\x8b\x04\x85" + _abs32(table) + RET
+
+    after = len(TABLE)
+    objects = (
+        (ORIG_TABLE + after, RECOMP_TABLE + 0x200, 0x40),
+        (ORIG_TABLE + 0x200, RECOMP_TABLE + after, 0x40),
+    )
+    base = RunInput.from_seed(HINT_SEED)
+    past = dataclasses.replace(base, stack_args=(17, *base.stack_args[1:]))
+    result = _search(
+        body(ORIG_TABLE),
+        body(RECOMP_TABLE),
+        hints=[past],
+        objects=objects,
+        pair_table=False,
+    )
+    assert result.witness is None
+    assert result.skipped["out_of_object_access"] >= 1
+
+
+def test_a_run_does_not_inherit_the_previous_runs_fpu_state():
+    """A reused machine and a new one (as in replay) run alike: the x87
+    stack a run leaves behind does not reach the next run."""
+    # fld1; fld1; ret  /  fnstsw ax; ret
+    push = bytes.fromhex("d9e8d9e8") + RET
+    status = bytes.fromhex("dfe0") + RET
+    code = push.ljust(0x10, b"\x90") + status
+    machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+    fresh = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
+    run_input = RunInput.from_seed(1)
+    machine.run(range(ORIG_FUNC, ORIG_FUNC + len(push)), run_input)
+    status_range = range(ORIG_FUNC + 0x10, ORIG_FUNC + 0x10 + len(status))
+    after = machine.run(status_range, run_input)
+    alone = fresh.run(status_range, run_input)
+    assert after.end == alone.end == "return"
+    assert after.eax & 0xFFFF == alone.eax & 0xFFFF

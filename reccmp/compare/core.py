@@ -1,9 +1,7 @@
 import logging
-import hashlib
 import difflib
 import struct
 from itertools import zip_longest
-from pathlib import Path
 from typing import Callable, Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
@@ -20,6 +18,7 @@ from reccmp.formats import (
     PEImage,
     TextFile,
 )
+from reccmp.formats.image import image_digest
 from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.event import (
@@ -82,20 +81,6 @@ from .verify import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _image_digest(image: Image) -> str | None:
-    """SHA-256 of the original image bytes, used as report source identity."""
-    data = getattr(image, "data", None)
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return hashlib.sha256(bytes(data)).hexdigest()
-    path = getattr(image, "filepath", None)
-    if path is None:
-        return None
-    try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
-        return None
 
 
 class Compare:
@@ -690,7 +675,7 @@ class Compare:
 
     @property
     def orig_source_digest(self) -> str | None:
-        return _image_digest(self.orig_bin)
+        return image_digest(self.orig_bin)
 
     ## Public API
 
@@ -834,7 +819,7 @@ class Compare:
     ) -> ReccmpStatusReport:
         """Creates a ReccmpStatusReport using the current reccmp state."""
         report = ReccmpStatusReport(
-            filename=filename, source_digest=_image_digest(self.orig_bin)
+            filename=filename, source_digest=image_digest(self.orig_bin)
         )
         for match in self.compare_all(
             filter_fn,

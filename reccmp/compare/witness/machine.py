@@ -39,7 +39,6 @@ from capstone.x86 import (  # type: ignore
     X86_INS_RDSEED,
     X86_INS_RDTSC,
     X86_INS_RDTSCP,
-    X86_INS_RET,
     X86_OP_IMM,
     X86_OP_MEM,
     X86_OP_REG,
@@ -65,6 +64,7 @@ from unicorn import (  # type: ignore[import-untyped]
     Uc,
     UcError,
 )
+from unicorn import x86_const  # type: ignore[import-untyped]
 from unicorn.x86_const import (  # type: ignore[import-untyped]
     UC_X86_REG_EAX,
     UC_X86_REG_EBP,
@@ -80,9 +80,18 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.decode import decode_one, direct_branch_target
 from reccmp.call_facts import CallFacts
+from reccmp.compare.diagnosis import WitnessInput
+from reccmp.compare.extent import EntityExtent
+
 from reccmp.formats import Image
 from reccmp.formats.image import ImageSectionFlags
 
+from .cleanup import CalleeCleanupMixin
+
+# Version of the execution model. Bump it whenever the same RunInput could
+# run differently (memory generation, call modelling, what a run records),
+# so a recorded witness is not replayed under another model.
+WITNESS_MODEL = 1
 PAGE = 0x1000
 STACK_BASE = 0x7F000000
 STACK_SIZE = 0x100000
@@ -254,6 +263,12 @@ class Trace:
     # it; each must lie within one known object for the run to be
     # layout-independent.
     image_reads: dict[AccessSpan, int] = field(default_factory=dict)
+    # For reads and writes off the stack whose instruction names an image
+    # address (its displacement, else its base register's value): that
+    # address, the object the access is meant for. An index past that
+    # object's end lands wherever each binary placed something else, in the
+    # image or, wrapping around, in modelled memory.
+    anchors: dict[tuple[str, AccessSpan], int] = field(default_factory=dict)
     eax: int = 0
     edx: int = 0
     esp_after_return: int = 0
@@ -278,9 +293,10 @@ class RunInput:
     stack_args: tuple[int, ...]
     # Constants the modelled memory and call results may draw from.
     pool: tuple[int, ...] = ()
-    # (address, size, value): bytes of modelled memory set when its page is
-    # first mapped, on both machines alike (solver hints, witness.hints).
-    memory: tuple[tuple[int, int, int], ...] = ()
+    # (address, byte) of modelled memory set when its page is first mapped,
+    # on both machines alike (solver hints, witness.hints); ascending, one
+    # per address, each in memory mapped on first touch (``lazily_mapped``).
+    memory: tuple[tuple[int, int], ...] = ()
 
     @classmethod
     def from_seed(cls, seed: int, pool: tuple[int, ...] = ()) -> "RunInput":
@@ -298,8 +314,27 @@ class RunInput:
         )
         return cls(seed, regs, args, pool)
 
+    def record(self) -> WitnessInput:
+        return WitnessInput(
+            self.seed,
+            tuple(sorted(self.registers.items())),
+            self.stack_args,
+            self.pool,
+            self.memory,
+        )
 
-class SideMachine:
+    @classmethod
+    def from_record(cls, record: WitnessInput) -> "RunInput":
+        return cls(
+            record.seed,
+            dict(record.registers),
+            record.stack_args,
+            record.pool,
+            record.memory,
+        )
+
+
+class SideMachine(CalleeCleanupMixin):
     """A Unicorn instance holding one binary, reusable across runs."""
 
     # pylint: disable=too-many-instance-attributes
@@ -309,17 +344,21 @@ class SideMachine:
         image: Image,
         imports: Mapping[str, int] | None = None,
         import_facts: Mapping[str, CallFacts] | None = None,
-        function_size: Callable[[int], int | None] = lambda _address: None,
+        function_window: Callable[[int], EntityExtent | None] = lambda _address: None,
     ):
         """``imports`` maps import keys to modelled addresses and must be
         the same registry for both machines of a comparison; by default it
         covers this image only. ``import_facts`` gives call facts by import
-        name. ``function_size`` gives the extent of a function starting at an
-        address, when known; a callee's ``ret N`` is only looked for inside
-        it."""
+        name. ``function_window`` bounds the bytes a function starting at an
+        address may occupy: its recorded size, or (not recorded) the gap to
+        the next known entity; the search for a callee's ``ret N`` stays
+        inside it."""
         self.image = image
         self.import_facts = import_facts or {}
-        self.function_size = function_size
+        self.function_window = function_window
+        # The certain cleanup of this side's callee's counterpart, when the
+        # two machines are paired (set by the Translator).
+        self.counterpart_cleanup: Callable[[int], int | None] = lambda _target: None
         self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
         lo = min(s.virtual_address for s in image.sections) & ~(PAGE - 1)
         hi = max(s.virtual_address + s.extent for s in image.sections)
@@ -343,10 +382,17 @@ class SideMachine:
             for section in image.sections
             if ImageSectionFlags.EXECUTE in section.flags
         )
+        # A run sets the general registers; every other register it can
+        # change starts each run as on a new machine, so a run (and its
+        # replay on another machine) does not depend on the runs before it.
+        self._fresh_registers = {
+            register: self.uc.reg_read(register) for register in _CARRIED_REGISTERS
+        }
         self.uc.mem_map(STACK_BASE, STACK_SIZE)
         self.uc.mem_map(RETURN_SENTINEL, PAGE)
         self._lazy_pages: set[int] = set()
-        self._memory: tuple[tuple[int, int, int], ...] = ()
+        # Page -> (address, byte) of the current run's memory overrides.
+        self._memory: dict[int, list[tuple[int, int]]] = {}
         self._dirty_image_pages: set[int] = set()
         # One flag per stack byte: nonzero once the current run wrote it.
         self._written_stack = bytearray(STACK_SIZE)
@@ -366,37 +412,6 @@ class SideMachine:
             return None
         offset = addr - self.image_range.start
         return decode_one(self._pristine[offset : offset + 16], addr)
-
-    def _callee_pop_bytes(self, target: int) -> int | None:
-        """``ret N`` of a callee in the image, read only inside its known
-        extent. A callee that starts with a direct ``jmp`` (a thunk) is
-        followed, and its destination needs a known extent too. Anything
-        else is unknown: scanning past an unknown end would lend a callee
-        that ends without ``ret`` (a tail jump, a call that does not return)
-        the next function's ``ret N``. An unknown cleanup is guessed for
-        exploration and makes the run give no verdict."""
-        for _ in range(8):  # thunk chains are short
-            first = self.insn_at(target)
-            jump = (
-                direct_branch_target(first)
-                if first is not None and first.id == X86_INS_JMP
-                else None
-            )
-            if jump is None:
-                break
-            target = jump
-        size = self.function_size(target)
-        if not size:
-            return None
-        addr = target
-        while target <= addr < target + size:
-            insn = self.insn_at(addr)
-            if insn is None:
-                return None
-            if insn.id == X86_INS_RET:
-                return insn.operands[0].imm if insn.operands else 0
-            addr += insn.size
-        return None
 
     def _pushed_bytes(self, recent: collections.deque[int]) -> int:
         """Bytes pushed on the executed path right before the current call:
@@ -474,12 +489,29 @@ class SideMachine:
             except UcError:
                 return False
             uc.mem_write(page, page_contents(self._seed, page, self._pool))
-            for address, width, value in self._memory:
-                if page <= address and address + width <= page + PAGE:
-                    data = (value & ((1 << 8 * width) - 1)).to_bytes(width, "little")
-                    uc.mem_write(address, data)
+            for address, byte in self._memory.get(page, ()):
+                uc.mem_write(address, bytes((byte,)))
             self._lazy_pages.add(page)
         return True
+
+    def _anchor(self, site: int) -> int | None:
+        """The image address the memory operand of the instruction at
+        ``site`` is based on: its displacement when that is in the image,
+        else its base register's current value when that is."""
+        insn = self.insn_at(site)
+        if insn is None:
+            return None
+        for op in insn.operands:
+            if op.type != X86_OP_MEM:
+                continue
+            displacement = op.mem.disp & 0xFFFFFFFF
+            if displacement in self.image_range:
+                return displacement
+            if op.mem.base in _UC_REGS:
+                base = self.uc.reg_read(_UC_REGS[op.mem.base])
+                if base in self.image_range:
+                    return base
+        return None
 
     def resolve_code(self, target: int) -> int:
         """Follow ``jmp rel32`` and ``jmp [slot]`` thunks from ``target``."""
@@ -504,6 +536,16 @@ class SideMachine:
                 return section.name
         return None
 
+    def read_only(self, span: AccessSpan) -> bool:
+        """Whether every byte of ``span`` is in one section that is neither
+        writable nor executable."""
+        return any(
+            span.within(section.virtual_range)
+            and not section.flags
+            & (ImageSectionFlags.WRITE | ImageSectionFlags.EXECUTE)
+            for section in self.image.sections
+        )
+
     def in_code(self, addr: int) -> bool:
         return any(addr in r for r in self.code_ranges)
 
@@ -517,9 +559,13 @@ class SideMachine:
         if target is not None:
             resolved = self.resolve_code(target)
             if resolved in self.image_range:
-                pop = self.callee_pop_bytes(resolved)
-                if pop is not None:
-                    return pop
+                cleanup = self.callee_pop_bytes(resolved)
+                if cleanup is not None and (
+                    cleanup.certain or self.counterpart_cleanup(resolved) == cleanup.pop
+                ):
+                    # An uncertain answer needs the paired callee's own
+                    # evidence to agree.
+                    return cleanup.pop
             if resolved in self.imports:
                 name = self.imports[resolved].split("!", 1)[1]
                 facts = self.import_facts.get(name)
@@ -538,8 +584,12 @@ class SideMachine:
         # pylint: disable=too-many-locals,too-many-statements
         uc = self.uc
         self._reset(run_input.seed, run_input.pool)
-        self._memory = run_input.memory
+        self._memory = {}
+        for address, byte in run_input.memory:
+            self._memory.setdefault(address & ~(PAGE - 1), []).append((address, byte))
         trace = Trace(end="return")
+        for register, value in self._fresh_registers.items():
+            uc.reg_write(register, value)
         for name, value in run_input.registers.items():
             uc.reg_write(_GP[name], value)
         uc.reg_write(UC_X86_REG_EFLAGS, 0x202)
@@ -561,6 +611,11 @@ class SideMachine:
                 mark_stack_written(addr, size)
                 return
             span = AccessSpan(addr, size)
+            # The write happens even when this hook stops the run, so every
+            # image page it touches is restored before the next run.
+            self._dirty_image_pages.update(
+                page for page in pages_touched(addr, size) if page in self.image_range
+            )
             if any(
                 span.address <= code.stop - 1 and code.start <= span.last
                 for code in self.code_ranges
@@ -570,6 +625,9 @@ class SideMachine:
                 stop("code_write", f"{addr:#x}")
                 return
             trace.writes[addr] = max(size, trace.writes.get(addr, 0))
+            anchor = self._anchor(uc.reg_read(UC_X86_REG_EIP))
+            if anchor is not None:
+                trace.anchors.setdefault(("write", span), anchor)
             writer = (
                 addr,
                 size,
@@ -578,23 +636,31 @@ class SideMachine:
             )
             for byte in range(addr, addr + size):
                 trace.last_writer[byte] = writer
-            self._dirty_image_pages.update(
-                page for page in pages_touched(addr, size) if page in self.image_range
-            )
 
         def on_read(_uc, _access, addr, size, _value, _data):
-            trace.image_reads.setdefault(
-                AccessSpan(addr, size), uc.reg_read(UC_X86_REG_EIP)
-            )
+            span = AccessSpan(addr, size)
+            site = uc.reg_read(UC_X86_REG_EIP)
+            if span not in trace.image_reads:
+                trace.image_reads[span] = site
+                anchor = self._anchor(site)
+                if anchor is not None:
+                    trace.anchors[("read", span)] = anchor
 
         pointer_bytes_read: list[int] = []
 
         def on_heap_read(_uc, _access, addr, size, _value, _data):
+            if addr in self.image_range or self.in_stack(addr):
+                return
+            span = AccessSpan(addr, size)
+            if ("read", span) not in trace.anchors:
+                # An address computed from an image address that left the
+                # image: where it lands depends on the layout.
+                anchor = self._anchor(uc.reg_read(UC_X86_REG_EIP))
+                if anchor is not None:
+                    trace.anchors[("read", span)] = anchor
             # Reading part of a stored pointer (or bytes of several stores
             # that include a pointer) yields a layout-dependent value.
-            if pointer_bytes_read or addr in self.image_range or self.in_stack(addr):
-                return
-            if trace.mixes_pointer_bytes(addr, size):
+            if not pointer_bytes_read and trace.mixes_pointer_bytes(addr, size):
                 pointer_bytes_read.append(addr)
 
         def on_stack_read(_uc, _access, addr, size, _value, _data):
@@ -765,6 +831,12 @@ NONDETERMINISTIC = frozenset(
 )
 
 
+def lazily_mapped(addr: int) -> bool:
+    """Whether ``addr`` is modelled memory a run maps on first touch, so a
+    run input can preset it: shared memory outside the image and stack."""
+    return _shared_region(addr) and not STACK_BASE <= addr < STACK_BASE + STACK_SIZE
+
+
 def _shared_region(addr: int) -> bool:
     """Memory both sides reach through the same pointer values: the low
     region (small integers used as pointers), heap objects and bound
@@ -777,6 +849,17 @@ def _shared_region(addr: int) -> bool:
         and offset % OBJECT_STRIDE < OBJECT_SIZE
     )
 
+
+# Registers outside the run input that instructions change: the x87 stack,
+# its control, status and tag words, and the SSE registers.
+_CARRIED_REGISTERS = (
+    x86_const.UC_X86_REG_FPCW,
+    x86_const.UC_X86_REG_FPSW,
+    x86_const.UC_X86_REG_FPTAG,
+    x86_const.UC_X86_REG_MXCSR,
+    *(getattr(x86_const, f"UC_X86_REG_FP{i}") for i in range(8)),
+    *(getattr(x86_const, f"UC_X86_REG_XMM{i}") for i in range(8)),
+)
 
 # Capstone register -> Unicorn register, for operands evaluated at run time.
 _UC_REGS = {

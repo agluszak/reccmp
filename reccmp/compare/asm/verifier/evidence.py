@@ -17,7 +17,16 @@ from reccmp.compare.asm.verifier.state import (
     Context,
     register_arguments,
 )
+from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.diagnosis import AnalysisRecorder
+
+
+def _symbolic_values(values: tuple | None) -> dict:
+    """``record_difference`` arguments for a value difference: its symbolic
+    values, and what the solver says about them."""
+    if values is None:
+        return {}
+    return {"values": values, "solver": bitvector.compare(values).summary()}
 
 
 def _clean_symbol(text: str) -> str:
@@ -283,7 +292,7 @@ def record_observable_difference(
                 index_r,
                 {"value": value_o},
                 {"value": value_r},
-                values=(
+                **_symbolic_values(
                     (first_o[3], first_r[3], 8 * width, "value")
                     if width is not None and first_o[2] == first_r[2]
                     else None
@@ -303,7 +312,7 @@ def record_observable_difference(
                 index_r,
                 {"predicate": value_o},
                 {"predicate": value_r},
-                values=(
+                **_symbolic_values(
                     (predicate_o, predicate_r, None, "predicate")
                     if predicate_o is not None and predicate_r is not None
                     else None
@@ -333,7 +342,7 @@ def record_observable_difference(
                     index_r,
                     {"value": value_o},
                     {"value": value_r},
-                    values=(
+                    **_symbolic_values(
                         (entry_o[1], entry_r[1], None, "value")
                         if entry_o[0] == "retval" and len(entry_o) == len(entry_r) == 2
                         else None

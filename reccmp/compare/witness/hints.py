@@ -15,10 +15,11 @@ assignment is only a suggestion, never a refutation by itself.
 from __future__ import annotations
 
 import dataclasses
+from dataclasses import dataclass
 from collections.abc import Hashable, Mapping
 from typing import Any
 
-from reccmp.compare.witness.machine import STACK_ARG_DWORDS, RunInput
+from reccmp.compare.witness.machine import STACK_ARG_DWORDS, RunInput, lazily_mapped
 
 _REGISTERS = {
     "a": "eax",
@@ -76,17 +77,28 @@ def _entry_load(term: Any) -> tuple[str, int, int] | None:
     return _REGISTERS[base[1]], displacement, _LOAD_SIZES[size]
 
 
+@dataclass(frozen=True)
+class Rejection:
+    """Why a solver assignment cannot become a run input."""
+
+    # uncontrollable_leaf: it constrains a term no run input sets (memory
+    # reached otherwise, a call result); conflicting_memory: two assigned
+    # loads overlap and disagree on a byte; invalid_destination: an assigned
+    # load reads memory a run does not map on first touch (the image, the
+    # stack), which an input cannot preset.
+    reason: str
+    term: str
+
+
 def input_from_assignment(
     assignment: Mapping[Hashable, int], base: RunInput
-) -> RunInput | None:
+) -> RunInput | Rejection:
     """``base`` with the assigned registers, stack arguments and memory read
-    through entry registers (`this->field`); None when the assignment
-    constrains anything else (memory reached otherwise, call results), which
-    a run input cannot set. Symbol addresses are ignored: the images fix
-    them."""
+    through entry registers (`this->field`). Symbol addresses are ignored:
+    the images fix them."""
     registers = dict(base.registers)
     arguments = list(base.stack_args)
-    loads: list[tuple[str, int, int, int]] = []
+    loads: list[tuple[Hashable, str, int, int, int]] = []
     for term, value in assignment.items():
         if isinstance(term, tuple) and term[:1] == ("sym",):
             # Each image fixes its symbols' addresses; the solver's choice is
@@ -101,14 +113,20 @@ def input_from_assignment(
             continue
         load = _entry_load(term)
         if load is None:
-            return None
-        loads.append((*load, value))
-    memory = tuple(
-        ((registers[register] + displacement) & 0xFFFFFFFF, size, value)
-        for register, displacement, size, value in loads
-    )
-    if len({address for address, _, _ in memory}) != len(memory):
-        return None  # overlapping reads the assignment may not agree on
+            return Rejection("uncontrollable_leaf", repr(term)[:200])
+        loads.append((term, *load, value))
+    memory: dict[int, int] = {}
+    for term, register, displacement, size, value in loads:
+        address = (registers[register] + displacement) & 0xFFFFFFFF
+        for offset, byte in enumerate(value.to_bytes(8, "little")[:size]):
+            at = (address + offset) & 0xFFFFFFFF
+            if not lazily_mapped(at):
+                return Rejection("invalid_destination", repr(term)[:200])
+            if memory.setdefault(at, byte) != byte:
+                return Rejection("conflicting_memory", repr(term)[:200])
     return dataclasses.replace(
-        base, registers=registers, stack_args=tuple(arguments), memory=memory
+        base,
+        registers=registers,
+        stack_args=tuple(arguments),
+        memory=tuple(sorted(memory.items())),
     )

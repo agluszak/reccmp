@@ -16,9 +16,12 @@ and the input may not be reachable from the program's real callers.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 from capstone.x86 import X86_OP_REG  # type: ignore
 
@@ -26,9 +29,13 @@ from reccmp.compare.asm.ir import FunctionImage
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.compare.diagnosis import RefutationWitness as Witness
+from reccmp.compare.diagnosis import WitnessReplay
+from reccmp.compare.extent import EntityExtent
+from reccmp.formats.image import image_digest
 from reccmp.types import ImageId
 
 from .machine import (
+    WITNESS_MODEL,
     LOW_PAGES,
     NEAR_IMAGE,
     SEH_CHAIN,
@@ -56,7 +63,7 @@ class Translator:
         orig: SideMachine,
         recomp: SideMachine,
         call_facts: Callable[[Identity], CallFacts | None] | None = None,
-        extent: Callable[[ImageId, ReccmpEntity], int | None] | None = None,
+        extent: Callable[[ImageId, ReccmpEntity], EntityExtent | None] | None = None,
     ):
         """``call_facts`` gives what is known about calling a paired callee
         (``("entity", ...)`` or ``("import", key)`` identity). ``extent``
@@ -64,7 +71,45 @@ class Translator:
         self.db = db
         self.machines = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
         self.call_facts = call_facts or (lambda _identity: None)
-        self.extent = extent or (lambda side, entity: entity.size(side))
+        self.extent = extent or _recorded_extent
+        # Whether an estimated extent may say an address belongs to an
+        # entity: only while exploring, never for a verdict.
+        self.admit_estimates = False
+        for side, machine in self.machines.items():
+            machine.counterpart_cleanup = functools.partial(
+                self._counterpart_cleanup, side
+            )
+        self._image_digests: tuple[str | None, str | None] | None = None
+
+    @property
+    def image_digests(self) -> tuple[str | None, str | None]:
+        """SHA-256 of the original and recompiled images, when known."""
+        if self._image_digests is None:
+            self._image_digests = (
+                image_digest(self.machines[ImageId.ORIG].image),
+                image_digest(self.machines[ImageId.RECOMP].image),
+            )
+        return self._image_digests
+
+    @contextmanager
+    def estimates_admitted(self) -> Iterator[None]:
+        self.admit_estimates = True
+        try:
+            yield
+        finally:
+            self.admit_estimates = False
+
+    def _counterpart_cleanup(self, side: ImageId, target: int) -> int | None:
+        """The certain cleanup of the callee paired with ``target``."""
+        ident = self.identity(side, target)
+        if ident[0] != "entity" or ident[2] != 0:
+            return None
+        other = ImageId.RECOMP if side == ImageId.ORIG else ImageId.ORIG
+        address = self.address(other, ident)
+        if address is None:
+            return None
+        cleanup = self.machines[other].callee_pop_bytes(address)
+        return cleanup.pop if cleanup is not None and cleanup.certain else None
 
     def identity(self, side: ImageId, addr: int) -> Identity:
         return self.classify(side, addr)[0]
@@ -72,7 +117,8 @@ class Translator:
     def classify(self, side: ImageId, addr: int) -> tuple[Identity, str]:
         """``identity`` and why it is what it is: ``stack``, ``outside_image``,
         ``entity``, or for UNRESOLVED ``no_entity``, ``unknown_extent``,
-        ``outside_extent``, ``unpaired`` or ``inside_code``."""
+        ``outside_extent``, ``estimated_extent``, ``unpaired`` or
+        ``inside_code``."""
         # pylint: disable=too-many-return-statements
         machine = self.machines[side]
         if machine.in_stack(addr):
@@ -83,13 +129,20 @@ class Translator:
         if entity is None:
             return UNRESOLVED, "no_entity"
         base = entity.addr(side)
-        size = self.extent(side, entity) if base is not None else None
-        if base is None or (size is None and addr != base):
+        extent = self.extent(side, entity) if base is not None else None
+        if base is None or (extent is None and addr != base):
             # Only an address past the start needs the extent to say that
             # it still belongs to the entity.
             return UNRESOLVED, "unknown_extent"
-        if size is not None and not base <= addr < base + max(size, 1):
+        if extent is not None and not base <= addr < base + max(extent.size, 1):
             return UNRESOLVED, "outside_extent"
+        if (
+            addr != base
+            and extent is not None
+            and not extent.recorded
+            and not self.admit_estimates
+        ):
+            return UNRESOLVED, "estimated_extent"
         canonical = self.db.alias_canonical_orig(side, base)
         if canonical is None:
             return UNRESOLVED, "unpaired"
@@ -118,10 +171,11 @@ class Translator:
             else None
         )
         if entity is not None and (base := entity.addr(side)) is not None:
-            size = self.extent(side, entity)
+            extent = self.extent(side, entity)
             info["entity"] = {
                 "address": f"{base:#x}",
-                "size": size,
+                "size": extent.size if extent is not None else None,
+                "size_recorded": extent is not None and extent.recorded,
                 "type": EntityTypeLookup.get(entity.entity_type or -1, "UNK"),
                 "name": entity.best_name(),
                 "matched": entity.matched,
@@ -133,6 +187,48 @@ class Translator:
                 ),
             }
         return info
+
+    def object_at(self, side: ImageId, addr: int) -> tuple[int, int] | None:
+        """(base, size) of the known entity whose extent, recorded or
+        estimated, covers ``addr``."""
+        entity = self.db.get(side, addr, exact=False)
+        if entity is None or (base := entity.addr(side)) is None:
+            return None
+        extent = self.extent(side, entity)
+        if extent is None or not base <= addr < base + max(extent.size, 1):
+            return None
+        return base, extent.size
+
+    def constant_span(
+        self, side: ImageId, span: AccessSpan, anchor: int | None
+    ) -> bool:
+        """Whether an access reads bytes whose values do not depend on the
+        layout although no pair identifies them: all inside one unpaired
+        object with a recorded extent in read-only data, the object its
+        instruction addresses (``anchor``), and none of them part of a
+        relocated pointer. Such a read sees a constant (a float, a string),
+        the same wherever the binary put it."""
+        first, why = self.classify(side, span.address)
+        if first != UNRESOLVED or why != "unpaired" or anchor is None:
+            return False
+        machine = self.machines[side]
+        if not machine.read_only(span):
+            return False
+        entity = self.db.get(side, span.address, exact=False)
+        assert entity is not None
+        base = entity.addr(side)
+        extent = self.extent(side, entity)
+        if base is None or extent is None or not extent.recorded:
+            return False
+        if span.last >= base + extent.size:
+            return False  # runs past the object's end
+        if not base <= anchor < base + extent.size:
+            return False  # the index left the object the instruction meant
+        image = machine.image
+        return not any(
+            image.is_relocated_addr(address)
+            for address in range(span.address - 3, span.last + 1)
+        )
 
     def identity_span(self, side: ImageId, span: AccessSpan) -> Identity:
         """Identity of an access, when all its bytes belong to one object
@@ -197,8 +293,14 @@ class Translator:
         return UNRESOLVED
 
 
+def _recorded_extent(side: ImageId, entity: ReccmpEntity) -> EntityExtent | None:
+    size = entity.size(side)
+    return EntityExtent(size) if size is not None else None
+
+
 @dataclass
 class SearchResult:
+    # pylint: disable=too-many-instance-attributes
     witness: Witness | None = None
     # Why seeds produced no verdict, e.g. {"call_structure": 3, "limit": 1}.
     skipped: Counter[str] = field(default_factory=Counter)
@@ -209,6 +311,11 @@ class SearchResult:
     # Instructions executed by the seeds on which both sides agreed.
     agreeing_orig: list[frozenset[int]] = field(default_factory=list)
     agreeing_recomp: list[frozenset[int]] = field(default_factory=list)
+    # For each hint run that refuted nothing: why it gave no verdict
+    # ("agreed" if none), and the instructions it executed on each side.
+    hint_runs: list[tuple[str, frozenset[int], frozenset[int]]] = field(
+        default_factory=list
+    )
 
     def agreeing_runs_through(self, orig: int | None, recomp: int | None) -> int:
         """Agreeing seeds that executed both given instructions."""
@@ -268,6 +375,32 @@ def _image_read_detail(
         if not other_machine.in_import_slot(read)
     ][:8]
     return detail
+
+
+def _off_anchor(
+    translator: Translator, side: ImageId, trace: Trace
+) -> tuple[str, AccessSpan, Identity, Identity] | None:
+    """An access that left the object its instruction addresses: an index
+    past a table's end reaches whatever each binary placed after it, so
+    what it reads or overwrites depends on the layout, not the code. The
+    object is the known entity around the anchor, paired or not."""
+    image = translator.machines[side].image_range
+    for (kind, span), anchor in trace.anchors.items():
+        inside = span.within(image)
+        if inside:
+            extent = translator.object_at(side, anchor)
+            if extent is None:
+                continue  # no known object to leave
+            base, size = extent
+            if base <= span.address and span.last < base + max(size, 1):
+                continue
+        return (
+            kind,
+            span,
+            translator.identity(side, anchor),
+            translator.identity_span(side, span),
+        )
+    return None
 
 
 def _call_detail(
@@ -338,6 +471,48 @@ def _argument_witness(
     return None
 
 
+def _layout_dependent_access(
+    translator: Translator,
+    t_o: Trace,
+    t_r: Trace,
+    details: dict[str, dict[str, object]] | None,
+) -> str | None:
+    """Why what a run read or wrote may depend on each binary's layout:
+    ``unknown_image_read`` (image bytes no object identifies) or
+    ``out_of_object_access`` (an access left the object its instruction
+    addresses); None when it does not. ``details`` gets the first case."""
+    orig, recomp = ImageId.ORIG, ImageId.RECOMP
+    for side, trace in ((orig, t_o), (recomp, t_r)):
+        machine = translator.machines[side]
+        for span in trace.image_reads:
+            anchor = trace.anchors.get(("read", span))
+            if machine.in_import_slot(span) or translator.constant_span(
+                side, span, anchor
+            ):
+                continue
+            if translator.identity_span(side, span) == UNRESOLVED:
+                if details is not None and "unknown_image_read" not in details:
+                    details["unknown_image_read"] = _image_read_detail(
+                        translator, side, span, trace, t_r if side == orig else t_o
+                    )
+                return "unknown_image_read"
+    for side, trace in ((orig, t_o), (recomp, t_r)):
+        stray = _off_anchor(translator, side, trace)
+        if stray is not None:
+            if details is not None and "out_of_object_access" not in details:
+                kind, span, meant, got = stray
+                details["out_of_object_access"] = {
+                    "side": side.name.lower(),
+                    "access": kind,
+                    "address": f"{span.address:#x}",
+                    "size": span.size,
+                    "meant": _fmt(meant),
+                    "reached": _fmt(got),
+                }
+            return "out_of_object_access"
+    return None
+
+
 def _compare(
     t_o: Trace,
     t_r: Trace,
@@ -348,24 +523,17 @@ def _compare(
 ) -> tuple[Witness | None, str | None]:
     """Return a witness, or the reason this seed gives no verdict. For
     ``unknown_image_read`` and ``unresolved_call``, ``details`` gets what
-    was not identified (first occurrence per reason)."""
+    was not identified (first occurrence per reason). A location is
+    compared only where both sides' addresses for it have its identity."""
     # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     ends = {t_o.end, t_r.end}
     if not ends <= {"return", "truncated"}:
         return None, sorted(ends - {"return", "truncated"})[0]
     orig, recomp = ImageId.ORIG, ImageId.RECOMP
-    for side, trace in ((orig, t_o), (recomp, t_r)):
-        machine = translator.machines[side]
-        for span in trace.image_reads:
-            if machine.in_import_slot(span):
-                continue
-            if translator.identity_span(side, span) == UNRESOLVED:
-                if details is not None and "unknown_image_read" not in details:
-                    details["unknown_image_read"] = _image_read_detail(
-                        translator, side, span, trace, t_r if side == orig else t_o
-                    )
-                return None, "unknown_image_read"
+    unsettled = _layout_dependent_access(translator, t_o, t_r, details)
+    if unsettled is not None:
+        return None, unsettled
     targets: list[Identity] = []
     for index, (call_o, call_r) in enumerate(zip(t_o.calls, t_r.calls)):
         target_o = translator.call_target(orig, call_o.target, call_o.target_slot)
@@ -432,6 +600,13 @@ def _compare(
         loc_o = translator.address(orig, ident)
         loc_r = translator.address(recomp, ident)
         if loc_o is None or loc_r is None:
+            continue
+        if any(
+            translator.identity_span(side, AccessSpan(loc, size)) != ident
+            for side, loc in ((orig, loc_o), (recomp, loc_r))
+        ):
+            # Only one side's store showed where the location is; on the
+            # other, nothing shows those bytes belong to the same object.
             continue
         if t_o.mixes_pointer_bytes(loc_o, size) or t_r.mixes_pointer_bytes(loc_r, size):
             continue
@@ -549,17 +724,47 @@ def find_witness(
         for i, c in enumerate(constants[:focused_seeds])
     ]
     inputs = [*hints, *(RunInput.from_seed(seed, pool) for seed, pool in plans)]
-    for run_input in inputs:
+    for index, run_input in enumerate(inputs):
         seed = run_input.seed
         t_o = orig.run(orig_range, run_input)
         t_r = recomp.run(recomp_range, run_input)
         witness, reason = _compare(
             t_o, t_r, translator, return_kind, seed, result.skipped_details
         )
+        if witness is None:
+            # Would the run refute the pair if estimated extents counted?
+            # Then it depends on bytes no record says belong to the object.
+            with translator.estimates_admitted():
+                estimated, _ = _compare(t_o, t_r, translator, return_kind, seed)
+            if estimated is not None:
+                reason = "estimated_extent"
+                result.skipped_details.setdefault(
+                    "estimated_extent",
+                    {
+                        "kind": estimated.kind,
+                        "location": estimated.location,
+                        "orig": estimated.orig_value,
+                        "recomp": estimated.recomp_value,
+                    },
+                )
         result.runs += 1
         if witness is not None:
-            result.witness = witness
+            result.witness = dataclasses.replace(
+                witness,
+                replay=WitnessReplay(
+                    run_input.record(),
+                    (orig_range.start, len(orig_range)),
+                    (recomp_range.start, len(recomp_range)),
+                    return_kind,
+                    WITNESS_MODEL,
+                    translator.image_digests,
+                ),
+            )
             return result
+        if index < len(hints):
+            result.hint_runs.append(
+                (reason or "agreed", frozenset(t_o.executed), frozenset(t_r.executed))
+            )
         if reason is not None:
             result.skipped[reason] += 1
         else:

@@ -1,4 +1,5 @@
 import enum
+import hashlib
 import re
 import dataclasses
 from typing import Iterator
@@ -165,3 +166,18 @@ class Image:
         data = bytearray(size)
         data[: len(view)] = view
         return bytes(data)
+
+
+def image_digest(image: Image) -> str | None:
+    """SHA-256 of an image's file bytes, when they can be read: its
+    identity in reports and witness replays."""
+    data = getattr(image, "data", None)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(data)).hexdigest()
+    path = getattr(image, "filepath", None)
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None

@@ -168,6 +168,10 @@ class ComparisonDifference:
     # value_recomp, bits, "value" or "predicate"). In memory only (for the
     # witness to ask a solver for a distinguishing input), never reported.
     values: tuple | None = field(default=None, compare=False, repr=False)
+    # What Z3 said about those values (bitvector.SolverOutcome.summary()):
+    # whether they differ in the verifier's abstraction, a term could not
+    # be lowered, or the budget ran out.
+    solver: dict[str, str | int | None] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.kind not in MISMATCH_KINDS:
@@ -216,6 +220,55 @@ WITNESS_KINDS = {
 
 
 @dataclass(frozen=True)
+class WitnessInput:
+    """The state both functions start from in one witness run. The seed
+    fixes everything else the model generates (memory pages, call results),
+    so this reproduces the run; see reccmp.compare.witness.machine.RunInput."""
+
+    seed: int
+    registers: tuple[tuple[str, int], ...]
+    stack_args: tuple[int, ...]
+    pool: tuple[int, ...] = ()
+    memory: tuple[tuple[int, int], ...] = ()  # (address, byte) presets
+
+    @classmethod
+    def from_json(cls, value: dict) -> "WitnessInput":
+        return cls(
+            value["seed"],
+            tuple((name, reg) for name, reg in value["registers"]),
+            tuple(value["stack_args"]),
+            tuple(value.get("pool", ())),
+            tuple((address, byte) for address, byte in value.get("memory", ())),
+        )
+
+
+@dataclass(frozen=True)
+class WitnessReplay:
+    """What replaying a witness needs besides the two binaries and their
+    entity database: no solver, no search."""
+
+    input: WitnessInput
+    orig_function: tuple[int, int]  # (start, extent)
+    recomp_function: tuple[int, int]
+    return_kind: str
+    # reccmp.compare.witness.machine.WITNESS_MODEL the run used.
+    model: int
+    # SHA-256 of the original and recompiled images, when known.
+    images: tuple[str | None, str | None] = (None, None)
+
+    @classmethod
+    def from_json(cls, value: dict) -> "WitnessReplay":
+        return cls(
+            WitnessInput.from_json(value["input"]),
+            tuple(value["orig_function"]),  # type: ignore[arg-type]
+            tuple(value["recomp_function"]),  # type: ignore[arg-type]
+            value["return_kind"],
+            value["model"],
+            tuple(value.get("images", (None, None))),  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
 class RefutationWitness:
     """Concrete inputs under which the two functions observably differ.
 
@@ -224,6 +277,7 @@ class RefutationWitness:
     need not be reachable from the program's real callers.
     """
 
+    # pylint: disable=too-many-instance-attributes
     seed: int
     kind: str  # key of WITNESS_KINDS
     location: str
@@ -231,10 +285,21 @@ class RefutationWitness:
     recomp_value: str
     orig_address: int | None = None
     recomp_address: int | None = None
+    replay: WitnessReplay | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in WITNESS_KINDS:
             raise ValueError(f"Unknown witness kind: {self.kind}")
+
+    @classmethod
+    def from_json(cls, value: dict) -> "RefutationWitness":
+        replay = value.get("replay")
+        return cls(
+            **{
+                **value,
+                "replay": WitnessReplay.from_json(replay) if replay else None,
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -255,7 +320,15 @@ class ExecutionEvidence:
     no_verdict: dict[str, int] = field(default_factory=dict)
     # For unknown_image_read and unresolved_call: the first unidentified
     # read or call (addresses, sections, database entities on each side).
+    # For estimated_extent: the difference a run would have shown if
+    # estimated extents were evidence.
     no_verdict_details: dict[str, dict[str, object]] = field(default_factory=dict)
+    # What came of asking the solver for an input under which the reported
+    # values differ: its answer when it gave none (``solver unsupported:
+    # ...``), why its assignment is no run input (``rejected: ...``), or
+    # what the run from it did (``run agreed``, ``run call_structure``, and
+    # whether it reached the difference). None without a value difference.
+    solver_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -404,6 +477,7 @@ class AnalysisRecorder:
         *,
         candidate: bool = False,
         values: tuple | None = None,
+        solver: dict[str, str | int | None] | None = None,
     ) -> None:
         # pylint: disable=too-many-arguments
         difference = ComparisonDifference(
@@ -411,6 +485,7 @@ class AnalysisRecorder:
             self.side("orig", orig_index, orig_facts),
             self.side("recomp", recomp_index, recomp_facts),
             values,
+            solver,
         )
         if candidate:
             if self.candidate_difference is None:

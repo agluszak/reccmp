@@ -9,6 +9,7 @@ body.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import cache
 
 from capstone import (  # type: ignore[import-untyped]
@@ -30,6 +31,16 @@ _TERMINALS = frozenset({"ret", "retf", "iret", "iretd", "int3", "hlt", "ud2"})
 # Walking further than this without closing every path means the start is
 # not a normal function (or flows into unknown code); give up.
 _MAX_EXTENT = 0x10000
+
+
+@dataclass(frozen=True)
+class EntityExtent:
+    """An entity's size on one side, and whether a record says so. An
+    estimate (for instance the other side's size) bounds where the entity
+    may end, but does not show that it owns every byte up to there."""
+
+    size: int
+    recorded: bool = True
 
 
 @cache
