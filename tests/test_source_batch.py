@@ -1,4 +1,4 @@
-"""Exercise the actual collector inside the pinned LLVM 19 analysis environment."""
+"""Exercise the actual collector inside the pinned LLVM 21 analysis environment."""
 
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -18,21 +18,21 @@ from reccmp.tools.decomplint import DecomplintTarget, lint_all_targets
 def _require_collector() -> None:
     if (
         not os.environ.get("RECCMP_SOURCE_INDEXER")
-        and not Path("/usr/lib/llvm-19/include/clang/AST/ASTConsumer.h").is_file()
+        and not Path("/usr/lib/llvm-21/include/clang/AST/ASTConsumer.h").is_file()
     ):
         pytest.skip(
-            "run inside the pinned analysis image (LLVM 19 + reccmp-source-indexer)"
+            "run inside the pinned analysis image (LLVM 21 + reccmp-source-indexer)"
         )
 
 
 def _clang_cl(repository: Path) -> str:
-    for candidate in ("/usr/bin/clang-cl", "/usr/bin/clang-cl-19"):
+    for candidate in ("/usr/bin/clang-cl", "/usr/bin/clang-cl-21"):
         if Path(candidate).is_file():
             return candidate
     # Debian's clang package may omit the cl driver name; the indexer still
     # selects CL mode from a path that ends in clang-cl.
     clang_cl = repository / "clang-cl"
-    clang_cl.symlink_to("/usr/bin/clang-19")
+    clang_cl.symlink_to("/usr/bin/clang-21")
     return str(clang_cl)
 
 

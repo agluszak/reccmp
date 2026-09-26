@@ -1,4 +1,4 @@
-"""Native per-TU source collection against a pinned LLVM 19 indexer."""
+"""Native per-TU source collection against a pinned LLVM 21 indexer."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from .index import (
 logger = logging.getLogger(__name__)
 
 _SOURCE = Path(__file__).with_name("indexer.cpp")
-_LLVM_VERSION = "19"
+_LLVM_VERSION = "21"
 _COMPILE = (
     "clang++ -O2 -std=c++17 -fno-rtti -fno-exceptions"
     " -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
@@ -105,8 +105,9 @@ def _build_indexer(binary: Path) -> None:
     )
     if clang_cpp is None or llvm is None:
         raise SourceIndexError(
-            "no LLVM 19 development libraries found; set RECCMP_SOURCE_INDEXER "
-            "to a prebuilt reccmp-source-indexer, or install libclang-19-dev"
+            f"no LLVM {_LLVM_VERSION} development libraries found; set "
+            "RECCMP_SOURCE_INDEXER to a prebuilt reccmp-source-indexer, or install "
+            f"libclang-{_LLVM_VERSION}-dev"
         )
     _run(
         shlex.split(
@@ -134,7 +135,10 @@ def resolve_indexer(cache: Path) -> Path:
         return Path(which)
     binary = cache / "indexer"
     stamp = cache / "indexer.sha256"
-    digest = hashlib.sha256(_SOURCE.read_bytes()).hexdigest()
+    # A binary built against another LLVM does not load once that LLVM is gone.
+    digest = hashlib.sha256(
+        _SOURCE.read_bytes() + f"\0llvm-{_LLVM_VERSION}".encode()
+    ).hexdigest()
 
     def current() -> bool:
         return binary.is_file() and stamp.is_file() and stamp.read_text() == digest

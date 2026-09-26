@@ -74,6 +74,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 
@@ -1304,7 +1305,7 @@ class Indexer {
           const ASTRecordLayout& layout = indexer_.context_.getASTRecordLayout(owner);
           offsetBits = static_cast<int64_t>(layout.getFieldOffset(field->getFieldIndex()));
           if (field->isBitField()) {
-            extentBits = static_cast<int64_t>(field->getBitWidthValue(indexer_.context_));
+            extentBits = static_cast<int64_t>(field->getBitWidthValue());
           } else if (!field->getType()->isIncompleteType() &&
                      field->getType()->isConstantSizeType()) {
             extentBits = static_cast<int64_t>(indexer_.context_.getTypeSize(field->getType()));
@@ -1425,7 +1426,7 @@ class Indexer {
         entry["offset"] = static_cast<int64_t>(bitOffset / 8);
         entry["size"] = context_.getTypeSizeInChars(field->getType()).getQuantity();
         if (field->isBitField()) {
-          entry["bitfield_width"] = field->getBitWidthValue(context_);
+          entry["bitfield_width"] = field->getBitWidthValue();
           entry["bitfield_offset"] = static_cast<int64_t>(bitOffset % 8);
         }
       }
@@ -1963,8 +1964,8 @@ int indexOneTranslationUnit(llvm::ArrayRef<const char*> argv, llvm::raw_ostream&
   if (parsedName.DriverMode) arguments.push_back(parsedName.DriverMode);
   arguments.insert(arguments.end(), argv.begin() + 1, argv.end());
 
-  llvm::IntrusiveRefCntPtr<DiagnosticOptions> diagnosticOptions(new DiagnosticOptions());
-  TextDiagnosticPrinter printer(diagnostics, diagnosticOptions.get());
+  DiagnosticOptions diagnosticOptions;
+  TextDiagnosticPrinter printer(diagnostics, diagnosticOptions);
   llvm::IntrusiveRefCntPtr<DiagnosticIDs> diagnosticIds(new DiagnosticIDs());
   DiagnosticsEngine engine(diagnosticIds, diagnosticOptions, &printer,
                            /*ShouldOwnClient=*/false);
@@ -2000,9 +2001,9 @@ int indexOneTranslationUnit(llvm::ArrayRef<const char*> argv, llvm::raw_ostream&
   if (!CompilerInvocation::CreateFromArgs(*invocation, compile->getArguments(), engine)) {
     return 1;
   }
-  CompilerInstance instance;
-  instance.setInvocation(std::move(invocation));
-  instance.createDiagnostics(&printer, /*ShouldOwnClient=*/false);
+  CompilerInstance instance(std::move(invocation));
+  instance.createDiagnostics(*llvm::vfs::getRealFileSystem(), &printer,
+                             /*ShouldOwnClient=*/false);
   if (!instance.hasDiagnostics()) return 1;
   profile.invocationMs = millisecondsSince(start);
 

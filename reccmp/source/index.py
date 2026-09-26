@@ -1864,7 +1864,7 @@ class SourceIndex:
         Expects to run in the same filesystem as the compile database (typically
         inside the pinned analysis image). ``RECCMP_SOURCE_INDEXER`` or
         ``reccmp-source-indexer`` on ``PATH`` supplies a prebuilt collector;
-        otherwise the collector is built once into ``cache_dir`` against LLVM 19.
+        otherwise the collector is built once into ``cache_dir`` against LLVM 21.
         """
         # pylint: disable=import-outside-toplevel
         from .batch import collect_compile_database

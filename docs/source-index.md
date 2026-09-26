@@ -2,7 +2,7 @@
 
 `SourceIndex.from_compile_database()` collects declarations, layouts and reccmp
 markers directly from Clang. Run reccmp inside the pinned analysis image
-(LLVM 19 + prebuilt `reccmp-source-indexer`): there is no Docker orchestration
+(LLVM 21 + prebuilt `reccmp-source-indexer`): there is no Docker orchestration
 inside the Python package.
 
 The index is the only source of markers: `reccmp-reccmp`, `Compare.from_target`
@@ -61,8 +61,8 @@ owners = index.functions_by_address(target="GAME")
 ```
 
 Set `RECCMP_SOURCE_INDEXER` (or put `reccmp-source-indexer` on `PATH`) to a
-collector built against LLVM 19. Without that, the first collection compiles
-`indexer.cpp` into the cache using the host's LLVM 19 development libraries.
+collector built against LLVM 21. Without that, the first collection compiles
+`indexer.cpp` into the cache using the host's LLVM 21 development libraries.
 `RECCMP_SOURCE_ROOT` must be the repository root the compile database paths use.
 `clang` optionally overrides the compiler named in the database.
 
@@ -168,9 +168,9 @@ from the working tree:
 
 ```sh
 docker run --rm -v "$PWD:/work" -w /work reccmp-source-test bash -lc '
-  clang++ -O1 -std=c++17 -fno-rtti -fno-exceptions -I/usr/lib/llvm-19/include \
+  clang++ -O1 -std=c++17 -fno-rtti -fno-exceptions -I/usr/lib/llvm-21/include \
     reccmp/source/indexer.cpp -o /tmp/indexer \
-    /usr/lib/llvm-19/lib/libclang-cpp.so.19.1 /usr/lib/llvm-19/lib/libLLVM.so.19.1 &&
+    /usr/lib/llvm-21/lib/libclang-cpp.so.21.1 /usr/lib/llvm-21/lib/libLLVM.so.21.1 &&
   uv venv -q /tmp/venv && uv pip install -q --python /tmp/venv -e . -r requirements-tests.txt &&
   RECCMP_SOURCE_INDEXER=/tmp/indexer /tmp/venv/bin/python -m pytest tests/test_source_batch.py'
 ```
