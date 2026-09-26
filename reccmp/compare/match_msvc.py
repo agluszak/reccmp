@@ -1,3 +1,5 @@
+import re
+
 from reccmp.types import EntityType
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.lines import LinesDb
@@ -94,14 +96,24 @@ def match_symbols(
                 )
 
 
+_ELABORATED_ARGUMENT = re.compile(r"([<,])\s*(?:class|struct|union|enum)\s+")
+_ARGUMENT_SPACE = re.compile(r"\s*,\s*")
+_CLOSING_SPACE = re.compile(r">\s+(?=>)")
+
+
 def match_name(name: str) -> str:
     """One comparable spelling for demangled-name matching.
 
-    MSVC's demangler separates pointer and reference sigils from template
-    arguments with a space (``T *>``) while annotation-side names may spell
-    them tight (``T*>``). The spacing carries no identity, so names match
-    on the tight form."""
-    return name.replace(" *", "*").replace(" &", "&")
+    MSVC's demangler spells template arguments loosely: a space before a
+    pointer or reference sigil (``T *>``), the elaborated keyword of a class
+    argument (``<T, class U, 1>``), a space after each comma and between
+    closing brackets (``> >``). Annotation-side names spell them tight
+    (``<T,U,1>``, ``T*>``, ``>>``). None of it carries identity, so names
+    match on the tight form."""
+    name = name.replace(" *", "*").replace(" &", "&")
+    name = _ELABORATED_ARGUMENT.sub(r"\1", name)
+    name = _ARGUMENT_SPACE.sub(",", name)
+    return _CLOSING_SPACE.sub(">", name)
 
 
 def match_functions(
