@@ -81,9 +81,11 @@ class Translator:
             return UNRESOLVED, "no_entity"
         base = entity.addr(side)
         size = entity.size(side)
-        if base is None or size is None:
+        if base is None or (size is None and addr != base):
+            # Only an address past the start needs the extent to say that
+            # it still belongs to the entity.
             return UNRESOLVED, "unknown_extent"
-        if not base <= addr < base + max(size, 1):
+        if size is not None and not base <= addr < base + max(size, 1):
             return UNRESOLVED, "outside_extent"
         canonical = self.db.alias_canonical_orig(side, base)
         if canonical is None:

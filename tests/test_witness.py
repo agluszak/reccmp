@@ -37,7 +37,7 @@ from reccmp.compare.witness.machine import (
     page_contents,
 )
 from reccmp.compare.witness.hints import input_from_assignment
-from reccmp.compare.witness.search import HINT_SEED, _excerpt_constants
+from reccmp.compare.witness.search import HINT_SEED, UNRESOLVED, _excerpt_constants
 
 CODE = 0x401000
 DATA = 0x402000
@@ -602,3 +602,25 @@ def test_a_solver_input_can_set_this_fields():
     assert _search(orig, recomp).witness is None
     witness = _search(orig, recomp, hints=hints).witness
     assert witness is not None and witness.seed == HINT_SEED
+
+
+def test_the_start_of_a_paired_entity_needs_no_extent():
+    """A call target or pointer equal to a paired entity's start is that
+    entity; only addresses past the start need its extent."""
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, ORIG_CALLEE, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, RECOMP_CALLEE, type=EntityType.FUNCTION, size=8)
+        batch.match(ORIG_CALLEE, RECOMP_CALLEE)
+    translator = Translator(
+        db,
+        SideMachine(_image(ORIG_FUNC, RET, ORIG_TABLE)),  # type: ignore[arg-type]
+        SideMachine(_image(RECOMP_FUNC, RET, RECOMP_TABLE)),  # type: ignore[arg-type]
+    )
+    start = ("entity", ORIG_CALLEE, 0)
+    assert translator.classify(ImageId.ORIG, ORIG_CALLEE) == (start, "entity")
+    assert translator.identity(ImageId.RECOMP, RECOMP_CALLEE) == start
+    assert translator.classify(ImageId.ORIG, ORIG_CALLEE + 4) == (
+        UNRESOLVED,
+        "unknown_extent",
+    )
