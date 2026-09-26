@@ -1322,8 +1322,9 @@ class SourceIndex:
         marker_blocks: Iterable[MarkerBlock] = (),
         source_digests: Mapping[str, str] | None = None,
         unit_dependencies: Mapping[str, Iterable[str]] | None = None,
+        document_digest: str | None = None,
     ) -> None:
-        # pylint: disable=too-many-arguments
+        # pylint: disable=too-many-arguments,too-many-locals
         # Every marker block the compiler saw, for all targets: the marker
         # grammar picks out each target's markers when reading them.
         self.marker_blocks = merge_marker_blocks(marker_blocks)
@@ -1352,6 +1353,8 @@ class SourceIndex:
         )
         self._keys_by_name: dict[str, list[DeclarationKey]] | None = None
         self._owner_keys: dict[int, DeclarationKey] | None = None
+        # The digest of the document this index was read from (see identity).
+        self._document_digest = document_digest
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
         self.abi = abi
         self.target_abis: dict[str, SourceAbi] = dict(target_abis or {})
@@ -1401,7 +1404,27 @@ class SourceIndex:
             marker_blocks=self.marker_blocks,
             source_digests=self.source_digests,
             unit_dependencies=self.unit_dependencies,
+            document_digest=(
+                f"{self._document_digest}:{target}"
+                if self._document_digest is not None
+                else None
+            ),
         )
+
+    def identity(self) -> str:
+        """A digest of everything this index states: cheap for an index read
+        from a file (the file's digest, recorded when it was read), a hash of
+        its JSON projection otherwise. Any change to what Clang reported —
+        declaration keys, marker ownership, ABI facts — changes it, also
+        when no source file changed."""
+        if self._document_digest is None:
+            projection = json.dumps(
+                self.to_dict(), sort_keys=True, separators=(",", ":")
+            )
+            self._document_digest = hashlib.sha256(
+                projection.encode("utf-8")
+            ).hexdigest()
+        return self._document_digest
 
     def call_facts_for(self, key: DeclarationKey) -> CallFacts | None:
         """Clang's call facts for the declaration with this key."""
@@ -1745,7 +1768,9 @@ class SourceIndex:
         )
 
     @classmethod
-    def from_dict(cls, document: Mapping[str, Any]) -> "SourceIndex":
+    def from_dict(
+        cls, document: Mapping[str, Any], *, document_digest: str | None = None
+    ) -> "SourceIndex":
         """Read the public JSON projection back into its canonical records.
         A document of another shape raises (usually KeyError); collect the
         index again."""
@@ -1793,6 +1818,7 @@ class SourceIndex:
             ),
             source_digests=document["source_digests"],
             unit_dependencies=document["unit_dependencies"],
+            document_digest=document_digest,
         )
 
     def functions_by_address(
@@ -1885,14 +1911,18 @@ class SourceIndex:
     @classmethod
     def read(cls, path: Path) -> "SourceIndex":
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-            return cls.from_dict(document)
+            content = path.read_bytes()
+            index = cls.from_dict(
+                json.loads(content),
+                document_digest=hashlib.sha256(content).hexdigest(),
+            )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             if isinstance(exc, SourceIndexError):
                 raise
             raise SourceIndexError(
                 f"source index at {path} is unusable: {exc}"
             ) from exc
+        return index
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

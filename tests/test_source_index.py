@@ -1,5 +1,6 @@
 """Marker join and link-namespace derivation from direct compiler records."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from reccmp.source import (
     SourceIndexError,
     keyed,
 )
-from reccmp.source.index import source_digest
+from reccmp.source.index import SourceDeclaration, source_digest
 
 
 def _declaration(**fields) -> dict:
@@ -728,3 +729,42 @@ def test_a_targets_markers_come_from_its_own_source_files(tmp_path: Path) -> Non
         marker.address
         for marker in SourceIndex.from_units(units, {"GAME": None}).markers
     ] == [0x1000, 0x2000]
+
+
+def test_identity_changes_with_what_clang_reported(tmp_path: Path) -> None:
+    """The prepared-analysis cache keys on the index's identity: any change
+    to the collected facts must change it, even with unchanged sources."""
+    key = DeclarationKey("GAME", "?f@@YAXXZ")
+    declaration = SourceDeclaration(
+        key.semantic_id,
+        "f",
+        "free_function",
+        "__cdecl",
+        "void",
+        (),
+        None,
+        False,
+        False,
+        "f.cpp",
+        2,
+        3,
+        True,
+    )
+    index = SourceIndex(declarations={key: declaration}, classes={}, markers=())
+    path = tmp_path / "source-index.json"
+    index.write(path)
+
+    first = SourceIndex.read(path)
+    assert first.identity() == SourceIndex.read(path).identity()
+    assert first.for_target("GAME").identity() == f"{first.identity()}:GAME"
+    # Built in memory: the projection's digest, stable across calls
+    assert index.identity() == index.identity()
+
+    moved = SourceIndex(
+        declarations={key: dataclasses.replace(declaration, line=5)},
+        classes={},
+        markers=(),
+    )
+    moved.write(path)
+    assert SourceIndex.read(path).identity() != first.identity()
+    assert moved.identity() != index.identity()
