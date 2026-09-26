@@ -6,7 +6,6 @@ from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
-    ComparisonDifference,
     ComparisonStatus,
     DifferenceSide,
     FactValue,
@@ -52,7 +51,7 @@ class SourcePinMixin(ComparatorState):
                     recomp_side = dataclasses.replace(
                         recomp_side, facts={**recomp_side.facts, **recomp_layout}
                     )
-            enriched = ComparisonDifference(diff.kind, orig_side, recomp_side)
+            enriched = dataclasses.replace(diff, orig=orig_side, recomp=recomp_side)
             return dataclasses.replace(
                 analysis,
                 difference=enriched,
@@ -80,10 +79,9 @@ class SourcePinMixin(ComparatorState):
                 diff = attempt.difference
                 attempt = dataclasses.replace(
                     attempt,
-                    difference=ComparisonDifference(
-                        diff.kind,
-                        diff.orig,
-                        self._enrich_side_with_source(diff.recomp, recomp=True),
+                    difference=dataclasses.replace(
+                        diff,
+                        recomp=self._enrich_side_with_source(diff.recomp, recomp=True),
                     ),
                 )
             elif attempt.location is not None:

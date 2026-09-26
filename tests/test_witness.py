@@ -14,7 +14,13 @@ from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.asm.verifier import verify_effective_match
+from reccmp.compare.diagnosis import (
+    AnalysisRecorder,
+    ComparisonAnalysis,
+    ComparisonStatus,
+)
+from reccmp.compare.refutation import _solver_hints
 from reccmp.formats.image import ImageSection, ImageSectionFlags
 from reccmp.types import EntityType, ImageId
 
@@ -30,7 +36,8 @@ from reccmp.compare.witness.machine import (
     import_registry,
     page_contents,
 )
-from reccmp.compare.witness.search import _excerpt_constants
+from reccmp.compare.witness.hints import input_from_assignment
+from reccmp.compare.witness.search import HINT_SEED, _excerpt_constants
 
 CODE = 0x401000
 DATA = 0x402000
@@ -84,6 +91,7 @@ def _search(
     *,
     callee_body: bytes = RET_BYTE,
     call_facts=None,
+    hints=(),
 ):
     db = EntityDb()
     with db.batch() as batch:
@@ -123,6 +131,7 @@ def _search(
         _function_image(ORIG_FUNC, orig_code),
         _function_image(RECOMP_FUNC, recomp_code),
         return_kind=return_kind,
+        hints=hints,
     )
 
 
@@ -490,3 +499,72 @@ def test_a_callee_without_ret_does_not_lend_the_next_functions():
             function_size=destination_size,
         )
         assert machine.callee_pop_bytes(ORIG_CALLEE) == expected
+
+
+def test_the_solver_suggests_the_input_the_seeds_miss():
+    """`arg + 5 < 0x1234` against `arg + 5 <= 0x1234` differ only at
+    arg == 0x122f. Z3 finds it from the verifier's values, and the run on
+    that input reproduces the divergence on both machines."""
+    # mov eax, [esp+4]; add eax, 5; cmp eax, 0x1234; jb/jbe +6;
+    # mov eax, 1; ret; xor eax, eax; ret
+    head = LOAD_ARG + bytes.fromhex("83c005") + bytes.fromhex("3d34120000")
+    tail = bytes.fromhex("06") + bytes.fromhex("b801000000c3") + bytes.fromhex("31c0c3")
+    orig, recomp = head + b"\x72" + tail, head + b"\x76" + tail
+
+    recorder = AnalysisRecorder()
+    assert not verify_effective_match(
+        list(disasm_detail(orig, ORIG_FUNC)),
+        list(disasm_detail(recomp, RECOMP_FUNC)),
+        recorder=recorder,
+    )
+    difference = recorder.difference or recorder.candidate_difference
+    assert difference is not None and difference.kind == "branch_condition"
+    hints = _solver_hints(ComparisonAnalysis.mismatch(difference))
+    assert [hint.stack_args[0] for hint in hints] == [0x122F]
+
+    assert _search(orig, recomp).witness is None  # the seeds miss it
+    witness = _search(orig, recomp, hints=hints).witness
+    assert witness is not None
+    assert (witness.seed, witness.kind) == (HINT_SEED, "return_value")
+
+
+def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
+    base = RunInput.from_seed(1)
+    argument = ("load", ("mem", "", ((("init", "sp"), 1),), 8, ()), "dword", 0)
+    hint = input_from_assignment({("init", "c"): 7, argument: 9}, base)
+    assert hint is not None
+    assert hint.registers["ecx"] == 7 and hint.stack_args[1] == 9
+    # this->field at entry: modelled memory, set when its page is mapped
+    field = ("load", ("mem", "", ((("init", "c"), 1),), 4, ()), "word", 0)
+    hint = input_from_assignment({("init", "c"): 0x20000000, field: 0xBEEF}, base)
+    assert hint is not None and hint.memory == ((0x20000004, 2, 0xBEEF),)
+    # an argument after a store cannot be set; a symbol's address is ignored
+    stored = ("load", argument[1], "dword", 3)
+    assert input_from_assignment({stored: 1}, base) is None
+    symbol = input_from_assignment({("sym", ("entity", 0x5000, 0)): 1}, base)
+    assert symbol is not None and symbol.registers == base.registers
+
+
+def test_a_solver_input_can_set_this_fields():
+    """`this->count + 5 < 0x1234` against `<=`: differs only when the field
+    holds 0x122f, which the input sets in modelled memory."""
+    # mov eax, [ecx + 8]; add eax, 5; cmp eax, 0x1234; jb/jbe +6;
+    # mov eax, 1; ret; xor eax, eax; ret
+    head = (
+        bytes.fromhex("8b4108") + bytes.fromhex("83c005") + bytes.fromhex("3d34120000")
+    )
+    tail = bytes.fromhex("06") + bytes.fromhex("b801000000c3") + bytes.fromhex("31c0c3")
+    orig, recomp = head + b"\x72" + tail, head + b"\x76" + tail
+    recorder = AnalysisRecorder()
+    verify_effective_match(
+        list(disasm_detail(orig, ORIG_FUNC)),
+        list(disasm_detail(recomp, RECOMP_FUNC)),
+        recorder=recorder,
+    )
+    difference = recorder.difference or recorder.candidate_difference
+    assert difference is not None
+    hints = _solver_hints(ComparisonAnalysis.mismatch(difference))
+    assert hints and hints[0].memory
+    assert _search(orig, recomp).witness is None
+    witness = _search(orig, recomp, hints=hints).witness
+    assert witness is not None and witness.seed == HINT_SEED

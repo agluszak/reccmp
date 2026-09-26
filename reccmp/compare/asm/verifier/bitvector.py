@@ -280,3 +280,37 @@ def observations_equal(obs_o: Sequence[Any], obs_r: Sequence[Any]) -> bool:
     return len(obs_o) == len(obs_r) and all(
         entries_equal(o, r) for o, r in zip(obs_o, obs_r)
     )
+
+
+def distinguishing_assignment(values: tuple) -> dict[Hashable, int] | None:
+    """For a verifier value difference ``(value_orig, value_recomp, bits,
+    kind)`` (see ComparisonDifference.values): values of the leaf terms
+    under which the two differ, when Z3 finds one. Leaves Z3 leaves free
+    are absent. None when they cannot differ, or the solver cannot tell."""
+    value_o, value_r, bits, kind = values
+    lowering = _Lowering()
+    try:
+        if kind == "predicate":
+            claim = lowering.predicate(value_o) != lowering.predicate(value_r)
+        elif bits is None:
+            left, right = lowering.operands(value_o, value_r, None)
+            claim = left != right
+        else:
+            claim = lowering.sized(value_o, bits) != lowering.sized(value_r, bits)
+    except _Unsupported:
+        return None
+    solver = z3.Solver()
+    solver.set("timeout", _TIMEOUT_MS)
+    solver.add(claim)
+    if solver.check() != z3.sat:
+        return None
+    model = solver.model()
+    assignment: dict[Hashable, int] = {}
+    for key, variable in lowering.variables.items():
+        term: Any = key[0]  # type: ignore[index]
+        if key[1] == "bool":  # type: ignore[index]
+            continue
+        value = model[variable]
+        if value is not None:
+            assignment[term] = value.as_long()
+    return assignment
