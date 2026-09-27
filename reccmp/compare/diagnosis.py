@@ -487,6 +487,24 @@ class AnalysisRecorder:
         solver: dict[str, str | int | None] | None = None,
     ) -> None:
         # pylint: disable=too-many-arguments
+        if (
+            values is not None
+            and len(values) == 4
+            and values[3]
+            in (
+                "value",
+                "predicate",
+            )
+        ):
+            tag_name = f"{values[3]}_tag"
+            for facts, value in zip((orig_facts, recomp_facts), values[:2]):
+                if (
+                    values[3] in facts
+                    and isinstance(value, tuple)
+                    and value
+                    and isinstance(value[0], str)
+                ):
+                    facts.setdefault(tag_name, value[0])
         difference = ComparisonDifference(
             kind,
             self.side("orig", orig_index, orig_facts),

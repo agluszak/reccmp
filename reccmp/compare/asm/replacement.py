@@ -383,8 +383,11 @@ def create_resolver(
         name = get_name(entity, offset)
         if offset == 0:
             entity = follow_thunk(entity)
+        entity_type = EntityTypeLookup.get(entity.entity_type or -1)
         return ResolvedAddress(
-            name, entity_proof_identity(db, image_id, entity, offset, equivalence_groups)
+            name,
+            entity_proof_identity(db, image_id, entity, offset, equivalence_groups),
+            entity_type,
         )
 
     def resolve(

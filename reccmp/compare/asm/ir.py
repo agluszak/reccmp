@@ -111,9 +111,13 @@ def rebind_local_identities(
 
     def rewrite_value(value):
         match value:
-            case Reference(display=display, identity=identity):
+            case Reference(display=display, identity=identity, entity_type=entity_type):
                 bound = bind(identity)
-                return value if bound == identity else Reference(display, bound)
+                return (
+                    value
+                    if bound == identity
+                    else Reference(display, bound, entity_type)
+                )
             case tuple():
                 return tuple(rewrite_value(item) for item in value)
             case list():
@@ -162,6 +166,21 @@ class FunctionImage:
     def with_excerpt(self, excerpt: Sequence[DecodedInstruction]) -> "FunctionImage":
         """Return a copy whose excerpt (and ids) come from ``excerpt``."""
         return replace(self, excerpt=tuple(excerpt))
+
+    @property
+    def control_flow_complete(self) -> bool:
+        """Every transfer is decoded or backed by a recognized switch table."""
+        switches = {
+            table.dispatch_address
+            for table in self.jump_tables
+            if table.is_recognized_switch()
+        }
+        return all(
+            not row.is_code
+            or row.control_flow_known
+            or (row.is_jump and row.address in switches)
+            for row in self.excerpt
+        )
 
 
 @dataclass(frozen=True)

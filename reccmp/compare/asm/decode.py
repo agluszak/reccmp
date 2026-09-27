@@ -28,7 +28,6 @@ from .ir import AsmRole, DecodedInstruction
 from .model import (
     REGISTERS,
     ST_RE,
-    format_operand,
     split_mnemonic_prefix,
 )
 
@@ -137,8 +136,9 @@ def capstone_operand(
             ),
             size_known,
         )
-    # Rare / unsupported (e.g. invalid): keep a unique opaque identity.
-    return ("opaque", op.type, str(insn.op_str), operand_index), False
+    # Rare / unsupported: machine bytes distinguish unknown operands without
+    # letting Capstone's display spelling influence matching.
+    return ("opaque", op.type, bytes(insn.bytes), operand_index), False
 
 
 def from_capstone(insn) -> DecodedInstruction:
@@ -172,17 +172,14 @@ def from_capstone(insn) -> DecodedInstruction:
         not (isinstance(operand, tuple) and operand and operand[0] == "opaque")
         for operand in operands
     )
-    # Indirect control transfers have no absolute branch_target at decode time.
-    # CFG may still recover switch tables via JumpTable metadata later.
+    # An indirect call's destination expression is its modeled operand; it
+    # needs no absolute branch_target for an exact instruction comparison.
+    # An indirect jump still needs a recovered switch table or destination
+    # before its local control-flow topology is known.
     if control_flow_known and (is_jump or is_call) and branch_target is None:
         if is_jump:
             control_flow_known = False
-        elif not any(
-            isinstance(op, tuple) and op and op[0] in ("imm", "sym", "reg")
-            for op in operands
-        ):
-            control_flow_known = False
-        elif any(isinstance(op, tuple) and op and op[0] == "mem" for op in operands):
+        elif not operands:
             control_flow_known = False
 
     # Preserve Capstone's own display text (including combined rep mnemonic).

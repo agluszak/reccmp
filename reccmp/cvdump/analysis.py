@@ -73,6 +73,8 @@ class CvdumpNode:
     section_contribution: int | None = None
     addr: int | None = None
     symbol_entry: SymbolsEntry | None = None
+    # The S_GPROC32/S_LPROC32 that contained this S_LDATA32 record.
+    parent_function: NodeKey | None = None
     # Preliminary - only used for non-static variables at the moment
     data_type: TypeInfo | None = None
 
@@ -231,21 +233,19 @@ class CvdumpAnalysis:
                 node_dict[key].node_type = EntityType.FUNCTION
                 node_dict[key].symbol_entry = sym
 
-                # Iterate through static variables defined in this function
-                # generate decorated name "<variable name>___<func name>"
+                # Keep the ownership expressed by the enclosing PDB symbol.
                 for v in sym.static_variables:
-                    key = NodeKey(v.section, v.offset)
-                    if key not in node_dict:
-                        node_dict[key] = CvdumpNode.from_node_key(key)
-                    node_dict[key].node_type = EntityType.DATA
-                    # TODO this format is required for `match_msvc::match_static_variables` to find the variable
-                    # Look at either documenting this dependency or reworking the query
-                    node_dict[key].decorated_name = f"{v.name}___{sym.name}"
-                    node_dict[key].friendly_name = v.name
+                    variable_key = NodeKey(v.section, v.offset)
+                    if variable_key not in node_dict:
+                        node_dict[variable_key] = CvdumpNode.from_node_key(variable_key)
+                    variable = node_dict[variable_key]
+                    variable.node_type = EntityType.DATA
+                    variable.parent_function = key
+                    variable.friendly_name = v.name
                     try:
                         v_info = parser.types.get(v.type)
-                        node_dict[key].confirmed_size = v_info.size
-                        node_dict[key].data_type = v_info
+                        variable.confirmed_size = v_info.size
+                        variable.data_type = v_info
                     except (CvdumpKeyError, CvdumpIntegrityError):
                         # No big deal if we don't have complete type information.
                         pass

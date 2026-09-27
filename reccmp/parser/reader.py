@@ -420,9 +420,15 @@ class _FileReader:
         variable = variables[0]
         assert anchor is not None
         if variable.enclosing_function is None:
-            self._variable(marker, anchor.line, variable.qualified_name)
+            self._variable(
+                marker, anchor.line, variable.qualified_name,
+                semantic_id=variable.semantic_id,
+            )
         elif variable.local_static:
-            symbol = self._variable(marker, anchor.line, variable.name, is_static=True)
+            symbol = self._variable(
+                marker, anchor.line, variable.name,
+                is_static=True, semantic_id=variable.semantic_id,
+            )
             self.static_locals.append(
                 _StaticVariable(symbol, variable.enclosing_function)
             )
@@ -461,7 +467,8 @@ class _FileReader:
             self.function_ids.setdefault((marker.module, semantic_id), marker.offset)
 
     def _variable(
-        self, marker: DecompMarker, line: int, name: str, *, is_static: bool = False
+        self, marker: DecompMarker, line: int, name: str, *,
+        is_static: bool = False, semantic_id: str | None = None
     ) -> ParserVariable:
         symbol = ParserVariable(
             type=marker.type,
@@ -471,6 +478,7 @@ class _FileReader:
             name=name,
             filename=self.path,
             is_static=is_static,
+            semantic_id=semantic_id,
         )
         self.symbols.append(symbol)
         return symbol

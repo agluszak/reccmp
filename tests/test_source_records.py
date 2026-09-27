@@ -33,6 +33,8 @@ CLASS = {
         {
             "name": "count",
             "type": "int",
+            "pointer_depth": 0,
+            "storage_kind": "scalar",
             "source_file": "include/wiz8/vector.h",
             "line": 24,
         }
@@ -47,6 +49,7 @@ VARIABLE = {
     "semantic_id": "_gThing",
     "qualified_name": "gThing",
     "type": "Foo *",
+    "storage_kind": "pointer",
     "linkage": "external",
     "storage_class": "none",
     "definition_kind": "declaration",

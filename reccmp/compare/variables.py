@@ -20,7 +20,6 @@ from reccmp.cvdump.types import (
     CvdumpIntegrityError,
 )
 from reccmp.types import ImageId
-from reccmp.source.index import strip_type_qualifiers, variable_type_is_indirection
 
 if TYPE_CHECKING:
     from reccmp.source import SourceIndex
@@ -250,30 +249,36 @@ class VariableComparator:
         Pointer/reference variables store an address; do not treat their
         pointee ``record_semantic_id`` as the variable's physical layout.
         """
-        if self.source_index is None or not var.name:
+        if self.source_index is None:
             return None
 
-        for item in self.source_index.variables.values():
-            if item.qualified_name != var.name and not item.qualified_name.endswith(
-                f"::{var.name}"
-            ):
-                continue
-            if variable_type_is_indirection(item.type):
-                return None
-            if item.record_semantic_id:
-                nested = self.source_index.class_for_semantic_id(
-                    item.record_semantic_id
-                )
-                if nested is not None and self.source_index.has_layout(
-                    nested.qualified_name
-                ):
-                    return nested.qualified_name
-            name = strip_type_qualifiers(item.type)
-            if self.source_index.has_layout(name):
-                return name
-        # Fall back: variable name may itself be a typed aggregate in the index.
-        if self.source_index.has_layout(var.name):
-            return var.name
+        semantic_id = var.get("semantic_id")
+        if semantic_id:
+            candidates = [
+                item
+                for item in self.source_index.variables.values()
+                if item.semantic_id == semantic_id
+            ]
+        elif var.name:
+            candidates = [
+                item
+                for item in self.source_index.variables.values()
+                if item.qualified_name == var.name
+                or item.qualified_name.endswith(f"::{var.name}")
+            ]
+        else:
+            return None
+        # A source index may contain the same declaration in several units.
+        # Resolve only when every candidate has the same physical type facts.
+        types = {(item.storage_kind, item.record_semantic_id) for item in candidates}
+        if len(types) != 1:
+            return None
+        storage_kind, record_id = next(iter(types))
+        if storage_kind in ("pointer", "reference") or record_id is None:
+            return None
+        nested = self.source_index.class_for_semantic_id(record_id)
+        if nested is not None and self.source_index.has_layout(nested.qualified_name):
+            return nested.qualified_name
         return None
 
     def _source_layout_members(

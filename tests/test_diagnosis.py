@@ -1,6 +1,7 @@
 """Structured semantic diagnosis and strategy-selection tests."""
 
 from difflib import SequenceMatcher
+from dataclasses import replace
 
 import pytest
 
@@ -11,13 +12,14 @@ from reccmp.compare.asm.verifier import (
 from reccmp.compare.asm.verifier.evidence import (
     diagnostic_summaries,
 )
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.ir import DecodedInstruction
+from tests.asm_rows import rows
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     StrategyAttempt,
 )
+from tests.asm_rows import analyze_effective_match
 
 
 def analyze(orig, recomp, **kwargs):
@@ -181,7 +183,7 @@ def test_thiscall_argument_difference():
     )
     assert result.difference.kind == "call_argument"
     assert result.difference.orig.facts["register"] == "ecx"
-    assert result.difference.orig.facts["value"] == "load:g_pMainView"
+    assert result.difference.orig.facts["value"] == "load:g_pMainView (DATA)"
 
 
 def test_memory_address_difference_has_components():
@@ -250,11 +252,10 @@ def test_branch_condition_difference():
     assert result.difference.kind == "branch_condition"
 
 
-def _jump_meta(address: int, target: int) -> InstructionMeta:
-    return InstructionMeta(
+def _jump_meta(address: int, target: int) -> DecodedInstruction:
+    return replace(rows(["je 0x2"])[0],
         address=address,
         size=2,
-        mnemonic="je",
         regs_read=("eflags",),
         regs_written=(),
         reads_flags=True,
@@ -313,11 +314,11 @@ def test_symbol_resolution_difference():
 def test_unsupported_instruction_is_inconclusive():
     result = analyze(["bswap eax", "ret"], ["bswap ecx", "ret"])
     assert result.status == ComparisonStatus.INCONCLUSIVE
-    assert result.inconclusive_reason == "missing_metadata"
+    assert result.inconclusive_reason == "unsupported_instruction"
     by_strategy = {attempt.strategy: attempt for attempt in result.attempts}
     assert by_strategy["lockstep"].blocker == "unsupported_instruction"
     assert by_strategy["lockstep"].location.instruction_index == 0
-    assert by_strategy["cfg"].blocker == "missing_metadata"
+    assert by_strategy["cfg"].blocker == "unsupported_instruction"
 
 
 def test_mismatch_keeps_every_strategy_attempt():

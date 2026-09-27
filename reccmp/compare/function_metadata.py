@@ -153,7 +153,12 @@ class FunctionMetadataMixin(ComparatorState):
         clang = self._clang_call_facts(node, orig_addr)
         if clang is not None:
             facts = facts.merged(clang)
-        if node.decorated_name:
+        if node.decorated_name and (
+            facts.uses_ecx is None
+            or facts.uses_edx is None
+            or facts.stack_cleanup is None
+            or facts.return_kind == "unknown"
+        ):
             facts = facts.merged(mangled_facts(node.decorated_name))
         return facts
 

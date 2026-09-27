@@ -437,14 +437,17 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         operands_complete = all(
             row.operand_model_complete for row in (*orig_rows, *recomp_rows)
         )
-        control_flow_complete = all(
-            (not row.is_code) or row.control_flow_known
-            for row in (*orig_rows, *recomp_rows)
+        control_flow_complete = (
+            orig.control_flow_complete and recomp.control_flow_complete
         )
         orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
         recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
         exact = admit_exact_analysis(
-            displays_equal=orig_keys == recomp_keys,
+            bytes_equal=(
+                orig.raw is not None
+                and recomp.raw is not None
+                and orig.raw == recomp.raw
+            ),
             topology_equal=(
                 orig_topology is not None and orig_topology == recomp_topology
             ),

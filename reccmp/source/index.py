@@ -134,15 +134,15 @@ class SourceField:
     type: str
     source_file: str
     line: int
-    pointer_depth: int | None = None
+    pointer_depth: int
+    # Physical storage: scalar, pointer, reference, embedded_record, array.
+    storage_kind: str
     offset: int | None = None
     size: int | None = None
     bitfield_width: int | None = None
     bitfield_offset: int | None = None
     # ``record:Qualified::Name`` when the field type is (or points to) a record.
     record_semantic_id: str | None = None
-    # Physical storage: scalar, pointer, reference, embedded_record, array.
-    storage_kind: str | None = None
     array_element_type: str | None = None
     array_stride: int | None = None
     array_count: int | None = None
@@ -315,6 +315,7 @@ class SourceBaseOffset:
     """Byte offset of one direct base subobject within a complete class."""
 
     name: str
+    semantic_id: str
     offset: int
 
 
@@ -779,7 +780,12 @@ def _layout_identity(source_class: SourceClass) -> tuple:
         tuple(
             (
                 field.name,
-                field.type,
+                field.storage_kind,
+                field.pointer_depth,
+                field.record_semantic_id,
+                field.array_element_kind,
+                field.array_stride,
+                field.array_count,
                 field.offset,
                 field.size,
                 field.bitfield_width,
@@ -787,7 +793,7 @@ def _layout_identity(source_class: SourceClass) -> tuple:
             )
             for field in source_class.fields
         ),
-        tuple((base.name, base.offset) for base in source_class.base_offsets),
+        tuple((base.semantic_id, base.offset) for base in source_class.base_offsets),
     )
 
 
@@ -804,9 +810,22 @@ def _layout_identity_signature(identity: tuple) -> tuple[str, ...]:
     """Flatten a layout identity into a conflict-variant signature."""
     size, alignment, fields, base_offsets = identity
     parts = [f"size={size}", f"align={alignment}"]
-    for name, type_name, offset, field_size, bit_width, bit_offset in fields:
+    for (
+        name,
+        kind,
+        depth,
+        record_id,
+        element_kind,
+        stride,
+        count,
+        offset,
+        field_size,
+        bit_width,
+        bit_offset,
+    ) in fields:
         parts.append(
-            f"field:{name}:{type_name}:{offset}:{field_size}:{bit_width}:{bit_offset}"
+            f"field:{name}:{kind}:{depth}:{record_id}:{element_kind}:"
+            f"{stride}:{count}:{offset}:{field_size}:{bit_width}:{bit_offset}"
         )
     for name, offset in base_offsets:
         parts.append(f"base:{name}:{offset}")
@@ -1048,43 +1067,13 @@ def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:
     )
 
 
-def strip_type_qualifiers(type_name: str) -> str:
-    """Reduce a Clang type spelling to a record name usable for layout lookup."""
-    name = type_name.strip()
-    for prefix in ("const ", "volatile ", "struct ", "class ", "union "):
-        if name.startswith(prefix):
-            name = name[len(prefix) :].strip()
-    while name.endswith("*") or name.endswith("&"):
-        name = name[:-1].rstrip()
-    return name
-
-
-def type_spelling_is_indirection(type_name: str) -> bool:
-    """True when the outermost type is a pointer or reference (not an array)."""
-    name = type_name.strip()
-    for prefix in ("const ", "volatile "):
-        if name.startswith(prefix):
-            name = name[len(prefix) :].strip()
-    # Array spellings look like ``T [N]`` or ``T[]``; those are containment.
-    if name.endswith("]") and "[" in name:
-        return False
-    return name.endswith("*") or name.endswith("&")
-
-
 def field_is_indirection(source_field: SourceField) -> bool:
     """Pointer/reference storage is a layout leaf; do not descend physically."""
     if source_field.storage_kind in ("pointer", "reference"):
         return True
     if source_field.storage_kind == "array":
         return source_field.array_element_kind in ("pointer", "reference")
-    if (source_field.pointer_depth or 0) > 0:
-        return True
-    return type_spelling_is_indirection(source_field.type)
-
-
-def variable_type_is_indirection(type_name: str) -> bool:
-    """A ``T*`` / ``T&`` variable stores an address, not a ``T`` aggregate."""
-    return type_spelling_is_indirection(type_name)
+    return False
 
 
 def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
@@ -1094,9 +1083,7 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         "size",
         "bitfield_width",
         "bitfield_offset",
-        "pointer_depth",
         "record_semantic_id",
-        "storage_kind",
         "array_element_type",
         "array_stride",
         "array_count",
@@ -1111,13 +1098,13 @@ def _field_from_dict(values: Mapping[str, Any]) -> SourceField:
         type=str(data["type"]),
         source_file=str(data["source_file"]),
         line=int(data["line"]),
-        pointer_depth=data.get("pointer_depth"),
+        pointer_depth=int(data["pointer_depth"]),
         offset=data.get("offset"),
         size=data.get("size"),
         bitfield_width=data.get("bitfield_width"),
         bitfield_offset=data.get("bitfield_offset"),
         record_semantic_id=data.get("record_semantic_id"),
-        storage_kind=data.get("storage_kind"),
+        storage_kind=str(data["storage_kind"]),
         array_element_type=data.get("array_element_type"),
         array_stride=data.get("array_stride"),
         array_count=data.get("array_count"),
@@ -1143,7 +1130,11 @@ def _class_from_dict(values: Mapping[str, Any]) -> SourceClass:
         size=values.get("size"),
         alignment=values.get("alignment"),
         base_offsets=tuple(
-            SourceBaseOffset(name=str(item["name"]), offset=int(item["offset"]))
+            SourceBaseOffset(
+                name=str(item["name"]),
+                semantic_id=str(item["semantic_id"]),
+                offset=int(item["offset"]),
+            )
             for item in values.get("base_offsets") or ()
         ),
         layout_trusted=values.get("layout_trusted"),
@@ -1549,14 +1540,8 @@ class SourceIndex:
             return self._classes_by_target_semantic_id.get((target, semantic_id))
         return self._classes_by_semantic_id.get(semantic_id)
 
-    def _lookup_nested_class(
-        self, source_field: SourceField, type_spelling: str
-    ) -> str | None:
-        """Prefer Clang ``record_semantic_id``; fall back to qualifier stripping.
-
-        Only for *embedded* record storage. Pointer/reference fields keep the
-        pointee id for metadata but are not physical containment.
-        """
+    def _lookup_nested_class(self, source_field: SourceField) -> str | None:
+        """Look up a physically contained record by Clang semantic ID."""
         if (
             source_field.storage_kind == "array"
             and source_field.array_element_kind
@@ -1568,14 +1553,8 @@ class SourceIndex:
             return None
         if field_is_indirection(source_field):
             return None
-        if source_field.record_semantic_id:
-            nested = self._classes_by_semantic_id.get(source_field.record_semantic_id)
-            if nested is not None:
-                return nested.qualified_name
-        stripped = strip_type_qualifiers(type_spelling)
-        if stripped in self._classes_by_name:
-            return stripped
-        return None
+        nested = self._classes_by_semantic_id.get(source_field.record_semantic_id)
+        return nested.qualified_name if nested is not None else None
 
     def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
         """Leaf field covering ``offset`` bytes within the class layout."""
@@ -1660,8 +1639,7 @@ class SourceIndex:
             if not covers:
                 continue
             remaining = offset - item.offset
-            nested_type = item.array_element_type or item.type
-            nested = self._lookup_nested_class(item, nested_type)
+            nested = self._lookup_nested_class(item)
             absolute = abs_base + item.offset
             if (
                 item.storage_kind == "array"
@@ -1702,7 +1680,10 @@ class SourceIndex:
         for base in source_class.base_offsets:
             if offset < base.offset:
                 continue
-            nested_name = strip_type_qualifiers(base.name)
+            nested = self._classes_by_semantic_id.get(base.semantic_id)
+            if nested is None:
+                continue
+            nested_name = nested.qualified_name
             base_label = nested_name.rsplit("::", 1)[-1]
             found = self._resolve_field(
                 nested_name,

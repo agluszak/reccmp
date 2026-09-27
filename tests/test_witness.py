@@ -22,7 +22,6 @@ from reccmp.compare.asm.ir import ExtentKind, FunctionImage
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.refutation import RefutationMixin
-from reccmp.compare.asm.verifier import verify_effective_match
 from reccmp.compare.comparison_json import analysis_json, parse_analysis
 from reccmp.compare.extent import EntityExtent
 from reccmp.compare.diagnosis import (
@@ -58,6 +57,7 @@ from reccmp.compare.witness.machine import (
 )
 from reccmp.compare.witness.hints import Rejection, input_from_assignment
 from reccmp.compare.witness.search import HINT_SEED, UNRESOLVED, _excerpt_constants
+from tests.asm_rows import verify_effective_match
 
 CODE = 0x401000
 DATA = 0x402000

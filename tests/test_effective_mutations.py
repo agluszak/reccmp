@@ -16,8 +16,8 @@ import pytest
 from reccmp.compare.asm.verifier import (
     CallFacts,
     FunctionMetadata,
-    verify_effective_match,
 )
+from tests.asm_rows import verify_effective_match
 
 CDECL = CallFacts(uses_ecx=False, uses_edx=False)
 

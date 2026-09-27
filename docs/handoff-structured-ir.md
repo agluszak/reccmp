@@ -1,105 +1,63 @@
-# Handoff: structured IR refactor (branch `refactor/structured-identities`)
+# Structured IR migration
 
-Goal (from the user): one PR where **no string reccmp produces is ever parsed
-by reccmp again**. Three migrations: (1) IR is mandatory, (2) derived analyses
-stay structured, (3) compiler/debug facts stay structured. No backwards
-compatibility. Base: `origin/master` `df3472c5`. This commit is **work in
-progress**: the pipeline runs end to end, but tests are not migrated and
-verdicts regressed (see "State").
+Branch: `refactor/structured-identities`. The starting commit was `6256ed08`;
+the work below continues it. The target is that reccmp parses text at input
+boundaries and never parses a string it rendered itself.
 
-## Done
+## Current state
 
-### IR is mandatory
-- `asm/instgen.py`: `CodeSection.contents` is `list[DecodedInstruction]`;
-  `DisasmLiteTuple`, `as_lite_tuple`, `displacement_regex`, `stop_at_int3`,
-  `get_disassembler` deleted. Jumps/tables from `branch_target` and typed mem
-  operands (`_table_displacement`).
-- `asm/parse.py` rewritten: one `ReferenceResolver` (`resolve(addr, exact,
-  indirect) -> ResolvedAddress(name, identity)`), no text sanitizer, no
-  `_should_sanitize`/`_hex_style_addr`/`from_hex`/regexes; every row goes
-  through `sanitize_row`; identity never inferred from display
-  (`_OFFSET_PLACEHOLDER` gone). `assert_fixup` replaces operands structurally.
-- `asm/replacement.py`: `create_name_lookup` -> `create_resolver`;
-  `canonical_callee_name` no longer appends `[CALLEE identity]`.
-- `asm/model.py`: `Instruction` class removed; `parse_instruction` returns
-  `(prefix, mnemonic, operands)` and is a text boundary for test fixtures only;
-  `STACK_ENTRY_REGEX` removed; `ResolvedAddress` added.
-- `asm/ir.py`: removed `ResolvedAsm`, `AsmStream`, `resolve_asm_stream`,
-  `instruction_at`, `is_data_row`, `with_display`, `as_effective`,
-  `from_effective`, `raw_operands`, `raw_op_str`, `excerpt_*`,
-  `rewrite_stack_displacements`, string branches of key functions. Table
-  markers carry payloads (`("case", offset)`, `("byte", b)`). Match key uses
-  identity for resolved references (display only for side-local ones).
-  New `local_branch_targets(rows)`.
-- Verifier (`asm/verifier/*`) takes `DecodedInstruction` rows: lockstep, cfg,
-  cfg_build, iso_cfg, relocation, block_align, schedule, obligations,
-  evidence, semantics. `analyze_effective_match(codes, orig: FunctionImage,
-  recomp: FunctionImage, metadata)`. `InstructionMeta` no longer passed
-  (class still exists in instgen: delete it and `meta_from_decoded`,
-  `collect_instruction_meta`). Display-equality admissions replaced by
-  `instruction_semantic_key` equality. `call_facts` keyed by proof identity
-  (`FunctionMetadata.call_facts: Callable[[Hashable], ...]`,
-  `_call_facts_map` keyed by `entity_proof_identity`).
-- `functions.py`: `compare_function_images` hands images to the verifier;
-  exactness uses match keys, not display equality; `_compare_function_assembly`
-  test wrapper removed.
+The verifier accepts `DecodedInstruction` rows and `FunctionImage`s only.
+`DisasmLiteTuple`, `ResolvedAsm`, `AsmStream`, `Instruction`, `InstructionMeta`,
+`with_display`, the text sanitizer, and the production text fallbacks are gone.
+The only `parse_instruction()` caller is the test fixture boundary. Direct
+control targets, relocations, helper calls, stack offsets, jump tables, and
+call facts travel as typed operands or identities. `RawDiffOutput` is used for
+reports, not as an analysis input. The `.display` reads in production are for
+reporting and diagnostics. Unsupported operands are keyed by instruction
+bytes, never Capstone's operand text.
 
-### Derived analyses structured
-- `stack_layout.py`: pairs from opcodes over row operands; modulo-stack via
-  remapped structured keys; `StackLayoutResult` carried on
-  `EntityCompareResult` / `ReccmpComparedEntity`; `tools/stackcmp.py` reads it.
-- `inlines.py`: `Fingerprint = tuple[FingerprintRow(prefix, mnemonic,
-  operands, callee)]`; register normalization on operands; effect summary on
-  operands; helper calls by callee identity (`HelperCatalogEntry.identity`).
-  `inline_accounting.py`: helper resolution from `("entity", orig, 0)`; the
-  name/hex identity index deleted.
-- `body_equivalence.py`: proofs on `FunctionImage`s via `_load_function_image`
-  and semantic keys; `_code_rows`, `_code_shape`, `_alias_fingerprint`,
-  caller edges all structured.
-- `analysis/crt_startup.py`: operands/branch targets instead of `op_str` regex.
+Static locals retain their PDB parent function key through `CvdumpAnalysis`
+and `load_cvdump`; matching uses the matched parent address and exact local
+name, rejecting ambiguity. The marker's variable semantic ID is retained.
+The Clang index emits variable storage kind and base semantic IDs, takes
+function return types from `getReturnType()`, and requires structural field,
+variable, and base metadata in Python. The old source-index schema is not
+accepted. Physical layout conflict checks use structural facts rather than
+type spelling. PDB frame offsets are parsed as signed integers at the cvdump
+boundary.
 
-### Compiler/debug facts
-- `cvdump/symbols.py`: `StackOrRegisterSymbol(frame_offset, register)` parsed
-  at the boundary (signed); `location` string gone. Consumers: stack_layout,
-  `ghidra/importer/pdb_extraction.py` (was unsigned `int(...,16)` — a bug).
+The resolver returns display and proof identity together. Call facts use the
+identity. Triage uses typed value tags and entity types, and the explanation
+path uses symbolic values and identities. `mangled_facts` fills only missing
+PDB facts. Importing `reccmp.analysis.crt_startup` before `reccmp.compare`
+works; the package's `Compare` export loads lazily.
 
-## State (measured on reccmp-corpus/2026-09-26, run.sh)
-- Runs: `refactor-base` (df3472c5) vs `refactor-1` (this commit).
-- **Regression**: 262 exact->mismatch, 12 effective->mismatch, 49
-  inconclusive->mismatch (e.g. SURRENDER 0x1000e130 `srClass::srClass`
-  memory_value). Likely cause to check first: stores of vtables / addresses
-  now become `("sym", Reference)` via `is_addr` on *every* row (the old gate
-  skipped size<=4 rows), or resolver identities differing between sides where
-  the old display compared equal. Diff one function with
-  `asmcmp --verbose 0x1000e130` against master.
-- **Performance**: WIZ8 470 s vs ~90 s. Suspect every-row sanitization
-  (resolver calls for every `cmp imm`) and `_load_function_image` in body
-  equivalence. Profile with cProfile on WIZ8.
-- **Tests**: broken (collection errors). Needed: a test fixture helper
-  (e.g. `tests/asm_rows.py`) that parses text once into `DecodedInstruction`
-  rows/`FunctionImage` (addresses `0x1000+i`, `branch_target` from target
-  indices, `control_target` for jumps, `register_access_known=False`), then
-  migrate ~170 call sites (test_effective*.py, test_review_regressions,
-  test_sanitize32 (rewrite onto sanitize_row), test_instgen, stack/inline
-  tests, test_name_replacement (create_resolver)).
+Exact admission requires equal semantic keys and branch topology, plus either
+equal raw bytes or complete operand and control-flow models. An indirect call's
+modeled operand completes its control target. A recognized jump table completes
+its indirect jump through `FunctionImage.control_flow_complete`. Opaque operands
+never gain exact proof from equal display text.
 
-## Not started (from the plan)
-- Static locals: keep `LdataEntry` parent relation in `CvdumpNode`
-  (`parent_function`), delete `f"{v.name}___{sym.name}"` in
-  `cvdump/analysis.py`, match by `(recomp_parent, name)` in
-  `match_msvc.match_static_variables` (reject ambiguity); keep the anchor's
-  variable semantic_id in `source/reader.py`.
-- Source index: `SourceVariable.storage_kind` + `record_semantic_id`,
-  `SourceBaseOffset.semantic_id`; make field structural fields mandatory;
-  delete `strip_type_qualifiers`, `type_spelling_is_indirection`,
-  `variable_type_is_indirection`; `indexer.cpp` return type from
-  `function->getReturnType()`; rebuild the collector.
-- `function_metadata._call_facts_of_node`: run `mangled_facts` only for fields
-  still unknown.
-- `triage._fact_shape`: stop regexing stringified facts; add typed facts.
-- `explain.py`: remove remaining `(DATA)` / text assumptions (now uses
-  identities; re-check `_fact_causes`).
-- Delete `InstructionMeta`/`meta_from_decoded`/`collect_instruction_meta`;
-  audit `grep -rn "\.display" reccmp` so no semantic code reads display.
-- Known pre-existing: importing `reccmp.analysis.crt_startup` first triggers a
-  circular import via `reccmp.compare.__init__`.
+## Validation
+
+- Full local suite: 1,408 passed, 221 skipped, 4 expected failures.
+- Updated C++ indexer built with LLVM 21 in the pinned analysis image; source
+  collector, source index, and source record integration tests: 30 passed.
+- The finished WIZ8/SURRENDER corpus run `refactor-final/run5` had zero
+  function status or reason changes against `refactor-3`. WIZ8 took 122.94 s
+  and SURRENDER 16.26 s. The previous `refactor-3` WIZ8 run took 126.48 s.
+- The corpus's original 150 MB source index uses the old schema. For validation,
+  `source-index.json` was regenerated from frozen sources with the updated
+  collector. The frozen snapshot lacks its original compile database; a
+  rewritten database from the matching Wizardry checkout omitted two frozen
+  translation units. The separate validation artifact
+  `source-index-merged.json` adds those two units' original marker blocks and
+  declarations. This is a corpus-only input artifact, not a compatibility path
+  in reccmp.
+
+## Publication follow-up
+
+The reccmp branch has not been pushed or opened as a PR. The Wizardry agent6
+change `wltkuuul` still pins `reccmp` to `6c3d6f53` with `[witness]`; update
+that pin only after this branch has a stable published revision, preserving
+that checkout's other active changes.

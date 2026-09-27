@@ -3,9 +3,10 @@ from reccmp.types import EntityType, ImageId
 from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.asm.replacement import (
+    ReferenceResolver,
     canonical_callee_name,
-    create_name_lookup,
-    NameReplacementProtocol,
+    create_resolver,
+    entity_proof_identity,
 )
 
 
@@ -19,7 +20,23 @@ def create_lookup(
     addrs: dict[int, int] | None = None,
     is_orig: bool = True,
     jumps: dict[int, int] | None = None,
-) -> NameReplacementProtocol:
+):
+    """The name each address resolves to (None without one)."""
+    resolve = create_resolve(db, addrs, is_orig, jumps)
+
+    def name(addr: int, exact: bool = False, indirect: bool = False) -> str | None:
+        resolved = resolve(addr, exact=exact, indirect=indirect)
+        return resolved.name if resolved is not None else None
+
+    return name
+
+
+def create_resolve(
+    db,
+    addrs: dict[int, int] | None = None,
+    is_orig: bool = True,
+    jumps: dict[int, int] | None = None,
+) -> ReferenceResolver:
     if addrs is None:
         addrs = {}
     if jumps is None:
@@ -32,7 +49,7 @@ def create_lookup(
         return ""
 
     if is_orig:
-        return create_name_lookup(
+        return create_resolver(
             db,
             ImageId.ORIG,
             bin_lookup,
@@ -40,7 +57,7 @@ def create_lookup(
             jump_target=jumps.get,
         )
 
-    return create_name_lookup(
+    return create_resolver(
         db,
         ImageId.RECOMP,
         bin_lookup,
@@ -62,10 +79,9 @@ def test_raw_jump_chain_resolves_function_pointer_identity(db: EntityDb):
             type=EntityType.FUNCTION,
         )
 
-    lookup = create_lookup(db, jumps={100: 200, 200: 300})
-    name = lookup(100)
-    assert name is not None
-    assert "[CALLEE symbol:??1CString@@QAE@XZ]" in name
+    resolved = create_resolve(db, jumps={100: 200, 200: 300})(100)
+    assert resolved is not None and resolved.name is not None
+    assert resolved.identity == ("symbol", "??1CString@@QAE@XZ", 0)
 
 
 def test_name_replacement(db):
@@ -219,10 +235,9 @@ def test_indirect_function(db):
 
     # No entity at 200
     assert lookup(200) is None
-    entity = lookup(200, indirect=True)
-    assert entity is not None
-
-    assert "CALLEE" in entity
+    assert lookup(200, indirect=True) is not None
+    resolved = create_resolve(db, {200: 100})(200, indirect=True)
+    assert resolved is not None and resolved.identity is not None
 
 
 def test_indirect_function_variable(db):
@@ -268,7 +283,11 @@ def test_unpaired_same_named_functions_do_not_define_callee_identity(db: EntityD
         batch.set(ImageId.ORIG, 100, name="Guess", type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 500, name="Guess", type=EntityType.FUNCTION)
 
-    assert create_lookup(db)(100) != create_lookup(db, is_orig=False)(500)
+    orig = create_resolve(db)(100)
+    recomp = create_resolve(db, is_orig=False)(500)
+    assert orig is not None and recomp is not None
+    assert orig.name == recomp.name  # a name is not an identity
+    assert orig.identity != recomp.identity
 
 
 def test_decorated_symbol_defines_duplicate_body_callee_identity(db: EntityDb):
@@ -289,10 +308,10 @@ def test_decorated_symbol_defines_duplicate_body_callee_identity(db: EntityDb):
             type=EntityType.FUNCTION,
         )
 
-    orig = create_lookup(db)(100)
-    recomp = create_lookup(db, is_orig=False)(500)
+    orig = create_resolve(db)(100)
+    recomp = create_resolve(db, is_orig=False)(500)
     assert orig is not None and recomp is not None
-    assert "symbol:" in orig
+    assert orig.identity[0] == "symbol"
     assert orig == recomp
 
 
@@ -331,7 +350,9 @@ def test_matched_pair_uses_canonical_original_identity_over_local_symbols(
 
     assert orig_name is not None
     assert orig_name == recomp_name
-    assert "[CALLEE orig:100]" in orig_name
+    assert entity_proof_identity(db, ImageId.ORIG, orig, 0) == entity_proof_identity(
+        db, ImageId.RECOMP, recomp, 0
+    )
 
 
 def test_import_without_name(db):

@@ -4,11 +4,11 @@
 # pylint: disable=too-many-lines
 
 import difflib
+from dataclasses import replace
 
 from reccmp.compare.asm.verifier import (
     CallFacts,
     FunctionMetadata,
-    verify_effective_match,
 )
 from reccmp.compare.asm.verifier.semantics import (
     receiver_equivalence_class,
@@ -16,7 +16,8 @@ from reccmp.compare.asm.verifier.semantics import (
 from reccmp.compare.asm.verifier.state import (
     Context,
 )
-from reccmp.compare.asm.instgen import InstructionMeta
+from tests.asm_rows import rows
+from tests.asm_rows import verify_effective_match
 
 # --- Register renaming (positive) ------------------------------------------
 
@@ -1032,10 +1033,9 @@ def test_unknown_register_access_meta_cannot_step_divergent_state():
     """Incomplete Capstone regs_access() must not look like an empty access set."""
 
     def meta(mnemonic, reads, writes, address, *, known=True):
-        return InstructionMeta(
+        return replace(rows([f"{mnemonic} ecx"])[0],
             address=address,
             size=2,
-            mnemonic=mnemonic,
             regs_read=reads,
             regs_written=writes,
             reads_flags=False,

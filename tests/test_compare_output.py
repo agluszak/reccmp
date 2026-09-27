@@ -1,6 +1,6 @@
 """Testing the output from the compare core: entity vital information and the diff report."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 import pytest
 from reccmp.compare import Compare
 from reccmp.compare.db import EntityDb
@@ -88,7 +88,7 @@ def test_compare_selected_addresses_from_both_images():
     )
 
 
-def test_exact_comparison_skips_detailed_instruction_metadata():
+def test_exact_comparison_uses_decoded_rows():
     orig_bin = RawImage.from_memory(b"\xc3")
     recomp_bin = RawImage.from_memory(b"\xc3")
     pdb = Mock(spec=CvdumpAnalysis)
@@ -99,24 +99,13 @@ def test_exact_comparison_skips_detailed_instruction_metadata():
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.match(0, 0)
 
-    with (
-        patch.object(
-            compare.function_comparator.orig_sanitize, "collect_instruction_meta"
-        ) as orig_meta,
-        patch.object(
-            compare.function_comparator.recomp_sanitize, "collect_instruction_meta"
-        ) as recomp_meta,
-    ):
-        match = compare.compare_address(0, include_diff=False)
+    match = compare.compare_address(0, include_diff=False)
 
     assert match is not None
     assert match.analysis == ComparisonAnalysis.exact()
-    orig_meta.assert_not_called()
-    recomp_meta.assert_not_called()
 
 
-def test_nonexact_comparison_uses_detail_metadata_from_single_decode():
-    """Non-exact compares use Capstone detail facts without a second meta pass."""
+def test_nonexact_comparison_uses_decoded_rows():
     orig_bin = RawImage.from_memory(b"\x90")
     recomp_bin = RawImage.from_memory(b"\xc3")
     pdb = Mock(spec=CvdumpAnalysis)
@@ -126,29 +115,9 @@ def test_nonexact_comparison_uses_detail_metadata_from_single_decode():
         batch.set(ImageId.RECOMP, 0, type=EntityType.FUNCTION, name="test", size=1)
         batch.match(0, 0)
 
-    orig_collect = compare.function_comparator.orig_sanitize.collect_instruction_meta
-    recomp_collect = (
-        compare.function_comparator.recomp_sanitize.collect_instruction_meta
-    )
-    with (
-        patch.object(
-            compare.function_comparator.orig_sanitize,
-            "collect_instruction_meta",
-            wraps=orig_collect,
-        ) as orig_meta,
-        patch.object(
-            compare.function_comparator.recomp_sanitize,
-            "collect_instruction_meta",
-            wraps=recomp_collect,
-        ) as recomp_meta,
-    ):
-        match = compare.compare_address(0, include_diff=False)
+    match = compare.compare_address(0, include_diff=False)
 
     assert match is not None
-    # Meta is projected from the single InstructGen detail decode during
-    # parse_asm; collect_instruction_meta is no longer required on the hot path.
-    orig_meta.assert_not_called()
-    recomp_meta.assert_not_called()
 
 
 def test_not_matched():
@@ -356,7 +325,7 @@ def test_compare_function_effective_match():
                     "orig": [("0x0", "cmp eax, ecx")],
                     "recomp": [("0x0", "cmp ecx, eax")],
                 },
-                {"both": [("0x2", "je 4", "0x2"), ("0x4", "ret ", "0x4")]},
+                {"both": [("0x2", "je 0x0", "0x2"), ("0x4", "ret ", "0x4")]},
             ],
         )
     ]

@@ -28,6 +28,7 @@ class Reference:
 
     display: str
     identity: Hashable
+    entity_type: str | None = None
 
     def __str__(self) -> str:
         return self.display
@@ -41,6 +42,7 @@ class ResolvedAddress:
 
     name: str | None
     identity: Hashable
+    entity_type: str | None = None
 
 
 def operand_display(value) -> str:
@@ -81,6 +83,7 @@ NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
 ST_RE = re.compile(r"^st(?:\((\d)\))?$")
 
 # ebp/esp ± offset tokens in display lines (shared by IR rewrite and stack_layout).
+
 
 def split_operands(op_str: str) -> list[str]:
     """Split on top-level ', ' only: brackets and parens may contain commas."""
@@ -180,9 +183,8 @@ def format_operand(operand) -> str:
     if kind == "sym":
         return operand_display(operand[1])
     if kind == "opaque":
-        # ("opaque", type, op_str, index) — prefer Capstone text when present.
-        if len(operand) >= 3 and operand[2]:
-            return str(operand[2])
+        # The canonical operand carries machine bytes; the original decoded
+        # instruction retains Capstone text separately for display.
         return "?"
     if kind != "mem":
         raise Reject

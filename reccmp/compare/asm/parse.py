@@ -54,6 +54,10 @@ class ParseAsm:
         """Whether the image says ``value`` is an address (a relocation)."""
         return self.addr_test(value) if self.addr_test is not None else False
 
+    def _image_address(self, value: int) -> bool:
+        """Whether an absolute value is an address in the image."""
+        return self.is_addr(value) or self.resolve(value) is not None
+
     def resolve(
         self, addr: int, exact: bool = False, indirect: bool = False
     ) -> ResolvedAddress | None:
@@ -94,7 +98,11 @@ class ParseAsm:
         identity = (
             resolved.identity if resolved is not None else self._local_identity(addr)
         )
-        return Reference(names[addr], identity)
+        return Reference(
+            names[addr],
+            identity,
+            resolved.entity_type if resolved is not None else None,
+        )
 
     def named_reference(self, addr: int, exact: bool = False) -> Reference | None:
         """The reference of an address with a name; None without one (no
@@ -102,7 +110,7 @@ class ParseAsm:
         resolved = self.resolve(addr, exact=exact)
         if resolved is None or resolved.name is None:
             return None
-        return Reference(resolved.name, resolved.identity)
+        return Reference(resolved.name, resolved.identity, resolved.entity_type)
 
     def control_identity(self, addr: int) -> Hashable:
         """Proof identity of a jump destination without creating a placeholder."""
@@ -111,18 +119,26 @@ class ParseAsm:
 
     def _sanitize_mem_operand(self, operand, *, indirect: bool):
         """An address in a memory operand becomes a reference: an absolute
-        pointer always, a displacement when the image says it is an address."""
+        or displacement the image says is an address (a relocation or a
+        known entity). A segment-relative one (``fs:[0]``) never is."""
         match operand:
-            case ("mem", size, seg, [], int() as disp, ()):
-                return ("mem", size, seg, [], 0, ((1, self.reference(disp, indirect=indirect)),))
-            case ("mem", size, seg, reg_terms, int() as disp, ()) if disp and self.is_addr(
-                abs(disp)
+            case ("mem", size, "", [], int() as disp, ()) if self._image_address(disp):
+                return (
+                    "mem",
+                    size,
+                    "",
+                    [],
+                    0,
+                    ((1, self.reference(disp, indirect=indirect)),),
+                )
+            case ("mem", size, "", reg_terms, int() as disp, ()) if (
+                disp and self.is_addr(abs(disp))
             ):
                 sign = 1 if disp >= 0 else -1
                 return (
                     "mem",
                     size,
-                    seg,
+                    "",
                     list(reg_terms),
                     0,
                     ((sign, self.reference(abs(disp))),),
@@ -131,14 +147,14 @@ class ParseAsm:
 
     def _sanitize_imm_operand(self, mnemonic: str, operand):
         """An immediate the image says is an address becomes a reference;
-        one a `cmp` compares becomes one only when it names an entity."""
+        one a `cmp` compares only when it names an entity."""
         value = operand[1]
+        if not self.is_addr(value):
+            return operand
         if mnemonic == "cmp":
             named = self.named_reference(value)
             return ("sym", named) if named is not None else operand
-        if self.is_addr(value):
-            return ("sym", self.reference(value))
-        return operand
+        return ("sym", self.reference(value))
 
     def _direct_transfer(self, insn: DecodedInstruction):
         """(operand, control target, relative?) of a direct call or jump."""

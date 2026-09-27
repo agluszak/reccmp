@@ -5,9 +5,6 @@ from __future__ import annotations
 import struct
 from unittest.mock import Mock
 
-from reccmp.compare.asm.verifier import (
-    verify_effective_match,
-)
 from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb, ReccmpMatch
@@ -19,7 +16,8 @@ from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.tools.asmcmp import print_match_verbose
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.asm.replacement import create_name_lookup
+from reccmp.compare.asm.replacement import create_resolver
+from tests.asm_rows import verify_effective_match
 
 # cmp ecx,0; je +5; push 0 (imm32); add eax,1; ret
 _TOPOLOGY_ORIG = bytes.fromhex("83F9007405680000000083C001C3")
@@ -146,13 +144,13 @@ def test_unresolved_data_offsets_are_not_exact_or_effective():
     recomp = _mov_abs_ret(0x527000)
     orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(orig, 0x200)
     recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(recomp, 0x400)
-    assert orig_rows[0].display == recomp_rows[0].display
-    assert "<OFFSET" in orig_rows[0].display
+    assert orig_rows[0].display != recomp_rows[0].display
+    assert "0x401000" in orig_rows[0].display
 
     result = _compare_bytes(orig, recomp)
     assert result.analysis.status != ComparisonStatus.EXACT
     assert result.analysis.is_effective is False
-    assert result.display_similarity == 1.0
+    assert result.display_similarity < 1.0
     assert result.match_ratio < 1.0
 
 
@@ -217,12 +215,12 @@ def test_unmatched_data_display_names_are_not_proof_identity():
         )
     orig_rows = ParseAsm(
         image_id=ImageId.ORIG,
-        name_lookup=db_lookup(db, ImageId.ORIG),
+        resolver=db_lookup(db, ImageId.ORIG),
         addr_test=lambda addr: addr in {0x401000},
     ).parse_asm(orig, 0x200)
     recomp_rows = ParseAsm(
         image_id=ImageId.RECOMP,
-        name_lookup=db_lookup(db, ImageId.RECOMP),
+        resolver=db_lookup(db, ImageId.RECOMP),
         addr_test=lambda addr: addr in {0x527000},
     ).parse_asm(recomp, 0x400)
     assert "g_state" in orig_rows[0].display
@@ -262,7 +260,7 @@ def test_unproven_display_match_is_not_printed_ok(capsys):
 
 def db_lookup(db: EntityDb, image_id: ImageId):
 
-    return create_name_lookup(
+    return create_resolver(
         db,
         image_id,
         lambda _addr: None,

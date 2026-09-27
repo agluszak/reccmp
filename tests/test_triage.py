@@ -43,8 +43,8 @@ def test_buckets():
 
 
 def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
-    strict = {"predicate": "lt_u:load:initial:sp+4,65"}
-    loose = {"predicate": "le_u:load:initial:sp+4,64"}
+    strict = {"predicate": "lt_u:load:initial:sp+4,65", "predicate_tag": "lt_u"}
+    loose = {"predicate": "le_u:load:initial:sp+4,64", "predicate_tag": "le_u"}
     entities = [
         _mismatch("0x1", "branch_condition", strict, loose, AGREED),
         _mismatch("0x2", "branch_condition", strict, loose, AGREED),
@@ -52,8 +52,8 @@ def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
         _mismatch(
             "0x4",
             "call_target",
-            {"target_name": "dword ptr [X (IMPORT) [CALLEE orig:5eb7c0]]"},
-            {"target_name": "X (IMPORT_THUNK)"},
+            {"target_name": "arbitrary text", "target_entity_type": "IMPORT", "target_indirect": True},
+            {"target_name": "arbitrary text", "target_entity_type": "IMPORT_THUNK"},
             AGREED,
         ),
         {"address": "0x5", "name": "g", "comparison": {"status": "exact"}},

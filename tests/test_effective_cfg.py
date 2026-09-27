@@ -1,14 +1,14 @@
 """Tests for CFG-aware relational effective-match verification."""
 
 from difflib import SequenceMatcher
+from dataclasses import replace
 
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
-    verify_cfg_effective_match,
-    verify_effective_match,
 )
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.ir import DecodedInstruction
+from tests.asm_rows import rows
+from tests.asm_rows import verify_effective_match, analyze_effective_match, verify_cfg_effective_match
 
 
 def test_cfg_rename_live_across_branch():
@@ -183,11 +183,10 @@ def test_analysis_uses_structured_branch_targets():
     orig_addrs = [0x1000, 0x1002, 0x1004, 0x1005]
     recomp_addrs = [0x2000, 0x2002, 0x2004, 0x2005]
 
-    def jump_meta(address: int, target: int) -> InstructionMeta:
-        return InstructionMeta(
+    def jump_meta(address: int, target: int) -> DecodedInstruction:
+        return replace(rows(["je 0x2"])[0],
             address=address,
             size=2,
-            mnemonic="je",
             regs_read=("eflags",),
             regs_written=(),
             reads_flags=True,

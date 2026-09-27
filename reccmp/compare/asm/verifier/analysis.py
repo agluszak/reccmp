@@ -9,7 +9,6 @@ from typing import Sequence
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     FunctionImage,
-    instruction_match_key,
     instruction_semantic_key,
     local_branch_targets,
 )
@@ -67,14 +66,19 @@ def analyze_effective_match(
     extent_closed = orig.extent_closed and recomp.extent_closed
     orig_rows, recomp_rows = orig.excerpt, recomp.excerpt
     exact = admit_exact_analysis(
-        displays_equal=[instruction_match_key(row) for row in orig_rows]
-        == [instruction_match_key(row) for row in recomp_rows],
+        bytes_equal=(
+            orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
+        ),
         topology_equal=local_branch_targets(orig_rows)
         == local_branch_targets(recomp_rows),
         keys_equal=[instruction_semantic_key(row) for row in orig_rows]
         == [instruction_semantic_key(row) for row in recomp_rows],
-        operands_complete=False,
-        control_flow_complete=False,
+        operands_complete=all(
+            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
+        ),
+        control_flow_complete=(
+            orig.control_flow_complete and recomp.control_flow_complete
+        ),
         coverage_incomplete=coverage_incomplete,
         extent_closed=extent_closed,
     )

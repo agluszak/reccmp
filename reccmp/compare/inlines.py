@@ -397,11 +397,16 @@ def find_fingerprint_spans_tolerant(
     if n == 0 or n > len(haystack):
         return [], "literal"
     norm_needle = register_normalized(needle)
-    norm_starts: list[int] = []
-    for start in range(len(haystack) - n + 1):
-        window = haystack[start : start + n]
-        if register_normalized(window) == norm_needle:
-            norm_starts.append(start)
+    # Normalizing renames registers only: a window can match only where the
+    # instructions themselves (prefix and mnemonic) already do.
+    heads = [(row.prefix, row.mnemonic) for row in haystack]
+    needle_heads = [(row.prefix, row.mnemonic) for row in needle]
+    norm_starts = [
+        start
+        for start in range(len(haystack) - n + 1)
+        if heads[start : start + n] == needle_heads
+        and register_normalized(haystack[start : start + n]) == norm_needle
+    ]
     if norm_starts:
         return norm_starts, "register"
     return [], "literal"

@@ -576,7 +576,7 @@ class Compare:
             match_ratio=ratio,
             analysis=(
                 admit_exact_analysis(
-                    displays_equal=ratio == 1.0,
+                    bytes_equal=False,
                     topology_equal=True,
                     keys_equal=ratio == 1.0,
                     extent_closed=True,

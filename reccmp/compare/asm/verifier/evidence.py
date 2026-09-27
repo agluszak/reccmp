@@ -8,7 +8,7 @@ from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import (
     format_operand,
     Reject,
-    operand_display,
+    Reference,
     operand_identity,
 )
 from reccmp.compare.asm.verifier.semantics import mem_address
@@ -159,8 +159,20 @@ def target_facts(
         "target_name": target_name,
         "target_instruction_index": target_index,
     }
-    if ins.operands and ins.operands[0][0] == "sym":
-        facts.update(identity_facts("target", ins.operands[0][1]))
+    if ins.operands:
+        operand = ins.operands[0]
+        if operand[0] == "sym":
+            facts.update(identity_facts("target", operand[1]))
+            if isinstance(operand[1], Reference):
+                facts["target_entity_type"] = operand[1].entity_type
+        elif operand[0] == "mem":
+            facts["target_indirect"] = True
+            symbols = operand[5]
+            if len(symbols) == 1 and symbols[0][0] == 1:
+                reference = symbols[0][1]
+                facts.update(identity_facts("target", reference))
+                if isinstance(reference, Reference):
+                    facts["target_entity_type"] = reference.entity_type
     return facts
 
 

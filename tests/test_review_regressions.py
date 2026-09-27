@@ -7,14 +7,13 @@ bugs. They fail on the buggy baseline and pass once Stage 0 repairs land.
 from __future__ import annotations
 
 import difflib
+from dataclasses import replace
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.verifier import (
-    verify_effective_match,
-)
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
+from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
+from reccmp.compare.asm.instgen import InstructGen, SectionType
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonStatus
@@ -22,6 +21,8 @@ from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
+from tests.asm_rows import verify_effective_match
+from tests.asm_rows import image_from_bytes, rows
 
 # --- A1: reachable code after jmp-over-int3 must not vanish -----------------
 
@@ -59,7 +60,11 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
     assert orig_asm != recomp_asm
 
     codes = difflib.SequenceMatcher(None, orig_asm, recomp_asm).get_opcodes()
-    analysis = analyze_effective_match(codes, orig_asm, recomp_asm)
+    analysis = analyze_images(
+        codes,
+        image_from_bytes(_A1_ORIG),
+        image_from_bytes(_A1_RECOMP),
+    )
     assert analysis.status != ComparisonStatus.EXACT
     assert analysis.is_effective is False
 
@@ -243,13 +248,13 @@ def test_a5b_sahf_preserves_overflow_flag_difference():
 # --- A6: unsupported path requires compatible meta on both sides ------------
 
 
-def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> InstructionMeta:
-    return InstructionMeta(
+def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstruction:
+    return replace(rows(["bswap ecx"])[0],
         address=4,
         size=2,
-        mnemonic="bswap",
         regs_read=reads,
         regs_written=writes,
+        register_access_known=True,
         reads_flags=False,
         writes_flags=False,
         accesses_memory=False,

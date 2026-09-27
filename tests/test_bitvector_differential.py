@@ -22,7 +22,6 @@ import z3  # type: ignore[import-untyped]
 from unicorn import x86_const  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.ir import instruction_at, resolve_asm_stream
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.semantics import execute
@@ -206,12 +205,12 @@ def _cpu(code: bytes, registers: list[int]) -> list[int]:
 
 
 def _symbolic(code: bytes) -> SideState | None:
-    stream = resolve_asm_stream(list(disasm_detail(code, BASE)))
+    rows = list(disasm_detail(code, BASE))
     state, ctx = SideState(), Context()
     obs: list[Any] = []
     try:
-        for index in range(len(stream)):
-            execute(state, ctx, index, instruction_at(stream, index), obs)
+        for index, row in enumerate(rows):
+            execute(state, ctx, index, row, obs)
     except Reject:
         return None  # an instruction the semantics do not model
     return state

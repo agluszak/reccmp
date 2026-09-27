@@ -88,9 +88,7 @@ def _operand_addresses(operand) -> list[int]:
         case _:
             values = []
     return [
-        value & 0xFFFFFFFF
-        for value in values
-        if (value & 0xFFFFFFFF) >= _MIN_ADDRESS
+        value & 0xFFFFFFFF for value in values if (value & 0xFFFFFFFF) >= _MIN_ADDRESS
     ]
 
 
@@ -348,25 +346,25 @@ def create_crt_matches(
     return matches
 
 
-def _resolve_entity_name(db: EntityDb, image_id: ImageId, addr: int) -> str | None:
-    """Resolve a direct target through thunk/reference edges to its best name."""
+def _is_atexit_target(db: EntityDb, image_id: ImageId, addr: int) -> bool:
+    """Recognize the CRT entry by its input symbol through thunk edges."""
     ref_key = "ref_orig" if image_id == ImageId.ORIG else "ref_recomp"
     seen: set[int] = set()
     for _ in range(8):
         if addr in seen:
-            return None
+            return False
         seen.add(addr)
         entity = db.get(image_id, addr, exact=True)
         if entity is None:
-            return None
-        name = entity.best_name()
-        if name is not None and "atexit" in name.lower():
-            return name
+            return False
+        names = (entity.get("symbol"), entity.get("name"))
+        if any(name in ("atexit", "_atexit") for name in names):
+            return True
         ref = entity.get(ref_key)
         if not isinstance(ref, int):
-            return name
+            return False
         addr = ref
-    return None
+    return False
 
 
 def find_initializer_atexit_helpers(
@@ -391,8 +389,7 @@ def find_initializer_atexit_helpers(
         for previous, current in zip(instructions, instructions[1:]):
             if not current.is_call or current.branch_target is None:
                 continue
-            target_name = _resolve_entity_name(db, image_id, current.branch_target)
-            if target_name is None or "atexit" not in target_name.lower():
+            if not _is_atexit_target(db, image_id, current.branch_target):
                 continue
             match previous.mnemonic, previous.operands:
                 case "push", (("imm", int() as helper_addr),):

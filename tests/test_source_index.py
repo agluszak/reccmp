@@ -102,6 +102,8 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
                 {
                     "name": "value",
                     "type": "int",
+                    "pointer_depth": 0,
+                    "storage_kind": "scalar",
                     "source_file": "sample.cpp",
                     "line": 6,
                 }
@@ -408,7 +410,8 @@ def test_conflicts_are_derived_inside_one_link_namespace(tmp_path: Path) -> None
             "record": "variable",
             "semantic_id": f"_{name}",
             "qualified_name": name,
-            "type": type_name,
+                "type": type_name,
+                "storage_kind": "scalar",
             "linkage": "external",
             "storage_class": "none",
             "definition_kind": "definition",

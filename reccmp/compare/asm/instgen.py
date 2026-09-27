@@ -3,9 +3,7 @@ switch statements and local jump/call destinations."""
 
 import bisect
 import struct
-from dataclasses import dataclass
 from enum import Enum, auto
-from collections.abc import Hashable
 from typing import Literal, NamedTuple
 from .const import JUMP_MNEMONICS
 from .decode import disasm_detail
@@ -298,73 +296,3 @@ class InstructGen:
                 ):
                     self.coverage_incomplete = True
                     break
-
-
-@dataclass(frozen=True)
-class InstructionMeta:
-    """Structured facts about one instruction, captured from capstone's
-    detail mode at disassembly time: register accesses including implicit
-    ones, flags effects, memory access, control-flow class and the branch
-    target. Consumed privately by the effective-match verifier.
-
-    Prefer reading these fields from ``DecodedInstruction`` directly; this
-    dataclass remains as a projection for callers that still pass parallel
-    meta lists into the verifier.
-    """
-
-    # pylint: disable=too-many-instance-attributes
-
-    address: int
-    size: int
-    mnemonic: str
-    regs_read: tuple[str, ...]
-    regs_written: tuple[str, ...]
-    reads_flags: bool
-    writes_flags: bool
-    accesses_memory: bool
-    is_jump: bool
-    is_call: bool
-    is_ret: bool
-    branch_target: int | None
-    register_access_known: bool = True
-    operand_model_complete: bool = True
-    control_flow_known: bool = True
-    control_target: Hashable | None = None
-
-
-def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
-    assert insn.address is not None
-    return InstructionMeta(
-        address=insn.address,
-        size=insn.size,
-        mnemonic=insn.mnemonic,
-        regs_read=insn.regs_read,
-        regs_written=insn.regs_written,
-        reads_flags=insn.reads_flags,
-        writes_flags=insn.writes_flags,
-        accesses_memory=insn.accesses_memory,
-        is_jump=insn.is_jump,
-        is_call=insn.is_call,
-        is_ret=insn.is_ret,
-        branch_target=insn.branch_target,
-        register_access_known=insn.register_access_known,
-        operand_model_complete=insn.operand_model_complete,
-        control_flow_known=insn.control_flow_known,
-        control_target=insn.control_target,
-    )
-
-
-def collect_instruction_meta(
-    blob: bytes, start: int, sections: list[FuncSection], is_32bit: bool = True
-) -> dict[int, InstructionMeta]:
-    """Project CODE-section IR into the legacy meta map via ``InstructGen``.
-
-    Honours embedded jump/data tables the same way as ``parse_asm``.
-    """
-    del sections  # InstructGen rediscovers section bounds from the blob.
-    ig = InstructGen(blob, start, is_32bit)
-    return {
-        addr: meta_from_decoded(insn)
-        for addr, insn in ig.decoded_by_addr.items()
-        if insn.address is not None
-    }

@@ -3,10 +3,10 @@
 side's private frame held apart, and must not where the frame could be
 reached, or a callee could see a difference."""
 
-from reccmp.compare.asm.verifier import verify_isomorphic_cfg_effective_match
 from reccmp.compare.asm.verifier.state import FunctionMetadata
 from reccmp.compare.callee_cleanup import CallStackEffect
 from reccmp.compare.diagnosis import AnalysisRecorder
+from tests.asm_rows import verify_isomorphic_cfg_effective_match
 
 
 def _verify(orig, recomp, *, effects=None, recorder=None) -> bool:

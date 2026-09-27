@@ -23,6 +23,8 @@ class SourceVariable:
     source_file: str
     line: int
     end_line: int
+    # Physical storage reported by Clang, independently of the type spelling.
+    storage_kind: str
     # ``record:Qualified::Name`` when the variable type is (or points to) a record.
     record_semantic_id: str | None = None
 
