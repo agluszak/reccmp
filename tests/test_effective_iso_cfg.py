@@ -591,6 +591,28 @@ def test_external_edge_with_divergent_state_is_located():
     assert location.facts["edge_kind"] == "jmp"
 
 
+def test_external_conditional_edge_checks_physical_state():
+    """A taken external edge can observe state overwritten on fallthrough."""
+    orig = [
+        "mov eax, 1",
+        "cmp ecx, 0",
+        "je target (FUNCTION)",
+        "xor eax, eax",
+        "ret",
+    ]
+    recomp = [
+        "mov eax, 2",
+        "cmp ecx, 0",
+        "je target (FUNCTION)",
+        "xor eax, eax",
+        "ret",
+    ]
+    targets = [None] * len(orig)
+    assert not verify_isomorphic_cfg_effective_match(
+        orig, recomp, targets, targets, FunctionMetadata(return_kind="void")
+    )
+
+
 def test_function_fallthrough_is_located():
     recorder = AnalysisRecorder(orig_addrs=[0x1000], recomp_addrs=[0x2000])
     assert not verify_isomorphic_cfg_effective_match(

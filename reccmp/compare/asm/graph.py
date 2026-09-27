@@ -142,6 +142,9 @@ def build_function_graph(
                 )
             else:
                 table = _switch_table(row, jump_tables)
+                direct_external = bool(
+                    row.operands and row.operands[0][0] in ("imm", "sym")
+                )
                 branches = (
                     tuple(
                         (
@@ -154,12 +157,8 @@ def build_function_graph(
                     if table is not None and table.entries
                     else (
                         GraphEdge(
-                            "jmp",
-                            (
-                                "external"
-                                if row.operands and row.operands[0][0] == "imm"
-                                else "unknown"
-                            ),
+                            "jmp" if row.mnemonic == "jmp" else "taken",
+                            "external" if direct_external else "unknown",
                         ),
                     )
                 )

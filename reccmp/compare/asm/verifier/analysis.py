@@ -98,10 +98,11 @@ def analyze_effective_match(
         (region.address - recomp.start_addr, region.data)
         for region in recomp.data_regions
     )
-    if orig_data != recomp_data:
-        return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
+    embedded_data_differs = orig_data != recomp_data
 
     def finish_effective(reasons) -> ComparisonAnalysis:
+        if embedded_data_differs:
+            return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
         reason_set = set(reasons)
         if not reason_set:
             reason_set.add("instruction_reorder")
