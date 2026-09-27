@@ -26,7 +26,7 @@ sides *and* the two symbolic states are fully synchronized; otherwise the
 whole function is rejected (not an effective match).
 
 Layers, each importing only from the ones above it: addresses, state,
-evidence, semantics, obligations; relocation, cfg_build, block_align and
+evidence, semantics, obligations; relocation, blocks, block_align and
 dataflow support the strategies lockstep and iso_cfg; analysis runs
 the strategies in turn and picks what to report.
 """

@@ -1,6 +1,5 @@
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.render import render_function_rows
-from reccmp.compare.asm.verifier.cfg_build import build_side_cfg
 
 
 def test_ret():
@@ -67,8 +66,7 @@ def test_decoded_image_keeps_tables_out_of_instructions():
     region = image.data_regions[0]
     assert region.address == 0x100014EC
     assert region.data == SCORE_NOTIFY[region.address - start :]
-    cfg = build_side_cfg(image)
-    assert cfg is not None and cfg.table_dests
+    assert image.control_graph().table_dests
     rendered = render_function_rows(image)
     assert sum(row.display == "Jump table:" for row in rendered) == 1
     assert sum(row.display == "Data table:" for row in rendered) == 1
