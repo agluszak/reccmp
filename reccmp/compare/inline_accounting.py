@@ -3,8 +3,7 @@ expansions at call sites."""
 
 from collections.abc import Hashable
 
-from reccmp.compare.asm.ir import ExtentKind
-from reccmp.compare.asm.parse import AsmExcerpt
+from reccmp.compare.asm.ir import DecodedInstruction, ExtentKind
 from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.body_equivalence import BodyEquivalenceMixin
 from reccmp.compare.db import ReccmpMatch
@@ -33,8 +32,8 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
     def _analyze_inline_expansions(
         self,
         match: ReccmpMatch,
-        orig_asm: AsmExcerpt,
-        recomp_asm: AsmExcerpt,
+        orig_asm: list[DecodedInstruction],
+        recomp_asm: list[DecodedInstruction],
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}

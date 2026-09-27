@@ -14,7 +14,7 @@ from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.instgen import InstructGen, SectionType
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonStatus
 from reccmp.compare.event import ReccmpReportProtocol
@@ -53,8 +53,10 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
     assert any(m == "mov" for m, _ in recomp_rows)
     assert orig_rows != recomp_rows
 
-    orig_asm = [row.display for row in ParseAsm().parse_asm(_A1_ORIG, 0x1000)]
-    recomp_asm = [row.display for row in ParseAsm().parse_asm(_A1_RECOMP, 0x1000)]
+    orig_asm = [row.display for row in decode_function(_A1_ORIG, 0x1000).instructions]
+    recomp_asm = [
+        row.display for row in decode_function(_A1_RECOMP, 0x1000).instructions
+    ]
     assert any("mov" in line and "1" in line for line in orig_asm)
     assert any("mov" in line and "2" in line for line in recomp_asm)
     assert orig_asm != recomp_asm
@@ -81,7 +83,7 @@ def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
         if not detail_movs:
             # Accept InstructGen-only coverage until the shared detail walker
-            # also drains pending targets; still require unequal ParseAsm lists.
+            # also drains pending targets; still require unequal decoded rows.
             continue
         assert any(("imm", imm) in insn.operands for insn in detail_movs)
 

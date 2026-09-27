@@ -2,7 +2,7 @@
 
 The one disassembly pass: typed operands, register and flag effects and
 branch targets come from Capstone's detail here; address sanitization
-happens later in ``ParseAsm``.
+happens when the function image is built.
 """
 
 from __future__ import annotations

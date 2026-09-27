@@ -28,7 +28,7 @@ START = 0x1000
 
 
 def _marker(line: str, address: int) -> DecodedInstruction | None:
-    """A jump/data table line, as ParseAsm renders them."""
+    """A rendered table line used only by assembly text fixtures."""
     role: AsmRole | None = None
     payload: tuple = ()
     if line == "Jump table:":
@@ -129,35 +129,9 @@ def fingerprint(lines: Sequence[str]):
 
 def image_from_bytes(code: bytes, start: int = START) -> FunctionImage:
     """Decode a real byte fixture once, including its local target topology."""
-    from reccmp.compare.asm.parse import ParseAsm
-    from reccmp.compare.asm.ir import compute_extent_closed, rebind_local_identities
+    from reccmp.compare.asm.parse import decode_function
 
-    parser = ParseAsm()
-    excerpt = tuple(
-        replace(row, instruction_id=index)
-        for index, row in enumerate(parser.parse_asm(code, start))
-    )
-    tables = tuple(parser.jump_tables)
-    excerpt = rebind_local_identities(
-        excerpt, start_addr=start, extent=len(code), jump_tables=tables
-    )
-    return FunctionImage(
-        start,
-        len(code),
-        ExtentKind.KNOWN,
-        excerpt,
-        tables,
-        parser.coverage_incomplete,
-        compute_extent_closed(
-            excerpt,
-            start_addr=start,
-            extent=len(code),
-            coverage_incomplete=parser.coverage_incomplete,
-            jump_tables=tables,
-            extent_kind=ExtentKind.KNOWN,
-        ),
-        code,
-    )
+    return decode_function(code, start)
 
 
 def as_rows(

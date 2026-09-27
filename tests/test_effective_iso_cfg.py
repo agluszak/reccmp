@@ -18,13 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from reccmp.compare.asm.parse import ParseAsm
-from reccmp.compare.asm.ir import (
-    DataRegion,
-    ExtentKind,
-    FunctionImage,
-    rebind_local_identities,
-)
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.ir import DataRegion
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
@@ -98,50 +93,17 @@ def fixture_wobble_analysis():
     orig_raw = (SAMPLES / "msvc5_regalloc_wobble_orig.bin").read_bytes()
     recomp_raw = (SAMPLES / "msvc5_regalloc_wobble_recomp.bin").read_bytes()
 
-    orig_parser = ParseAsm()
-    recomp_parser = ParseAsm()
-    orig = orig_parser.parse_asm(orig_raw, base)
-    recomp = recomp_parser.parse_asm(recomp_raw, base)
+    orig_image = decode_function(orig_raw, base)
+    recomp_image = decode_function(recomp_raw, base)
+    orig, recomp = orig_image.instructions, recomp_image.instructions
 
     orig_asm = [x.display for x in orig]
     recomp_asm = [x.display for x in recomp]
     codes = SequenceMatcherWithPins(orig_asm, recomp_asm, []).get_opcodes()
     return analyze_images(
         codes,
-        FunctionImage(
-            base,
-            len(orig_raw),
-            ExtentKind.KNOWN,
-            _sample_relocations(
-                rebind_local_identities(
-                    orig,
-                    start_addr=base,
-                    extent=len(orig_raw),
-                    jump_tables=orig_parser.jump_tables,
-                ),
-                orig_raw,
-                base,
-            ),
-            tuple(orig_parser.jump_tables),
-            raw=orig_raw,
-        ),
-        FunctionImage(
-            base,
-            len(recomp_raw),
-            ExtentKind.KNOWN,
-            _sample_relocations(
-                rebind_local_identities(
-                    recomp,
-                    start_addr=base,
-                    extent=len(recomp_raw),
-                    jump_tables=recomp_parser.jump_tables,
-                ),
-                recomp_raw,
-                base,
-            ),
-            tuple(recomp_parser.jump_tables),
-            raw=recomp_raw,
-        ),
+        orig_image.with_instructions(_sample_relocations(orig, orig_raw, base)),
+        recomp_image.with_instructions(_sample_relocations(recomp, recomp_raw, base)),
     )
 
 

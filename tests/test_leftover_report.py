@@ -26,7 +26,7 @@ from reccmp.compare.asm.ir import (
     rebind_local_identities,
 )
 from reccmp.compare.asm.model import Reference
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.replacement import create_resolver
 from reccmp.compare.db import EntityDb, FrozenEntityDbError, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult
@@ -66,7 +66,7 @@ from tests.raw_image import RawImage
 
 def test_instruction_ids_survive_slice_and_reorder():
     blob = bytes.fromhex("B80100000083C001C3")  # mov eax,1; add eax,1; ret
-    rows = ParseAsm().parse_asm(blob, 0x1000)
+    rows = decode_function(blob, 0x1000).instructions
     stamped = tuple(replace(row, instruction_id=100 + i) for i, row in enumerate(rows))
     image = FunctionImage(0x1000, len(blob), ExtentKind.KNOWN, stamped)
     assert image.instruction_ids == (100, 101, 102)
@@ -79,7 +79,7 @@ def test_instruction_ids_survive_slice_and_reorder():
 
 def test_estimated_extent_without_terminal_is_open():
     blob = bytes.fromhex("B801000000B802000000")  # mov eax,1; mov eax,2
-    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    excerpt = decode_function(blob, 0x1000).instructions
     assert (
         compute_extent_closed(
             excerpt,
@@ -93,7 +93,7 @@ def test_estimated_extent_without_terminal_is_open():
 
 def test_known_extent_with_plain_fallthrough_is_open():
     blob = bytes.fromhex("B801000000B901000000")  # mov eax,1; mov ecx,1
-    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    excerpt = decode_function(blob, 0x1000).instructions
     assert (
         compute_extent_closed(
             excerpt,
@@ -107,11 +107,7 @@ def test_known_extent_with_plain_fallthrough_is_open():
 
 def test_known_extent_ending_in_ret_is_closed():
     blob = bytes.fromhex("B801000000C3")  # mov eax,1; ret
-    sanitizer = ParseAsm()
-    excerpt = tuple(
-        replace(row, instruction_id=i)
-        for i, row in enumerate(sanitizer.parse_asm(blob, 0x1000))
-    )
+    excerpt = decode_function(blob, 0x1000).instructions
     image = FunctionImage(
         start_addr=0x1000,
         extent=len(blob),
@@ -129,7 +125,7 @@ def test_known_extent_ending_in_ret_is_closed():
 
 
 def _ret_at(addr: int, iid: int) -> DecodedInstruction:
-    row = ParseAsm().parse_asm(b"\xc3", addr)[0]
+    row = decode_function(b"\xc3", addr).instructions[0]
     return replace(row, instruction_id=iid)
 
 

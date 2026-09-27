@@ -155,7 +155,7 @@ class FunctionImage:
 
     Owns the extent evidence, decoded instructions, jump tables, and coverage
     flag for a single side (original or recompiled). Callers should not
-    read long-lived state off a shared ``ParseAsm`` after construction.
+    read state from the decoder after construction.
     """
 
     start_addr: int
@@ -279,25 +279,6 @@ class DecodedInstruction:
     @property
     def is_code(self) -> bool:
         return self.role == AsmRole.CODE
-
-
-def marker(
-    display: str,
-    *,
-    address: int | None = None,
-    role: AsmRole,
-    payload: tuple = (),
-) -> DecodedInstruction:
-    """Build a non-code excerpt row (jump/data table header or entry)."""
-    return DecodedInstruction(
-        address=address,
-        size=0,
-        mnemonic="",
-        prefix="",
-        operands=payload,
-        display=display,
-        role=role,
-    )
 
 
 # Identities private to one image: across images such references match by

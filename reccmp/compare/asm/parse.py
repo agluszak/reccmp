@@ -17,22 +17,17 @@ from reccmp.types import ImageId
 from .instgen import InstructGen, SectionType
 from .graph import build_function_graph
 from .ir import (
-    AsmRole,
     DataRegion,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
-    JumpTable,
-    marker,
     rebind_local_identities,
 )
 from .model import Reference, ResolvedAddress, format_instruction
 from .replacement import AddrTestProtocol, ReferenceResolver
 
-AsmExcerpt = list[DecodedInstruction]
 
-
-class ParseAsm:
+class AddressSanitizer:
     # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
@@ -52,14 +47,8 @@ class ParseAsm:
         self.replacements: dict[int, str] = {}
         self.indirect_replacements: dict[int, str] = {}
         self.number_placeholders = True
-        self.jump_tables: tuple[JumpTable, ...] = ()
-        self.coverage_incomplete: bool = False
         self._body_start: int | None = body_bounds[0] if body_bounds else None
         self._body_end: int | None = body_bounds[1] if body_bounds else None
-
-    def reset(self):
-        self.replacements = {}
-        self.indirect_replacements = {}
 
     def is_addr(self, value: int) -> bool:
         """Whether the image says ``value`` is an address (a relocation)."""
@@ -226,45 +215,6 @@ class ParseAsm:
             insn, operands=ops_tuple, display=display, control_target=control_target
         )
 
-    def parse_asm(self, data: Buffer, start_addr: int) -> AsmExcerpt:
-        self.reset()
-        asm: AsmExcerpt = []
-        blob = bytes(data)
-        self._body_start = start_addr
-        self._body_end = start_addr + len(blob)
-
-        ig = InstructGen(blob, start_addr, self.is_32bit)
-        self.jump_tables = tuple(ig.jump_tables)
-        self.coverage_incomplete = ig.coverage_incomplete
-
-        for section in ig.sections:
-            if section.type == SectionType.CODE:
-                asm.extend(self.sanitize_row(insn) for insn in section.contents)
-            elif section.type == SectionType.ADDR_TAB:
-                asm.append(marker("Jump table:", role=AsmRole.JUMP_TABLE_HEADER))
-                for ofs, target in section.contents:
-                    asm.append(
-                        marker(
-                            f"start + 0x{target - start_addr:x}",
-                            address=ofs,
-                            role=AsmRole.JUMP_TABLE_ENTRY,
-                            payload=(("case", target - start_addr),),
-                        )
-                    )
-            elif section.type == SectionType.DATA_TAB:
-                asm.append(marker("Data table:", role=AsmRole.DATA_TABLE_HEADER))
-                for ofs, b in section.contents:
-                    asm.append(
-                        marker(
-                            hex(b),
-                            address=ofs,
-                            role=AsmRole.DATA_TABLE_ENTRY,
-                            payload=(("byte", b),),
-                        )
-                    )
-
-        return asm
-
 
 def decode_function(
     data: Buffer,
@@ -283,7 +233,7 @@ def decode_function(
     image is the only value subsequent analysis needs.
     """
     blob = bytes(data)
-    sanitizer = ParseAsm(
+    sanitizer = AddressSanitizer(
         addr_test, resolver, is_32bit, image_id, (start_addr, start_addr + len(blob))
     )
     sections = InstructGen(blob, start_addr, is_32bit)
@@ -351,7 +301,7 @@ def _with_operand(row: DecodedInstruction, operand) -> DecodedInstruction:
     )
 
 
-def assert_fixup(asm: AsmExcerpt):
+def assert_fixup(asm: list[DecodedInstruction]):
     """Detect assert calls and replace the code filename and line number
     arguments with the macros (from assert.h)."""
     for i, row in enumerate(asm):

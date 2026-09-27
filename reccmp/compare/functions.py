@@ -17,11 +17,11 @@ from reccmp.compare.asm.render import render_function_rows
 from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
+    DecodedInstruction,
     control_flow_topology_keys,
     instruction_match_key,
     instruction_semantic_key,
 )
-from reccmp.compare.asm.parse import AsmExcerpt
 from reccmp.compare.asm.replacement import (
     create_resolver,
 )
@@ -570,7 +570,9 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         )
         return result
 
-    def _collect_line_annotations(self, recomp: AsmExcerpt) -> list[ReccmpMatch]:
+    def _collect_line_annotations(
+        self, recomp: list[DecodedInstruction]
+    ) -> list[ReccmpMatch]:
         """
         Finds all `// LINE:` annotations within the given function
         and drops any whose order is not consistent between original and recomp.
@@ -604,10 +606,10 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
 
     def _split_code_on_line_annotations(
         self,
-        orig_combined: AsmExcerpt,
-        recomp_combined: AsmExcerpt,
+        orig_combined: list[DecodedInstruction],
+        recomp_combined: list[DecodedInstruction],
         line_annotations: list[ReccmpMatch],
-    ) -> Iterator[tuple[AsmExcerpt, AsmExcerpt]]:
+    ) -> Iterator[tuple[list[DecodedInstruction], list[DecodedInstruction]]]:
         """
         For each given `// LINE:` annotation, splits the code into the part before,
         the annotated line, and the part after it.
@@ -625,7 +627,10 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             )
 
     def _compute_split_points(
-        self, orig: AsmExcerpt, recomp: AsmExcerpt, line_annotations: list[ReccmpMatch]
+        self,
+        orig: list[DecodedInstruction],
+        recomp: list[DecodedInstruction],
+        line_annotations: list[ReccmpMatch],
     ) -> list[tuple[int, int]]:
         """
         Computes the index pairs into `orig` and `recomp`
