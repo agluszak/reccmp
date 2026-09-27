@@ -1,0 +1,402 @@
+[
+ {
+  "orig": 4427360,
+  "recomp": 4984304,
+  "name": "QuickSort",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4557520,
+  "recomp": 5004928,
+  "name": "W8PathingService::WritePathNodes",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4765152,
+  "recomp": 5942144,
+  "name": "MonGen::Load",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4974912,
+  "recomp": 5495952,
+  "name": "ProjectPointThroughCamera",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4992512,
+  "recomp": 5502624,
+  "name": "ChooseDifferentMonsterDirection",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4993760,
+  "recomp": 5532624,
+  "name": "W8Monster::AdvanceAnimationFrame",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5010640,
+  "recomp": 5532832,
+  "name": "W8Monster::HandleAnimationFrame",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5041648,
+  "recomp": 5551264,
+  "name": "InsertionSort",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5067328,
+  "recomp": 5577072,
+  "name": "ReadParticleSystemFile",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5134736,
+  "recomp": 4844176,
+  "name": "GetMonsterCombatMoveRange",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5140624,
+  "recomp": 4362992,
+  "name": "StartCombat",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5142256,
+  "recomp": 4368992,
+  "name": "EndMonsterTurn",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5172608,
+  "recomp": 4357440,
+  "name": "CalcCharacterLevelBand",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5222864,
+  "recomp": 4271168,
+  "name": "IsSpellBlockedForMonster",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5239824,
+  "recomp": 4276304,
+  "name": "GetSpellFailureChance",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5304464,
+  "recomp": 4353584,
+  "name": "ApplyModifierBlock",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5310160,
+  "recomp": 4857760,
+  "name": "RefreshMonsterGroupAndAllies",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 5357408,
+  "recomp": 4209648,
+  "name": "CreateItemIntoHandOrPool",
+  "category": "effective",
+  "reccmp_status": "effective",
+  "note": ""
+ },
+ {
+  "orig": 4213744,
+  "recomp": 6057376,
+  "name": "FileExists",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 4253840,
+  "recomp": 6148720,
+  "name": "DrawGenericButton",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 4405872,
+  "recomp": 4951840,
+  "name": "W8Octree::GetPathSurfaceNormal",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 4606640,
+  "recomp": 5032864,
+  "name": "W8PathingService::PlanMovementToPosition",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": "sibling control for PlanMovement"
+ },
+ {
+  "orig": 4646432,
+  "recomp": 5611408,
+  "name": "WorldGetPropAt",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 4751824,
+  "recomp": 5137776,
+  "name": "ReleaseReadMeshScratch",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 5159296,
+  "recomp": 4381152,
+  "name": "MonsterFleeAction",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 5246608,
+  "recomp": 4272576,
+  "name": "TickSpellEffects",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 5347824,
+  "recomp": 4346032,
+  "name": "GetCharActionRange",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 6092064,
+  "recomp": 5449632,
+  "name": "DrawDialog",
+  "category": "exact",
+  "reccmp_status": "exact",
+  "note": ""
+ },
+ {
+  "orig": 4600928,
+  "recomp": 5025264,
+  "name": "W8PathingService::PlanMovement",
+  "category": "known-bad",
+  "reccmp_status": "inconclusive",
+  "note": "pathing loop bound/parent mixup (498cf7dfa)"
+ },
+ {
+  "orig": 4973856,
+  "recomp": 5494864,
+  "name": "ElevationToTargetCPP",
+  "category": "known-bad",
+  "reccmp_status": "mismatch",
+  "note": "immediate 16 vs 24 offset suspect"
+ },
+ {
+  "orig": 4992240,
+  "recomp": 5525648,
+  "name": "W8Monster::IsCycleInterruptable",
+  "category": "known-bad",
+  "reccmp_status": "mismatch",
+  "note": "recomp resolves string ref to empty literal"
+ },
+ {
+  "orig": 4998752,
+  "recomp": 5532192,
+  "name": "W8Monster::Query",
+  "category": "known-bad",
+  "reccmp_status": "inconclusive",
+  "note": "missing result=0 init (fixed in 498cf7dfa)"
+ },
+ {
+  "orig": 5005664,
+  "recomp": 5536416,
+  "name": "MonsterSetStateA0",
+  "category": "known-bad",
+  "reccmp_status": "mismatch",
+  "note": "orig loads arg; recomp booleanizes (setcc)"
+ },
+ {
+  "orig": 5084512,
+  "recomp": 5617600,
+  "name": "WorldCursorNodeApplyItemEffect004D9560",
+  "category": "known-bad",
+  "reccmp_status": "mismatch",
+  "note": "orig loads global; recomp uses literal 27"
+ },
+ {
+  "orig": 5132992,
+  "recomp": 4852080,
+  "name": "FormatMonsterHealth",
+  "category": "known-bad",
+  "reccmp_status": "mismatch",
+  "note": "L\"\" vs L\"?\" HP display (498cf7dfa)"
+ },
+ {
+  "orig": 5158304,
+  "recomp": 4384032,
+  "name": "StepMonsterCombatAction",
+  "category": "known-bad",
+  "reccmp_status": "inconclusive",
+  "note": "ternary <= vs > inversion (498cf7dfa)"
+ },
+ {
+  "orig": 5465456,
+  "recomp": 5591168,
+  "name": "RepickActionTarget",
+  "category": "known-bad",
+  "reccmp_status": "inconclusive",
+  "note": "arg vs resolved targeting context (498cf7dfa)"
+ },
+ {
+  "orig": 5488512,
+  "recomp": 5595952,
+  "name": "RefreshAllPartyTargets",
+  "category": "known-bad",
+  "reccmp_status": "inconclusive",
+  "note": "inverted weapon-swap condition (498cf7dfa)"
+ },
+ {
+  "orig": 4310896,
+  "recomp": 4921120,
+  "name": "W8GameData::ProcessCrossedSurface",
+  "category": "ugly",
+  "reccmp_status": "mismatch",
+  "note": "x87 compare"
+ },
+ {
+  "orig": 4332096,
+  "recomp": 4307136,
+  "name": "srMatrix3T<float>::MultiplyBy",
+  "category": "ugly",
+  "reccmp_status": "mismatch",
+  "note": "x87"
+ },
+ {
+  "orig": 4347968,
+  "recomp": 5984176,
+  "name": "RotateNodeInDegrees",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "x87"
+ },
+ {
+  "orig": 4416208,
+  "recomp": 4980000,
+  "name": "W8Octree::BuildCellWalk(class srVector3T<float> const *, class srVector3T<float> const *, struct W8OctreeWalk *)",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "float-heavy traversal, big CFG"
+ },
+ {
+  "orig": 4446528,
+  "recomp": 5239424,
+  "name": "Trigger::Run",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "switch"
+ },
+ {
+  "orig": 4989184,
+  "recomp": 5509344,
+  "name": "W8Monster::Update",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "large switch"
+ },
+ {
+  "orig": 5013728,
+  "recomp": 5514560,
+  "name": "W8Monster::ProcessScript",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "large switch"
+ },
+ {
+  "orig": 5154240,
+  "recomp": 4377280,
+  "name": "ExecuteCharacterAction",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "large switch"
+ },
+ {
+  "orig": 5156384,
+  "recomp": 4379216,
+  "name": "ExecuteMonsterAction",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "large switch"
+ },
+ {
+  "orig": 5223616,
+  "recomp": 4289936,
+  "name": "CastSpellFromSource",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "switch"
+ },
+ {
+  "orig": 5275888,
+  "recomp": 5683344,
+  "name": "EvaluateFact",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "switch"
+ },
+ {
+  "orig": 5364944,
+  "recomp": 4221904,
+  "name": "GetItemUseDifficulty",
+  "category": "ugly",
+  "reccmp_status": "inconclusive",
+  "note": "switch"
+ }
+]

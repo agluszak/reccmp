@@ -1,0 +1,17 @@
+.venv/
+out/
+out-sxs/
+ghidra_projects/
+ghidriffs/
+ghidriff.log
+*.log
+__pycache__/
+wiz8-report*.json
+bin/
+bin-dup/
+out2/
+out2-sxs/
+out3/
+out3-sxs/
+out4/
+out4-sxs/
