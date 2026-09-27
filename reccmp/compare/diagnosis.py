@@ -125,6 +125,7 @@ INCONCLUSIVE_REASONS = frozenset(
         "control_flow_metadata_mismatch",
         "invalid_control_flow_target",
         "jump_table_data",
+        "embedded_data_mismatch",
         "non_isomorphic_cfg",
         "indirect_jump",
         "external_control_flow_state",

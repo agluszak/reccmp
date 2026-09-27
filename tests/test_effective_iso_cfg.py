@@ -19,7 +19,12 @@ from pathlib import Path
 import pytest
 
 from reccmp.compare.asm.parse import ParseAsm
-from reccmp.compare.asm.ir import ExtentKind, FunctionImage, rebind_local_identities
+from reccmp.compare.asm.ir import (
+    DataRegion,
+    ExtentKind,
+    FunctionImage,
+    rebind_local_identities,
+)
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
@@ -33,12 +38,22 @@ from reccmp.compare.asm.verifier.state import SideState
 from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from tests.asm_rows import (
+    image_from_bytes,
     verify_effective_match,
     verify_cfg_effective_match,
     verify_isomorphic_cfg_effective_match,
 )
 
 SAMPLES = Path(__file__).parent / "samples"
+
+
+def test_embedded_data_change_cannot_pass_code_only_proof():
+    original = image_from_bytes(b"\xc3")
+    original = replace(original, data_regions=(DataRegion(0x1001, b"\x01"),))
+    recompiled = replace(original, data_regions=(DataRegion(0x1001, b"\x02"),))
+    analysis = analyze_images([], original, recompiled)
+    assert analysis.status == ComparisonStatus.INCONCLUSIVE
+    assert analysis.inconclusive_reason == "embedded_data_mismatch"
 
 
 def _sample_relocations(rows, raw, base):
@@ -543,9 +558,9 @@ def test_a_shared_tail_must_match_each_copy():
     )
 
 
-def test_jump_table_data_reports_side_location_and_count():
-    orig = ["jmp dword ptr [eax * 4]", "Jump table:", "0x1000"]
-    recomp = ["jmp dword ptr [ecx * 4]", "Jump table:", "0x2000"]
+def test_unresolved_switch_reports_dispatch_location():
+    orig = ["jmp dword ptr [eax*4]", "Jump table:", "0x1000"]
+    recomp = ["jmp dword ptr [ecx*4]", "Jump table:", "0x2000"]
     recorder = AnalysisRecorder(
         orig_addrs=[0x1000, 0x1002, 0x1006],
         recomp_addrs=[0x2000, 0x2002, 0x2006],
@@ -560,11 +575,10 @@ def test_jump_table_data_reports_side_location_and_count():
     analysis = recorder.failure_analysis()
     assert analysis.inconclusive_reason == "jump_table_data"
     location = require_inconclusive_location(analysis)
-    assert location.address == 0x1002
+    assert location.address == 0x1000
     assert location.facts == {
         "side": "orig",
-        "data_line_count": 2,
-        "data_line": "Jump table:",
+        "failure": "unresolved_switch_table",
     }
 
 

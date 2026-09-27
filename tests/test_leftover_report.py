@@ -14,11 +14,10 @@ import pytest
 from reccmp.source import keyed
 
 from reccmp.compare import Compare
-from reccmp.compare.asm.verifier.cfg_build import (
-    extract_switch_tables,
-)
+from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
     AsmRole,
+    DataRegion,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -134,27 +133,14 @@ def _ret_at(addr: int, iid: int) -> DecodedInstruction:
     return replace(row, instruction_id=iid)
 
 
-def _table_entry(addr: int, display: str, iid: int) -> DecodedInstruction:
-    return replace(
-        ParseAsm().parse_asm(b"\xc3", addr)[0],
-        address=addr,
-        size=4,
-        mnemonic="",
-        operands=(),
-        display=display,
-        role=AsmRole.JUMP_TABLE_ENTRY,
-        instruction_id=iid,
-    )
-
-
 def test_jump_table_dispatch_closes_indirect_switch_extent():
     dispatch = DecodedInstruction(
         address=0x1000,
         size=2,
         mnemonic="jmp",
         prefix="",
-        operands=(("mem", "dword", "", (("eax", 4),), 0, ()),),
-        display="jmp dword ptr [eax*4]",
+        operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
+        display="jmp dword ptr [eax*4+0x1004]",
         role=AsmRole.CODE,
         is_jump=True,
         branch_target=None,
@@ -167,6 +153,7 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         address=0x1004,
         entries=((0x1004, 0x1010), (0x1008, 0x1020)),
         dispatch_address=0x1000,
+        index_register="eax",
     )
     excerpt = (dispatch, case0, case1)
     assert (
@@ -404,8 +391,6 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
     )
     excerpt = (
         dispatch,
-        _table_entry(0x1004, "start + 0x10", 3),
-        _table_entry(0x1008, "start + 0x20", 4),
         _ret_at(0x1010, 1),
         _ret_at(0x1020, 2),
     )
@@ -417,14 +402,8 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    extracted = extract_switch_tables(
-        excerpt,
-        ["jmp", "data", "data", "ret", "ret"],
-        (table,),
-    )
-    assert extracted is not None
-    dests, _owned = extracted
-    assert dests == {}
+    graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
+    assert graph.table_dests == ()
 
 
 def test_first_class_jump_table_accepts_scale4_indexed_jmp():
@@ -441,8 +420,6 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
     )
     excerpt = (
         dispatch,
-        _table_entry(0x1004, "start + 0x10", 3),
-        _table_entry(0x1008, "start + 0x20", 4),
         _ret_at(0x1010, 1),
         _ret_at(0x1020, 2),
     )
@@ -454,15 +431,8 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    extracted = extract_switch_tables(
-        excerpt,
-        ["jmp", "data", "data", "ret", "ret"],
-        (table,),
-    )
-    assert extracted is not None
-    dests, owned = extracted
-    assert dests[0] == [3, 4]
-    assert owned == {1, 2}
+    graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
+    assert graph.table_dests == ((0, (1, 2)),)
 
 
 def test_gate_mints_verification_result_not_strategy():

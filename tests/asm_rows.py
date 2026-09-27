@@ -224,6 +224,17 @@ def as_rows(
                 if hasattr(facts, name):
                     changes[name] = getattr(facts, name)
         updated.append(replace(row, **changes) if changes else row)
+    if addresses is not None:
+        for index, row in enumerate(updated[:-1]):
+            following = updated[index + 1]
+            if (
+                row.is_code
+                and following.is_code
+                and row.address is not None
+                and following.address is not None
+                and following.address > row.address
+            ):
+                updated[index] = replace(row, size=following.address - row.address)
     return tuple(updated)
 
 
@@ -294,13 +305,64 @@ def verify_isomorphic_cfg_effective_match(
             recomp_addrs if recomp_addrs is not None else recorder.recomp_addrs
         )
 
+    def fixture_image(lines, targets, addresses, start):
+        fixture_rows = as_rows(
+            lines, targets=targets or None, addresses=addresses, start=start
+        )
+        code = tuple(row for row in fixture_rows if row.is_code)
+        tables = []
+        for position, row in enumerate(fixture_rows):
+            if row.role != AsmRole.JUMP_TABLE_HEADER:
+                continue
+            dispatch = next(
+                (
+                    candidate
+                    for candidate in reversed(fixture_rows[:position])
+                    if candidate.is_code
+                ),
+                None,
+            )
+            if dispatch is None or dispatch.address is None:
+                continue
+            entries = []
+            for entry in fixture_rows[position + 1 :]:
+                if entry.role != AsmRole.JUMP_TABLE_ENTRY:
+                    break
+                if entry.address is not None:
+                    entries.append((entry.address, start + entry.operands[0][1]))
+            if not entries:
+                continue
+            index_reg = next(
+                (
+                    reg
+                    for op in dispatch.operands
+                    if op[0] == "mem"
+                    for reg, scale in op[3]
+                    if scale == 4
+                ),
+                None,
+            )
+            tables.append(
+                JumpTable(
+                    entries[0][0],
+                    tuple(entries),
+                    dispatch.address,
+                    index_register=index_reg,
+                )
+            )
+        extent = max(
+            (
+                row.address + row.size - start
+                for row in fixture_rows
+                if row.address is not None
+            ),
+            default=0,
+        )
+        return FunctionImage(start, extent, ExtentKind.KNOWN, code, tuple(tables))
+
     return verify(
-        as_rows(orig, targets=orig_targets or None, addresses=orig_addrs),
-        as_rows(
-            recomp, targets=recomp_targets or None, addresses=recomp_addrs, start=0x2000
-        ),
-        (),
-        (),
+        fixture_image(orig, orig_targets, orig_addrs, START),
+        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000),
         metadata,
         recorder,
     )

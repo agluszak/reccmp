@@ -88,6 +88,19 @@ def analyze_effective_match(
     if exact is not None:
         return exact
 
+    # Embedded bytes can be read through indexed operands without appearing
+    # as instruction effects. Until those reads are modeled against regions,
+    # a change to the data cannot be admitted by a code-only proof.
+    orig_data = tuple(
+        (region.address - orig.start_addr, region.data) for region in orig.data_regions
+    )
+    recomp_data = tuple(
+        (region.address - recomp.start_addr, region.data)
+        for region in recomp.data_regions
+    )
+    if orig_data != recomp_data:
+        return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
+
     def finish_effective(reasons) -> ComparisonAnalysis:
         reason_set = set(reasons)
         if not reason_set:
@@ -157,10 +170,8 @@ def analyze_effective_match(
     # elided copies) and the shifted branch displacements they cause.
     iso = new_recorder()
     if verify_isomorphic_cfg_effective_match(
-        orig_rows,
-        recomp_rows,
-        orig.jump_tables,
-        recomp.jump_tables,
+        orig,
+        recomp,
         metadata=metadata,
         recorder=iso,
     ):

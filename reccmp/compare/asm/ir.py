@@ -8,11 +8,15 @@ diffs and is never read back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from collections.abc import Hashable, Sequence
+from typing import TYPE_CHECKING
 
 from .model import Reference
+
+if TYPE_CHECKING:
+    from .graph import FunctionGraph
 
 _STACK_SLOT = ("stack_slot",)
 
@@ -163,6 +167,7 @@ class FunctionImage:
     extent_closed: bool = True
     raw: bytes | None = None
     data_regions: tuple[DataRegion, ...] = ()
+    graph: FunctionGraph | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if any(not row.is_code for row in self.instructions):
@@ -180,7 +185,21 @@ class FunctionImage:
         self, instructions: Sequence[DecodedInstruction]
     ) -> "FunctionImage":
         """Return a copy with the supplied instructions and their ids."""
-        return replace(self, instructions=tuple(instructions))
+        return replace(self, instructions=tuple(instructions), graph=None)
+
+    def control_graph(self) -> FunctionGraph:
+        # pylint: disable=import-outside-toplevel
+        """The graph built with this image, or derived for a synthetic fixture."""
+        if self.graph is not None:
+            return self.graph
+        from .graph import build_function_graph
+
+        return build_function_graph(
+            self.instructions,
+            self.jump_tables,
+            start_addr=self.start_addr,
+            extent=self.extent,
+        )
 
     @property
     def data_shape(self) -> tuple:
@@ -492,46 +511,6 @@ def local_destination_keys(
     return tuple(keys)
 
 
-_NO_FALLTHROUGH = frozenset({"ret", "jmp", "int3"})
-_MODELED_EXTERNAL = frozenset(
-    {"entity", "import", "jmp_through", "unmatched", "symbol"}
-)
-
-
-def _is_modeled_external_target(row: DecodedInstruction) -> bool:
-    """True when the destination is independently known as another entity."""
-    ident = row.control_target
-    if ident is None:
-        ident = _operand_identity(row)
-    if not isinstance(ident, tuple) or not ident:
-        return False
-    return ident[0] in _MODELED_EXTERNAL
-
-
-def _enqueue_or_close_target(
-    target: int,
-    *,
-    addr_to_row: dict[int, DecodedInstruction],
-    window: range,
-    extent_kind: ExtentKind,
-    row: DecodedInstruction,
-    pending: list[int],
-) -> bool:
-    """Enqueue an in-window target, accept a modeled external, or reject.
-
-    Returns False when an estimated extent jumps into unknown bytes.
-    """
-    if target in addr_to_row or target in window:
-        pending.append(target)
-        return True
-    if _is_modeled_external_target(row):
-        return True
-    if extent_kind is ExtentKind.ESTIMATED:
-        return False
-    pending.append(target)
-    return True
-
-
 def compute_extent_closed(
     excerpt: Sequence[DecodedInstruction],
     *,
@@ -541,108 +520,13 @@ def compute_extent_closed(
     jump_tables: Sequence[JumpTable] = (),
     extent_kind: ExtentKind = ExtentKind.KNOWN,
 ) -> bool:
-    # pylint: disable=too-many-nested-blocks,too-many-return-statements
-    """True when every reachable path ends inside a modeled terminal.
+    # pylint: disable=import-outside-toplevel
+    """Extent closure from the same control-flow graph used by comparison."""
+    from .graph import build_function_graph
 
-    A coverage walk can only prove the supplied byte window. Implicit
-    fallthrough past the window is never a modeled terminal, even for a
-    known annotated size. Explicit ``jmp`` to a known entity, import, or
-    unmatched symbol can close a path. For estimated extents, jumping into
-    unknown bytes just past the guessed window is not a terminal.
-    """
-    if coverage_incomplete:
-        return False
-    if extent <= 0:
-        return True
-    code = [row for row in excerpt if row.is_code and row.address is not None]
-    if not code:
-        return False
-    addr_to_row = {row.address: row for row in code if row.address is not None}
-    window = range(start_addr, start_addr + extent)
-    pending = list(addr_to_row)[:1]
-    seen: set[int] = set()
-    while pending:
-        addr = pending.pop()
-        if addr in seen:
-            continue
-        seen.add(addr)
-        row = addr_to_row.get(addr)
-        if row is None:
-            if addr in window:
-                return False
-            if extent_kind is ExtentKind.ESTIMATED:
-                return False
-            continue
-        nxt = addr + row.size
-        mnemonic = row.mnemonic
-        if mnemonic in _NO_FALLTHROUGH:
-            if mnemonic == "jmp":
-                if row.branch_target is not None:
-                    if not _enqueue_or_close_target(
-                        row.branch_target,
-                        addr_to_row=addr_to_row,
-                        window=window,
-                        extent_kind=extent_kind,
-                        row=row,
-                        pending=pending,
-                    ):
-                        return False
-                else:
-                    table = _table_for_dispatch(row.address, jump_tables)
-                    if table is None:
-                        return False
-                    for _entry, target in table.entries:
-                        if not _enqueue_or_close_target(
-                            target,
-                            addr_to_row=addr_to_row,
-                            window=window,
-                            extent_kind=extent_kind,
-                            row=row,
-                            pending=pending,
-                        ):
-                            return False
-            continue
-        if row.is_jump and row.branch_target is not None:
-            if not _enqueue_or_close_target(
-                row.branch_target,
-                addr_to_row=addr_to_row,
-                window=window,
-                extent_kind=extent_kind,
-                row=row,
-                pending=pending,
-            ):
-                return False
-        elif row.is_jump and row.branch_target is None:
-            table = _table_for_dispatch(row.address, jump_tables)
-            if table is None:
-                return False
-            for _entry, target in table.entries:
-                if not _enqueue_or_close_target(
-                    target,
-                    addr_to_row=addr_to_row,
-                    window=window,
-                    extent_kind=extent_kind,
-                    row=row,
-                    pending=pending,
-                ):
-                    return False
-            if mnemonic == "jmp":
-                continue
-        if nxt not in window:
-            return False
-        pending.append(nxt)
-    return True
-
-
-def _table_for_dispatch(
-    address: int | None, jump_tables: Sequence[JumpTable]
-) -> JumpTable | None:
-    if address is None:
-        return None
-    for table in jump_tables:
-        if table.dispatch_address == address:
-            return table
-    return None
+    return build_function_graph(
+        excerpt, jump_tables, start_addr=start_addr, extent=extent
+    ).extent_closed(extent_kind=extent_kind, coverage_incomplete=coverage_incomplete)
 
 
 def _normalize_operand_stack(operand) -> Hashable:

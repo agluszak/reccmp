@@ -67,7 +67,7 @@ def test_decoded_image_keeps_tables_out_of_instructions():
     region = image.data_regions[0]
     assert region.address == 0x100014EC
     assert region.data == SCORE_NOTIFY[region.address - start :]
-    cfg = build_side_cfg(image.instructions, image.jump_tables)
+    cfg = build_side_cfg(image)
     assert cfg is not None and cfg.table_dests
     rendered = render_function_rows(image)
     assert sum(row.display == "Jump table:" for row in rendered) == 1

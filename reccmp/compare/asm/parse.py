@@ -15,6 +15,7 @@ from typing_extensions import Buffer
 from reccmp.types import ImageId
 
 from .instgen import InstructGen, SectionType
+from .graph import build_function_graph
 from .ir import (
     AsmRole,
     DataRegion,
@@ -22,7 +23,6 @@ from .ir import (
     ExtentKind,
     FunctionImage,
     JumpTable,
-    compute_extent_closed,
     marker,
     rebind_local_identities,
 )
@@ -40,6 +40,7 @@ class ParseAsm:
         resolver: ReferenceResolver | None = None,
         is_32bit: bool = True,
         image_id: ImageId | None = None,
+        body_bounds: tuple[int, int] | None = None,
     ) -> None:
         self.addr_test = addr_test
         self.resolver = resolver
@@ -53,8 +54,8 @@ class ParseAsm:
         self.number_placeholders = True
         self.jump_tables: tuple[JumpTable, ...] = ()
         self.coverage_incomplete: bool = False
-        self._body_start: int | None = None
-        self._body_end: int | None = None
+        self._body_start: int | None = body_bounds[0] if body_bounds else None
+        self._body_end: int | None = body_bounds[1] if body_bounds else None
 
     def reset(self):
         self.replacements = {}
@@ -275,15 +276,16 @@ def decode_function(
     is_32bit: bool = True,
     image_id: ImageId | None = None,
 ) -> FunctionImage:
+    # pylint: disable=too-many-arguments
     """Decode one byte window into instructions and separate embedded data.
 
     All discovery and sanitization state is local to this call. The returned
     image is the only value subsequent analysis needs.
     """
     blob = bytes(data)
-    sanitizer = ParseAsm(addr_test, resolver, is_32bit, image_id)
-    sanitizer._body_start = start_addr
-    sanitizer._body_end = start_addr + len(blob)
+    sanitizer = ParseAsm(
+        addr_test, resolver, is_32bit, image_id, (start_addr, start_addr + len(blob))
+    )
     sections = InstructGen(blob, start_addr, is_32bit)
     instructions: list[DecodedInstruction] = []
     data_regions: list[DataRegion] = []
@@ -308,6 +310,9 @@ def decode_function(
         jump_tables=tables,
         image_id=image_id.name.lower() if image_id is not None else "unknown",
     )
+    graph = build_function_graph(
+        stamped, tables, start_addr=start_addr, extent=len(blob)
+    )
     return FunctionImage(
         start_addr=start_addr,
         extent=len(blob),
@@ -315,16 +320,13 @@ def decode_function(
         instructions=stamped,
         jump_tables=tables,
         coverage_incomplete=sections.coverage_incomplete,
-        extent_closed=compute_extent_closed(
-            stamped,
-            start_addr=start_addr,
-            extent=len(blob),
+        extent_closed=graph.extent_closed(
             coverage_incomplete=sections.coverage_incomplete,
-            jump_tables=tables,
             extent_kind=extent_kind,
         ),
         raw=blob,
         data_regions=tuple(data_regions),
+        graph=graph,
     )
 
 
