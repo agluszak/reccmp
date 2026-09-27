@@ -26,6 +26,7 @@ from reccmp.compare.asm.operand import (
     format_operand,
 )
 from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.asm.verifier.addresses import Init, Phi
 from reccmp.compare.asm.verifier.render import render, render_number
 from reccmp.source.records import SourceComparison, SourceComparisonOperand
 from reccmp.compare.diagnosis import (
@@ -214,8 +215,8 @@ def _identity_kinds(value: Any) -> set[str]:
 def _without_joins(value: Any) -> Any:
     """``value`` with every join's identity erased."""
     match value:
-        case ("phi" | "scratch_phi", *_):
-            return ("phi",)
+        case Phi():
+            return Phi(0, 0)
         case (*items,):
             return tuple(_without_joins(item) for item in items)
         case _:
@@ -275,7 +276,7 @@ def _part_cause(parent: Any, part_o: Any, part_r: Any) -> Cause | None:
                 f"only a constant differs ({render_number(value_o)} vs "
                 f"{render_number(value_r)}): a wrong literal, bound, enum value or size",
             )
-        case _, ("init", _), ("init", _):
+        case _, Init(), Init():
             return Cause(
                 CauseCode.OTHER_INPUT,
                 Group.LOGIC,

@@ -11,6 +11,8 @@ from reccmp.compare.asm.model import FAMILY_REGISTER, REGISTERS, Reject
 from reccmp.compare.asm.operand import Mem, Reg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
+    Init,
+    Resync,
     Value,
     mem_disjoint,
     unwind_spadd,
@@ -93,12 +95,14 @@ def resync(states: tuple[SideState, SideState], idx: int, ctx: Context) -> None:
     paired value so no stale claims survive."""
     for state in states:
         for family in FAMILIES:
-            state.regs[family] = ("resync", idx, family)
-        state.flags = ("resync_flags", idx)
-        state.carry = ("resync_cf", idx)
-        state.fpu_flags = ("resync_fpuflags", idx)
-        state.x87.known = [("resync_st", idx, i) for i in range(len(state.x87.known))]
-    commit_clobber(ctx, ("resync", idx))
+            state.regs[family] = Resync(idx, family)
+        state.flags = Resync(idx, "flags")
+        state.carry = Resync(idx, "carry")
+        state.fpu_flags = Resync(idx, "fpuflags")
+        state.x87.known = [
+            Resync(idx, ("st", index)) for index in range(len(state.x87.known))
+        ]
+    commit_clobber(ctx, Resync(idx, "memory"))
 
 
 def _contained(value: Value, ctx: Context) -> bool:
@@ -376,7 +380,7 @@ def _one_sided_push_ok(
     value = read_operand(state, ctx, ins.operands[0])
     new_esp = esp_add(state.read_reg("esp"), -4)
     root, offset = unwind_spadd(new_esp)
-    if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
+    if root != Init("sp") or offset >= 0 or ctx.stack_escaped:
         return False
     if frame_pointer_value(value):
         return False
@@ -403,7 +407,7 @@ def _one_sided_pop_ok(side: ImageId, state: SideState, ctx: Context, ins) -> boo
             return False
     esp = state.read_reg("esp")
     root, offset = unwind_spadd(esp)
-    if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
+    if root != Init("sp") or offset >= 0 or ctx.stack_escaped:
         return False
     tag = memory_load_tag(ctx, esp, 4, "pop")
     value: Value = ("load", esp, "stack", tag)
@@ -619,16 +623,15 @@ def callee_save_swap(
         and stores[0] is not None
         and stores[1] is not None
         and stores[0].address == stores[1].address
-        and isinstance(stores[0].value, tuple)
-        and isinstance(stores[1].value, tuple)
-        and stores[0].value[:1] == stores[1].value[:1] == ("init",)
-        and stores[0].value[1] in CALLEE_SAVED
-        and stores[1].value[1] in CALLEE_SAVED
+        and isinstance(stores[0].value, Init)
+        and isinstance(stores[1].value, Init)
+        and stores[0].value.family in CALLEE_SAVED
+        and stores[1].value.family in CALLEE_SAVED
         and stores[0].value != stores[1].value
     ):
         ctx.save_stack.append(
             CalleeSaveSubstitution(
-                stores[0].value[1], stores[1].value[1], stores[0].address
+                stores[0].value.family, stores[1].value.family, stores[0].address
             )
         )
         ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
@@ -670,8 +673,8 @@ def _restores_swapped_save(
     ):
         return False
     ctx.save_stack.pop()
-    orig.regs[family_o] = ("init", family_o)
-    recomp.regs[family_r] = ("init", family_r)
+    orig.regs[family_o] = Init(family_o)
+    recomp.regs[family_r] = Init(family_r)
     return True
 
 

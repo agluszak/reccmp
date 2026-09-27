@@ -20,6 +20,7 @@ import pytest
 
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
+from reccmp.compare.asm.verifier.addresses import Init
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.refutation import RefutationMixin
@@ -709,18 +710,18 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
 
 def _field(offset: int, size: str = "word", register: str = "c") -> tuple:
     """A load of `[register + offset]` as memory was at entry."""
-    return ("load", ("mem", "", (((("init", register)), 1),), offset, ()), size, 0)
+    return ("load", ("mem", "", ((Init(register), 1),), offset, ()), size, 0)
 
 
 def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     base = RunInput.from_seed(1)
-    argument = ("load", ("mem", "", ((("init", "sp"), 1),), 8, ()), "dword", 0)
-    hint = input_from_assignment({("init", "c"): 7, argument: 9}, base)
+    argument = ("load", ("mem", "", ((Init("sp"), 1),), 8, ()), "dword", 0)
+    hint = input_from_assignment({Init("c"): 7, argument: 9}, base)
     assert isinstance(hint, RunInput)
     assert hint.registers["ecx"] == 7 and hint.stack_args[1] == 9
     # this->field at entry: modelled memory, set byte by byte when its page
     # is mapped
-    hint = input_from_assignment({("init", "c"): 0x20000000, _field(4): 0xBEEF}, base)
+    hint = input_from_assignment({Init("c"): 0x20000000, _field(4): 0xBEEF}, base)
     assert isinstance(hint, RunInput)
     assert hint.memory == ((0x20000004, 0xEF), (0x20000005, 0xBE))
     # an argument after a store cannot be set; a symbol's address is ignored
@@ -734,7 +735,7 @@ def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
 
 def test_overlapping_solver_loads_must_agree_on_every_byte():
     base = RunInput.from_seed(1)
-    this: dict[Hashable, int] = {("init", "c"): 0x20000000}
+    this: dict[Hashable, int] = {Init("c"): 0x20000000}
     # a dword at +4 and a word at +5 share bytes 5 and 6
     agree = input_from_assignment(
         {**this, _field(4, "dword"): 0x11223344, _field(5): 0x2233}, base
@@ -746,7 +747,7 @@ def test_overlapping_solver_loads_must_agree_on_every_byte():
     assert isinstance(disagree, Rejection)
     assert disagree.reason == "conflicting_memory"
     # memory an input cannot preset: the stack is mapped from the start
-    stack = input_from_assignment({("init", "c"): STACK_BASE, _field(4): 1}, base)
+    stack = input_from_assignment({Init("c"): STACK_BASE, _field(4): 1}, base)
     assert isinstance(stack, Rejection) and stack.reason == "invalid_destination"
 
 
@@ -755,7 +756,7 @@ def test_a_preset_dword_across_a_page_boundary_is_written_whole():
     code = bytes.fromhex("8b81fe0f0000") + RET
     machine = SideMachine(_image(ORIG_FUNC, code, ORIG_TABLE))  # type: ignore[arg-type]
     hint = input_from_assignment(
-        {("init", "c"): 0x20000000, _field(0xFFE, "dword"): 0x11223344},
+        {Init("c"): 0x20000000, _field(0xFFE, "dword"): 0x11223344},
         RunInput.from_seed(1),
     )
     assert isinstance(hint, RunInput)
@@ -871,7 +872,7 @@ def test_the_fate_of_a_solver_hint_is_recorded():
     analysis = ComparisonAnalysis.mismatch(difference)
     hints, failure = _solver_hints(analysis)
     assert hints and failure is None
-    stored = ("load", ("mem", "", (((("init", "c")), 1),), 8, ()), "dword", 3)
+    stored = ("load", ("mem", "", (((Init("c")), 1),), 8, ()), "dword", 3)
     rejected = dataclasses.replace(difference, values=(stored, ("imm", 1), 32, "value"))
     assert _solver_hints(ComparisonAnalysis.mismatch(rejected)) == (
         [],

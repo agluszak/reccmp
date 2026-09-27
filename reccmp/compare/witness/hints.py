@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from collections.abc import Hashable, Mapping
 from typing import Any
 
+from reccmp.compare.asm.verifier.addresses import Init
 from reccmp.compare.witness.machine import STACK_ARG_DWORDS, RunInput, lazily_mapped
 
 _REGISTERS = {
@@ -44,7 +45,7 @@ def _stack_argument(term: Any) -> int | None:
     if not (isinstance(address, tuple) and len(address) == 5 and address[0] == "mem"):
         return None
     _, segment, terms, displacement, symbols = address
-    if segment or symbols or terms != (((("init", "sp")), 1),):
+    if segment or symbols or terms != ((Init("sp"), 1),):
         return None
     if not isinstance(displacement, int) or displacement % 4:
         return None
@@ -70,11 +71,11 @@ def _entry_load(term: Any) -> tuple[str, int, int] | None:
     if segment or symbols or len(terms) != 1 or not isinstance(displacement, int):
         return None
     ((base, scale),) = terms
-    if scale != 1 or not (isinstance(base, tuple) and base[:1] == ("init",)):
+    if scale != 1 or not isinstance(base, Init):
         return None
-    if base[1] not in _REGISTERS:
+    if base.family not in _REGISTERS:
         return None
-    return _REGISTERS[base[1]], displacement, _LOAD_SIZES[size]
+    return _REGISTERS[base.family], displacement, _LOAD_SIZES[size]
 
 
 @dataclass(frozen=True)
@@ -104,8 +105,8 @@ def input_from_assignment(
             # Each image fixes its symbols' addresses; the solver's choice is
             # not an input. The run decides whether the rest reproduces.
             continue
-        if isinstance(term, tuple) and term[:1] == ("init",) and term[1] in _REGISTERS:
-            registers[_REGISTERS[term[1]]] = value & 0xFFFFFFFF
+        if isinstance(term, Init) and term.family in _REGISTERS:
+            registers[_REGISTERS[term.family]] = value & 0xFFFFFFFF
             continue
         index = _stack_argument(term)
         if index is not None:

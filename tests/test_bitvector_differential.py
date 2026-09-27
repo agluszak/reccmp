@@ -24,6 +24,7 @@ from unicorn import x86_const  # type: ignore[import-untyped]
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.asm.verifier.addresses import Init
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import Context, SideState
 
@@ -229,9 +230,9 @@ def _evaluate(value, registers: list[int]) -> int | None:
     for key, variable in lowering.variables.items():
         term: Any = key[0]  # type: ignore[index]
         bits: Any = key[1]  # type: ignore[index]
-        if bits == "bool" or term[:1] != ("init",) or term[1] not in FAMILIES:
+        if bits == "bool" or not isinstance(term, Init) or term.family not in FAMILIES:
             return None
-        concrete = registers[FAMILIES.index(term[1])]
+        concrete = registers[FAMILIES.index(term.family)]
         substitutions.append((variable, z3.BitVecVal(concrete, bits)))
     result = z3.simplify(z3.substitute(expression, *substitutions))
     return result.as_long() if z3.is_bv_value(result) else None

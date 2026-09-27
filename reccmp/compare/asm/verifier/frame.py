@@ -24,13 +24,14 @@ from __future__ import annotations
 
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.addresses import (
+    Init,
     Value,
     constant_offset,
     flatten_mem,
 )
 from reccmp.compare.asm.verifier.state import Context, SideState
 
-_ENTRY_SP = ("init", "sp")
+_ENTRY_SP = Init("sp")
 
 
 def maybe_frame_pointer(value: Value) -> bool:
@@ -42,10 +43,14 @@ def maybe_frame_pointer(value: Value) -> bool:
     stack = [value]
     while stack:
         node = stack.pop()
+        if isinstance(node, Init):
+            if node.family in ("sp", "bp"):
+                return True
+            continue
         if not isinstance(node, tuple) or not node or id(node) in seen:
             continue
         seen.add(id(node))
-        if node in (("init", "sp"), ("init", "bp")) or node[0] == "callesp":
+        if node[0] == "callesp":
             return True
         if node[0] == "load":
             continue

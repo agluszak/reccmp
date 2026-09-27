@@ -27,6 +27,13 @@ from typing import Any
 
 import z3  # type: ignore[import-untyped]
 
+from reccmp.compare.asm.verifier.addresses import (
+    CallResult,
+    Init,
+    Phi,
+    Resync,
+    StringResult,
+)
 from reccmp.compare.asm.verifier.state import (
     Branch,
     Observation,
@@ -94,6 +101,8 @@ class _Lowering:
     # whose width its context decides.
     def value(self, value: Any):
         # pylint: disable=too-many-return-statements,too-many-branches
+        if isinstance(value, (Init, CallResult, StringResult, Resync, Phi)):
+            return self.opaque(value)
         if not isinstance(value, tuple) or not value:
             raise _Unsupported(f"value {value!r:.40}")
         tag = value[0]
@@ -339,7 +348,7 @@ def _assignment(lowering: _Lowering, model) -> tuple[tuple[Hashable, int], ...]:
         if key[1] == "bool":  # type: ignore[index]
             continue
         match key[0]:  # type: ignore[index]
-            case ("symbol", *_) | ("init", "sp"):
+            case ("symbol", *_) | Init("sp"):
                 # A symbol's address is the image's, and the stack pointer
                 # the run's: neither is an input.
                 continue

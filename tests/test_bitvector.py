@@ -1,11 +1,12 @@
 """Bit-vector equivalence of the verifier's symbolic values (z3)."""
 
 from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.asm.verifier.addresses import CallResult, Init
 from reccmp.compare.asm.verifier.state import Call, FunctionMetadata, Store
 from tests.asm_rows import verify_effective_match
 
-EAX = ("init", "a")
-ECX = ("init", "c")
+EAX = Init("a")
+ECX = Init("c")
 LOAD = ("load", ("mem", "", ((ECX, 1),), 4, ()), "dword", 0)
 BYTE = ("load", ("mem", "", ((ECX, 1),), 8, ()), "byte", 0)
 
@@ -74,9 +75,9 @@ def test_terms_it_cannot_lower_are_not_proven():
     qword = ("load", ("mem", "", ((ECX, 1),), 4, ()), "qword", 0)
     assert not bitvector.values_equal(qword, ("add", qword, imm(0)))
     # an opaque term is an unconstrained value: equal only to itself
-    call = ("callret", 3, "eax")
+    call = CallResult(3, "eax")
     assert bitvector.values_equal(("add", call, imm(0)), call)
-    assert not bitvector.values_equal(call, ("callret", 4, "eax"))
+    assert not bitvector.values_equal(call, CallResult(4, "eax"))
 
 
 def test_observations():

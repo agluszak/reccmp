@@ -3,6 +3,7 @@
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.operand import SignedSymbol
 from reccmp.compare.asm.replacement import entity_proof_identity
+from reccmp.compare.asm.verifier.addresses import Init
 from reccmp.compare.asm.verifier.semantics import _import_call
 from reccmp.compare.db import EntityDb
 from reccmp.types import EntityType, ImageId
@@ -51,7 +52,7 @@ def test_calls_through_the_thunk_and_the_slot_have_one_callee():
     offset = ("load", ("mem", "", (), 4, (SignedSymbol(1, reference),)), "dword", 0)
     indexed = (
         "load",
-        ("mem", "", ((("init", "a"), 4),), 0, (SignedSymbol(1, reference),)),
+        ("mem", "", (((Init("a"), 4)),), 0, (SignedSymbol(1, reference),)),
         "dword",
         0,
     )

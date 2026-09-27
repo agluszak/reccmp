@@ -2,8 +2,62 @@
 
 from __future__ import annotations
 
-# A symbolic value. Nested tuples of str/int; compared structurally.
-Value = tuple
+from collections.abc import Hashable
+from dataclasses import dataclass
+from typing import TypeAlias
+
+
+@dataclass(frozen=True, slots=True)
+class Init:
+    family: str
+
+    @property
+    def is_scratch(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class CallResult:
+    site: int
+    register: str
+
+    @property
+    def is_scratch(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class StringResult:
+    site: int
+    family: str
+
+    @property
+    def is_scratch(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class Resync:
+    site: int
+    location: Hashable
+
+    @property
+    def is_scratch(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class Phi:
+    block: int
+    class_id: int
+    settled: bool = False
+
+    @property
+    def is_scratch(self) -> bool:
+        return self.settled
+
+
+Value: TypeAlias = tuple | Init | CallResult | StringResult | Resync | Phi
 
 
 def _foldable_address_value(value: Value, scale: int, segment: str) -> bool:
@@ -14,10 +68,12 @@ def _foldable_address_value(value: Value, scale: int, segment: str) -> bool:
     return len(value) == 2 and value[0] == "addr" and value[1][1] in ("", segment)
 
 
-def flatten_mem(addr: Value) -> Value:
+def flatten_mem(addr: Value) -> tuple:
     """Fold scale-1 base registers that hold a computed address (from lea)
     into the memory expression itself, so `[esi]` with esi = &[ebx + 0x1c6]
     compares as `[ebx + 0x1c6]`."""
+    if not isinstance(addr, tuple):
+        return ("mem", "", ((addr, 1),), 0, ())
     _, seg, terms, disp, syms = addr
     for _ in range(8):
         folded = None
@@ -47,10 +103,10 @@ def flatten_mem(addr: Value) -> Value:
 
 def stack_rooted(value: Value) -> bool:
     """Is the value derived from the stack pointer or frame pointer?"""
+    if isinstance(value, Init):
+        return value.family in ("sp", "bp")
     if not isinstance(value, tuple) or not value:
         return False
-    if value in (("init", "sp"), ("init", "bp")):
-        return True
     tag = value[0]
     children: tuple[Value, ...] = ()
     if tag == "spadd":
@@ -62,7 +118,7 @@ def stack_rooted(value: Value) -> bool:
     return any(stack_rooted(child) for child in children)
 
 
-def _is_pure_global(mem: Value) -> bool:
+def _is_pure_global(mem: tuple) -> bool:
     return not mem[2] and bool(mem[4])
 
 

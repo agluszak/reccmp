@@ -10,6 +10,7 @@ from reccmp.compare.asm.verifier import (
     CallFacts,
     FunctionMetadata,
 )
+from reccmp.compare.asm.verifier.addresses import Init
 from reccmp.compare.asm.verifier.semantics import (
     receiver_equivalence_class,
 )
@@ -241,7 +242,7 @@ def test_reject_virtual_receiver_reload_after_exact_pointer_store():
     store_tag = ("mem", 1, 0)
     ctx = Context()
     ctx.mem_events.append((store_tag, (address, 4, False)))
-    ctx.receiver_values[(address, 4)] = (store_tag, ("init", "di"))
+    ctx.receiver_values[(address, 4)] = (store_tag, Init("di"))
     before_store = ("load", address, "dword", 0)
     after_store = ("load", address, "dword", store_tag)
     assert receiver_equivalence_class(before_store, ctx) != receiver_equivalence_class(

@@ -17,7 +17,7 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.asm.verifier.addresses import Value, unwind_spadd
+from reccmp.compare.asm.verifier.addresses import Init, Value, unwind_spadd
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.block_align import AlignedPair, align_block_lines
 from reccmp.compare.asm.verifier.blocks import (
@@ -682,7 +682,7 @@ def _pass_frame(
     assert state.frame is not None
     esp = before.read_reg("esp")
     root, top = unwind_spadd(esp)
-    if root != ("init", "sp"):
+    if root != Init("sp"):
         if state.frame:
             raise Reject  # the arguments cannot be placed
         return FrameArguments(None)

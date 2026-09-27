@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from reccmp.compare.asm.model import FAMILY_REGISTER
+from reccmp.compare.asm.verifier.addresses import (
+    CallResult,
+    Init,
+    Phi,
+    Resync,
+    StringResult,
+)
 
 _BINARY = {
     "and": "&",
@@ -34,7 +41,7 @@ def render_number(value: int) -> str:
     return str(value) if -10 < value < 10 else hex(value)
 
 
-_ENTRY_SP = (("init", "sp"), 1)
+_ENTRY_SP = (Init("sp"), 1)
 
 
 def render(value: Any, depth: int = 0) -> str:
@@ -49,7 +56,7 @@ def render(value: Any, depth: int = 0) -> str:
     match value:
         case ("imm", int() as constant):
             return render_number(constant)
-        case ("init", family):
+        case Init(family):
             return f"{FAMILY_REGISTER.get(family, family)}@entry"
         case ("load", ("mem", "", (entry,), int() as displacement, ()), "dword", _) if (
             entry == _ENTRY_SP and displacement > 0 and displacement % 4 == 0
@@ -79,10 +86,14 @@ def render(value: Any, depth: int = 0) -> str:
             return f"zext({inner(operand)})"
         case ("movsx", _, operand):
             return f"sext({inner(operand)})"
-        case ("callret", call, family):
+        case CallResult(call, family):
             return f"{FAMILY_REGISTER.get(family, family)} after call@{call}"
-        case ("phi" | "scratch_phi", block, klass):
-            return f"join{block}#{klass}"
+        case StringResult(site, family):
+            return f"{FAMILY_REGISTER.get(family, family)} after string@{site}"
+        case Resync(site, location):
+            return f"{location} after resync@{site}"
+        case Phi(block, class_id):
+            return f"join{block}#{class_id}"
         case ("eq" | "ne" as tag, (left, right), *width):
             return _comparison(tag, left, right, width, depth)
         case (tag, left, right, *width) if tag in _PREDICATE:

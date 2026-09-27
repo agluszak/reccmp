@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from reccmp.compare.asm.verifier.addresses import Value
+from reccmp.compare.asm.verifier.addresses import Phi, Value
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.state import (
     CalleeSaveSubstitution,
@@ -277,12 +277,13 @@ def join_states(
         class_id = classes.setdefault(key, n)
         # A join of values that each have no content (see is_scratch) or
         # were already observed on their edge holds nothing unobserved.
-        tag = (
-            "scratch_phi"
-            if _settled(entry_value, entry) and _settled(in_value, incoming)
-            else "phi"
+        setter(
+            Phi(
+                block,
+                class_id,
+                settled=_settled(entry_value, entry) and _settled(in_value, incoming),
+            )
         )
-        setter((tag, block, class_id))
 
     if entry.memory == incoming.memory:
         memory = entry.memory

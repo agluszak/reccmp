@@ -15,6 +15,11 @@ from reccmp.compare.asm.model import (
 )
 from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
+    CallResult,
+    Init,
+    Phi,
+    Resync,
+    StringResult,
     Value,
     abs_stack_offset,
     constant_offset,
@@ -31,18 +36,14 @@ if TYPE_CHECKING:
 
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
 
-# Values with no unobserved content: the untouched initial register value,
-# the clobbered result of a call or string instruction, a register given up
-# after an unmodeled instruction, and a join of values each of which is one
-# of these or was matched on its edge.
-SCRATCH_TAGS = frozenset({"init", "callret", "strres", "resync", "scratch_phi"})
-
 
 def is_scratch(value: object) -> bool:
-    """Whether ``value`` is one of the SCRATCH_TAGS values. Left in a
-    caller-saved register while the other side holds something else, such a
-    value marks the register dead."""
-    return isinstance(value, tuple) and bool(value) and value[0] in SCRATCH_TAGS
+    """Whether ``value`` has no unobserved content. Left in a caller-saved
+    register while the other side holds something else, such a value marks
+    the register dead."""
+    return isinstance(value, (Init, CallResult, StringResult, Resync)) or (
+        isinstance(value, Phi) and value.settled
+    )
 
 
 COMMUTATIVE_BINOPS = {"add", "and", "or", "xor", "imul"}
@@ -140,7 +141,7 @@ class X87Stack:
 class SideState:
     # pylint: disable=too-many-instance-attributes
     regs: dict[str, Value] = field(
-        default_factory=lambda: {f: ("init", f) for f in FAMILIES}
+        default_factory=lambda: {family: Init(family) for family in FAMILIES}
     )
     # Every ordinary memory read performed by this side, as (address value,
     # memory generation). Used to discharge the trap-parity obligation of a
@@ -148,13 +149,13 @@ class SideState:
     # harmless when the other side provably reads the same address at the
     # same memory generation (e.g. folded into another instruction).
     load_log: set = field(default_factory=set)
-    flags: Value = ("init", "flags")
-    fpu_flags: Value = ("init", "fpuflags")
+    flags: Value = Init("flags")
+    fpu_flags: Value = Init("fpuflags")
     # The carry flag is tracked separately from the other integer flags:
     # inc/dec preserve CF while rewriting the rest, so a single combined
     # flag value would let e.g. `cmp a, b; inc ecx; adc ...` erase a
     # CF difference introduced by swapped cmp operands.
-    carry: Value = ("init", "carry")
+    carry: Value = Init("carry")
     x87: X87Stack = field(default_factory=X87Stack)
     # Frame-slot alpha-renaming: negative ebp displacements are replaced by
     # slot ids assigned in first-use order, so the two sides may lay out
@@ -201,7 +202,7 @@ class SideState:
                 # Promotion places slots by offset from the entry stack
                 # pointer: keep stack pointers in one form.
                 root, offset = constant_offset(value)
-                if root == ("init", "sp"):
+                if root == Init("sp"):
                     value = ("spadd", root, offset) if offset else root
             self.regs[family] = value
             return
@@ -385,7 +386,7 @@ def observation_values(observation: Observation) -> tuple[Value, ...]:
             values = found
         case ReturnFpu(value) | LoadControlWord(value):
             values = (value,)
-        case FrameArguments(tuple() as arguments):
+        case FrameArguments(values=arguments) if arguments is not None:
             values = tuple(value for _, _, value in arguments)
         case StringOperation(values=found):
             values = found
@@ -480,6 +481,9 @@ class Context:
         stack = [value]
         while stack:
             node = stack.pop()
+            if isinstance(node, (Init, CallResult, StringResult, Resync, Phi)):
+                self.matched_nodes.add(node)
+                continue
             if not isinstance(node, tuple):
                 continue
             key = id(node)
@@ -528,10 +532,10 @@ def frame_pointer_value(value: Value) -> bool:
             # when it is stack-rooted at all.
             return any(stack_rooted(term) for term, _ in value[1][2])
         root, offset = resolved
-        return root == ("init", "sp") and offset < 0
+        return root == Init("sp") and offset < 0
     if value[0] == "spadd":
         root, offset = unwind_spadd(value)
-        return root == ("init", "sp") and offset < 0
+        return root == Init("sp") and offset < 0
     return False
 
 
@@ -547,7 +551,7 @@ def _store_may_alias_load(store: tuple, load: tuple, stack_escaped: bool) -> boo
             resolved = abs_stack_offset(scratch[0], scratch[2])
             if (
                 resolved is not None
-                and resolved[0] == ("init", "sp")
+                and resolved[0] == Init("sp")
                 and resolved[1] < 0
                 and not other[2]
             ):

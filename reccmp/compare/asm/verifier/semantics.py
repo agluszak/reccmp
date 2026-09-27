@@ -8,6 +8,8 @@ from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import REGISTERS, Reject
 from reccmp.compare.asm.operand import Imm, Mem, Operand, Reg, ScaledReg, St, Sym
 from reccmp.compare.asm.verifier.addresses import (
+    CallResult,
+    StringResult,
     Value,
     flatten_mem,
     stack_rooted,
@@ -610,7 +612,7 @@ def execute(
         obs.append(Call(virtual_target or target, tuple(arguments)))
         incoming_esp = state.read_reg("esp")
         for reg in ("eax", "ecx", "edx"):
-            state.write_reg(reg, ("callret", idx, reg))
+            state.write_reg(reg, CallResult(idx, reg))
         # Preserve dependence on incoming SP; unknown cleanup must not
         # erase a pre-call stack discrepancy.
         state.write_reg("esp", ("callesp", idx, incoming_esp))
@@ -686,9 +688,9 @@ def execute(
             StringOperation(mnemonic, ins.prefix, tuple(observed), _writes_memory)
         )
         for family in writes.split():
-            state.regs[family] = ("strres", idx, family)
+            state.regs[family] = StringResult(idx, family)
         if ins.prefix:
-            state.regs["c"] = ("strres", idx, "c")
+            state.regs["c"] = StringResult(idx, "c")
         if mnemonic.startswith(("scas", "cmps")):
             state.flags = ("strflags", idx)
             state.carry = ("strcf", idx)
