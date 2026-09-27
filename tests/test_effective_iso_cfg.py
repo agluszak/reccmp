@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from reccmp.compare.asm.parse import decode_function
-from reccmp.compare.asm.ir import DataRegion, JumpTable
+from reccmp.compare.asm.ir import DataRegion, FlowKind, JumpTable
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.operand import Sym
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
@@ -592,7 +592,7 @@ def test_external_edge_with_divergent_state_is_located():
     location = recorder.inconclusive_location
     assert location is not None
     assert location.address == 0x1005
-    assert location.facts["edge_kind"] == "jmp"
+    assert location.facts["edge_kind"] == FlowKind.JUMP.value
 
 
 def test_external_conditional_edge_checks_physical_state():

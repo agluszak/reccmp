@@ -34,7 +34,6 @@ from reccmp.compare.asm.verifier.blocks import (
     Blocks,
     Exits,
     pair_heads,
-    roles_fact,
     unsupported_control_flow,
 )
 from reccmp.compare.asm.verifier.dataflow import (
@@ -224,8 +223,8 @@ def _verify_product(
                         indices_r[local_r] if local_r is not None else None,
                         {
                             "stage": "block_terminator_alignment",
-                            "orig_kind": _KIND_FACT[kind_o],
-                            "recomp_kind": _KIND_FACT[kind_r],
+                            "orig_kind": kind_o.value,
+                            "recomp_kind": kind_r.value,
                         },
                     )
                 return None
@@ -264,8 +263,6 @@ def _verify_product(
                         ),
                         "orig_block_count": len(cfg_o.heads),
                         "recomp_block_count": len(cfg_r.heads),
-                        "orig_edge_roles": roles_fact(exits_o),
-                        "recomp_edge_roles": roles_fact(exits_r),
                     },
                 )
             return None
@@ -451,7 +448,7 @@ def _verify_product(
                             "external_control_flow_state",
                             index_o,
                             index_r,
-                            {"edge_kind": _KIND_FACT[kind]},
+                            {"edge_kind": kind.value},
                         )
                     return False
             commit_memory(ctx, obs_o, index_o)
@@ -571,15 +568,6 @@ _COMPLEMENT_JCC = {
         ("jp", "jnp"),
     )
     for a, b in ((x, y), (y, x))
-}
-
-
-# How reports name the ways an instruction ends a block.
-_KIND_FACT = {
-    FlowKind.NORMAL: "code",
-    FlowKind.CONDITIONAL: "jcc",
-    FlowKind.JUMP: "jmp",
-    FlowKind.RETURN: "ret",
 }
 
 

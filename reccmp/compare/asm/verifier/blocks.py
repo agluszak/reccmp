@@ -44,13 +44,6 @@ class Exit:
     role: EdgeRole | None
     case: int | None = None
 
-    def __str__(self) -> str:
-        if self.role is None:
-            return "next"
-        if self.role is EdgeRole.CASE:
-            return f"case{self.case}"
-        return "jmp" if self.role is EdgeRole.JUMP else self.role.value
-
 
 NEXT = Exit(None)
 TAKEN = Exit(EdgeRole.TAKEN)
@@ -364,8 +357,6 @@ def pair_heads(
                     facts={
                         "failure": "edge_roles",
                         **counts,
-                        "orig_edge_roles": roles_fact(exits_o),
-                        "recomp_edge_roles": roles_fact(exits_r),
                     },
                 )
             return None
@@ -379,7 +370,6 @@ def pair_heads(
                         recomp_index=recomp.start(head_r),
                         facts={
                             "failure": "external_edge",
-                            "edge_role": str(role),
                             "orig_external": to_o is None,
                             "recomp_external": to_r is None,
                             **counts,
@@ -389,7 +379,3 @@ def pair_heads(
             if to_o is not None and to_r is not None:
                 queue.append((to_o, to_r, (head_o, head_r, role)))
     return order
-
-
-def roles_fact(exits: Exits) -> str:
-    return ",".join(sorted(str(role) for role in exits))
