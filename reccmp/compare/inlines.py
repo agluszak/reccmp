@@ -7,43 +7,39 @@ diagnostic proposals — not automatic semantic proofs.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from collections.abc import Hashable
-from typing import Callable, Literal, Sequence, Union
+from typing import Callable, Literal, Sequence
 
-from reccmp.compare.asm.ir import AsmRole, DecodedInstruction
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Reject,
-    format_operand,
-    parse_instruction,
-)
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.model import REGISTERS
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
-Fingerprint = tuple[tuple[str, str], ...]
+
+@dataclass(frozen=True)
+class FingerprintRow:
+    """One instruction of a fingerprint: its shape (operands as the match
+    key freezes them: references by identity, side-local ones by the
+    placeholder they show), and for a direct call the callee's identity."""
+
+    prefix: str
+    mnemonic: str
+    operands: tuple
+    callee: Hashable | None = None
+
+
+Fingerprint = tuple[FingerprintRow, ...]
 FingerprintFn = Callable[[int, int], Fingerprint | None]
 Counterpart = Literal["call", "inline", "absent"]
 InlineSide = Literal["orig", "recomp", "both"]
 MatchKind = Literal["literal", "register", "summary"]
-AsmInput = Union[Sequence[str], Sequence[DecodedInstruction]]
 
 # Trailing opcodes that belong to a standalone helper epilog, not an inline site.
 _EPILOG_MNEMONICS = frozenset({"ret", "retn", "retf"})
 _STORE_MNEMONICS = frozenset(
     {"mov", "movzx", "movsx", "lea", "add", "sub", "or", "xor", "and", "xchg"}
 )
-# Dest-memory forms with ecx/this + optional displacement (thiscall helpers).
-_THIS_STORE = re.compile(
-    r"^(?:dword|word|byte|qword)\s+ptr\s+"
-    r"\[(?:ecx)(?:\s*([+-])\s*(?:0x)?([0-9a-f]+))?\]\s*,",
-    re.IGNORECASE,
-)
-_ARG_STORE = re.compile(
-    r"^(?:dword|word|byte|qword)\s+ptr\s+"
-    r"\[(?:esp|ebp)(?:\s*([+-])\s*(?:0x)?([0-9a-f]+))?\]\s*,",
-    re.IGNORECASE,
-)
+_STORE_SIZES = frozenset({"dword", "word", "byte", "qword"})
 _UNSUPPORTED_FOR_SUMMARY = frozenset(
     {
         "call",
@@ -58,6 +54,20 @@ _UNSUPPORTED_FOR_SUMMARY = frozenset(
         "outs",
     }
 )
+
+
+def fingerprint_of(rows: Sequence[DecodedInstruction]) -> Fingerprint:
+    """The fingerprint of an excerpt's instructions (table rows skipped)."""
+    return tuple(
+        FingerprintRow(
+            row.prefix,
+            row.mnemonic,
+            instruction_match_key(row)[3],  # type: ignore[index]
+            row.control_target if row.is_call else None,
+        )
+        for row in rows
+        if row.is_code and row.mnemonic
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +129,8 @@ class HelperCatalogEntry:
     recomp_addr: int
     name: str
     fingerprint: Fingerprint  # epilog already stripped
+    # The proof identity a call to the helper carries.
+    identity: Hashable
     byte_size: int
     # How many helpers share this exact fingerprint across the catalog.
     # Used as an inverse-frequency confidence weight (1.0 = unique).
@@ -126,76 +138,54 @@ class HelperCatalogEntry:
     effect_summary: HelperEffectSummary | None = None
 
 
+def _registers(operand) -> list[str]:
+    match operand:
+        case ("reg", name):
+            return [name]
+        case ("mem", _, _, reg_terms, _, _):
+            return [name for name, _scale in reg_terms]
+    return []
+
+
 def summarize_helper_effects(
     fingerprint: Fingerprint,
     *,
     max_length: int = 32,
 ) -> HelperEffectSummary | None:
-    """Derive a cheap effect summary from a helper fingerprint.
+    """Derive a cheap effect summary from a helper fingerprint: which of
+    ecx/edx it reads, whether it returns in eax, and the stores it makes
+    through ``this`` (ecx) or the stack at a constant displacement.
 
-    Prefer short bodies without unsupported ops. Returns ``None`` when the
-    helper is too long or cannot be summarized safely. Full symbolic
-    ``execute()`` is optional future work; displacement-pattern parsing is the MVP.
-    """
+    Returns ``None`` when the helper is too long or cannot be summarized
+    safely."""
     if not fingerprint or len(fingerprint) > max_length:
         return None
-    if any(mnemonic.lower() in _UNSUPPORTED_FOR_SUMMARY for mnemonic, _ in fingerprint):
+    if any(row.mnemonic in _UNSUPPORTED_FOR_SUMMARY for row in fingerprint):
         return None
 
     inputs: set[str] = set()
     stores: list[StoreEffect] = []
     return_kind: Literal["void", "register", "stack", "unknown"] = "void"
 
-    for mnemonic, operand in fingerprint:
-        lower = mnemonic.lower()
-        operand_l = operand.lower()
-        if "ecx" in operand_l:
-            inputs.add("ecx")
-        if "edx" in operand_l:
-            inputs.add("edx")
-        if "eax" in operand_l and lower.startswith("mov") and "," in operand_l:
-            # mov eax, ... counts as producing a register return.
-            dest = operand_l.split(",", 1)[0].strip()
-            if dest == "eax":
+    for row in fingerprint:
+        for operand in row.operands:
+            inputs.update(name for name in _registers(operand) if name in ("ecx", "edx"))
+        match row.mnemonic, row.operands:
+            case mnemonic, (("reg", "eax"), _) if mnemonic.startswith("mov"):
                 return_kind = "register"
-
-        if lower not in _STORE_MNEMONICS:
-            if lower in _EPILOG_MNEMONICS:
-                continue
-            continue
-
-        this_match = _THIS_STORE.match(operand)
-        if this_match and "," in operand:
-            # Only count when the memory operand is the destination.
-            dest = operand.split(",", 1)[0].strip().lower()
-            if dest.startswith(("dword", "word", "byte", "qword")) and "ecx" in dest:
-                sign, digits = this_match.group(1), this_match.group(2)
-                disp = int(f"{sign or '+'}{digits or '0'}", 16)
-                stores.append(StoreEffect("this", disp))
-                inputs.add("ecx")
-                continue
-
-        arg_match = _ARG_STORE.match(operand)
-        if arg_match and "," in operand:
-            dest = operand.split(",", 1)[0].strip().lower()
-            if dest.startswith(("dword", "word", "byte", "qword")):
-                sign, digits = arg_match.group(1), arg_match.group(2)
-                disp = int(f"{sign or '+'}{digits or '0'}", 16)
-                base: Literal["arg", "stack"] = (
-                    "arg" if "ebp" in dest and disp >= 8 else "stack"
-                )
-                stores.append(StoreEffect(base, disp))
+            case mnemonic, (("mem", size, _, ((base, 1),), int() as disp, _), _) if (
+                mnemonic in _STORE_MNEMONICS and size in _STORE_SIZES
+            ):
+                if base == "ecx":
+                    stores.append(StoreEffect("this", disp))
+                elif base in ("esp", "ebp"):
+                    kind: Literal["arg", "stack"] = (
+                        "arg" if base == "ebp" and disp >= 8 else "stack"
+                    )
+                    stores.append(StoreEffect(kind, disp))
 
     # Deduplicate while preserving order.
-    unique_stores: list[StoreEffect] = []
-    seen: set[tuple[str, int]] = set()
-    for store in stores:
-        key = (store.base, store.displacement)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_stores.append(store)
-
+    unique_stores = list(dict.fromkeys(stores))
     if not unique_stores and return_kind == "void" and not inputs:
         return None
 
@@ -219,10 +209,7 @@ class _Span:
 
 def strip_helper_epilog(fingerprint: Fingerprint) -> Fingerprint:
     """Drop a trailing ret so the needle matches an inlined body."""
-    if not fingerprint:
-        return fingerprint
-    mnemonic, _ = fingerprint[-1]
-    if mnemonic.lower() in _EPILOG_MNEMONICS:
+    if fingerprint and fingerprint[-1].mnemonic in _EPILOG_MNEMONICS:
         return fingerprint[:-1]
     return fingerprint
 
@@ -285,21 +272,6 @@ def select_nonoverlapping(spans: Sequence[_Span]) -> list[_Span]:
             i -= 1
     chosen.sort(key=lambda s: s.offset)
     return chosen
-
-
-def call_operand_identities(operand: str) -> set[str]:
-    """Canonical identity tokens extractable from a sanitized call operand."""
-    text = operand.strip()
-    # Drop trailing entity annotations: "Foo (FUNCTION)"
-    text = re.sub(r"\s+\((?:DATA|STRING|FLOAT|FUNCTION|IMPORT)\)$", "", text)
-    identities = {text}
-    # Bare hex address
-    if text.lower().startswith("0x"):
-        try:
-            identities.add(f"{int(text, 16):#x}")
-        except ValueError:
-            pass
-    return identities
 
 
 def elide_spans(
@@ -368,141 +340,46 @@ def _remap_elisions(
     return remapped
 
 
-def asm_fingerprint_from_lines(lines: Sequence[str]) -> Fingerprint:
-    """Build a cheap (mnemonic, operand) fingerprint from sanitized asm lines."""
-    result: list[tuple[str, str]] = []
-    for line in lines:
-        if not line or line.startswith("Jump table:") or line.startswith("Data table:"):
-            continue
-        if line.startswith("start + ") or (
-            line.startswith("0x") and " " not in line.strip()
-        ):
-            continue
-        mnemonic, _, operand = line.partition(" ")
-        if mnemonic in ("rep", "repe", "repne"):
-            rest_m, _, rest_o = operand.partition(" ")
-            mnemonic = f"{mnemonic} {rest_m}"
-            operand = rest_o
-        result.append((mnemonic, operand))
-    return tuple(result)
-
-
-def asm_fingerprint_from_ir(rows: Sequence[DecodedInstruction]) -> Fingerprint:
-    """Build a fingerprint from structured IR operands (not display splits).
-
-    Table markers (``AsmRole`` non-CODE) are skipped. Operand text is rendered
-    from the typed Capstone/sanitizer tuples via ``format_operand``.
-    """
-    result: list[tuple[str, str]] = []
-    for row in rows:
-        if row.role != AsmRole.CODE:
-            continue
-        mnemonic = (
-            f"{row.prefix} {row.mnemonic}".strip() if row.prefix else row.mnemonic
-        )
-        if not mnemonic:
-            continue
-        if row.operands:
-            try:
-                operand = ", ".join(format_operand(op) for op in row.operands)
-            except Reject:
-                operand = ", ".join(row.raw_operands) if row.raw_operands else ""
-        else:
-            operand = ""
-        result.append((mnemonic, operand))
-    return tuple(result)
-
-
-def fingerprint_from_asm(asm: AsmInput) -> Fingerprint:
-    """Prefer IR fingerprints when ``DecodedInstruction`` rows are available."""
-    if asm and isinstance(asm[0], DecodedInstruction):
-        return asm_fingerprint_from_ir(asm)  # type: ignore[arg-type]
-    return asm_fingerprint_from_lines(asm)  # type: ignore[arg-type]
-
-
-def _canon_reg_family(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
-    """Map a GP register to a stable ``(placeholder, width)`` slot, or None."""
+def _canon_reg_family(name: str, mapping: dict[str, str]) -> str | None:
+    """A GP register as an occurrence-ordered placeholder (``R0.r32``)."""
     info = REGISTERS.get(name)
     if info is None:
         return None
     family, width = info
     if family not in mapping:
         mapping[family] = f"R{len(mapping)}"
-    return mapping[family], width
+    return f"{mapping[family]}.{width}"
 
 
-def _rename_structured_operand(operand, mapping: dict[str, str]):
-    if not isinstance(operand, tuple) or not operand:
-        return operand
-    kind = operand[0]
-    if kind == "reg":
-        renamed = _canon_reg_family(operand[1], mapping)
-        if renamed is None:
-            return operand
-        placeholder, width = renamed
-        return ("sym", f"{placeholder}.{width}")
-    if kind == "mem":
-        size, seg, reg_terms, disp, syms = (
-            operand[1],
-            operand[2],
-            operand[3],
-            operand[4],
-            operand[5],
-        )
-        new_terms = []
-        for reg, scale in reg_terms:
-            renamed = _canon_reg_family(reg, mapping)
-            if renamed is None:
-                new_terms.append((reg, scale))
-            else:
-                placeholder, width = renamed
-                new_terms.append((f"{placeholder}.{width}", scale))
-        return ("mem", size, seg, tuple(new_terms), disp, syms)
+def _rename_operand(operand, mapping: dict[str, str]):
+    match operand:
+        case ("reg", name) if (renamed := _canon_reg_family(name, mapping)) is not None:
+            return ("reg", renamed)
+        case ("mem", size, seg, reg_terms, disp, syms):
+            terms = tuple(
+                (_canon_reg_family(name, mapping) or name, scale)
+                for name, scale in reg_terms
+            )
+            return ("mem", size, seg, terms, disp, syms)
     return operand
 
 
-def register_normalized_fingerprint(fingerprint: Fingerprint) -> Fingerprint:
+def register_normalized(fingerprint: Fingerprint) -> Fingerprint:
     """Rewrite GP registers to occurrence-ordered placeholders (R0.r32, …).
 
-    Used as a second-level span key when the literal IR fingerprint misses.
+    Used as a second-level span key when the literal fingerprint misses.
     Relative register identity is preserved; absolute names are not.
     """
     mapping: dict[str, str] = {}
-    result: list[tuple[str, str]] = []
-    for mnemonic, operand in fingerprint:
-        line = f"{mnemonic} {operand}".rstrip() if operand else mnemonic
-        try:
-            ins = parse_instruction(line)
-        except (Reject, IndexError, KeyError, ValueError, TypeError):
-            result.append((mnemonic, operand))
-            continue
-        new_ops = tuple(_rename_structured_operand(op, mapping) for op in ins.operands)
-        head = f"{ins.prefix} {ins.mnemonic}".strip() if ins.prefix else ins.mnemonic
-        try:
-            op_text = ", ".join(format_operand(op) for op in new_ops) if new_ops else ""
-        except Reject:
-            op_text = operand
-        result.append((head, op_text))
-    return tuple(result)
-
-
-def register_normalized_from_ir(rows: Sequence[DecodedInstruction]) -> Fingerprint:
-    """Register-normalize directly from IR operands (no display reparse)."""
-    mapping: dict[str, str] = {}
-    result: list[tuple[str, str]] = []
-    for row in rows:
-        if row.role != AsmRole.CODE:
-            continue
-        head = f"{row.prefix} {row.mnemonic}".strip() if row.prefix else row.mnemonic
-        if not head:
-            continue
-        new_ops = tuple(_rename_structured_operand(op, mapping) for op in row.operands)
-        try:
-            op_text = ", ".join(format_operand(op) for op in new_ops) if new_ops else ""
-        except Reject:
-            op_text = ", ".join(row.raw_operands) if row.raw_operands else ""
-        result.append((head, op_text))
-    return tuple(result)
+    return tuple(
+        FingerprintRow(
+            row.prefix,
+            row.mnemonic,
+            tuple(_rename_operand(op, mapping) for op in row.operands),
+            row.callee,
+        )
+        for row in fingerprint
+    )
 
 
 def find_fingerprint_spans_tolerant(
@@ -519,11 +396,11 @@ def find_fingerprint_spans_tolerant(
     n = len(needle)
     if n == 0 or n > len(haystack):
         return [], "literal"
-    norm_needle = register_normalized_fingerprint(needle)
+    norm_needle = register_normalized(needle)
     norm_starts: list[int] = []
     for start in range(len(haystack) - n + 1):
         window = haystack[start : start + n]
-        if register_normalized_fingerprint(window) == norm_needle:
+        if register_normalized(window) == norm_needle:
             norm_starts.append(start)
     if norm_starts:
         return norm_starts, "register"
@@ -542,9 +419,7 @@ def _span_match_kind(
     host_slice = host_fp[offset : offset + length]
     if host_slice == needle:
         return "literal"
-    if register_normalized_fingerprint(host_slice) == register_normalized_fingerprint(
-        needle
-    ):
+    if register_normalized(host_slice) == register_normalized(needle):
         return "register"
     if helper_summary is not None:
         host_summary = summarize_helper_effects(host_slice)
@@ -553,65 +428,24 @@ def _span_match_kind(
     return "literal"
 
 
-def find_call_sites(
-    fingerprint: Fingerprint,
-) -> list[tuple[int, set[str]]]:
-    """Return ``(index, identity_set)`` for every call in ``fingerprint``."""
-    sites: list[tuple[int, set[str]]] = []
-    for i, (mnemonic, operand) in enumerate(fingerprint):
-        if mnemonic == "call":
-            sites.append((i, call_operand_identities(operand)))
-    return sites
+def find_call_sites(fingerprint: Fingerprint) -> list[tuple[int, Hashable]]:
+    """``(index, callee identity)`` of every direct call in ``fingerprint``."""
+    return [
+        (i, row.callee)
+        for i, row in enumerate(fingerprint)
+        if row.mnemonic == "call" and row.callee is not None
+    ]
 
 
 def find_call_indices_for_helper(
     fingerprint: Fingerprint, helper: HelperCatalogEntry
 ) -> list[int]:
-    """Call indices that resolve to ``helper`` by name or address identity."""
-    wanted = {
-        helper.name,
-        f"{helper.orig_addr:#x}",
-        f"{helper.recomp_addr:#x}",
-        f"{helper.orig_addr:x}",
-        f"{helper.recomp_addr:x}",
-    }
-    # Also accept demangled/decorated substrings via exact identity match only.
-    indices: list[int] = []
-    for index, identities in find_call_sites(fingerprint):
-        if identities & wanted:
-            indices.append(index)
-            continue
-        # Substring match on the rendered name as a last resort for decorated
-        # forms that still contain the helper's best_name.
-        if any(helper.name and helper.name in identity for identity in identities):
-            indices.append(index)
-    return indices
-
-
-def find_call_indices_in_fingerprint(
-    fingerprint: Fingerprint, helper_names: Sequence[str]
-) -> list[int]:
-    """Indices of ``call`` entries whose operand mentions a helper name."""
-    needles = [name for name in helper_names if name]
-    if not needles:
-        return []
-    indices: list[int] = []
-    for i, (mnemonic, operand) in enumerate(fingerprint):
-        if mnemonic != "call":
-            continue
-        identities = call_operand_identities(operand)
-        for name in needles:
-            if name in identities or any(name in identity for identity in identities):
-                indices.append(i)
-                break
-    return indices
-
-
-def find_call_indices(lines: Sequence[str], helper_names: Sequence[str]) -> list[int]:
-    """Indices of ``call`` instructions whose operand mentions a helper name."""
-    return find_call_indices_in_fingerprint(
-        asm_fingerprint_from_lines(lines), helper_names
-    )
+    """Indices of the calls to ``helper``, by the callee's identity."""
+    return [
+        index
+        for index, callee in find_call_sites(fingerprint)
+        if callee == helper.identity
+    ]
 
 
 def _inline_confidence(
@@ -707,21 +541,17 @@ class _Pairing:
 
 
 def analyze_inline_layout(
-    orig_asm: AsmInput,
-    recomp_asm: AsmInput,
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
     helpers: Sequence[HelperCatalogEntry],
     *,
     min_helper_ops: int = 3,
     exclude_orig_addrs: Sequence[int] = (),
 ) -> InlineLayoutResult:
     # pylint: disable=too-many-locals,too-many-statements
-    """Detect CALL↔inline asymmetries; handle every occurrence of each helper.
-
-    Accepts sanitized display lines or ``DecodedInstruction`` excerpts; IR is
-    preferred when available.
-    """
-    orig_fp = fingerprint_from_asm(orig_asm)
-    recomp_fp = fingerprint_from_asm(recomp_asm)
+    """Detect CALL↔inline asymmetries; handle every occurrence of each helper."""
+    orig_fp = fingerprint_of(orig_rows)
+    recomp_fp = fingerprint_of(recomp_rows)
     if not orig_fp or not recomp_fp:
         return InlineLayoutResult()
 

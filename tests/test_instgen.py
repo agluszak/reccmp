@@ -41,7 +41,7 @@ def test_score_notify():
     # CODE section stopped at correct place?
     section = ig.sections[0]
     assert section.type == SectionType.CODE
-    last_inst_address = section.contents[-1][0]
+    last_inst_address = section.contents[-1].address
 
     assert last_inst_address == 0x100014D2
     # n.b. 0x100014d2 is the dummy instruction `mov edi, edi`
@@ -76,7 +76,7 @@ def test_smack_case():
     # Make sure we captured the instruction immediately after
     section = ig.sections[2]
     assert section.type == SectionType.CODE
-    first_inst_mnemonic = section.contents[0][2]
+    first_inst_mnemonic = section.contents[0].mnemonic
     assert first_inst_mnemonic == "mov"
 
 
@@ -105,7 +105,7 @@ def test_beta_case():
     # Make sure we captured the instruction immediately after
     section = ig.sections[2]
     assert section.type == SectionType.CODE
-    first_inst_mnemonic = section.contents[0][2]
+    first_inst_mnemonic = section.contents[0].mnemonic
     assert first_inst_mnemonic == "mov"
 
 
@@ -136,9 +136,9 @@ def test_thunk_case():
     assert len(ig.sections) == 2
     first, second = ig.sections[0], ig.sections[1]
     assert isinstance(first, CodeSection) and isinstance(second, CodeSection)
-    assert first.contents[0][2] == "sub"
-    assert first.contents[1][2] == "jmp"
-    assert second.contents[0][2] == "push"
+    assert first.contents[0].mnemonic == "sub"
+    assert first.contents[1].mnemonic == "jmp"
+    assert second.contents[0].mnemonic == "push"
 
     # TODO: We might detect the 0xCC padding bytes and cut off the function.
     # If we did that, we would correctly read only 2 instructions.

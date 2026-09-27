@@ -29,15 +29,14 @@ _A1_ORIG = bytes.fromhex("EB01CCB801000000C3")  # jmp +1; int3; mov eax,1; ret
 _A1_RECOMP = bytes.fromhex("EB01CCB802000000C3")  # jmp +1; int3; mov eax,2; ret
 
 
-def _code_mnemonics(blob: bytes, base: int = 0x1000) -> list[tuple[str, str]]:
-    """Collect (mnemonic, op_str) from InstructGen CODE sections."""
-    rows: list[tuple[str, str]] = []
-    for section in InstructGen(blob, base).sections:
-        if section.type != SectionType.CODE:
-            continue
-        for _addr, _size, mnemonic, op_str in section.contents:
-            rows.append((mnemonic, op_str))
-    return rows
+def _code_mnemonics(blob: bytes, base: int = 0x1000) -> list[tuple[str, tuple]]:
+    """Collect (mnemonic, operands) from InstructGen CODE sections."""
+    return [
+        (insn.mnemonic, insn.operands)
+        for section in InstructGen(blob, base).sections
+        if section.type == SectionType.CODE
+        for insn in section.contents
+    ]
 
 
 def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
@@ -68,10 +67,10 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
 def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
     """Prefer detail/InstructGen coverage of the mov after the forward jmp."""
     # Linear Capstone stop-at-int3 may still truncate; InstructGen must not.
-    for blob, imm in ((_A1_ORIG, "1"), (_A1_RECOMP, "2")):
-        ig_movs = [op for m, op in _code_mnemonics(blob) if m == "mov"]
+    for blob, imm in ((_A1_ORIG, 1), (_A1_RECOMP, 2)):
+        ig_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
         assert ig_movs, "InstructGen must decode the mov after jmp-over-int3"
-        assert any(imm in op for op in ig_movs)
+        assert any(("imm", imm) in ops for ops in ig_movs)
 
         detail = disasm_detail(blob, 0x1000)
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
@@ -79,7 +78,7 @@ def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
             # Accept InstructGen-only coverage until the shared detail walker
             # also drains pending targets; still require unequal ParseAsm lists.
             continue
-        assert any(imm in insn.display for insn in detail_movs)
+        assert any(("imm", imm) in insn.operands for insn in detail_movs)
 
 
 # --- A2: matched-node membership is not live-out proof at a branch ----------

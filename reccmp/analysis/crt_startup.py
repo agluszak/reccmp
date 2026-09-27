@@ -1,5 +1,4 @@
 import enum
-import re
 import struct
 from dataclasses import dataclass
 from functools import partial
@@ -10,6 +9,7 @@ from reccmp.compare.asm.instgen import (
     InstructGen,
     SectionType,
 )
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.formats import Image, PEImage
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.db import EntityDb
@@ -72,7 +72,35 @@ class CrtStartupArray:
     The thunk is what actually appeared in the ___xc_a/z list."""
 
 
-ADDR_REGEX = re.compile(r"0x[0-9a-f]{6,8}")
+# Values below this are not taken for addresses: an image's addresses are
+# at least 0x100000 (six hex digits).
+_MIN_ADDRESS = 0x100000
+
+
+def _operand_addresses(operand) -> list[int]:
+    """The values in one operand that may be addresses: an immediate, or a
+    memory operand's displacement."""
+    match operand:
+        case ("imm", int() as value):
+            values = [value]
+        case ("mem", _, _, _, int() as displacement, _):
+            values = [displacement]
+        case _:
+            values = []
+    return [
+        value & 0xFFFFFFFF
+        for value in values
+        if (value & 0xFFFFFFFF) >= _MIN_ADDRESS
+    ]
+
+
+def _code_instructions(raw: bytes, start: int) -> list[DecodedInstruction]:
+    return [
+        insn
+        for section in InstructGen(raw, start, True).sections
+        if section.type == SectionType.CODE
+        for insn in section.contents
+    ]
 
 
 class UsedAddressCollector:
@@ -86,34 +114,28 @@ class UsedAddressCollector:
         self.is_entity = is_entity
         self.seen_addrs = []
 
-    def _append_addrs(self, text: str, used_how: UsedHow):
-        for hex_str in ADDR_REGEX.findall(text):
-            addr = int(hex_str, 16)
-            if self.is_entity(addr):
-                self.seen_addrs.append((addr, used_how))
+    def _append_addrs(self, operands, used_how: UsedHow):
+        for operand in operands:
+            for addr in _operand_addresses(operand):
+                if self.is_entity(addr):
+                    self.seen_addrs.append((addr, used_how))
 
     def analyze(self, data: Buffer, start_addr: int):
-        ig = InstructGen(bytes(data), start_addr, True)
-
-        for section in ig.sections:
-            if section.type == SectionType.CODE:
-                for inst in section.contents:
-                    inst_mnemonic, inst_op_str = inst[2:]
-                    if inst_mnemonic == "ret":
-                        break
-
-                    if inst_mnemonic in JUMP_MNEMONICS:
-                        continue
-
-                    if inst_mnemonic in ("call",):
-                        self._append_addrs(inst_op_str, UsedHow.CALL)
-                        # self._append_addrs(inst_op_str, UsedHow.READ)
-                    elif inst_mnemonic in ("mov", "fstp"):
-                        dst_operand, _, src_operand = inst_op_str.partition(", ")
-                        self._append_addrs(dst_operand, UsedHow.WRITE)
-                        self._append_addrs(src_operand, UsedHow.READ)
-                    else:
-                        self._append_addrs(inst_op_str, UsedHow.READ)
+        for insn in _code_instructions(bytes(data), start_addr):
+            if insn.mnemonic == "ret":
+                break
+            if insn.mnemonic in JUMP_MNEMONICS:
+                continue
+            if insn.is_call:
+                if insn.branch_target is not None:
+                    self._append_addrs([("imm", insn.branch_target)], UsedHow.CALL)
+                else:
+                    self._append_addrs(insn.operands, UsedHow.CALL)
+            elif insn.mnemonic in ("mov", "fstp"):
+                self._append_addrs(insn.operands[:1], UsedHow.WRITE)
+                self._append_addrs(insn.operands[1:], UsedHow.READ)
+            else:
+                self._append_addrs(insn.operands, UsedHow.READ)
 
 
 def get_function_sample_size(db: EntityDb, image_id: ImageId, addr: int) -> int:
@@ -363,33 +385,20 @@ def find_initializer_atexit_helpers(
     for initializer_addr in initializer_addrs:
         size = get_function_sample_size(db, image_id, initializer_addr)
         raw = binfile.read(initializer_addr, size)
-        instructions: list[tuple[str, str]] = []
-        for section in InstructGen(raw, initializer_addr, True).sections:
-            if section.type == SectionType.CODE:
-                instructions.extend(
-                    (mnemonic, operands)
-                    for _, _, mnemonic, operands in section.contents
-                )
+        instructions = _code_instructions(raw, initializer_addr)
 
         helpers: list[int] = []
         for previous, current in zip(instructions, instructions[1:]):
-            mnemonic, operands = current
-            if mnemonic != "call":
+            if not current.is_call or current.branch_target is None:
                 continue
-            try:
-                call_target = int(operands, 16)
-            except ValueError:
-                continue
-            target_name = _resolve_entity_name(db, image_id, call_target)
+            target_name = _resolve_entity_name(db, image_id, current.branch_target)
             if target_name is None or "atexit" not in target_name.lower():
                 continue
-            prev_mnemonic, prev_operands = previous
-            if prev_mnemonic != "push":
-                continue
-            try:
-                helper_addr = int(prev_operands, 16)
-            except ValueError:
-                continue
+            match previous.mnemonic, previous.operands:
+                case "push", (("imm", int() as helper_addr),):
+                    pass
+                case _:
+                    continue
             helper = db.get(image_id, helper_addr, exact=True)
             if helper is not None and helper.get("type") == EntityType.FUNCTION:
                 helpers.append(helper_addr)

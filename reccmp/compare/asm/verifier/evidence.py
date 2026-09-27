@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import re
 
-from reccmp.compare.asm.instgen import InstructionMeta
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import (
-    Instruction,
+    format_operand,
     Reject,
     operand_display,
     operand_identity,
@@ -34,11 +33,6 @@ def _symbolic_values(values: tuple | None) -> dict:
     return {"values": values, "solver": bitvector.compare(values).summary()}
 
 
-def _clean_symbol(text: str) -> str:
-    """Sanitized symbol without the display-only entity annotation."""
-    return re.sub(r"\s+\((?:DATA|STRING|FLOAT|FUNCTION|IMPORT)\)$", "", text)
-
-
 def _symbolic_summary(value, depth: int = 0) -> str:
     # pylint: disable=too-many-return-statements
     """Small stable rendering for diagnosis; never expands the whole DAG."""
@@ -48,7 +42,7 @@ def _symbolic_summary(value, depth: int = 0) -> str:
     if tag == "imm" and len(value) > 1:
         return str(value[1])
     if tag == "sym" and len(value) > 1:
-        return _clean_symbol(str(value[1]))
+        return str(value[1])
     if tag == "init" and len(value) > 1:
         return f"initial:{value[1]}"
     if tag == "load" and len(value) > 1:
@@ -56,7 +50,7 @@ def _symbolic_summary(value, depth: int = 0) -> str:
     if tag == "mem" and len(value) >= 5:
         symbols = value[4]
         if symbols:
-            return _clean_symbol(str(symbols[0][1]))
+            return str(symbols[0][1])
         terms = value[2]
         base = _symbolic_summary(terms[0][0], depth + 1) if terms else "absolute"
         return f"{base}{int(value[3]):+d}"
@@ -134,7 +128,7 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
     symbol = None
     if symbols:
         symbol = " + ".join(
-            ("-" if sign < 0 else "") + _clean_symbol(str(name))
+            ("-" if sign < 0 else "") + str(name)
             for sign, name in symbols
         )
     facts: dict[str, str | int | bool | None] = {
@@ -150,15 +144,18 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
 
 
 def target_facts(
-    ins: Instruction, meta: InstructionMeta | None, target_index: int | None = None
+    ins: DecodedInstruction, target_index: int | None = None
 ) -> dict[str, str | int | bool | None]:
+    """A control transfer's destination: its address, what it names, its
+    row in the excerpt, and the identity it resolves to."""
     target_name = None
-    if ins.raw_operands:
-        raw = ins.raw_operands[0]
-        if not raw.startswith(("0x", "-0x")):
-            target_name = _clean_symbol(raw)
+    match ins.operands:
+        case (("imm", _), *_):
+            pass
+        case (operand, *_):
+            target_name = format_operand(operand)
     facts: dict[str, str | int | bool | None] = {
-        "target": meta.branch_target if meta is not None else None,
+        "target": ins.branch_target,
         "target_name": target_name,
         "target_instruction_index": target_index,
     }
@@ -168,26 +165,24 @@ def target_facts(
 
 
 def _target_index(
-    recorder: AnalysisRecorder | None,
-    which: str,
-    meta: InstructionMeta | None,
+    recorder: AnalysisRecorder | None, which: str, ins: DecodedInstruction
 ) -> int | None:
-    if recorder is None or meta is None or meta.branch_target is None:
+    if recorder is None or ins.branch_target is None:
         return None
     addrs = recorder.orig_addrs if which == "orig" else recorder.recomp_addrs
     if addrs is None:
         return None
     try:
-        return addrs.index(meta.branch_target)
+        return addrs.index(ins.branch_target)
     except ValueError:
         return None
 
 
-def _checked_call_registers(ctx: Context, ins: Instruction) -> list[str]:
+def _checked_call_registers(ctx: Context, ins: DecodedInstruction) -> list[str]:
     facts = None
     if ctx.metadata is not None and ctx.metadata.call_facts is not None:
         if ins.operands and ins.operands[0][0] == "sym":
-            facts = ctx.metadata.call_facts(operand_display(ins.operands[0][1]))
+            facts = ctx.metadata.call_facts(operand_identity(ins.operands[0][1]))
     ecx_argument, edx_argument = register_arguments(facts)
     return [
         register
@@ -215,7 +210,7 @@ def _operand_addresses(
         return None
 
 
-def _stack_adjustment(ins: Instruction) -> bool:
+def _stack_adjustment(ins: DecodedInstruction) -> bool:
     """`add/sub esp, N`: a frame size or an argument cleanup, which the
     stack pointer's own value accounts for."""
     return (
@@ -229,8 +224,8 @@ def record_operand_candidate(
     ctx: Context,
     index_o: int,
     index_r: int,
-    ins_o: Instruction,
-    ins_r: Instruction,
+    ins_o: DecodedInstruction,
+    ins_r: DecodedInstruction,
     states: tuple[SideState, SideState] | None = None,
 ) -> None:
     """Record a candidate difference between two paired instructions'
@@ -289,8 +284,8 @@ def record_operand_candidate(
                 "symbol_resolution",
                 index_o,
                 index_r,
-                {"symbol": _clean_symbol(str(op_o[1]))},
-                {"symbol": _clean_symbol(str(op_r[1]))},
+                {"symbol": str(op_o[1])},
+                {"symbol": str(op_r[1])},
                 candidate=True,
             )
             return
@@ -300,12 +295,10 @@ def record_observable_difference(
     ctx: Context,
     index_o: int,
     index_r: int,
-    ins_o: Instruction,
-    ins_r: Instruction,
+    ins_o: DecodedInstruction,
+    ins_r: DecodedInstruction,
     obs_o: list,
     obs_r: list,
-    meta_o: InstructionMeta | None,
-    meta_r: InstructionMeta | None,
 ) -> None:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-return-statements,too-many-locals
@@ -324,8 +317,8 @@ def record_observable_difference(
                 "call_target",
                 index_o,
                 index_r,
-                target_facts(ins_o, meta_o),
-                target_facts(ins_r, meta_r),
+                target_facts(ins_o),
+                target_facts(ins_r),
             )
             return
         registers = _checked_call_registers(ctx, ins_o)
@@ -415,14 +408,14 @@ def record_observable_difference(
                 ),
             )
             return
-        target_o = _target_index(recorder, "orig", meta_o)
-        target_r = _target_index(recorder, "recomp", meta_r)
+        target_o = _target_index(recorder, "orig", ins_o)
+        target_r = _target_index(recorder, "recomp", ins_r)
         recorder.record_difference(
             "branch_target",
             index_o,
             index_r,
-            target_facts(ins_o, meta_o, target_o),
-            target_facts(ins_r, meta_r, target_r),
+            target_facts(ins_o, target_o),
+            target_facts(ins_r, target_r),
         )
         return
 

@@ -9,11 +9,22 @@ logger = logging.getLogger(__name__)
 
 
 class StackOrRegisterSymbol(NamedTuple):
+    """A function's local or argument: in a frame slot (S_BPREL32, at a
+    signed offset from the frame pointer) or in a register (S_REGISTER)."""
+
     symbol_type: str
-    location: str
-    """Should always be set/converted to lowercase."""
     data_type: CvdumpTypeKey
     name: str
+    frame_offset: int | None = None
+    register: str | None = None
+
+
+def _frame_offset(location: str) -> int | None:
+    """``[FFFFFFF8]``: a 32-bit two's-complement frame offset."""
+    if not (location.startswith("[") and location.endswith("]")):
+        return None
+    value = int(location[1:-1], 16) & 0xFFFFFFFF
+    return value - (1 << 32) if value >> 31 else value
 
 
 class LdataEntry(NamedTuple):
@@ -185,11 +196,15 @@ class CvdumpSymbolsParser:
                 logger.error("Invalid stack/register symbol: %s", line[:-1])
                 return
 
+            location = match.group("location").lower()
             new_symbol = StackOrRegisterSymbol(
                 symbol_type=symbol_type,
-                location=match.group("location").lower(),
                 data_type=CvdumpTypeKey.from_str(match.group("data_type")),
                 name=match.group("name"),
+                frame_offset=(
+                    _frame_offset(location) if symbol_type == "S_BPREL32" else None
+                ),
+                register=location if symbol_type == "S_REGISTER" else None,
             )
             self.current_function.symbols.append(new_symbol)
 

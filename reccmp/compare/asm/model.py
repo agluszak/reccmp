@@ -1,7 +1,8 @@
-"""Instruction/operand text model for sanitized assembly lines.
+"""The operand vocabulary: references, rendering operands and instructions
+to Intel text, and parsing Intel text (a boundary for assembly that arrives
+as text, never for text reccmp rendered).
 
-Leaf module: no imports from ``effective``, ``ir``, or ``stack_layout``.
-Parsing lives here so IR and the symbolic executor can share it without cycles.
+Leaf module: no imports from ``ir`` or the verifier.
 """
 
 from __future__ import annotations
@@ -30,6 +31,16 @@ class Reference:
 
     def __str__(self) -> str:
         return self.display
+
+
+@dataclass(frozen=True)
+class ResolvedAddress:
+    """What an address resolves to, in one lookup: the entity's proof
+    identity, and the name to show for it (None when it has no name, and
+    the sanitizer shows a placeholder)."""
+
+    name: str | None
+    identity: Hashable
 
 
 def operand_display(value) -> str:
@@ -70,10 +81,6 @@ NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
 ST_RE = re.compile(r"^st(?:\((\d)\))?$")
 
 # ebp/esp ± offset tokens in display lines (shared by IR rewrite and stack_layout).
-STACK_ENTRY_REGEX = re.compile(
-    r"(?P<register>e[sb]p)\s(?P<sign>[+-])\s(?P<offset>(0x)?[0-9a-f]+)(?![0-9a-f])"
-)
-
 
 def split_operands(op_str: str) -> list[str]:
     """Split on top-level ', ' only: brackets and parens may contain commas."""
@@ -139,24 +146,18 @@ def parse_operand(text: str):
     return ("sym", text)
 
 
-@dataclass(frozen=True)
-class Instruction:
-    mnemonic: str
-    prefix: str  # rep/repe/repne or ""
-    operands: tuple
-    raw_operands: tuple[str, ...]
-    # Proof identity of a jump/call destination (not the display displacement).
-    control_target: Hashable | None = None
+def parse_instruction(line: str) -> tuple[str, str, tuple]:
+    """``(prefix, mnemonic, operands)`` of one line of Intel assembly text.
 
-
-def parse_instruction(line: str) -> Instruction:
+    A text boundary: for assembly that arrives as text (test fixtures).
+    Nothing reccmp renders is parsed back."""
     mnemonic, _, op_str = line.partition(" ")
     prefix = ""
     if mnemonic in ("rep", "repe", "repne"):
         prefix = mnemonic
         mnemonic, _, op_str = op_str.partition(" ")
     raw = tuple(split_operands(op_str)) if op_str else ()
-    return Instruction(mnemonic, prefix, tuple(parse_operand(t) for t in raw), raw)
+    return prefix, mnemonic, tuple(parse_operand(token) for token in raw)
 
 
 def format_imm(value: int) -> str:

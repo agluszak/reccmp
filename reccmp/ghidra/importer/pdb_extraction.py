@@ -93,21 +93,16 @@ class PdbFunctionExtractor:
         stack_offset_delta = -4 if fn.frame_pointer_present else 0
 
         for symbol in fn.symbols:
-            if symbol.symbol_type == "S_REGISTER":
+            if symbol.register is not None:
                 symbols.append(
-                    CppRegisterSymbol(
-                        symbol.name,
-                        symbol.data_type,
-                        symbol.location,
-                    )
+                    CppRegisterSymbol(symbol.name, symbol.data_type, symbol.register)
                 )
-            elif symbol.symbol_type == "S_BPREL32":
-                stack_offset = int(symbol.location[1:-1], 16)
+            elif symbol.frame_offset is not None:
                 symbols.append(
                     CppStackSymbol(
                         symbol.name,
                         symbol.data_type,
-                        stack_offset + stack_offset_delta,
+                        symbol.frame_offset + stack_offset_delta,
                     )
                 )
 

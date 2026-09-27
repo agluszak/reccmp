@@ -671,6 +671,7 @@ class Compare:
             inline_expansions=result.inline_expansions,
             accuracy_modulo_inline=result.accuracy_modulo_inline,
             diagnostic_normalizations=result.diagnostic_normalizations,
+            stack_layout=result.stack_layout,
         )
 
     @property

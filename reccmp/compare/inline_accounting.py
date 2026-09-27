@@ -1,7 +1,10 @@
 """Known-inline accounting: fingerprint paired helpers and find their
 expansions at call sites."""
 
+from collections.abc import Hashable
+
 from reccmp.compare.asm.parse import AsmExcerpt
+from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.body_equivalence import BodyEquivalenceMixin
 from reccmp.compare.db import ReccmpMatch
 from reccmp.compare.inlines import (
@@ -10,10 +13,9 @@ from reccmp.compare.inlines import (
     InlineHit,
     InlineLayoutResult,
     analyze_inline_layout,
-    asm_fingerprint_from_ir,
     find_call_sites,
     find_inline_expansions,
-    fingerprint_from_asm,
+    fingerprint_of,
     strip_helper_epilog,
     summarize_helper_effects,
 )
@@ -34,12 +36,10 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
         recomp_asm: AsmExcerpt,
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
-        orig_fp = fingerprint_from_asm(orig_asm)
-        recomp_fp = fingerprint_from_asm(recomp_asm)
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}
-        for fingerprint in (orig_fp, recomp_fp):
-            for _index, identities in find_call_sites(fingerprint):
-                helper = self._resolve_helper_from_call_identities(identities)
+        for rows in (orig_asm, recomp_asm):
+            for _index, callee in find_call_sites(fingerprint_of(rows)):
+                helper = self._helper_called(callee)
                 if helper is None or helper.orig_addr == match.orig_addr:
                     continue
                 helpers_by_orig[helper.orig_addr] = helper
@@ -56,6 +56,7 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
                 recomp_addr=entry.recomp_addr,
                 name=entry.name,
                 fingerprint=entry.fingerprint,
+                identity=entry.identity,
                 byte_size=entry.byte_size,
                 uniqueness=1.0 / freq[entry.fingerprint],
                 effect_summary=entry.effect_summary,
@@ -91,8 +92,7 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
             memo[entity.orig_addr] = None
             return None
         excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-        fingerprint = asm_fingerprint_from_ir(excerpt)
-        needle = strip_helper_epilog(fingerprint)
+        needle = strip_helper_epilog(fingerprint_of(excerpt))
         if len(needle) < 3:
             memo[entity.orig_addr] = None
             return None
@@ -102,44 +102,14 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
             recomp_addr=entity.recomp_addr,
             name=name,
             fingerprint=needle,
+            identity=entity_proof_identity(
+                self.db, ImageId.RECOMP, entity, 0, self.equivalence_groups
+            ),
             byte_size=recomp_size,
             effect_summary=summarize_helper_effects(needle),
         )
         memo[entity.orig_addr] = entry
         return entry
-
-    def _ensure_helper_identity_index(self) -> None:
-        """Build exact-identity maps for call-driven helper resolution.
-
-        Ambiguous names (overloads / collisions) are recorded but never chosen.
-        Substring matching is not used for modulo-inline accounting.
-        """
-        if self._helper_identity_index is not None:
-            return
-        index: dict[str, int] = {}
-        ambiguous: set[str] = set()
-
-        def add_key(key: str, orig_addr: int) -> None:
-            if not key or key in ambiguous:
-                return
-            existing = index.get(key)
-            if existing is None:
-                index[key] = orig_addr
-            elif existing != orig_addr:
-                del index[key]
-                ambiguous.add(key)
-
-        for entity in self.db.get_functions():
-            add_key(f"{entity.orig_addr:#x}", entity.orig_addr)
-            add_key(f"{entity.recomp_addr:#x}", entity.orig_addr)
-            add_key(f"{entity.orig_addr:x}", entity.orig_addr)
-            add_key(f"{entity.recomp_addr:x}", entity.orig_addr)
-            name = entity.best_name() or ""
-            if name:
-                add_key(name, entity.orig_addr)
-
-        self._helper_identity_index = index
-        self._helper_identity_ambiguous = ambiguous
 
     def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
         """Full catalog for ``find-inlines`` only — not used on the hot compare path."""
@@ -161,6 +131,7 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
                 recomp_addr=entry.recomp_addr,
                 name=entry.name,
                 fingerprint=entry.fingerprint,
+                identity=entry.identity,
                 byte_size=entry.byte_size,
                 uniqueness=1.0 / freq[entry.fingerprint],
                 effect_summary=entry.effect_summary,
@@ -171,27 +142,13 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
         self._helper_catalog = catalog
         return catalog
 
-    def _resolve_helper_from_call_identities(
-        self, identities: set[str]
-    ) -> HelperCatalogEntry | None:
-        """Map sanitized call-operand identities to a paired helper."""
-        self._ensure_helper_identity_index()
-        assert self._helper_identity_index is not None
-        assert self._helper_identity_ambiguous is not None
-
-        matched_orig: set[int] = set()
-        for identity in identities:
-            if identity in self._helper_identity_ambiguous:
-                continue
-            orig_addr = self._helper_identity_index.get(identity)
-            if orig_addr is not None:
-                matched_orig.add(orig_addr)
-        if len(matched_orig) != 1:
-            return None
-        entity = self.db.get_one_match(next(iter(matched_orig)))
-        if entity is None:
-            return None
-        return self._helper_entry_for_match(entity)
+    def _helper_called(self, callee: Hashable) -> HelperCatalogEntry | None:
+        """The paired helper a call's callee identity names, if any."""
+        match callee:
+            case ("entity", int() as orig_addr, 0):
+                entity = self.db.get_one_match(orig_addr)
+                return self._helper_entry_for_match(entity) if entity else None
+        return None
 
     def find_inlines(self, helper: ReccmpMatch) -> list[InlineHit]:
         """Search original functions for probable expansions of ``helper``'s body."""

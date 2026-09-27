@@ -4,15 +4,8 @@ swaps, frame slots and the end-of-run admission checklist."""
 
 from __future__ import annotations
 
-import re
-
-from reccmp.compare.asm.instgen import InstructionMeta
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Instruction,
-    Reject,
-    parse_instruction,
-)
+from reccmp.compare.asm.ir import DecodedInstruction
+from reccmp.compare.asm.model import REGISTERS, Reject
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     Value,
@@ -51,13 +44,8 @@ from reccmp.compare.diagnosis import AnalysisRecorder
 # ---------------------------------------------------------------------------
 # Lockstep driver
 
-# Non-executable lines emitted by the sanitizer (jump/data tables).
-DATA_LINE_RE = re.compile(r"^(Jump table:|Data table:|start \+ |0x[0-9a-f]+$)")
-# Jump-table entries produced by ParseAsm for ADDR_TAB destinations.
-JUMP_TABLE_ENTRY_RE = re.compile(r"^start \+ (0x[0-9a-f]+)$")
 
-
-def switch_index_observation(state: SideState, ins: Instruction) -> tuple:
+def switch_index_observation(state: SideState, ins: DecodedInstruction) -> tuple:
     """Index register values that select a recognized switch-table case."""
     op = ins.operands[0]
     assert isinstance(op, tuple) and op[0] == "mem"
@@ -191,47 +179,31 @@ def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> b
     return True
 
 
-def addrs_from_meta(
-    metas: list[InstructionMeta | None] | None,
-) -> list[int | None] | None:
-    if metas is None:
-        return None
-    return [meta.address if meta is not None else None for meta in metas]
-
-
 def _control_destination(
     raw_operand: object,
-    meta: InstructionMeta | None,
-    addrs: list[int | None] | None,
+    row: DecodedInstruction,
+    addrs: list[int | None],
 ) -> object:
     """Prefer local instruction-id; never a relative displacement."""
-    if meta is None:
-        return raw_operand
-    if meta.branch_target is not None and addrs is not None:
+    if row.branch_target is not None:
         try:
-            return ("L", addrs.index(meta.branch_target))
+            return ("L", addrs.index(row.branch_target))
         except ValueError:
             pass
-    if meta.control_target is not None:
-        return ("ext", meta.control_target)
-    if meta.branch_target is not None:
-        return ("ext", ("unresolved", None, meta.branch_target))
+    if row.control_target is not None:
+        return ("ext", row.control_target)
+    if row.branch_target is not None:
+        return ("ext", ("unresolved", None, row.branch_target))
     return raw_operand
 
 
 def rewrite_control_observables(
-    obs: list,
-    meta: InstructionMeta | None,
-    addrs: list[int | None] | None,
+    obs: list, row: DecodedInstruction, addrs: list[int | None]
 ) -> None:
-    if meta is None or addrs is None:
-        return
+    """A branch observation's destination as a row index or an identity."""
     for index, entry in enumerate(obs):
         if entry and entry[0] in CONTROL_TAGS - {"jmpind"}:
-            obs[index] = (
-                *entry[:-1],
-                _control_destination(entry[-1], meta, addrs),
-            )
+            obs[index] = (*entry[:-1], _control_destination(entry[-1], row, addrs))
 
 
 def _is_scratch(value: Value) -> bool:
@@ -322,7 +294,7 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
     paired value. Anything with memory access, control flow, x87, or
     unmapped registers falls back to the full-synchronization rule."""
     # pylint: disable=too-many-return-statements,too-many-boolean-expressions
-    if not getattr(meta, "register_access_known", True):
+    if not meta.register_access_known:
         return False
     if (
         meta.accesses_memory
@@ -437,13 +409,9 @@ def one_sided_ok(
     other: SideState,
     ctx: Context,
     idx: int,
-    line: str,
-    *,
-    ins: Instruction | None = None,
-    is_data: bool = False,
+    ins: DecodedInstruction,
 ) -> bool:
     # pylint: disable=too-many-return-statements
-    # pylint: disable=too-many-arguments
     """Execute an instruction that exists on only one side. Any instruction
     with no observable effect (no store, call, branch or return) is allowed:
     its register and flag writes are validated downstream by the observables
@@ -452,13 +420,8 @@ def one_sided_ok(
     read the same address at the same memory generation somewhere in the
     same verification scope (the folded-load case). Control flow, stack
     adjustments, x87 and potentially-faulting arithmetic stay excluded."""
-    if is_data or (ins is None and DATA_LINE_RE.match(line)):
+    if not ins.is_code:
         return False
-    if ins is None:
-        try:
-            ins = parse_instruction(line)
-        except (Reject, IndexError, KeyError, ValueError, TypeError):
-            return False
     if ins.prefix or ins.mnemonic in _ONE_SIDED_BLACKLIST:
         return False
     if ins.mnemonic == "nop":
@@ -588,11 +551,13 @@ def admit_unsupported_identical(
     recomp: SideState,
     ctx: Context,
     idx: int,
-    meta_o: InstructionMeta | None,
-    meta_r: InstructionMeta | None,
+    meta_o: DecodedInstruction | None,
+    meta_r: DecodedInstruction | None,
 ) -> bool:
     # pylint: disable=too-many-positional-arguments
-    """Shared policy for identical unsupported instructions on both sides."""
+    """Shared policy for identical unsupported instructions on both sides:
+    step over them by their Capstone effects when both agree and are
+    known, else only from fully synchronized states."""
     if (
         meta_o is not None
         and meta_r is not None
@@ -740,8 +705,8 @@ def _commutative_order_used(
     before_o: SideState,
     before_r: SideState,
     ctx: Context,
-    ins_o: Instruction,
-    ins_r: Instruction,
+    ins_o: DecodedInstruction,
+    ins_r: DecodedInstruction,
 ) -> bool:
     # pylint: disable=too-many-return-statements
     """Whether this paired operation needed commutative-order normalization."""
@@ -787,7 +752,7 @@ def _commutative_order_used(
 
 
 def _same_meta_effects(
-    orig: InstructionMeta | None, recomp: InstructionMeta | None
+    orig: DecodedInstruction | None, recomp: DecodedInstruction | None
 ) -> bool:
     """Whether two metadata records describe the same non-address effects.
 
@@ -800,9 +765,7 @@ def _same_meta_effects(
         return False
     if not orig.register_access_known or not recomp.register_access_known:
         return False
-    if not getattr(orig, "control_flow_known", True) or not getattr(
-        recomp, "control_flow_known", True
-    ):
+    if not orig.control_flow_known or not recomp.control_flow_known:
         return False
     fields = (
         "mnemonic",
@@ -824,8 +787,8 @@ def record_pair_categories(
     before_r: SideState,
     after_o: SideState,
     after_r: SideState,
-    ins_o: Instruction,
-    ins_r: Instruction,
+    ins_o: DecodedInstruction,
+    ins_r: DecodedInstruction,
     obs_o: list,
     obs_r: list,
 ) -> None:
@@ -872,9 +835,8 @@ def accept_agreeing_pair(
     index_r: int,
     before: tuple[SideState, SideState],
     after: tuple[SideState, SideState],
-    ins: tuple[Instruction, Instruction],
+    ins: tuple[DecodedInstruction, DecodedInstruction],
     obs: tuple[list, list],
-    meta: tuple[InstructionMeta | None, InstructionMeta | None],
 ) -> bool:
     """CFG strategies' per-pair check: the observables must agree; then the
     pair's effects become matched evidence. Records the difference and
@@ -883,7 +845,7 @@ def accept_agreeing_pair(
     obs_o, obs_r = obs
     if not observations_agree(ctx, obs_o, obs_r):
         record_observable_difference(
-            ctx, index_o, index_r, ins[0], ins[1], obs_o, obs_r, meta[0], meta[1]
+            ctx, index_o, index_r, ins[0], ins[1], obs_o, obs_r
         )
         return False
     invalidate_save_slots(ctx, obs_o)

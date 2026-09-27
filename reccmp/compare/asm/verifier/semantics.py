@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import (
     REGISTERS,
-    Instruction,
     Reject,
-    operand_display,
     operand_identity,
 )
 from reccmp.compare.asm.verifier.addresses import (
@@ -370,17 +369,13 @@ def _compare_width(op_a, op_b) -> int | str:
     return "unk"
 
 
-def _branch_obs_dest(ins: Instruction) -> object:
+def _branch_obs_dest(ins: DecodedInstruction) -> object:
     """Proof identity of a direct transfer; never a relative displacement."""
-    if ins.control_target is not None:
-        return ins.control_target
-    if ins.raw_operands:
-        return ins.raw_operands[0]
-    return None
+    return ins.control_target
 
 
 def execute(
-    state: SideState, ctx: Context, idx: int, ins: Instruction, obs: list
+    state: SideState, ctx: Context, idx: int, ins: DecodedInstruction, obs: list
 ) -> None:
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-branches,too-many-statements
@@ -558,7 +553,7 @@ def execute(
         facts = None
         if ctx.metadata is not None and ctx.metadata.call_facts is not None:
             if ops[0][0] == "sym":
-                facts = ctx.metadata.call_facts(operand_display(ops[0][1]))
+                facts = ctx.metadata.call_facts(operand_identity(ops[0][1]))
         ecx_argument, edx_argument = register_arguments(facts)
         target = _import_call(read_operand(state, ctx, ops[0]))
         virtual_target = _canonical_virtual_target(target, ctx)
@@ -587,7 +582,7 @@ def execute(
         state.carry = ("callcf", idx)
         state.x87 = X87Stack(epoch=idx + 1)
     elif mnemonic == "ret":
-        obs.append(("retstack", ins.raw_operands, state.x87.state_key()[1:]))
+        obs.append(("retstack", ins.operands, state.x87.state_key()[1:]))
         # Externally observable machine state at return must match exactly:
         # the callee-saved registers, the stack pointer, and the return
         # value as determined by the function's return kind. Without
@@ -669,7 +664,7 @@ def execute(
         raise Reject
 
 
-def execute_x87(state: SideState, ctx: Context, ins: Instruction, obs: list) -> None:
+def execute_x87(state: SideState, ctx: Context, ins: DecodedInstruction, obs: list) -> None:
     # pylint: disable=too-many-branches,too-many-statements
     mnemonic = ins.mnemonic
     ops = ins.operands

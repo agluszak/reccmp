@@ -2,6 +2,7 @@ import bisect
 from functools import cache
 from collections.abc import Hashable
 from typing import Callable, Protocol
+from reccmp.compare.asm.model import ResolvedAddress
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.types import EntityType, ImageId
@@ -11,10 +12,17 @@ class AddrTestProtocol(Protocol):
     def __call__(self, addr: int, /) -> bool: ...
 
 
-class NameReplacementProtocol(Protocol):
+class ReferenceResolver(Protocol):
+    """Resolve an address to its entity's identity and name, in one lookup.
+
+    * exact:    the address must be the entity's start; otherwise an address
+                inside a variable resolves to it at an offset.
+    * indirect: the address is a pointer; the entity may be the one it
+                points at."""
+
     def __call__(
         self, addr: int, exact: bool = False, indirect: bool = False
-    ) -> str | None: ...
+    ) -> ResolvedAddress | None: ...
 
 
 _CALLABLE_TYPES = {
@@ -31,14 +39,9 @@ def canonical_callee_name(
     entity: ReccmpEntity,
     equivalence_groups: dict[int, int] | None = None,
 ) -> str | None:
-    """Display name plus a stable identity for a callable entity.
-
-    Names remain useful diagnostics, but are not identities: FID guesses and
-    local wrapper names can disagree, while unrelated functions can share a
-    display name.  Prefer an explicitly configured original-address alias,
-    then a matched pair, a decorated symbol/import, and finally a side-local
-    opaque identity that cannot accidentally compare equal across images.
-    """
+    """The name to show for a callable entity: its canonical entity's (a
+    configured alias's, or its pair's original), else its own. A name, not
+    an identity: see entity_proof_identity."""
     if entity.entity_type not in _CALLABLE_TYPES:
         return entity.match_name()
 
@@ -71,32 +74,13 @@ def canonical_callee_name(
     if canonical_orig is not None and (
         configured_alias or entity.matched or canonical_entity.matched
     ):
-        # A proven pair (or a configured equivalence-group alias) is a stronger
-        # identity than either side's local decorated symbol: the two images can
-        # spell the same callee differently while a match proves they are one
-        # entity. Resolve display through the canonical original entity too.
         original_entity = db.get(ImageId.ORIG, canonical_orig, exact=True)
         if original_entity is not None:
             canonical_entity = original_entity
-        identity = f"orig:{canonical_orig:x}"
-        display = canonical_entity.match_name() or entity.match_name()
-    elif symbol:
-        identity = f"symbol:{symbol}"
-        display = f"{symbol} ({EntityTypeLookup.get(entity.entity_type or -1, 'UNK')})"
-    elif entity.entity_type == EntityType.IMPORT:
-        identity = f"import:{canonical_entity.best_name() or entity.best_name()}"
-        display = canonical_entity.match_name() or entity.match_name()
-    elif canonical_orig is not None and entity.addr(image_id) is None:
-        identity = f"orig:{canonical_orig:x}"
-        display = canonical_entity.match_name() or entity.match_name()
-    else:
-        addr = entity.addr(image_id)
-        assert addr is not None
-        identity = f"{image_id.name.lower()}:{addr:x}"
-        display = canonical_entity.match_name() or entity.match_name()
-    if display is None:
-        return None
-    return f"{display} [CALLEE {identity}]"
+        return canonical_entity.match_name() or entity.match_name()
+    if symbol:
+        return f"{symbol} ({EntityTypeLookup.get(entity.entity_type or -1, 'UNK')})"
+    return canonical_entity.match_name() or entity.match_name()
 
 
 def entity_proof_identity(
@@ -205,7 +189,7 @@ def _resolve_raw_jump_entity(
     return entity
 
 
-def create_name_lookup(
+def create_resolver(
     db: EntityDb,
     image_id: ImageId,
     bin_read: Callable[[int], int | None],
@@ -213,9 +197,9 @@ def create_name_lookup(
     equivalence_groups: dict[int, int] | None = None,
     *,
     jump_target: Callable[[int], int | None] | None = None,
-) -> NameReplacementProtocol:
+) -> ReferenceResolver:
     # pylint: disable=too-many-statements
-    """Function generator for name replacement"""
+    """The ReferenceResolver of one image's entities."""
     assert image_id in (ImageId.ORIG, ImageId.RECOMP), "Invalid image id"
 
     def follow_indirect(pointer: int) -> ReccmpEntity | None:
@@ -388,41 +372,24 @@ def create_name_lookup(
         return entity, addr - base_addr
 
     @cache
-    def lookup_cached(_gen: int, addr: int, exact: bool, indirect: bool) -> str | None:
-        del _gen
-        resolved = resolve_entity(addr, exact=exact, indirect=indirect)
-        if resolved is None:
-            return None
-        entity, offset = resolved
-        return get_name(entity, offset)
-
-    def lookup(addr: int, exact: bool = False, indirect: bool = False) -> str | None:
-        """Returns the name that represents the entity at the given address.
-        If there is no suitable name, return None and let the caller choose one (i.e. placeholder).
-        * exact:    If the addr is an offset of an entity (e.g. struct/array) we may return
-                    a name like 'variable+8'. If exact is True, return a name only if the entity's addr
-                    matches the addr parameter.
-        * indirect: If True, the given addr is a pointer so we have the option to read the address
-                    from the binary to find the name."""
-        return lookup_cached(db.generation, addr, exact, indirect)
-
-    @cache
-    def identity_cached(
+    def resolve_cached(
         _gen: int, addr: int, exact: bool, indirect: bool
-    ) -> Hashable | None:
+    ) -> ResolvedAddress | None:
         del _gen
         resolved = resolve_entity(addr, exact=exact, indirect=indirect)
         if resolved is None:
             return None
         entity, offset = resolved
+        name = get_name(entity, offset)
         if offset == 0:
             entity = follow_thunk(entity)
-        return entity_proof_identity(db, image_id, entity, offset, equivalence_groups)
+        return ResolvedAddress(
+            name, entity_proof_identity(db, image_id, entity, offset, equivalence_groups)
+        )
 
-    def identity(
+    def resolve(
         addr: int, exact: bool = False, indirect: bool = False
-    ) -> Hashable | None:
-        return identity_cached(db.generation, addr, exact, indirect)
+    ) -> ResolvedAddress | None:
+        return resolve_cached(db.generation, addr, exact, indirect)
 
-    lookup.identity = identity  # type: ignore[attr-defined]
-    return lookup
+    return resolve

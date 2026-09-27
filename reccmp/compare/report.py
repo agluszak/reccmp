@@ -1,6 +1,6 @@
 from datetime import datetime
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Iterator, Literal
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Literal
 
 from pydantic import BaseModel, ValidationError
 from pydantic_core import from_json
@@ -27,6 +27,9 @@ from .diff import (
     raw_diff_to_udiff,
 )
 from .inlines import InlineExpansionEvidence
+
+if TYPE_CHECKING:
+    from .stack_layout import StackLayoutResult
 
 
 def format_address(addr: int) -> str:
@@ -75,6 +78,8 @@ class ReccmpComparedEntity:
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
     accuracy_modulo_inline: float | None = None
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
+    # The stack slots the paired instructions use (not serialized).
+    stack_layout: "StackLayoutResult | None" = None
 
     def is_matched(self) -> bool:
         return self.recomp_addr is not None or self.recomp_addr_varies

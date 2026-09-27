@@ -1,28 +1,21 @@
 """Stack-layout pairing shared by the comparator and reccmp-stackcmp.
 
-Infers an orig↔recomp mapping of ebp/esp-relative offsets from a unified
-assembly diff, and scores how much of a mismatch collapses once that map is
-applied.
+Infers an orig↔recomp mapping of ebp/esp-relative offsets from the paired
+instructions of a diff, and scores how much of a mismatch collapses once
+that map is applied.
 """
 
 from __future__ import annotations
 
-import struct
+from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Literal, NamedTuple, Sequence
 
-from reccmp.compare.asm.model import STACK_ENTRY_REGEX
+from reccmp.compare.asm.ir import AsmRole, DecodedInstruction, instruction_match_key
 from reccmp.compare.diagnosis import StackPermutationEntry
-from reccmp.compare.diff import (
-    CombinedDiffOutput,
-    MatchingOrMismatchingBlock,
-    RawDiffOutput,
-)
-from reccmp.compare.diff import raw_diff_to_udiff
+from reccmp.compare.pinned_sequences import DiffOpcode, SequenceMatcherWithPins
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.cvdump.types import CvdumpTypeKey
-from reccmp.compare.asm.ir import rewrite_stack_displacements
-from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 StackRefKind = Literal["argument", "local", "spill", "saved", "unknown"]
 
@@ -187,34 +180,16 @@ class StackLayoutResult:
     pairs: StackPairs = field(default_factory=set)
 
 
-def extract_stack_offset_from_instruction(
-    instruction: str,
-) -> StackRegisterOffset | None:
-    match = STACK_ENTRY_REGEX.search(instruction)
-    if not match:
-        return None
-    offset = int(match.group("sign") + match.group("offset"), 16)
-    slot = StackRegisterOffset(match.group("register"), offset)
-    slot.attach_canonical()
-    return slot
-
-
 def extract_stack_offset_from_operands(
     operands: Sequence,
 ) -> StackRegisterOffset | None:
-    """Pull the first ebp/esp-relative displacement from structured operands."""
+    """The first ebp/esp-relative displacement among structured operands."""
     for op in operands:
-        if not isinstance(op, tuple) or not op or op[0] != "mem":
-            continue
-        _size, _seg, reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
-        if syms:
-            continue
-        regs = [name for name, _scale in reg_terms]
-        if len(regs) != 1 or regs[0] not in ("ebp", "esp"):
-            continue
-        slot = StackRegisterOffset(regs[0], int(disp))
-        slot.attach_canonical()
-        return slot
+        match op:
+            case ("mem", _, _, [(("ebp" | "esp") as register, _)], int() as disp, ()):
+                slot = StackRegisterOffset(register, disp)
+                slot.attach_canonical()
+                return slot
     return None
 
 
@@ -243,10 +218,9 @@ def pdb_stack_slots(
     if fn_symbol is None:
         return slots
     for symbol in fn_symbol.symbols:
-        if symbol.symbol_type != "S_BPREL32":
+        if symbol.frame_offset is None:
             continue
-        hex_bytes = bytes.fromhex(symbol.location[1:-1])
-        stack_offset = struct.unpack(">l", hex_bytes)[0]
+        stack_offset = symbol.frame_offset
         size = 4
         if types is not None:
             try:
@@ -263,41 +237,40 @@ def pdb_stack_slots(
     return slots
 
 
-def analyze_diff_block(
-    diff: MatchingOrMismatchingBlock, warnings: Warnings
-) -> StackPairs:
-    stack_pairs: StackPairs = set()
-    if "both" in diff:
-        for line in diff["both"]:
-            instruction = line[1]
-            if match := extract_stack_offset_from_instruction(instruction):
-                stack_pairs.add(StackPair(match, match.copy()))
-        return stack_pairs
-
-    assert "orig" in diff
-    assert "recomp" in diff
-    orig = diff["orig"]
-    recomp = diff["recomp"]
-    if len(orig) != len(recomp):
-        warnings.structural_mismatches_present = True
-        return set()
-
-    for orig_line, recomp_line in zip(orig, recomp):
-        if orig_match := extract_stack_offset_from_instruction(orig_line[1]):
-            recomp_match = extract_stack_offset_from_instruction(recomp_line[1])
-            if not recomp_match:
-                warnings.structural_mismatches_present = True
-                return set()
-            stack_pairs.add(StackPair(orig_match, recomp_match))
-    return stack_pairs
+def _stack_slot(row: DecodedInstruction) -> StackRegisterOffset | None:
+    return extract_stack_offset_from_operands(row.operands) if row.is_code else None
 
 
-def collect_stack_pairs(udiff: CombinedDiffOutput) -> tuple[StackPairs, Warnings]:
+def collect_stack_pairs(
+    orig: Sequence[DecodedInstruction],
+    recomp: Sequence[DecodedInstruction],
+    opcodes: Sequence[DiffOpcode],
+) -> tuple[StackPairs, Warnings]:
+    """The stack slots paired rows use: the same slot where the diff says
+    the rows are equal, the two sides' slots where it pairs a replacement
+    row by row. A replacement of unequal length, or a slot one side uses
+    where the other uses none, is a structural mismatch."""
     warnings = Warnings()
     stack_pairs: StackPairs = set()
-    for block in udiff:
-        for diff in block[1]:
-            stack_pairs |= analyze_diff_block(diff, warnings)
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            for row in orig[i1:i2]:
+                if (slot := _stack_slot(row)) is not None:
+                    stack_pairs.add(StackPair(slot, slot.copy()))
+            continue
+        if (i2 - i1) != (j2 - j1):
+            warnings.structural_mismatches_present = True
+            continue
+        block: StackPairs = set()
+        for row_o, row_r in zip(orig[i1:i2], recomp[j1:j2]):
+            if (slot_o := _stack_slot(row_o)) is None:
+                continue
+            if (slot_r := _stack_slot(row_r)) is None:
+                warnings.structural_mismatches_present = True
+                block = set()
+                break
+            block.add(StackPair(slot_o, slot_r))
+        stack_pairs |= block
     return stack_pairs, warnings
 
 
@@ -309,11 +282,10 @@ def annotate_recomp_symbols(
     if fn_symbol is None:
         return stack_symbols
     for symbol in fn_symbol.symbols:
-        if symbol.symbol_type != "S_BPREL32":
-            continue
-        hex_bytes = bytes.fromhex(symbol.location[1:-1])
-        stack_offset = struct.unpack(">l", hex_bytes)[0]
-        stack_symbols[stack_offset] = StackSymbol(symbol.name, symbol.data_type)
+        if symbol.frame_offset is not None:
+            stack_symbols[symbol.frame_offset] = StackSymbol(
+                symbol.name, symbol.data_type
+            )
     for _, recomp in stack_pairs:
         if recomp.register == "ebp":
             recomp.symbol = stack_symbols.get(recomp.offset)
@@ -393,35 +365,60 @@ def permutation_entries(
     return tuple(entries)
 
 
+def _remapped_key(
+    row: DecodedInstruction, mapping: dict[tuple[str, int], tuple[str, int]]
+) -> Hashable:
+    """A row's match key with its stack slot moved through ``mapping``."""
+    if row.role != AsmRole.CODE:
+        return instruction_match_key(row)
+    operands = []
+    for op in row.operands:
+        match op:
+            case ("mem", size, seg, [(("ebp" | "esp") as register, 1)], int() as disp, ()) if (
+                (register, disp) in mapping
+            ):
+                new_register, new_disp = mapping[(register, disp)]
+                operands.append(("mem", size, seg, [(new_register, 1)], new_disp, ()))
+            case _:
+                operands.append(op)
+    return instruction_match_key(
+        DecodedInstruction(
+            address=row.address,
+            size=row.size,
+            mnemonic=row.mnemonic,
+            prefix=row.prefix,
+            operands=tuple(operands),
+            display="",
+        )
+    )
+
+
 def accuracy_after_stack_map(
-    orig_asm: Sequence[str],
-    recomp_asm: Sequence[str],
+    orig: Sequence[DecodedInstruction],
+    recomp: Sequence[DecodedInstruction],
     mapping: dict[tuple[str, int], tuple[str, int]],
 ) -> float:
-    """SequenceMatcher ratio after rewriting orig stack offsets toward recomp."""
-    if not mapping:
-        return SequenceMatcherWithPins(list(orig_asm), list(recomp_asm), []).ratio()
-
-    rewritten = [rewrite_stack_displacements(line, mapping) for line in orig_asm]
-    return SequenceMatcherWithPins(rewritten, list(recomp_asm), []).ratio()
+    """SequenceMatcher ratio after moving orig stack slots toward recomp's."""
+    orig_keys = [_remapped_key(row, mapping) for row in orig]
+    recomp_keys = [instruction_match_key(row) for row in recomp]
+    return SequenceMatcherWithPins(orig_keys, recomp_keys, []).ratio()
 
 
 def analyze_stack_layout(
-    rdiff: RawDiffOutput | None,
-    orig_asm: Sequence[str],
-    recomp_asm: Sequence[str],
+    orig: Sequence[DecodedInstruction],
+    recomp: Sequence[DecodedInstruction],
+    opcodes: Sequence[DiffOpcode],
     fn_symbol: SymbolsEntry | None = None,
     types: object | None = None,
 ) -> StackLayoutResult | None:
-    """Infer stack permutation and modulo-stack accuracy from a raw diff.
+    """Infer stack permutation and modulo-stack accuracy from paired rows.
 
     Returns None when there is no diff or no stack offsets to analyze.
     """
-    if rdiff is None or not rdiff.codes:
+    if not opcodes:
         return None
 
-    udiff = raw_diff_to_udiff(rdiff, grouped=False)
-    stack_pairs, warnings = collect_stack_pairs(udiff)
+    stack_pairs, warnings = collect_stack_pairs(orig, recomp, opcodes)
     if not stack_pairs:
         return None
 
@@ -433,10 +430,7 @@ def analyze_stack_layout(
     non_identity = {k: v for k, v in mapping.items() if k != v}
     modulo = None
     if bijective and non_identity:
-        modulo = accuracy_after_stack_map(orig_asm, recomp_asm, non_identity)
-    elif bijective and not non_identity:
-        # All observed stack offsets already agree.
-        modulo = None
+        modulo = accuracy_after_stack_map(orig, recomp, non_identity)
 
     return StackLayoutResult(
         permutation=permutation_entries(stack_pairs),

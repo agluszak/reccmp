@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from reccmp.compare.asm.instgen import InstructionMeta
+from collections.abc import Sequence
+
 from reccmp.compare.asm.ir import (
-    AsmStream,
-    ResolvedAsm,
-    instruction_at,
-    is_data_row,
-    resolve_asm_stream,
+    DecodedInstruction,
+    instruction_semantic_key,
+    local_branch_targets,
 )
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.dataflow import (
@@ -49,13 +48,9 @@ from reccmp.compare.diagnosis import AnalysisRecorder
 
 
 def verify_cfg_effective_match(
-    orig_asm: AsmStream,
-    recomp_asm: AsmStream,
-    orig_targets: list[int | None],
-    recomp_targets: list[int | None],
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
     metadata: FunctionMetadata | None = None,
-    orig_meta: list[InstructionMeta | None] | None = None,
-    recomp_meta: list[InstructionMeta | None] | None = None,
     recorder: AnalysisRecorder | None = None,
 ) -> bool:
     """CFG-aware verification: split both sequences into basic blocks
@@ -67,87 +62,57 @@ def verify_cfg_effective_match(
     (a divergence created in one arm and overwritten after the join)."""
     # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
     # pylint: disable=too-many-locals
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
-    orig_stream = resolve_asm_stream(orig_asm)
-    recomp_stream = resolve_asm_stream(recomp_asm)
-    orig_asm = orig_stream.displays
-    recomp_asm = recomp_stream.displays
-    total = len(orig_asm)
-    if (
-        len(recomp_asm) != total
-        or len(orig_targets) != total
-        or len(recomp_targets) != total
-        or total == 0
-    ):
+    orig_targets = local_branch_targets(orig_rows)
+    recomp_targets = local_branch_targets(recomp_rows)
+    total = len(orig_rows)
+    if len(recomp_rows) != total or total == 0:
         if recorder is not None:
             recorder.mark_inconclusive(
                 "alignment_failure",
                 facts={
                     "stage": "positional_cfg_precondition",
                     "orig_instruction_count": total,
-                    "recomp_instruction_count": len(recomp_asm),
-                    "orig_target_count": len(orig_targets),
-                    "recomp_target_count": len(recomp_targets),
+                    "recomp_instruction_count": len(recomp_rows),
                 },
             )
         return False
     if orig_targets != recomp_targets:
         if recorder is not None:
             differing = next(
-                (
-                    index
-                    for index, pair in enumerate(zip(orig_targets, recomp_targets))
-                    if pair[0] != pair[1]
-                ),
-                None,
+                index
+                for index, pair in enumerate(zip(orig_targets, recomp_targets))
+                if pair[0] != pair[1]
             )
-            if differing is not None:
-                meta_o = orig_meta[differing] if orig_meta is not None else None
-                meta_r = recomp_meta[differing] if recomp_meta is not None else None
-                try:
-                    facts_o = target_facts(
-                        instruction_at(orig_stream, differing),
-                        meta_o,
-                        orig_targets[differing],
-                    )
-                    facts_r = target_facts(
-                        instruction_at(recomp_stream, differing),
-                        meta_r,
-                        recomp_targets[differing],
-                    )
-                except (Reject, IndexError, KeyError, ValueError, TypeError):
-                    facts_o = facts_r = {}
-                recorder.record_difference(
-                    "branch_target",
-                    differing,
-                    differing,
-                    facts_o,
-                    facts_r,
-                )
+            recorder.record_difference(
+                "branch_target",
+                differing,
+                differing,
+                target_facts(orig_rows[differing], orig_targets[differing]),
+                target_facts(recomp_rows[differing], recomp_targets[differing]),
+            )
         return False
 
-    def classify(stream: ResolvedAsm) -> list[str]:
+    def classify(rows: Sequence[DecodedInstruction]) -> list[str]:
         kinds = []
-        for index in range(len(stream)):
-            if is_data_row(stream, index):
+        for row in rows:
+            if not row.is_code:
                 kinds.append("data")
-                continue
-            try:
-                mnemonic = instruction_at(stream, index).mnemonic
-            except (Reject, IndexError, KeyError, ValueError, TypeError):
-                mnemonic = stream.displays[index].partition(" ")[0]
-            if mnemonic in JCC_MNEMONICS:
+            elif row.mnemonic in JCC_MNEMONICS or row.mnemonic in (
+                "loop",
+                "loope",
+                "loopne",
+                "jcxz",
+                "jecxz",
+            ):
                 kinds.append("jcc")
-            elif mnemonic in ("jmp", "ret"):
-                kinds.append(mnemonic)
-            elif mnemonic in ("loop", "loope", "loopne", "jcxz", "jecxz"):
-                kinds.append("jcc")
+            elif row.mnemonic in ("jmp", "ret"):
+                kinds.append(row.mnemonic)
             else:
                 kinds.append("code")
         return kinds
 
-    kinds = classify(orig_stream)
-    recomp_kinds = classify(recomp_stream)
+    kinds = classify(orig_rows)
+    recomp_kinds = classify(recomp_rows)
     if kinds != recomp_kinds:
         if recorder is not None:
             differing = next(
@@ -189,7 +154,7 @@ def verify_cfg_effective_match(
                         i,
                         {
                             "target_instruction_index": target,
-                            "data_line": orig_asm[target],
+                            "data_line": orig_rows[target].display,
                         },
                     )
                 return False
@@ -234,14 +199,13 @@ def verify_cfg_effective_match(
         ctx = Context(gen=flow.memory, metadata=metadata, recorder=recorder)
         seed_context_from_cfg(ctx, flow)
         for i in range(order[block], ends[block]):
-            line_o, line_r = orig_asm[i], recomp_asm[i]
+            ins_o, ins_r = orig_rows[i], recomp_rows[i]
+            same = instruction_semantic_key(ins_o) == instruction_semantic_key(ins_r)
             if kinds[i] == "data":
-                if line_o != line_r:
+                if not same:
                     return False
                 continue
             try:
-                ins_o = instruction_at(orig_stream, i)
-                ins_r = instruction_at(recomp_stream, i)
                 record_operand_candidate(
                     ctx, i, i, ins_o, ins_r, (orig_state, recomp_state)
                 )
@@ -252,14 +216,12 @@ def verify_cfg_effective_match(
                 execute(orig_state, ctx, i, ins_o, obs_o)
                 execute(recomp_state, ctx, i, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
-                if line_o != line_r:
+                if not same:
                     if recorder is not None:
                         recorder.mark_inconclusive("unsupported_instruction", i, i)
                     return False
-                meta_o = orig_meta[i] if orig_meta is not None else None
-                meta_r = recomp_meta[i] if recomp_meta is not None else None
                 if admit_unsupported_identical(
-                    orig_state, recomp_state, ctx, i, meta_o, meta_r
+                    orig_state, recomp_state, ctx, i, ins_o, ins_r
                 ):
                     continue
                 if recorder is not None:
@@ -293,10 +255,6 @@ def verify_cfg_effective_match(
                 (orig_state, recomp_state),
                 (ins_o, ins_r),
                 (obs_o, obs_r),
-                (
-                    orig_meta[i] if orig_meta is not None else None,
-                    recomp_meta[i] if recomp_meta is not None else None,
-                ),
             ):
                 return False
             # We do not yet pair jump-table destinations. A computed jump

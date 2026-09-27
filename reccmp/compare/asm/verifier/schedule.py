@@ -11,7 +11,9 @@ thing as the emitted one; the lockstep checks then decide equivalence.
 
 from __future__ import annotations
 
-from reccmp.compare.asm.ir import ResolvedAsm
+from collections.abc import Sequence
+
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.verifier.block_align import DpLine, dp_line
 from reccmp.compare.asm.verifier.relocation import (
     LineEffects,
@@ -23,16 +25,12 @@ from reccmp.compare.asm.verifier.relocation import (
 _MAX_BLOCK = 256
 
 
-def _block_effects(stream: ResolvedAsm, indices: list[int]) -> list[LineEffects]:
+def _block_effects(
+    rows: Sequence[DecodedInstruction], indices: list[int]
+) -> list[LineEffects]:
     """Effects of a block's instructions, executed from a fresh state at
     the block entry so addresses are relative to the entry registers."""
-    block = ResolvedAsm(
-        [stream.displays[i] for i in indices],
-        [stream.instructions[i] for i in indices],
-        [stream.roles[i] for i in indices],
-        from_ir=stream.from_ir,
-    )
-    effects = sequence_effects(block)
+    effects = sequence_effects([rows[i] for i in indices])
     return (
         effects if effects is not None else [LineEffects(barrier=True)] * len(indices)
     )
@@ -46,14 +44,14 @@ def _independent(moved: LineEffects, crossed: LineEffects) -> bool:
 
 
 def _same_instruction(a: DpLine, b: DpLine) -> bool:
-    return a.display == b.display or (
+    return a.key == b.key or (
         a.skeleton is not None and a.skeleton == b.skeleton
     )
 
 
 def schedule_like(
-    orig_stream: ResolvedAsm,
-    recomp_stream: ResolvedAsm,
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
     indices_o: list[int],
     indices_r: list[int],
 ) -> list[int]:
@@ -61,9 +59,9 @@ def schedule_like(
     where that only swaps independent instructions."""
     if len(indices_r) > _MAX_BLOCK or len(indices_r) < 2:
         return indices_r
-    lines_o = [dp_line(orig_stream, i) for i in indices_o]
-    lines_r = {i: dp_line(recomp_stream, i) for i in indices_r}
-    effects = dict(zip(indices_r, _block_effects(recomp_stream, indices_r)))
+    lines_o = [dp_line(orig_rows[i]) for i in indices_o]
+    lines_r = {i: dp_line(recomp_rows[i]) for i in indices_r}
+    effects = dict(zip(indices_r, _block_effects(recomp_rows, indices_r)))
 
     placed: list[int] = []
     remaining = list(indices_r)

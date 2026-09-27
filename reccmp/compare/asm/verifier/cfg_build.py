@@ -8,22 +8,14 @@ from dataclasses import (
     field,
 )
 
+from collections.abc import Hashable, Sequence
+
 from reccmp.compare.asm.ir import (
     AsmRole,
-    AsmStream,
-    ResolvedAsm,
-    instruction_at,
-    is_data_row,
-    resolve_asm_stream,
-)
-from reccmp.compare.asm.model import (
-    Instruction,
-    Reject,
-    parse_instruction,
-)
-from reccmp.compare.asm.verifier.obligations import (
-    DATA_LINE_RE,
-    JUMP_TABLE_ENTRY_RE,
+    DecodedInstruction,
+    JumpTable,
+    instruction_semantic_key,
+    local_branch_targets,
 )
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
@@ -41,189 +33,134 @@ from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 # and runs the same paired symbolic execution with dataflow joins.
 
 
-def _control_kind(line: str) -> str:
-    if DATA_LINE_RE.match(line):
+_LOOPS = frozenset({"loop", "loope", "loopne", "jcxz", "jecxz"})
+
+
+def _control_kind(row: DecodedInstruction) -> str:
+    if not row.is_code:
         return "data"
-    mnemonic = line.partition(" ")[0]
-    if mnemonic in JCC_MNEMONICS or mnemonic in (
-        "loop",
-        "loope",
-        "loopne",
-        "jcxz",
-        "jecxz",
-    ):
+    if row.mnemonic in JCC_MNEMONICS or row.mnemonic in _LOOPS:
         return "jcc"
-    if mnemonic in ("jmp", "ret"):
-        return mnemonic
+    if row.mnemonic in ("jmp", "ret"):
+        return row.mnemonic
     return "code"
 
 
-def _control_kind_at(stream: ResolvedAsm, index: int) -> str:
-    if is_data_row(stream, index):
-        return "data"
-    try:
-        mnemonic = instruction_at(stream, index).mnemonic
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return _control_kind(stream.displays[index])
-    if mnemonic in JCC_MNEMONICS or mnemonic in (
-        "loop",
-        "loope",
-        "loopne",
-        "jcxz",
-        "jecxz",
-    ):
-        return "jcc"
-    if mnemonic in ("jmp", "ret"):
-        return mnemonic
-    return "code"
-
-
-def _scale4_mem_jmp(line: str, *, ins: Instruction | None = None) -> bool:
+def _scale4_mem_jmp(row: DecodedInstruction) -> bool:
     """True for ``jmp dword ptr [idx*4 + …]`` regardless of table base."""
-    if ins is None:
-        try:
-            ins = parse_instruction(line)
-        except (Reject, IndexError, KeyError, ValueError, TypeError):
-            return False
-    if ins.mnemonic != "jmp" or len(ins.operands) != 1:
-        return False
-    op = ins.operands[0]
-    if not isinstance(op, tuple) or op[0] != "mem":
-        return False
-    _size, _seg, reg_terms, _disp, _syms = op[1], op[2], op[3], op[4], op[5]
-    return any(scale == 4 for _reg, scale in reg_terms)
+    match row.mnemonic, row.operands:
+        case "jmp", (("mem", _, _, reg_terms, _, _),):
+            return any(scale == 4 for _reg, scale in reg_terms)
+    return False
 
 
-def _is_recognized_switch_jmp(line: str, *, ins: Instruction | None = None) -> bool:
+def _is_recognized_switch_jmp(row: DecodedInstruction) -> bool:
     """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
-    if ins is None:
-        try:
-            ins = parse_instruction(line)
-        except (Reject, IndexError, KeyError, ValueError, TypeError):
-            return False
-    if not _scale4_mem_jmp(line, ins=ins):
-        return False
-    op = ins.operands[0]
-    _size, _seg, _reg_terms, disp, syms = op[1], op[2], op[3], op[4], op[5]
-    # Require an identifiable table base (sanitized symbol and/or displacement).
-    return bool(syms) or disp != 0
+    match row.operands:
+        case (("mem", _, _, _, disp, syms),) if _scale4_mem_jmp(row):
+            # Require an identifiable table base (symbol and/or displacement).
+            return bool(syms) or disp != 0
+    return False
+
+
+def _case_offset(row: DecodedInstruction) -> int | None:
+    """A jump-table entry's target, as an offset from the function start."""
+    match row.role, row.operands:
+        case AsmRole.JUMP_TABLE_ENTRY, (("case", int() as offset),):
+            return offset
+    return None
 
 
 def extract_switch_tables(
-    stream: ResolvedAsm,
+    rows: Sequence[DecodedInstruction],
     kinds: list[str],
-    addrs: list[int | None] | None,
+    jump_tables: Sequence[JumpTable] = (),
 ) -> tuple[dict[int, list[int]], set[int]] | None:
-    # pylint: disable=too-many-nested-blocks,too-many-statements
+    # pylint: disable=too-many-nested-blocks,too-many-branches
     """Map recognized switch jmps to case destination indices.
 
     Returns ``(jmp_index -> dest line indices, owned data line indices)``.
     ``None`` means a candidate table could not be resolved conservatively.
 
-    A table is recognized when a switch jmp is followed by a jump-table header
-    (display ``Jump table:`` and/or ``AsmRole.JUMP_TABLE_HEADER``) and then
-    contiguous ``start + …`` entry lines (and/or ``AsmRole.JUMP_TABLE_ENTRY``).
+    A table is recognized when a switch jmp is followed by a jump-table
+    header row and then contiguous entry rows.
     """
-    # pylint: disable=too-many-locals
-    asm = stream.displays
-    roles = stream.roles
-    total = len(asm)
+    total = len(rows)
     table_dests: dict[int, list[int]] = {}
     owned: set[int] = set()
     addr_index: dict[int, int] = {}
     func_start: int | None = None
-    if addrs is not None and len(addrs) == total:
-        for i, addr in enumerate(addrs):
-            if addr is None or kinds[i] == "data":
-                continue
-            if func_start is None:
-                func_start = addr
-            addr_index.setdefault(addr, i)
+    for i, row in enumerate(rows):
+        if row.address is None or kinds[i] == "data":
+            continue
+        if func_start is None:
+            func_start = row.address
+        addr_index.setdefault(row.address, i)
 
     def _is_table_header(index: int) -> bool:
-        if stream.from_ir and roles[index] == AsmRole.JUMP_TABLE_HEADER:
-            return True
-        return asm[index] == "Jump table:"
+        return rows[index].role == AsmRole.JUMP_TABLE_HEADER
 
-    def _is_table_entry(index: int) -> bool:
-        if stream.from_ir and roles[index] == AsmRole.JUMP_TABLE_ENTRY:
-            return True
-        return JUMP_TABLE_ENTRY_RE.match(asm[index]) is not None
-
-    # Prefer first-class JumpTable objects from InstructGen when addresses align.
-    if stream.jump_tables and addrs is not None:
-        addr_to_index = {addr: i for i, addr in enumerate(addrs) if addr is not None}
-        for table in stream.jump_tables:
-            if table.dispatch_address is None:
-                continue
-            dispatch_i = addr_to_index.get(table.dispatch_address)
-            if dispatch_i is None or kinds[dispatch_i] != "jmp":
-                continue
-            switch_ins = None
-            try:
-                switch_ins = instruction_at(stream, dispatch_i)
-            except (Reject, IndexError, KeyError, ValueError, TypeError):
-                switch_ins = None
-            # First-class tables still have to be a scale-4 indexed mem jmp.
-            # Metadata alone (a dispatch address on any jmp) is not enough.
-            if not table.is_recognized_switch() or not _scale4_mem_jmp(
-                asm[dispatch_i], ins=switch_ins
-            ):
-                continue
-            dests: list[int] = []
-            entry_indices: list[int] = []
-            for entry_addr, target_va in table.entries:
-                entry_i = addr_to_index.get(entry_addr)
-                dest_i = addr_to_index.get(target_va)
-                if entry_i is None or dest_i is None:
-                    dests = []
-                    break
-                entry_indices.append(entry_i)
-                dests.append(dest_i)
-            if not dests:
-                continue
-            table_dests[dispatch_i] = dests
-            owned.update(entry_indices)
-            if entry_indices:
-                header_i = min(entry_indices) - 1
-                if header_i >= 0 and _is_table_header(header_i):
-                    owned.add(header_i)
+    # Prefer the JumpTables InstructGen found.
+    for table in jump_tables:
+        if table.dispatch_address is None:
+            continue
+        dispatch_i = addr_index.get(table.dispatch_address)
+        if dispatch_i is None or kinds[dispatch_i] != "jmp":
+            continue
+        # First-class tables still have to be a scale-4 indexed mem jmp.
+        # Metadata alone (a dispatch address on any jmp) is not enough.
+        if not table.is_recognized_switch() or not _scale4_mem_jmp(rows[dispatch_i]):
+            continue
+        entry_index = {row.address: i for i, row in enumerate(rows) if not row.is_code}
+        dests: list[int] = []
+        entry_indices: list[int] = []
+        for entry_addr, target_va in table.entries:
+            entry_i = entry_index.get(entry_addr)
+            dest_i = addr_index.get(target_va)
+            if entry_i is None or dest_i is None:
+                dests = []
+                break
+            entry_indices.append(entry_i)
+            dests.append(dest_i)
+        if not dests:
+            continue
+        table_dests[dispatch_i] = dests
+        owned.update(entry_indices)
+        header_i = min(entry_indices) - 1
+        if header_i >= 0 and _is_table_header(header_i):
+            owned.add(header_i)
 
     i = 0
     while i < total:
         if i in table_dests:
             i += 1
             continue
-        switch_ins = None
-        if kinds[i] == "jmp":
-            try:
-                switch_ins = instruction_at(stream, i)
-            except (Reject, IndexError, KeyError, ValueError, TypeError):
-                switch_ins = None
-        if kinds[i] == "jmp" and _is_recognized_switch_jmp(asm[i], ins=switch_ins):
-            if i + 1 < total and _is_table_header(i + 1):
-                entries: list[int] = []
-                j = i + 2
-                while j < total and _is_table_entry(j):
-                    entries.append(j)
-                    j += 1
-                if entries:
-                    if func_start is None:
+        if (
+            kinds[i] == "jmp"
+            and _is_recognized_switch_jmp(rows[i])
+            and i + 1 < total
+            and _is_table_header(i + 1)
+        ):
+            entries: list[int] = []
+            j = i + 2
+            while j < total and _case_offset(rows[j]) is not None:
+                entries.append(j)
+                j += 1
+            if entries:
+                if func_start is None:
+                    return None
+                dests = []
+                for entry_i in entries:
+                    offset = _case_offset(rows[entry_i])
+                    assert offset is not None
+                    dest_i = addr_index.get(func_start + offset)
+                    if dest_i is None:
                         return None
-                    dests = []
-                    for entry_i in entries:
-                        match = JUMP_TABLE_ENTRY_RE.match(asm[entry_i])
-                        if match is None:
-                            return None
-                        dest_va = func_start + int(match.group(1), 16)
-                        dest_i = addr_index.get(dest_va)
-                        if dest_i is None:
-                            return None
-                        dests.append(dest_i)
-                    table_dests[i] = dests
-                    owned.update(range(i + 1, j))
-                    i = j
-                    continue
+                    dests.append(dest_i)
+                table_dests[i] = dests
+                owned.update(range(i + 1, j))
+                i = j
+                continue
         i += 1
     return table_dests, owned
 
@@ -274,36 +211,20 @@ def block_terminator(
 
 
 def build_side_cfg(
-    asm: AsmStream,
-    targets: list[int | None],
+    rows: Sequence[DecodedInstruction],
+    jump_tables: Sequence[JumpTable] = (),
     *,
     recorder: AnalysisRecorder | None = None,
     side: str = "orig",
-    addrs: list[int | None] | None = None,
-    roles: list[AsmRole] | None = None,
 ) -> _SideCfg | None:
     """One side's basic-block structure, or None when the shape is outside
     this verifier's model (unrecognized jump/data tables, invalid targets).
 
-    Recognized ``jmp [idx*4 + table]`` + ``Jump table:`` / ``start + …``
-    sequences become ``caseN`` CFG edges; other table/data lines still bail.
-    Optional ``roles`` (``AsmRole``) strengthens header/entry detection when
-    display text alone is ambiguous; prefer passing a ``DecodedInstruction``
-    stream so roles come from IR.
+    Recognized ``jmp [idx*4 + table]`` + jump-table rows become ``caseN``
+    CFG edges; other table/data rows still bail.
     """
     # pylint: disable=too-many-branches,too-many-locals,too-many-return-statements
-    stream = resolve_asm_stream(asm)
-    if roles is not None and len(roles) == len(stream) and not stream.from_ir:
-        stream = ResolvedAsm(
-            stream.displays,
-            stream.instructions,
-            list(roles),
-            from_ir=True,
-            jump_tables=stream.jump_tables,
-            instruction_ids=stream.instruction_ids,
-        )
-    displays = stream.displays
-    total = len(displays)
+    total = len(rows)
     if total == 0:
         _mark_side_inconclusive(
             recorder,
@@ -313,21 +234,9 @@ def build_side_cfg(
             {"side": side, "instruction_count": 0},
         )
         return None
-    if len(targets) != total:
-        _mark_side_inconclusive(
-            recorder,
-            side,
-            "control_flow_metadata_mismatch",
-            None,
-            {
-                "side": side,
-                "instruction_count": total,
-                "target_count": len(targets),
-            },
-        )
-        return None
-    kinds = [_control_kind_at(stream, i) for i in range(total)]
-    extracted = extract_switch_tables(stream, kinds, addrs)
+    targets = local_branch_targets(rows)
+    kinds = [_control_kind(row) for row in rows]
+    extracted = extract_switch_tables(rows, kinds, jump_tables)
     if extracted is None:
         first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
         _mark_side_inconclusive(
@@ -338,7 +247,7 @@ def build_side_cfg(
             {
                 "side": side,
                 "data_line_count": kinds.count("data"),
-                "data_line": displays[first_data] if displays else "",
+                "data_line": rows[first_data].display,
                 "failure": "unresolved_switch_table",
             },
         )
@@ -357,7 +266,7 @@ def build_side_cfg(
             {
                 "side": side,
                 "data_line_count": len(unowned_data),
-                "data_line": displays[first_data],
+                "data_line": rows[first_data].display,
             },
         )
         return None
@@ -609,20 +518,19 @@ def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
 
 
 def _collapse_duplicate_ret_blocks(
-    cfg: _SideCfg, asm: list[str]
+    cfg: _SideCfg, rows: Sequence[DecodedInstruction]
 ) -> tuple[_SideCfg, bool]:
     """Collapse empty ``ret`` blocks that share identical terminator text.
 
     ``ret`` and ``ret 4`` must not be treated as the same exit — collapsing
     them would let stdcall/cdecl differences prove EFFECTIVE.
     """
-    groups: dict[str, list[int]] = {}
+    groups: dict[Hashable, list[int]] = {}
     for block in range(len(cfg.starts)):
         if not _is_empty_ret_block(cfg, block):
             continue
         indices = _block_code_indices(cfg, block)
-        text = asm[indices[0]] if indices[0] < len(asm) else ""
-        groups.setdefault(text, []).append(block)
+        groups.setdefault(instruction_semantic_key(rows[indices[0]]), []).append(block)
 
     redirect: dict[int, int] = {}
     for blocks in groups.values():
@@ -637,7 +545,9 @@ def _collapse_duplicate_ret_blocks(
     return _rebuild_cfg_keeping(cfg, keep, redirect=redirect), True
 
 
-def canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
+def canonicalize_side_cfg(
+    cfg: _SideCfg, rows: Sequence[DecodedInstruction]
+) -> _SideCfg:
     """Conservative CFG cleanup before isomorphic block pairing.
 
     Removes empty jump-only trampolines, merges trivial fallthrough splits,
@@ -648,7 +558,7 @@ def canonicalize_side_cfg(cfg: _SideCfg, asm: list[str]) -> _SideCfg:
     for _ in range(len(cfg.starts) + 2):
         current, jumped = _remove_empty_jump_blocks(current)
         current, fell = _merge_trivial_fallthrough_splits(current)
-        current, rets = _collapse_duplicate_ret_blocks(current, asm)
+        current, rets = _collapse_duplicate_ret_blocks(current, rows)
         if not (jumped or fell or rets):
             break
     return current

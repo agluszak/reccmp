@@ -6,6 +6,7 @@ from dataclasses import (
     dataclass,
     field,
 )
+from collections.abc import Hashable
 from typing import TYPE_CHECKING, Callable
 
 from reccmp.call_facts import CallFacts
@@ -208,11 +209,12 @@ class FunctionMetadata:
     "void" (eax is dead at ret), "i8"/"i16" (only al/ax matter),
     "i32", "i64" (edx:eax), "float" (st0), or "unknown" (exact eax).
 
-    call_facts: resolves a sanitized call-target name to what is known about
-    calling it; an unknown register usage means ecx/edx are compared."""
+    call_facts: what is known about calling a callee, by its proof identity
+    (the call operand's Reference.identity); an unknown register usage
+    means ecx/edx are compared."""
 
     return_kind: str = "unknown"
-    call_facts: Callable[[str], CallFacts | None] | None = None
+    call_facts: Callable[[Hashable], CallFacts | None] | None = None
     # Accept observed values z3 proves equal (project `verifier` config).
     algebraic_identities: bool = True
     # The stack effect of the call instruction at an address, from each

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from functools import cache
 import struct
 from itertools import pairwise
+from collections.abc import Hashable
 from typing import Callable, Iterator
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
@@ -12,25 +13,18 @@ from reccmp.compare.asm.verifier import FunctionMetadata
 from reccmp.call_facts import CallFacts
 from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.asm.parse import assert_fixup
-from reccmp.compare.asm.instgen import (
-    InstructionMeta,
-    meta_from_decoded,
-)
 from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
     compute_extent_closed,
     control_flow_topology_keys,
-    excerpt_addrs,
-    excerpt_displays,
     instruction_match_key,
     instruction_semantic_key,
     rebind_local_identities,
-    resolve_asm_stream,
 )
 from reccmp.compare.asm.parse import AsmExcerpt, ParseAsm
 from reccmp.compare.asm.replacement import (
-    create_name_lookup,
+    create_resolver,
 )
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
@@ -139,17 +133,6 @@ def create_bin_lookup(bin_file: Image) -> Callable[[int], int | None]:
     return lookup
 
 
-def _stamp_instruction_ids(excerpt: AsmExcerpt) -> tuple:
-    """Assign stable program-point ids when a test excerpt has none."""
-    rows = []
-    for index, row in enumerate(excerpt):
-        if row.instruction_id is None:
-            rows.append(dataclasses.replace(row, instruction_id=index))
-        else:
-            rows.append(row)
-    return tuple(rows)
-
-
 @dataclass
 class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     # pylint: disable=too-many-instance-attributes
@@ -175,22 +158,19 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     algebraic_identities: bool = True
 
     def __post_init__(self):
-        self._call_facts_cache: dict[str, CallFacts | None] | None = None
+        self._call_facts_cache: dict[Hashable, CallFacts | None] | None = None
         self._fp_cache: dict[
             tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
         ] = {}
         self._helper_catalog: list[HelperCatalogEntry] | None = None
         self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
-        # Exact call-identity → unique orig_addr (ambiguous keys omitted).
-        self._helper_identity_index: dict[str, int] | None = None
-        self._helper_identity_ambiguous: set[str] | None = None
         self._witness_translator = None
         self._witness_extents = {}
         self._import_facts_cache = None
         self._static_code_cache = {}
         self.orig_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(self.db, ImageId.ORIG, self.orig_bin),
-            name_lookup=create_name_lookup(
+            resolver=create_resolver(
                 self.db,
                 ImageId.ORIG,
                 create_bin_lookup(self.orig_bin),
@@ -199,14 +179,13 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 jump_target=lambda addr: read_e9_jmp_target(self.orig_bin, addr),
             ),
             is_32bit=self.is_32bit,
-            collect_meta=False,
             image_id=ImageId.ORIG,
         )
         self.recomp_sanitize = ParseAsm(
             addr_test=create_valid_addr_lookup(
                 self.db, ImageId.RECOMP, self.recomp_bin
             ),
-            name_lookup=create_name_lookup(
+            resolver=create_resolver(
                 self.db,
                 ImageId.RECOMP,
                 create_bin_lookup(self.recomp_bin),
@@ -215,7 +194,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 jump_target=lambda addr: read_e9_jmp_target(self.recomp_bin, addr),
             ),
             is_32bit=self.is_32bit,
-            collect_meta=False,
             image_id=ImageId.RECOMP,
         )
 
@@ -437,8 +415,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         include_diff: bool = True,
         include_exact_diff: bool = True,
         metadata: FunctionMetadata | None = None,
-        orig_meta: list[InstructionMeta | None] | None = None,
-        recomp_meta: list[InstructionMeta | None] | None = None,
     ) -> EntityCompareResult:
         """Compare two owned function images; they are the source of excerpt,
         tables, addresses, and coverage."""
@@ -447,8 +423,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         recomp_rows = list(recomp.excerpt)
         coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
         extent_closed = orig.extent_closed and recomp.extent_closed
-        orig_asm = excerpt_displays(orig_rows)
-        recomp_asm = excerpt_displays(recomp_rows)
 
         orig_keys = [instruction_match_key(row) for row in orig_rows]
         recomp_keys = [instruction_match_key(row) for row in recomp_rows]
@@ -467,11 +441,10 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             (not row.is_code) or row.control_flow_known
             for row in (*orig_rows, *recomp_rows)
         )
-        displays_match = orig_asm == recomp_asm
         orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
         recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
         exact = admit_exact_analysis(
-            displays_equal=displays_match,
+            displays_equal=orig_keys == recomp_keys,
             topology_equal=(
                 orig_topology is not None and orig_topology == recomp_topology
             ),
@@ -486,27 +459,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         else:
             if metadata is None and match is not None:
                 metadata = self._function_metadata(match)
-            if orig_meta is None:
-                orig_meta = [
-                    meta_from_decoded(row) if row.is_code else None for row in orig_rows
-                ]
-            if recomp_meta is None:
-                recomp_meta = [
-                    meta_from_decoded(row) if row.is_code else None
-                    for row in recomp_rows
-                ]
-            analysis = analyze_effective_match(
-                opcodes,
-                resolve_asm_stream(orig_rows, jump_tables=orig.jump_tables),
-                resolve_asm_stream(recomp_rows, jump_tables=recomp.jump_tables),
-                orig_addrs=excerpt_addrs(orig_rows),
-                metadata=metadata,
-                orig_meta=orig_meta,
-                recomp_addrs=excerpt_addrs(recomp_rows),
-                recomp_meta=recomp_meta,
-                coverage_incomplete=coverage_incomplete,
-                extent_closed=extent_closed,
-            )
+            analysis = analyze_effective_match(opcodes, orig, recomp, metadata)
         analysis = admit_proof(
             analysis,
             coverage_incomplete=coverage_incomplete,
@@ -523,27 +476,10 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
 
         stack_layout = None
         if ratio < 1.0:
-            stack_rdiff = RawDiffOutput(
-                codes=opcodes,
-                orig_inst=[
-                    (
-                        hex(row.address) if row.address is not None else "",
-                        row.display,
-                    )
-                    for row in orig_rows
-                ],
-                recomp_inst=[
-                    (
-                        hex(row.address) if row.address is not None else "",
-                        row.display,
-                    )
-                    for row in recomp_rows
-                ],
-            )
             stack_layout = analyze_stack_layout(
-                stack_rdiff,
-                orig_asm,
-                recomp_asm,
+                orig_rows,
+                recomp_rows,
+                opcodes,
                 fn_symbol=self._fn_symbol_entry(match),
                 types=self.types,
             )
@@ -569,6 +505,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                     if inline_layout is not None
                     else None
                 ),
+                stack_layout=stack_layout,
             )
             return result
 
@@ -617,50 +554,9 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 if inline_layout is not None
                 else None
             ),
+            stack_layout=stack_layout,
         )
         return result
-
-    def _compare_function_assembly(
-        self,
-        orig: AsmExcerpt,
-        recomp: AsmExcerpt,
-        split_points: list[tuple[int, int]],
-        *,
-        match: ReccmpMatch | None = None,
-        include_diff: bool = True,
-        include_exact_diff: bool = True,
-        metadata: FunctionMetadata | None = None,
-        orig_meta: list[InstructionMeta | None] | None = None,
-        recomp_meta: list[InstructionMeta | None] | None = None,
-        coverage_incomplete: bool = False,
-    ) -> EntityCompareResult:
-        # pylint: disable=too-many-arguments
-        """Test/legacy wrapper that lifts excerpts into ephemeral function images."""
-        orig_image = FunctionImage(
-            start_addr=0,
-            extent=0,
-            extent_kind=ExtentKind.KNOWN,
-            excerpt=_stamp_instruction_ids(orig),
-            coverage_incomplete=coverage_incomplete,
-        )
-        recomp_image = FunctionImage(
-            start_addr=0,
-            extent=0,
-            extent_kind=ExtentKind.KNOWN,
-            excerpt=_stamp_instruction_ids(recomp),
-            coverage_incomplete=coverage_incomplete,
-        )
-        return self.compare_function_images(
-            orig_image,
-            recomp_image,
-            split_points,
-            match=match,
-            include_diff=include_diff,
-            include_exact_diff=include_exact_diff,
-            metadata=metadata,
-            orig_meta=orig_meta,
-            recomp_meta=recomp_meta,
-        )
 
     def _collect_line_annotations(self, recomp: AsmExcerpt) -> list[ReccmpMatch]:
         """
