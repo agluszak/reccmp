@@ -11,6 +11,8 @@ the row each jump reaches (None for none, or outside the rows).
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -21,9 +23,94 @@ from reccmp.compare.asm.ir import (
     FunctionImage,
     JumpTable,
 )
-from reccmp.compare.asm.model import parse_instruction
+from reccmp.compare.asm.model import REGISTERS, Reject
 
 START = 0x1000
+
+_ST_RE = re.compile(r"^st(?:\((\d)\))?$")
+_MEM_RE = re.compile(
+    r"^(?:(byte|word|dword|qword|tbyte|xword|xmmword) ptr )?"
+    r"(?:(cs|ds|es|fs|gs|ss):)?\[(.+)\]$"
+)
+_SCALED_REG_RE = re.compile(r"^(e[a-d]x|e[sd]i|e[bs]p)\*([1248])$")
+_NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
+
+
+def _split_operands(op_str: str) -> list[str]:
+    """Split on top-level ', ' only: brackets and parens may contain commas."""
+    operands = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(op_str):
+        char = op_str[i]
+        if char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif depth == 0 and op_str.startswith(", ", i):
+            operands.append(op_str[start:i])
+            start = i + 2
+            i += 2
+            continue
+        i += 1
+    operands.append(op_str[start:])
+    return [op for op in (o.strip() for o in operands) if op]
+
+
+def _parse_operand(text: str):
+    if text in REGISTERS:
+        return ("reg", text)
+
+    st_match = _ST_RE.match(text)
+    if st_match:
+        return ("st", int(st_match.group(1) or 0))
+
+    if _NUM_RE.match(text):
+        return ("imm", int(text, 0))
+
+    mem_match = _MEM_RE.match(text)
+    if mem_match:
+        size, seg, content = mem_match.groups()
+        reg_terms: list[tuple[str, int]] = []
+        disp = 0
+        syms: list[tuple[int, str]] = []
+        tokens = re.split(r" ([+-]) ", content)
+        sign = 1
+        for k, token in enumerate(tokens):
+            if k % 2 == 1:
+                sign = 1 if token == "+" else -1
+                continue
+            token = token.strip()
+            if token in REGISTERS:
+                if sign < 0:
+                    raise Reject
+                reg_terms.append((token, 1))
+            elif (scaled := _SCALED_REG_RE.match(token)) is not None:
+                if sign < 0:
+                    raise Reject
+                reg_terms.append((scaled.group(1), int(scaled.group(2))))
+            elif _NUM_RE.match(token):
+                disp += sign * int(token, 0)
+            else:
+                syms.append((sign, token))
+        return ("mem", size or "", seg or "", reg_terms, disp, tuple(sorted(syms)))
+
+    # Symbol, placeholder, or anything else we treat as an opaque token.
+    return ("sym", text)
+
+
+def parse_instruction(line: str) -> tuple[str, str, tuple]:
+    """``(prefix, mnemonic, operands)`` of one line of Intel assembly text.
+
+    Only test fixtures arrive as text; reccmp decodes machine code."""
+    mnemonic, _, op_str = line.partition(" ")
+    prefix = ""
+    if mnemonic in ("rep", "repe", "repne"):
+        prefix = mnemonic
+        mnemonic, _, op_str = op_str.partition(" ")
+    raw = tuple(_split_operands(op_str)) if op_str else ()
+    return prefix, mnemonic, tuple(_parse_operand(token) for token in raw)
 
 
 def rows(

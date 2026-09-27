@@ -7,6 +7,8 @@ happens when the function image is built.
 
 from __future__ import annotations
 
+import re
+
 from functools import cache
 from typing import Iterable
 
@@ -25,11 +27,9 @@ from capstone import (  # type: ignore
 from capstone import x86_const  # type: ignore
 
 from .ir import DecodedInstruction
-from .model import (
-    REGISTERS,
-    ST_RE,
-    split_mnemonic_prefix,
-)
+from .model import REGISTERS, split_mnemonic_prefix
+
+_ST_RE = re.compile(r"^st(?:\((\d)\))?$")
 
 _EFLAGS_READ_MASK = 0
 for _name in dir(x86_const):
@@ -81,10 +81,10 @@ def stop_at_int3_detail(instructions) -> Iterable:
 
 
 def _reg_operand(name: str):
-    """Map a Capstone register name to the parse_operand tuple shape."""
+    """Map a Capstone register name to a typed operand."""
     if name in REGISTERS:
         return ("reg", name)
-    st_match = ST_RE.match(name)
+    st_match = _ST_RE.match(name)
     if st_match:
         return ("st", int(st_match.group(1) or 0))
     return ("sym", name)
@@ -107,7 +107,7 @@ def _mem_size_name(mnemonic: str, size: int) -> tuple[str, bool]:
 def capstone_operand(
     insn, op, mnemonic: str, operand_index: int
 ) -> tuple[object, bool]:
-    """Convert one Capstone operand to the ``parse_operand`` tuple shape.
+    """Convert one Capstone operand to a typed operand.
 
     Returns ``(operand, model_complete)``. Unsupported kinds become unique
     opaque tuples so distinct unknowns cannot share match keys.

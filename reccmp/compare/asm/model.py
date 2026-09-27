@@ -7,7 +7,6 @@ Leaf module: no imports from ``ir`` or the verifier.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from collections.abc import Hashable
 
@@ -73,94 +72,6 @@ REGISTERS: dict[str, tuple[str, str]] = {
     "esp": ("sp", "r32"),
     "sp": ("sp", "r16"),
 }
-
-MEM_RE = re.compile(
-    r"^(?:(byte|word|dword|qword|tbyte|xword|xmmword) ptr )?"
-    r"(?:(cs|ds|es|fs|gs|ss):)?\[(.+)\]$"
-)
-SCALED_REG_RE = re.compile(r"^(e[a-d]x|e[sd]i|e[bs]p)\*([1248])$")
-NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
-ST_RE = re.compile(r"^st(?:\((\d)\))?$")
-
-# ebp/esp ± offset tokens in display lines (shared by IR rewrite and stack_layout).
-
-
-def split_operands(op_str: str) -> list[str]:
-    """Split on top-level ', ' only: brackets and parens may contain commas."""
-    operands = []
-    depth = 0
-    start = 0
-    i = 0
-    while i < len(op_str):
-        char = op_str[i]
-        if char in "[(":
-            depth += 1
-        elif char in "])":
-            depth -= 1
-        elif depth == 0 and op_str.startswith(", ", i):
-            operands.append(op_str[start:i])
-            start = i + 2
-            i += 2
-            continue
-        i += 1
-    operands.append(op_str[start:])
-    return [op for op in (o.strip() for o in operands) if op]
-
-
-def parse_operand(text: str):
-    if text in REGISTERS:
-        return ("reg", text)
-
-    st_match = ST_RE.match(text)
-    if st_match:
-        return ("st", int(st_match.group(1) or 0))
-
-    if NUM_RE.match(text):
-        return ("imm", int(text, 0))
-
-    mem_match = MEM_RE.match(text)
-    if mem_match:
-        size, seg, content = mem_match.groups()
-        reg_terms: list[tuple[str, int]] = []
-        disp = 0
-        syms: list[tuple[int, str]] = []
-        tokens = re.split(r" ([+-]) ", content)
-        sign = 1
-        for k, token in enumerate(tokens):
-            if k % 2 == 1:
-                sign = 1 if token == "+" else -1
-                continue
-            token = token.strip()
-            if token in REGISTERS:
-                if sign < 0:
-                    raise Reject
-                reg_terms.append((token, 1))
-            elif (scaled := SCALED_REG_RE.match(token)) is not None:
-                if sign < 0:
-                    raise Reject
-                reg_terms.append((scaled.group(1), int(scaled.group(2))))
-            elif NUM_RE.match(token):
-                disp += sign * int(token, 0)
-            else:
-                syms.append((sign, token))
-        return ("mem", size or "", seg or "", reg_terms, disp, tuple(sorted(syms)))
-
-    # Symbol, placeholder, or anything else we treat as an opaque token.
-    return ("sym", text)
-
-
-def parse_instruction(line: str) -> tuple[str, str, tuple]:
-    """``(prefix, mnemonic, operands)`` of one line of Intel assembly text.
-
-    A text boundary: for assembly that arrives as text (test fixtures).
-    Nothing reccmp renders is parsed back."""
-    mnemonic, _, op_str = line.partition(" ")
-    prefix = ""
-    if mnemonic in ("rep", "repe", "repne"):
-        prefix = mnemonic
-        mnemonic, _, op_str = op_str.partition(" ")
-    raw = tuple(split_operands(op_str)) if op_str else ()
-    return prefix, mnemonic, tuple(parse_operand(token) for token in raw)
 
 
 def format_imm(value: int) -> str:
