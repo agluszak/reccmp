@@ -9,39 +9,71 @@ from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     AddressValue,
     CallResult,
+    Compare,
+    CompareKind,
+    ConditionCode,
     Constant,
+    DivideResult,
+    Extend,
+    ExtendKind,
+    Extract,
     Init,
+    Insert,
     Load,
     MemoryAddress,
+    MultiplyResult,
+    Operation,
+    OperationKind,
     Phi,
+    RegisterPart,
     Resync,
+    Select,
+    SetCondition,
     StackOffset,
     StringResult,
     SymbolValue,
+    UnaryOperation,
 )
 
 _BINARY = {
-    "and": "&",
-    "or": "|",
-    "xor": "^",
-    "sub": "-",
-    "imul": "*",
-    "imul3": "*",
-    "shl": "<<",
-    "shr": ">>u",
-    "sar": ">>s",
+    OperationKind.AND: "&",
+    OperationKind.OR: "|",
+    OperationKind.XOR: "^",
+    OperationKind.SUB: "-",
+    OperationKind.IMUL: "*",
+    OperationKind.IMUL3: "*",
+    OperationKind.SHL: "<<",
+    OperationKind.SHR: ">>u",
+    OperationKind.SAR: ">>s",
+    OperationKind.ROL: "rol",
+    OperationKind.ROR: "ror",
+    OperationKind.ADC: "+carry",
+    OperationKind.SBB: "-carry",
 }
 _PREDICATE = {
-    "eq": "==",
-    "ne": "!=",
-    "lt_u": "<u",
-    "le_u": "<=u",
-    "lt_s": "<s",
-    "le_s": "<=s",
+    CompareKind.EQ: "==",
+    CompareKind.NE: "!=",
+    CompareKind.LT_U: "<u",
+    CompareKind.LE_U: "<=u",
+    CompareKind.LT_S: "<s",
+    CompareKind.LE_S: "<=s",
 }
-_UNARY = {"inc": "{} + 1", "dec": "{} - 1", "neg": "-{}", "not": "~{}"}
-_PART = {"l8": "low8", "h8": "bits8_15", "r16": "low16"}
-_INSERT = {"ins_l8": "al", "ins_h8": "ah", "ins_r16": "ax"}
+_UNARY = {
+    OperationKind.INC: "{} + 1",
+    OperationKind.DEC: "{} - 1",
+    OperationKind.NEG: "-{}",
+    OperationKind.NOT: "~{}",
+}
+_PART = {
+    RegisterPart.LOW8: "low8",
+    RegisterPart.HIGH8: "bits8_15",
+    RegisterPart.LOW16: "low16",
+}
+_INSERT = {
+    RegisterPart.LOW8: "al",
+    RegisterPart.HIGH8: "ah",
+    RegisterPart.LOW16: "ax",
+}
 
 
 def render_number(value: int) -> str:
@@ -53,7 +85,7 @@ _ENTRY_SP = AddressTerm(Init("sp"), 1)
 
 def render(value: Any, depth: int = 0) -> str:
     """A C-like spelling of a verifier symbolic value."""
-    # pylint: disable=too-many-return-statements,too-many-branches
+    # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals
     if depth > 8:
         return "…"
 
@@ -79,19 +111,23 @@ def render(value: Any, depth: int = 0) -> str:
             return _symbol(identity)
         case StackOffset(base, offset):
             return f"{inner(base)} {'+' if offset >= 0 else '-'} {render_number(abs(offset))}"
-        case (tag, whole) if tag in _PART:
-            return f"{_PART[tag]}({inner(whole)})"
-        case (tag, old, new) if tag in _INSERT:
-            return f"({inner(old)} with {_INSERT[tag]} = {inner(new)})"
-        case ("add", *terms) if len(terms) >= 2:
-            return "(" + " + ".join(inner(term) for term in terms) + ")"
-        case (tag, left, right) if tag in _BINARY:
-            return f"({inner(left)} {_BINARY[tag]} {inner(right)})"
-        case (tag, operand) if tag in _UNARY:
-            return "(" + _UNARY[tag].format(inner(operand)) + ")"
-        case ("movzx", _, operand):
+        case Extract(part, whole):
+            return f"{_PART[part]}({inner(whole)})"
+        case Insert(part, old, new):
+            return f"({inner(old)} with {_INSERT[part]} = {inner(new)})"
+        case Operation(OperationKind.ADD, operands) if len(operands) >= 2:
+            return "(" + " + ".join(inner(term) for term in operands) + ")"
+        case Operation(kind, (left, right)) if kind in _BINARY:
+            return f"({inner(left)} {_BINARY[kind]} {inner(right)})"
+        case Operation(kind, operands):
+            return f"{kind.value}(" + ", ".join(inner(term) for term in operands) + ")"
+        case UnaryOperation(kind, operand) if kind in _UNARY:
+            return "(" + _UNARY[kind].format(inner(operand)) + ")"
+        case UnaryOperation(kind, operand):
+            return f"{kind.value}({inner(operand)})"
+        case Extend(ExtendKind.MOVZX, _, operand):
             return f"zext({inner(operand)})"
-        case ("movsx", _, operand):
+        case Extend(ExtendKind.MOVSX, _, operand):
             return f"sext({inner(operand)})"
         case CallResult(call, family):
             return f"{FAMILY_REGISTER.get(family, family)} after call@{call}"
@@ -101,26 +137,39 @@ def render(value: Any, depth: int = 0) -> str:
             return f"{location} after resync@{site}"
         case Phi(block, class_id):
             return f"join{block}#{class_id}"
-        case ("eq" | "ne" as tag, (left, right), *width):
-            return _comparison(tag, left, right, width, depth)
-        case (tag, left, right, *width) if tag in _PREDICATE:
-            return _comparison(tag, left, right, width, depth)
-        case ("cc", condition, flags, *_):
-            return f"{condition} of {inner(flags)}"
+        case Compare(kind, left, right, width):
+            return _comparison(kind, left, right, width, depth)
+        case ConditionCode(condition, flags, carry):
+            text = f"{condition} of {inner(flags)}"
+            return text if carry is None else f"{text}; cf {inner(carry)}"
+        case SetCondition(predicate):
+            return f"setcc({inner(predicate)})"
+        case Select(predicate, fallthrough, taken):
+            return f"({inner(taken)} if {inner(predicate)} else {inner(fallthrough)})"
+        case MultiplyResult(signed, part, operands):
+            mnemonic = "imul" if signed else "mul"
+            return (
+                f"{mnemonic}.{part.value}({inner(operands[0])}, {inner(operands[1])})"
+            )
+        case DivideResult(signed, part, high, low, divisor):
+            mnemonic = "idiv" if signed else "div"
+            return (
+                f"{mnemonic}.{part.value}(({inner(high)}, {inner(low)}), "
+                f"{inner(divisor)})"
+            )
         case (tag, *operands):
             return f"{tag}(" + ", ".join(inner(item) for item in operands[:2]) + ")"
         case _:
             return repr(value)
 
 
-def _comparison(tag: str, left: Any, right: Any, width: list, depth: int) -> str:
-    match width:
-        case [int() as size]:
-            bits = f" ({8 * size}-bit)"
-        case _:
-            bits = ""
+def _comparison(
+    kind: CompareKind, left: Any, right: Any, width: int | str | None, depth: int
+) -> str:
+    bits = f" ({8 * width}-bit)" if isinstance(width, int) else ""
     return (
-        f"{render(left, depth + 1)} {_PREDICATE[tag]} {render(right, depth + 1)}{bits}"
+        f"{render(left, depth + 1)} {_PREDICATE[kind]} "
+        f"{render(right, depth + 1)}{bits}"
     )
 
 

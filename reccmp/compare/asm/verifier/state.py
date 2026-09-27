@@ -16,11 +16,17 @@ from reccmp.compare.asm.model import (
 from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
     CallResult,
+    CompareKind,
     Constant,
+    Extract,
     Init,
+    Insert,
+    Operation,
+    OperationKind,
     Phi,
     AddressValue,
     Resync,
+    RegisterPart,
     Slot,
     StackOffset,
     StringResult,
@@ -60,16 +66,16 @@ CARRY_BINOPS = {"adc", "sbb"}
 # jcc/setcc condition codes with their operand-swap counterpart for
 # a `cmp`-produced flag state. eq/ne are symmetric under a swap.
 CC_CANON = {
-    "e": ("eq", False),
-    "ne": ("ne", False),
-    "l": ("lt_s", False),
-    "g": ("lt_s", True),
-    "le": ("le_s", False),
-    "ge": ("le_s", True),
-    "b": ("lt_u", False),
-    "a": ("lt_u", True),
-    "be": ("le_u", False),
-    "ae": ("le_u", True),
+    "e": (CompareKind.EQ, False),
+    "ne": (CompareKind.NE, False),
+    "l": (CompareKind.LT_S, False),
+    "g": (CompareKind.LT_S, True),
+    "le": (CompareKind.LE_S, False),
+    "ge": (CompareKind.LE_S, True),
+    "b": (CompareKind.LT_U, False),
+    "a": (CompareKind.LT_U, True),
+    "be": (CompareKind.LE_U, False),
+    "ae": (CompareKind.LE_U, True),
 }
 
 # Canonical flag state of every zero idiom (`xor r, r`, `sub r, r`,
@@ -93,18 +99,19 @@ def commutative_result(mnemonic: str, a: Value, b: Value) -> Value:
     binary expressions by execute(): reassociation can change the flags from
     the final physical add even when the destination value is equal.
     """
+    kind = OperationKind(mnemonic)
     if mnemonic not in ASSOCIATIVE_COMMUTATIVE_BINOPS:
-        return (mnemonic, *vsort(a, b))
+        return Operation(kind, vsort(a, b))
 
     terms: list[Value] = []
     pending = [a, b]
     while pending:
         value = pending.pop()
-        if isinstance(value, tuple) and value and value[0] == mnemonic:
-            pending.extend(value[1:])
+        if isinstance(value, Operation) and value.kind is kind:
+            pending.extend(value.operands)
         else:
             terms.append(value)
-    return (mnemonic, *sorted(terms, key=repr))
+    return Operation(kind, tuple(sorted(terms, key=repr)))
 
 
 @dataclass
@@ -197,9 +204,10 @@ class SideState:
         if part == "r32":
             return value
         # Reading back the part that was just inserted yields that value.
-        if isinstance(value, tuple) and value and value[0] == "ins_" + part:
-            return value[2]
-        return (part, value)
+        register_part = RegisterPart(part)
+        if isinstance(value, Insert) and value.part is register_part:
+            return value.new
+        return Extract(register_part, value)
 
     def write_reg(self, name: str, value: Value) -> None:
         family, part = REGISTERS[name]
@@ -213,10 +221,11 @@ class SideState:
             self.regs[family] = value
             return
         old = self.regs[family]
+        register_part = RegisterPart(part)
         # Overwriting the same part again: the previous insertion is dead.
-        if isinstance(old, tuple) and old and old[0] == "ins_" + part:
-            old = old[1]
-        self.regs[family] = ("ins_" + part, old, value)
+        if isinstance(old, Insert) and old.part is register_part:
+            old = old.old
+        self.regs[family] = Insert(register_part, old, value)
 
 
 WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10}

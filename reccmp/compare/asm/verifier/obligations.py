@@ -13,7 +13,9 @@ from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     Constant,
     Init,
+    Insert,
     Load,
+    RegisterPart,
     Resync,
     Value,
     mem_disjoint,
@@ -120,15 +122,10 @@ def _assembled(value: Value, ctx: Context) -> bool:
     (`and al, 1` on a loaded value: the load and the new byte were observed;
     or a constant under the new byte), so the register holds nothing
     unobserved."""
-    if not (
-        isinstance(value, tuple)
-        and len(value) == 3
-        and str(value[0]).startswith("ins_")
-    ):
+    if not isinstance(value, Insert):
         return False
-    old = value[1]
-    old_ok = isinstance(old, Constant) or _dead_or_contained(old, ctx)
-    return old_ok and _dead_or_contained(value[2], ctx)
+    old_ok = isinstance(value.old, Constant) or _dead_or_contained(value.old, ctx)
+    return old_ok and _dead_or_contained(value.new, ctx)
 
 
 def _returned_insert(value: Value, ctx: Context) -> bool:
@@ -137,9 +134,9 @@ def _returned_insert(value: Value, ctx: Context) -> bool:
     dead, and the returned part is already observed."""
     kind = ctx.metadata.return_kind if ctx.metadata is not None else "unknown"
     match value:
-        case ("ins_l8", _, part) if kind == "i8":
+        case Insert(RegisterPart.LOW8, _, part) if kind == "i8":
             return _contained(part, ctx)
-        case ("ins_r16", _, part) if kind == "i16":
+        case Insert(RegisterPart.LOW16, _, part) if kind == "i16":
             return _contained(part, ctx)
     return False
 
@@ -150,15 +147,12 @@ def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
     garbage as long as they came from consumed computations or are a
     constant (`xor eax, eax` before `setcc al`)."""
     return (
-        isinstance(value_o, tuple)
-        and isinstance(value_r, tuple)
-        and len(value_o) == 3
-        and len(value_r) == 3
-        and value_o[0] == value_r[0]
-        and str(value_o[0]).startswith("ins_")
-        and value_o[2] == value_r[2]
-        and _old_bits_ok(value_o[1], ctx)
-        and _old_bits_ok(value_r[1], ctx)
+        isinstance(value_o, Insert)
+        and isinstance(value_r, Insert)
+        and value_o.part is value_r.part
+        and value_o.new == value_r.new
+        and _old_bits_ok(value_o.old, ctx)
+        and _old_bits_ok(value_r.old, ctx)
     )
 
 
@@ -169,7 +163,7 @@ def _inserted_over(value: Value, base: Value, ctx: Context) -> bool:
     match value:
         case _ if value == base:
             return True
-        case (str() as tag, old, new) if tag.startswith("ins_"):
+        case Insert(old=old, new=new):
             return _old_bits_ok(new, ctx) and _inserted_over(old, base, ctx)
     return False
 
@@ -200,15 +194,12 @@ def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> b
         if value_o == value_r:
             continue
         if (
-            isinstance(value_o, tuple)
-            and isinstance(value_r, tuple)
-            and len(value_o) == 3
-            and len(value_r) == 3
-            and value_o[0] == value_r[0]
-            and str(value_o[0]).startswith("ins_")
-            and value_o[2] == value_r[2]
-            and is_scratch(value_o[1])
-            and is_scratch(value_r[1])
+            isinstance(value_o, Insert)
+            and isinstance(value_r, Insert)
+            and value_o.part is value_r.part
+            and value_o.new == value_r.new
+            and is_scratch(value_o.old)
+            and is_scratch(value_r.old)
         ):
             continue
         if is_scratch(value_o) and is_scratch(value_r):

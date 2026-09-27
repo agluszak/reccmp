@@ -27,14 +27,31 @@ from reccmp.compare.asm.operand import (
 )
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
     AddressValue,
+    Compare,
+    CompareKind,
+    ConditionCode,
     Constant,
+    DivideResult,
+    Extend,
+    ExtendKind,
+    Extract,
     Init,
+    Insert,
     Load,
     MemoryAddress,
+    MultiplyResult,
+    Operation,
+    OperationKind,
     Phi,
+    Select,
+    SetCondition,
     StackOffset,
     SymbolValue,
+    UnaryOperation,
+    is_value,
+    value_children,
 )
 from reccmp.compare.asm.verifier.render import render, render_number
 from reccmp.source.records import SourceComparison, SourceComparisonOperand
@@ -47,7 +64,12 @@ from reccmp.compare.diagnosis import (
     SolverResult,
 )
 
-_SIGN_SWAP = {"lt_u": "lt_s", "le_u": "le_s", "lt_s": "lt_u", "le_s": "le_u"}
+_SIGN_SWAP = {
+    CompareKind.LT_U: CompareKind.LT_S,
+    CompareKind.LE_U: CompareKind.LE_S,
+    CompareKind.LT_S: CompareKind.LT_U,
+    CompareKind.LE_S: CompareKind.LE_U,
+}
 
 
 def _where(side: DifferenceSide) -> str:
@@ -135,16 +157,49 @@ def _swap_signedness(value: Any) -> Any:
     other signedness."""
     # pylint: disable=too-many-return-statements
     match value:
-        case (tag, *rest) if tag in _SIGN_SWAP:
-            return (_SIGN_SWAP[tag], *rest)
-        case ("movzx", width, operand):
-            return ("movsx", width, _swap_signedness(operand))
-        case ("movsx", width, operand):
-            return ("movzx", width, _swap_signedness(operand))
-        case ("shr", operand, count):
-            return ("sar", _swap_signedness(operand), count)
-        case ("sar", operand, count):
-            return ("shr", _swap_signedness(operand), count)
+        case Compare(kind, left, right, width):
+            return Compare(
+                _SIGN_SWAP.get(kind, kind),
+                _swap_signedness(left),
+                _swap_signedness(right),
+                width,
+            )
+        case Extend(ExtendKind.MOVZX, width, operand):
+            return Extend(ExtendKind.MOVSX, width, _swap_signedness(operand))
+        case Extend(ExtendKind.MOVSX, width, operand):
+            return Extend(ExtendKind.MOVZX, width, _swap_signedness(operand))
+        case Operation(OperationKind.SHR, (operand, count)):
+            return Operation(
+                OperationKind.SAR,
+                (_swap_signedness(operand), count),
+            )
+        case Operation(OperationKind.SAR, (operand, count)):
+            return Operation(
+                OperationKind.SHR,
+                (_swap_signedness(operand), count),
+            )
+        case Operation(kind, operands):
+            return Operation(kind, tuple(_swap_signedness(item) for item in operands))
+        case UnaryOperation(kind, operand):
+            return UnaryOperation(kind, _swap_signedness(operand))
+        case Extract(part, whole):
+            return Extract(part, _swap_signedness(whole))
+        case Insert(part, old, new):
+            return Insert(part, _swap_signedness(old), _swap_signedness(new))
+        case SetCondition(predicate):
+            return SetCondition(_swap_signedness(predicate))
+        case Select(predicate, fallthrough, taken):
+            return Select(
+                _swap_signedness(predicate),
+                _swap_signedness(fallthrough),
+                _swap_signedness(taken),
+            )
+        case ConditionCode(condition, flags, carry):
+            return ConditionCode(
+                condition,
+                _swap_signedness(flags),
+                None if carry is None else _swap_signedness(carry),
+            )
         case (*items,):
             return tuple(_swap_signedness(item) for item in items)
         case _:
@@ -152,18 +207,23 @@ def _swap_signedness(value: Any) -> Any:
 
 
 # not (a < b) is b <= a, and not (a <= b) is b < a.
-_NEGATED_ORDER = {"lt_u": "le_u", "le_u": "lt_u", "lt_s": "le_s", "le_s": "lt_s"}
+_NEGATED_ORDER = {
+    CompareKind.LT_U: CompareKind.LE_U,
+    CompareKind.LE_U: CompareKind.LT_U,
+    CompareKind.LT_S: CompareKind.LE_S,
+    CompareKind.LE_S: CompareKind.LT_S,
+}
 
 
 def _negate(predicate: Any) -> Any:
     """The predicate taken exactly when ``predicate`` is not."""
     match predicate:
-        case ("eq", *rest):
-            return ("ne", *rest)
-        case ("ne", *rest):
-            return ("eq", *rest)
-        case (tag, left, right, *rest) if tag in _NEGATED_ORDER:
-            return (_NEGATED_ORDER[tag], right, left, *rest)
+        case Compare(CompareKind.EQ, left, right, width):
+            return Compare(CompareKind.NE, left, right, width)
+        case Compare(CompareKind.NE, left, right, width):
+            return Compare(CompareKind.EQ, left, right, width)
+        case Compare(kind, left, right, width) if kind in _NEGATED_ORDER:
+            return Compare(_NEGATED_ORDER[kind], right, left, width)
         case _:
             return None
 
@@ -227,21 +287,106 @@ def _identity_kinds(value: Any) -> set[str]:
             case tuple() if id(node) not in seen:
                 seen.add(id(node))
                 stack.extend(node)
+            case _ if is_value(node) and id(node) not in seen:
+                seen.add(id(node))
+                stack.extend(value_children(node))
     return kinds
 
 
 def _without_joins(value: Any) -> Any:
     """``value`` with every join's identity erased."""
+    # pylint: disable=too-many-return-statements,too-many-locals
     match value:
         case Phi():
             return Phi(0, 0)
+        case Load(address, width, generation):
+            return Load(
+                _without_joins(address),
+                width,
+                (
+                    generation
+                    if isinstance(generation, int)
+                    else _without_joins(generation)
+                ),
+            )
+        case AddressValue(address):
+            return AddressValue(_without_joins(address))
+        case MemoryAddress(segment, terms, displacement, symbols):
+            return MemoryAddress(
+                segment,
+                tuple(
+                    AddressTerm(_without_joins(term.value), term.scale)
+                    for term in terms
+                ),
+                (
+                    displacement
+                    if isinstance(displacement, int)
+                    else _without_joins(displacement)
+                ),
+                symbols,
+            )
+        case StackOffset(base, offset):
+            return StackOffset(_without_joins(base), offset)
+        case Operation(kind, operands):
+            return Operation(kind, tuple(_without_joins(item) for item in operands))
+        case UnaryOperation(kind, operand):
+            return UnaryOperation(kind, _without_joins(operand))
+        case Extract(part, whole):
+            return Extract(part, _without_joins(whole))
+        case Insert(part, old, new):
+            return Insert(part, _without_joins(old), _without_joins(new))
+        case Extend(kind, width, source):
+            return Extend(kind, width, _without_joins(source))
+        case Compare(kind, left, right, width):
+            return Compare(kind, _without_joins(left), _without_joins(right), width)
+        case ConditionCode(condition, flags, carry):
+            return ConditionCode(
+                condition,
+                _without_joins(flags),
+                None if carry is None else _without_joins(carry),
+            )
+        case SetCondition(predicate):
+            return SetCondition(_without_joins(predicate))
+        case Select(predicate, fallthrough, taken):
+            return Select(
+                _without_joins(predicate),
+                _without_joins(fallthrough),
+                _without_joins(taken),
+            )
+        case MultiplyResult(signed, part, operands):
+            return MultiplyResult(
+                signed, part, tuple(_without_joins(item) for item in operands)
+            )
+        case DivideResult(signed, part, high, low, divisor):
+            return DivideResult(
+                signed,
+                part,
+                _without_joins(high),
+                _without_joins(low),
+                _without_joins(divisor),
+            )
         case (*items,):
             return tuple(_without_joins(item) for item in items)
         case _:
             return value
 
 
+def _difference_in_children(
+    parent: Any, children_o: tuple[Any, ...], children_r: tuple[Any, ...]
+) -> tuple[Any, Any, Any] | None:
+    differing = [
+        (child_o, child_r)
+        for child_o, child_r in zip(children_o, children_r)
+        if child_o != child_r
+    ]
+    if len(differing) != 1:
+        return None
+    inner = first_difference(*differing[0])
+    return inner if inner is not None else (parent, *differing[0])
+
+
 def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
+    # pylint: disable=too-many-locals
     """The smallest subterms where two values differ, with the node that
     holds them: ``(parent, orig part, recomp part)``. None when the two
     differ in shape (another operation) above any single part."""
@@ -273,6 +418,55 @@ def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
             symbols_r,
         ):
             result = (orig, displacement_o, displacement_r)
+        case Operation(kind_o, operands_o), Operation(
+            kind_r, operands_r
+        ) if kind_o == kind_r and len(operands_o) == len(operands_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case UnaryOperation(kind_o, operand_o), UnaryOperation(kind_r, operand_r) if (
+            kind_o == kind_r
+        ):
+            result = _difference_in_children(orig, (operand_o,), (operand_r,))
+        case Extract(part_o, whole_o), Extract(part_r, whole_r) if part_o == part_r:
+            result = _difference_in_children(orig, (whole_o,), (whole_r,))
+        case Insert(part_o, old_o, new_o), Insert(part_r, old_r, new_r) if (
+            part_o == part_r
+        ):
+            result = _difference_in_children(orig, (old_o, new_o), (old_r, new_r))
+        case Extend(kind_o, width_o, source_o), Extend(kind_r, width_r, source_r) if (
+            kind_o,
+            width_o,
+        ) == (kind_r, width_r):
+            result = _difference_in_children(orig, (source_o,), (source_r,))
+        case Compare(kind_o, left_o, right_o, width_o), Compare(
+            kind_r, left_r, right_r, width_r
+        ) if (kind_o, width_o) == (kind_r, width_r):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case ConditionCode(condition_o, flags_o, carry_o), ConditionCode(
+            condition_r, flags_r, carry_r
+        ) if condition_o == condition_r and (carry_o is None) == (carry_r is None):
+            children_o = (flags_o,) if carry_o is None else (flags_o, carry_o)
+            children_r = (flags_r,) if carry_r is None else (flags_r, carry_r)
+            result = _difference_in_children(orig, children_o, children_r)
+        case SetCondition(predicate_o), SetCondition(predicate_r):
+            result = _difference_in_children(orig, (predicate_o,), (predicate_r,))
+        case Select(predicate_o, old_o, new_o), Select(predicate_r, old_r, new_r):
+            result = _difference_in_children(
+                orig,
+                (predicate_o, old_o, new_o),
+                (predicate_r, old_r, new_r),
+            )
+        case MultiplyResult(signed_o, part_o, operands_o), MultiplyResult(
+            signed_r, part_r, operands_r
+        ) if (signed_o, part_o) == (signed_r, part_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case DivideResult(signed_o, part_o, high_o, low_o, divisor_o), DivideResult(
+            signed_r, part_r, high_r, low_r, divisor_r
+        ) if (signed_o, part_o) == (signed_r, part_r):
+            result = _difference_in_children(
+                orig,
+                (high_o, low_o, divisor_o),
+                (high_r, low_r, divisor_r),
+            )
         case (tag_o, *items_o), (tag_r, *items_r) if tag_o == tag_r and len(
             items_o
         ) == len(items_r):

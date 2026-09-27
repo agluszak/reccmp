@@ -11,12 +11,25 @@ from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     AddressValue,
     CallResult,
+    Compare,
+    CompareKind,
+    ConditionCode,
     Constant,
+    DivideResult,
+    Extend,
+    ExtendKind,
     Load,
     MemoryAddress,
+    MultiplyResult,
+    Operation,
+    OperationKind,
+    ProductPart,
+    Select,
+    SetCondition,
     StackOffset,
     StringResult,
     SymbolValue,
+    UnaryOperation,
     Value,
     flatten_mem,
     stack_rooted,
@@ -325,16 +338,16 @@ def _absolute_symbol(address: Value) -> Hashable | None:
     return address.symbols[0].ref.identity
 
 
-def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
+def _constant_order(pred: CompareKind, a: Value, b: Value, width) -> Compare:
     """One spelling of an order against a constant: `x < c` is `x <= c-1`
     and `c < x` is `c+1 <= x`, except at the ends of the range, and the
     constant is written in the comparison's signedness. A compiler picks
     either spelling (`cmp eax, 0x41; jb` / `cmp eax, 0x40; jbe`)."""
     if not isinstance(width, int):
-        return (pred, a, b)  # the range, and so the rewrite, is unknown
+        return Compare(pred, a, b)  # the range, and so the rewrite, is unknown
     bits = 8 * width
     mask = (1 << bits) - 1
-    signed = pred.endswith("_s")
+    signed = pred in (CompareKind.LT_S, CompareKind.LE_S)
 
     def value(constant: int) -> int:
         constant &= mask
@@ -343,19 +356,19 @@ def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
         return constant
 
     low, high = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, mask)
-    strict = pred.startswith("lt_")
-    kind = "le_s" if signed else "le_u"
+    strict = pred in (CompareKind.LT_U, CompareKind.LT_S)
+    kind = CompareKind.LE_S if signed else CompareKind.LE_U
     if isinstance(b, Constant):
         constant = value(b.value)
         if strict and constant > low:
-            return (kind, a, Constant(constant - 1))
-        return (pred, a, Constant(constant))
+            return Compare(kind, a, Constant(constant - 1), width)
+        return Compare(pred, a, Constant(constant), width)
     if isinstance(a, Constant):
         constant = value(a.value)
         if strict and constant < high:
-            return (kind, Constant(constant + 1), b)
-        return (pred, Constant(constant), b)
-    return (pred, a, b)
+            return Compare(kind, Constant(constant + 1), b, width)
+        return Compare(pred, Constant(constant), b, width)
+    return Compare(pred, a, b, width)
 
 
 def canon_condition(cc: str, state: SideState) -> Value:
@@ -363,16 +376,21 @@ def canon_condition(cc: str, state: SideState) -> Value:
     that `cmp a, b` + jg equals `cmp b, a` + jl."""
     flags = state.flags
     entry = CC_CANON.get(cc)
-    if entry is not None and isinstance(flags, tuple) and flags[0] == "cmp":
+    if (
+        entry is not None
+        and isinstance(flags, tuple)
+        and flags[:1] == ("cmp",)
+        and len(flags) >= 3
+    ):
         pred, swap = entry
         a, b = flags[1], flags[2]
         width = flags[3] if len(flags) > 3 else None
-        base: tuple
-        if pred in ("eq", "ne"):
-            base = (pred, vsort(a, b))
-        else:
-            base = _constant_order(*((pred, b, a) if swap else (pred, a, b)), width)
-        return base if width is None else (*base, width)
+        if pred in (CompareKind.EQ, CompareKind.NE):
+            left, right = vsort(a, b)
+            return Compare(pred, left, right, width)
+        if swap:
+            return _constant_order(pred=pred, a=b, b=a, width=width)
+        return _constant_order(pred=pred, a=a, b=b, width=width)
     if (
         cc in ("o", "no")
         and isinstance(flags, tuple)
@@ -380,12 +398,12 @@ def canon_condition(cc: str, state: SideState) -> Value:
         and len(flags) > 2
     ):
         # OF is preserved across SAHF; observe the prior flag producer.
-        return ("cc", cc, flags[2])
+        return ConditionCode(cc, flags[2])
     if cc in CF_CONDITIONS:
         # The carry flag may have a different (older) producer than the
         # rest of the flags.
-        return ("cc", cc, flags, state.carry)
-    return ("cc", cc, flags)
+        return ConditionCode(cc, flags, state.carry)
+    return ConditionCode(cc, flags)
 
 
 _PART_BYTES = {"l8": 1, "h8": 1, "r8": 1, "r8h": 1, "r16": 2, "r32": 4}
@@ -429,7 +447,9 @@ def execute(
         write_operand(state, ctx, ops[0], read_operand(state, ctx, ops[1]), obs)
     elif mnemonic in ("movsx", "movzx") and len(ops) == 2:
         src = ops[1]
-        value = (mnemonic, _operand_width(src), read_operand(state, ctx, src))
+        value = Extend(
+            ExtendKind(mnemonic), _operand_width(src), read_operand(state, ctx, src)
+        )
         write_operand(state, ctx, ops[0], value, obs)
     elif mnemonic == "lea" and len(ops) == 2 and isinstance(ops[1], Mem):
         address = mem_address(state, ops[1], escape=True)
@@ -467,18 +487,21 @@ def execute(
         else:
             state.carry = ("carry", mnemonic, *pair)
     elif mnemonic == "imul" and len(ops) == 3:
-        value = (
-            "imul3",
-            read_operand(state, ctx, ops[1]),
-            read_operand(state, ctx, ops[2]),
+        value = Operation(
+            OperationKind.IMUL3,
+            (read_operand(state, ctx, ops[1]), read_operand(state, ctx, ops[2])),
         )
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", *value)
-        state.carry = ("carry", *value)
+        state.flags = ("flags", value.kind.value, *value.operands)
+        state.carry = ("carry", value.kind.value, *value.operands)
     elif mnemonic in ORDERED_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        value = Constant(0) if (mnemonic == "sub" and a == b) else (mnemonic, a, b)
+        value = (
+            Constant(0)
+            if mnemonic == "sub" and a == b
+            else Operation(OperationKind(mnemonic), (a, b))
+        )
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic == "sub" and a == b:
             # Zero idiom: same flag state as xor r, r.
@@ -488,23 +511,27 @@ def execute(
             state.flags = ("flags", mnemonic, a, b)
             # The borrow out of sub is the unsigned comparison of its operands.
             state.carry = (
-                ("lt_u", a, b) if mnemonic == "sub" else ("carry", mnemonic, a, b)
+                Compare(CompareKind.LT_U, a, b)
+                if mnemonic == "sub"
+                else ("carry", mnemonic, a, b)
             )
     elif mnemonic in CARRY_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        value = (mnemonic, a, b, state.carry)
+        value = Operation(OperationKind(mnemonic), (a, b, state.carry))
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", *value)
-        state.carry = ("carry", *value)
+        state.flags = ("flags", value.kind.value, *value.operands)
+        state.carry = ("carry", value.kind.value, *value.operands)
     elif mnemonic in ("inc", "dec", "neg", "not") and len(ops) == 1:
-        value = (mnemonic, read_operand(state, ctx, ops[0]))
+        value = UnaryOperation(
+            OperationKind(mnemonic), read_operand(state, ctx, ops[0])
+        )
         write_operand(state, ctx, ops[0], value, obs)
         # inc/dec rewrite the flags but preserve CF; not touches nothing.
         if mnemonic != "not":
-            state.flags = ("flags", *value)
+            state.flags = ("flags", value.kind.value, value.operand)
         if mnemonic == "neg":
-            state.carry = ("carry", *value)
+            state.carry = ("carry", value.kind.value, value.operand)
     elif mnemonic == "cmp" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -517,7 +544,7 @@ def execute(
         if b in (a, Constant(0)):
             state.carry = ("cf0",)
         else:
-            state.carry = ("lt_u", a, b, width)
+            state.carry = Compare(CompareKind.LT_U, a, b, width)
     elif mnemonic == "test" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -532,22 +559,41 @@ def execute(
     elif mnemonic in ("mul", "imul") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         pair = vsort(state.read_reg(acc), read_operand(state, ctx, ops[0]))
-        state.write_reg(acc, (mnemonic, "lo", *pair))
-        state.write_reg(hi, (mnemonic, "hi", *pair))
+        signed = mnemonic == "imul"
+        state.write_reg(acc, MultiplyResult(signed, ProductPart.LOW, pair))
+        state.write_reg(hi, MultiplyResult(signed, ProductPart.HIGH, pair))
         state.flags = ("flags", mnemonic, *pair)
         state.carry = ("carry", mnemonic, *pair)
     elif mnemonic in ("div", "idiv") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         divisor = read_operand(state, ctx, ops[0])
-        dividend = (state.read_reg(hi), state.read_reg(acc))
-        state.write_reg(acc, (mnemonic, "quot", dividend, divisor))
-        state.write_reg(hi, (mnemonic, "rem", dividend, divisor))
+        signed = mnemonic == "idiv"
+        state.write_reg(
+            acc,
+            DivideResult(
+                signed,
+                ProductPart.QUOTIENT,
+                state.read_reg(hi),
+                state.read_reg(acc),
+                divisor,
+            ),
+        )
+        state.write_reg(
+            hi,
+            DivideResult(
+                signed,
+                ProductPart.REMAINDER,
+                state.read_reg(hi),
+                state.read_reg(acc),
+                divisor,
+            ),
+        )
         state.flags = ("undef_flags", idx)
         state.carry = ("undef_cf", idx)
     elif mnemonic == "cdq":
-        state.write_reg("edx", ("cdq", state.read_reg("eax")))
+        state.write_reg("edx", UnaryOperation(OperationKind.CDQ, state.read_reg("eax")))
     elif mnemonic == "cwde":
-        state.write_reg("eax", ("cwde", state.read_reg("ax")))
+        state.write_reg("eax", UnaryOperation(OperationKind.CWDE, state.read_reg("ax")))
     elif mnemonic == "sahf":
         # SAHF loads SF/ZF/AF/PF/CF from AH; OF is preserved.
         state.flags = ("sahf", state.read_reg("ah"), state.flags)
@@ -665,14 +711,16 @@ def execute(
             )
         )
         if mnemonic.startswith("loop"):
-            state.write_reg("ecx", ("loopdec", state.read_reg("ecx")))
+            state.write_reg(
+                "ecx",
+                UnaryOperation(OperationKind.LOOP_DECREMENT, state.read_reg("ecx")),
+            )
     elif mnemonic.startswith("set") and mnemonic[3:] in CC_CANON and len(ops) == 1:
         pred = canon_condition(mnemonic[3:], state)
-        write_operand(state, ctx, ops[0], ("setcc", pred), obs)
+        write_operand(state, ctx, ops[0], SetCondition(pred), obs)
     elif mnemonic.startswith("cmov") and mnemonic[4:] in JCC_MNEMONICS.values():
         pred = canon_condition(mnemonic[4:], state)
-        value = (
-            "cmov",
+        value = Select(
             pred,
             read_operand(state, ctx, ops[0]),
             read_operand(state, ctx, ops[1]),

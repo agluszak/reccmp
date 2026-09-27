@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 from dataclasses import dataclass
+from enum import Enum
 from typing import TypeAlias
 
 
@@ -104,6 +105,132 @@ class Slot:
     index: int
 
 
+class OperationKind(Enum):
+    ADD = "add"
+    AND = "and"
+    OR = "or"
+    XOR = "xor"
+    IMUL = "imul"
+    IMUL3 = "imul3"
+    SUB = "sub"
+    SHL = "shl"
+    SHR = "shr"
+    SAR = "sar"
+    ROL = "rol"
+    ROR = "ror"
+    ADC = "adc"
+    SBB = "sbb"
+    INC = "inc"
+    DEC = "dec"
+    NEG = "neg"
+    NOT = "not"
+    LOOP_DECREMENT = "loopdec"
+    CDQ = "cdq"
+    CWDE = "cwde"
+
+
+@dataclass(frozen=True, slots=True)
+class Operation:
+    kind: OperationKind
+    operands: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnaryOperation:
+    kind: OperationKind
+    operand: Value
+
+
+class RegisterPart(Enum):
+    LOW8 = "l8"
+    HIGH8 = "h8"
+    LOW16 = "r16"
+
+
+@dataclass(frozen=True, slots=True)
+class Extract:
+    part: RegisterPart
+    whole: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Insert:
+    part: RegisterPart
+    old: Value
+    new: Value
+
+
+class ExtendKind(Enum):
+    MOVZX = "movzx"
+    MOVSX = "movsx"
+
+
+@dataclass(frozen=True, slots=True)
+class Extend:
+    kind: ExtendKind
+    width: str
+    source: Value
+
+
+class CompareKind(Enum):
+    EQ = "eq"
+    NE = "ne"
+    LT_U = "lt_u"
+    LE_U = "le_u"
+    LT_S = "lt_s"
+    LE_S = "le_s"
+
+
+@dataclass(frozen=True, slots=True)
+class Compare:
+    kind: CompareKind
+    left: Value
+    right: Value
+    width: int | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionCode:
+    condition: str
+    flags: Value
+    carry: Value | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetCondition:
+    predicate: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Select:
+    predicate: Value
+    fallthrough: Value
+    taken: Value
+
+
+class ProductPart(Enum):
+    LOW = "lo"
+    HIGH = "hi"
+    QUOTIENT = "quot"
+    REMAINDER = "rem"
+
+
+@dataclass(frozen=True, slots=True)
+class MultiplyResult:
+    signed: bool
+    part: ProductPart
+    operands: tuple[Value, Value]
+
+
+@dataclass(frozen=True, slots=True)
+class DivideResult:
+    signed: bool
+    part: ProductPart
+    high: Value
+    low: Value
+    divisor: Value
+
+
 Value: TypeAlias = (
     tuple
     | Init
@@ -118,6 +245,17 @@ Value: TypeAlias = (
     | Load
     | StackOffset
     | Slot
+    | Operation
+    | UnaryOperation
+    | Extract
+    | Insert
+    | Extend
+    | Compare
+    | ConditionCode
+    | SetCondition
+    | Select
+    | MultiplyResult
+    | DivideResult
 )
 
 _VALUE_TYPES = (
@@ -133,6 +271,17 @@ _VALUE_TYPES = (
     Load,
     StackOffset,
     Slot,
+    Operation,
+    UnaryOperation,
+    Extract,
+    Insert,
+    Extend,
+    Compare,
+    ConditionCode,
+    SetCondition,
+    Select,
+    MultiplyResult,
+    DivideResult,
 )
 
 
@@ -141,6 +290,7 @@ def is_value(value: object) -> bool:
 
 
 def value_children(value: Value) -> tuple[Value, ...]:
+    # pylint: disable=too-many-return-statements
     match value:
         case MemoryAddress(terms=terms, displacement=displacement):
             children = tuple(term.value for term in terms)
@@ -151,8 +301,24 @@ def value_children(value: Value) -> tuple[Value, ...]:
             return (address,)
         case Load(address, _, generation):
             return (address,) if isinstance(generation, int) else (address, generation)
-        case StackOffset(base):
+        case (
+            StackOffset(base)
+            | Extract(_, base)
+            | UnaryOperation(_, base)
+            | Extend(_, _, base)
+            | SetCondition(base)
+        ):
             return (base,)
+        case Operation(operands=operands) | MultiplyResult(operands=operands):
+            return operands
+        case Insert(old=old, new=new) | Compare(left=old, right=new):
+            return (old, new)
+        case ConditionCode(flags=flags, carry=carry):
+            return (flags,) if carry is None else (flags, carry)
+        case Select(predicate, fallthrough, taken):
+            return (predicate, fallthrough, taken)
+        case DivideResult(high=high, low=low, divisor=divisor):
+            return (high, low, divisor)
         case tuple():
             return tuple(child for child in value if is_value(child))
     return ()
@@ -163,7 +329,7 @@ def _foldable_address_value(value: Value, scale: int, segment: str) -> bool:
         return False
     if isinstance(value, AddressValue) and isinstance(value.address, MemoryAddress):
         return value.address.segment in ("", segment)
-    return isinstance(value, tuple) and bool(value) and value[0] == "add"
+    return isinstance(value, Operation) and value.kind is OperationKind.ADD
 
 
 def flatten_mem(addr: Value) -> MemoryAddress:
@@ -205,8 +371,8 @@ def flatten_mem(addr: Value) -> MemoryAddress:
             syms = tuple(sorted(set(syms) | set(inner.symbols), key=repr))
             seg = seg or inner.segment
         else:
-            assert isinstance(value, tuple) and value[0] == "add"
-            for leaf in value[1:]:
+            assert isinstance(value, Operation) and value.kind is OperationKind.ADD
+            for leaf in value.operands:
                 if isinstance(leaf, Constant):
                     assert isinstance(disp, int)
                     disp += leaf.value
@@ -216,6 +382,7 @@ def flatten_mem(addr: Value) -> MemoryAddress:
 
 
 def stack_rooted(value: Value) -> bool:
+    # pylint: disable=too-many-return-statements
     """Is the value derived from the stack pointer or frame pointer?"""
     if isinstance(value, Init):
         return value.family in ("sp", "bp")
@@ -225,10 +392,12 @@ def stack_rooted(value: Value) -> bool:
         if isinstance(value.address, MemoryAddress):
             return any(stack_rooted(term.value) for term in value.address.terms)
         return stack_rooted(value.address)
-    if not isinstance(value, tuple) or not value:
-        return False
-    children: tuple[Value, ...] = value[1:] if value[0] in ("add", "ins_r16") else ()
-    return any(stack_rooted(child) for child in children)
+    match value:
+        case Operation(OperationKind.ADD, operands):
+            return any(stack_rooted(child) for child in operands)
+        case Insert(RegisterPart.LOW16, old, new):
+            return stack_rooted(old) or stack_rooted(new)
+    return False
 
 
 def _is_pure_global(mem: MemoryAddress) -> bool:
@@ -256,20 +425,20 @@ def constant_offset(value: Value) -> tuple[Value, int]:
             offset += value.offset
             value = value.base
         elif (
-            isinstance(value, tuple)
-            and len(value) == 3
-            and value[0] == "sub"
-            and isinstance(value[2], Constant)
+            isinstance(value, Operation)
+            and value.kind is OperationKind.SUB
+            and len(value.operands) == 2
+            and isinstance(value.operands[1], Constant)
         ):
-            offset -= _signed32(value[2].value)
-            value = value[1]
-        elif isinstance(value, tuple) and value and value[0] == "add":
-            terms = [term for term in value[1:] if not isinstance(term, Constant)]
+            offset -= _signed32(value.operands[1].value)
+            value = value.operands[0]
+        elif isinstance(value, Operation) and value.kind is OperationKind.ADD:
+            terms = [term for term in value.operands if not isinstance(term, Constant)]
             if len(terms) != 1:
                 break
             offset += sum(
                 _signed32(term.value)
-                for term in value[1:]
+                for term in value.operands
                 if isinstance(term, Constant)
             )
             value = terms[0]
