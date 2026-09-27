@@ -67,11 +67,9 @@ class DataRegion:
 
 
 def instruction_ids(rows: Sequence[DecodedInstruction]) -> dict[int, int]:
-    """Instruction id (its position unless stamped) by address."""
+    """Instruction position by address."""
     return {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(rows)
-        if row.address is not None
+        row.address: index for index, row in enumerate(rows) if row.address is not None
     }
 
 
@@ -219,19 +217,6 @@ class FunctionImage:
             ),
         )
 
-    @property
-    def control_flow_complete(self) -> bool:
-        """Every transfer is decoded or backed by a recognized switch table."""
-        switches = {
-            table.dispatch_address
-            for table in self.jump_tables
-            if table.is_recognized_switch()
-        }
-        return all(
-            row.control_flow_known or (row.is_jump and row.address in switches)
-            for row in self.instructions
-        )
-
 
 @dataclass(frozen=True)
 class DecodedInstruction:
@@ -262,8 +247,6 @@ class DecodedInstruction:
     operand_model_complete: bool = True
     # False when jump/call target modeling is incomplete (e.g. opaque operands).
     control_flow_known: bool = True
-    # Immutable program-point identity assigned by ``FunctionImage``.
-    instruction_id: int | None = None
     # Proof identity of a jump/call destination. Display may be a relative
     # displacement; this is never that displacement.
     control_target: Hashable | None = None
@@ -344,132 +327,3 @@ def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
         tuple(operand_key(operand, semantic=True) for operand in row.operands),
         row.control_target,
     )
-
-
-def _operand_identity(row: DecodedInstruction) -> Hashable:
-    match row.operands:
-        case (Sym(ref), *_):
-            return ref.identity
-        case (operand, *_):
-            return operand_key(operand, semantic=True)
-    return None
-
-
-def _local_destination_id(
-    target: int | None, addr_to_id: dict[int, int]
-) -> Hashable | None:
-    if target is None:
-        return None
-    return addr_to_id.get(target)
-
-
-def _branch_proof_identity(
-    row: DecodedInstruction,
-    addr_to_id: dict[int, int],
-) -> Hashable | None:
-    """Proof identity of a direct branch, never a relative displacement."""
-    local_id = _local_destination_id(row.branch_target, addr_to_id)
-    if local_id is not None:
-        return ("local", local_id)
-    if row.control_target is not None:
-        return ("ext", row.control_target)
-    if row.branch_target is not None:
-        return ("ext", ("unresolved", None, row.branch_target))
-    ident = _operand_identity(row)
-    if ident is not None:
-        return ("ext", ident)
-    return None
-
-
-def _switch_destination_key(
-    row: DecodedInstruction,
-    addr_to_id: dict[int, int],
-    jump_tables: Sequence[JumpTable],
-) -> Hashable | None:
-    for table in jump_tables:
-        if table.dispatch_address != row.address:
-            continue
-        cases = tuple(
-            (
-                ("L", addr_to_id[target])
-                if target in addr_to_id
-                else ("ext", ("unresolved", None, target))
-            )
-            for _entry, target in table.entries
-        )
-        if cases:
-            return ("switch", cases)
-    return None
-
-
-def control_flow_topology_keys(
-    excerpt: Sequence[DecodedInstruction],
-    jump_tables: Sequence[JumpTable] = (),
-) -> tuple[Hashable, ...] | None:
-    """Per-row exact control-flow identities, or None if a transfer is unmodeled.
-
-    Ordinary instructions contribute ``()``. Local branches contribute the
-    destination instruction id in this excerpt. External branches contribute
-    a ``ControlTarget`` identity (entity, import, unmatched, or side-local
-    address) — never a relative displacement. Switch tables contribute the
-    tuple of case destination ids.
-    """
-    addr_to_id = instruction_ids(excerpt)
-    keys: list[Hashable] = []
-    for row in excerpt:
-        if row.is_call:
-            keys.append(("call", _operand_identity(row)))
-            continue
-        if not (row.is_jump or row.is_ret):
-            keys.append(())
-            continue
-        if row.is_ret:
-            keys.append(("ret",))
-            continue
-        proof = _branch_proof_identity(row, addr_to_id)
-        if isinstance(proof, tuple) and proof[0] == "local":
-            keys.append(proof)
-            continue
-        if proof is not None and row.branch_target is not None:
-            keys.append(proof)
-            continue
-        switch_key = _switch_destination_key(row, addr_to_id, jump_tables)
-        if switch_key is not None:
-            keys.append(switch_key)
-            continue
-        return None
-    return tuple(keys)
-
-
-def local_destination_keys(
-    excerpt: Sequence[DecodedInstruction],
-    *,
-    start_addr: int,
-    extent: int,
-) -> tuple[Hashable, ...] | None:
-    """Per-row instruction ids of local branch and switch-case destinations.
-
-    Rows without a local destination contribute ``()``. Displays show local
-    branches as byte displacements, which identify the same instruction on
-    both sides only if every crossed instruction has the same encoding
-    length; these keys make the destination explicit. Returns None when a
-    destination falls inside the extent but not on an instruction boundary.
-    """
-    addr_to_id = instruction_ids(excerpt)
-
-    def key(target: int | None, tag: str) -> Hashable | None:
-        if target is None or not start_addr <= target < start_addr + extent:
-            return ()
-        local_id = addr_to_id.get(target)
-        return None if local_id is None else (tag, local_id)
-
-    keys: list[Hashable] = []
-    for row in excerpt:
-        if row.is_jump:
-            item = key(row.branch_target, "local")
-        else:
-            item = ()
-        if item is None:
-            return None
-        keys.append(item)
-    return tuple(keys)

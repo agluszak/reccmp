@@ -800,18 +800,23 @@ def _same_meta_effects(
         return False
     if not orig.control_flow_known or not recomp.control_flow_known:
         return False
-    fields = (
-        "mnemonic",
-        "regs_read",
-        "regs_written",
-        "reads_flags",
-        "writes_flags",
-        "accesses_memory",
-        "is_jump",
-        "is_call",
-        "is_ret",
+    return (
+        orig.mnemonic,
+        orig.regs_read,
+        orig.regs_written,
+        orig.reads_flags,
+        orig.writes_flags,
+        orig.accesses_memory,
+        orig.flow,
+    ) == (
+        recomp.mnemonic,
+        recomp.regs_read,
+        recomp.regs_written,
+        recomp.reads_flags,
+        recomp.writes_flags,
+        recomp.accesses_memory,
+        recomp.flow,
     )
-    return all(getattr(orig, field) == getattr(recomp, field) for field in fields)
 
 
 def record_pair_categories(

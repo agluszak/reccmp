@@ -69,7 +69,6 @@ def admit_exact(
     topology_equal: bool,
     keys_equal: bool,
     operands_complete: bool = True,
-    control_flow_complete: bool = True,
     coverage_incomplete: bool = False,
     extent_closed: bool,
 ) -> VerificationResult | None:
@@ -81,7 +80,7 @@ def admit_exact(
         return None
     if not keys_equal:
         return None
-    if not (bytes_equal or (operands_complete and control_flow_complete)):
+    if not (bytes_equal or operands_complete):
         return None
     return VerificationResult(
         analysis=ComparisonAnalysis.exact(),
@@ -98,7 +97,6 @@ def admit_exact_analysis(
     topology_equal: bool,
     keys_equal: bool,
     operands_complete: bool = True,
-    control_flow_complete: bool = True,
     coverage_incomplete: bool = False,
     extent_closed: bool,
 ) -> ComparisonAnalysis | None:
@@ -115,7 +113,6 @@ def admit_exact_analysis(
         topology_equal=topology_equal,
         keys_equal=keys_equal,
         operands_complete=operands_complete,
-        control_flow_complete=control_flow_complete,
         coverage_incomplete=coverage_incomplete,
         extent_closed=extent_closed,
     )

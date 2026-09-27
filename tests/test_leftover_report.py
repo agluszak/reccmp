@@ -80,9 +80,8 @@ def test_extent_closure_needs_every_path_to_end():
     assert _extent_closed("B801000000C3", ExtentKind.KNOWN)
 
 
-def _ret_at(addr: int, iid: int) -> DecodedInstruction:
-    row = decode_function(b"\xc3", addr).instructions[0]
-    return replace(row, instruction_id=iid)
+def _ret_at(addr: int) -> DecodedInstruction:
+    return decode_function(b"\xc3", addr).instructions[0]
 
 
 def test_jump_table_dispatch_closes_indirect_switch_extent():
@@ -96,10 +95,9 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         flow=FlowKind.JUMP,
         branch_target=None,
         control_flow_known=False,
-        instruction_id=0,
     )
-    case0 = _ret_at(0x1010, 1)
-    case1 = _ret_at(0x1020, 2)
+    case0 = _ret_at(0x1010)
+    case1 = _ret_at(0x1020)
     table = JumpTable(
         address=0x1004,
         entries=((0x1004, 0x1010), (0x1008, 0x1020)),
@@ -344,12 +342,11 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         operands=(Mem("dword", "", (ScaledReg("eax", 1),), 0x1004),),
         display="jmp dword ptr [eax+0x1004]",
         flow=FlowKind.JUMP,
-        instruction_id=0,
     )
     excerpt = (
         dispatch,
-        _ret_at(0x1010, 1),
-        _ret_at(0x1020, 2),
+        _ret_at(0x1010),
+        _ret_at(0x1020),
     )
     table = JumpTable(
         address=0x1004,
@@ -370,12 +367,11 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         operands=(Mem("dword", "", (ScaledReg("eax", 4),), 0x1004),),
         display="jmp dword ptr [eax*4+0x1004]",
         flow=FlowKind.JUMP,
-        instruction_id=0,
     )
     excerpt = (
         dispatch,
-        _ret_at(0x1010, 1),
-        _ret_at(0x1020, 2),
+        _ret_at(0x1010),
+        _ret_at(0x1020),
     )
     table = JumpTable(
         address=0x1004,
@@ -623,9 +619,8 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
             Sym(Reference("<OFFSET>", ("local", 8))),
         ),
         display="lea eax, <OFFSET>",
-        instruction_id=0,
     )
-    ret = _ret_at(0x1008, 1)
+    ret = _ret_at(0x1008)
     rebound = rebind_local_identities(
         (lea, ret),
         start_addr=0x1000,

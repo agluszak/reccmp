@@ -208,13 +208,17 @@ class Blocks:
             if self.head(block) == block and block not in run_into
         )
 
-    def exits(self, head: int) -> Exits:
-        """A head's exits through its chain; one unconditional edge to a
-        head of the function is ``NEXT``."""
-        exits = {
+    def edges(self, head: int) -> Exits:
+        """A head's successors by edge role, through its chain."""
+        return {
             role: None if target is None else self.head(target)
             for role, target in self._raw_exits(self._chain(head)[-1]).items()
         }
+
+    def exits(self, head: int) -> Exits:
+        """A head's edges, where one unconditional edge to a head of the
+        function is ``NEXT``, whether it falls through or jumps."""
+        exits = self.edges(head)
         if len(exits) == 1:
             ((role, target),) = exits.items()
             if role in (FALL, JUMP) and target is not None:
@@ -347,7 +351,7 @@ def pair_heads(
         map_o[head_o] = head_r
         map_r[head_r] = head_o
         order.append((head_o, head_r))
-        exits_o, exits_r = orig.exits(head_o), recomp.exits(head_r)
+        exits_o, exits_r = orig.edges(head_o), recomp.edges(head_r)
         if set(exits_o) != set(exits_r):
             if recorder is not None:
                 recorder.mark_inconclusive(

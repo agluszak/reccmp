@@ -43,7 +43,6 @@ def test_admit_exact_requires_coverage_topology_and_models_or_bytes():
             topology_equal=True,
             keys_equal=True,
             operands_complete=False,
-            control_flow_complete=True,
             extent_closed=True,
         )
         is None
@@ -53,7 +52,6 @@ def test_admit_exact_requires_coverage_topology_and_models_or_bytes():
         topology_equal=True,
         keys_equal=True,
         operands_complete=True,
-        control_flow_complete=True,
         extent_closed=True,
     )
     assert admitted is not None

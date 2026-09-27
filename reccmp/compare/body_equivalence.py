@@ -12,7 +12,6 @@ from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
     instruction_semantic_key,
-    local_destination_keys,
 )
 from reccmp.compare.inlines import Fingerprint, FingerprintRow
 from reccmp.compare.comparator_state import ComparatorState
@@ -231,12 +230,8 @@ class BodyEquivalenceMixin(ComparatorState):
             or orig_cases != recomp_cases
         ):
             return False
-        orig_topology = local_destination_keys(
-            orig_rows, start_addr=orig_addr, extent=size
-        )
-        recomp_topology = local_destination_keys(
-            recomp_rows, start_addr=recomp_addr, extent=size
-        )
+        orig_topology = orig_image.control_graph().shape()
+        recomp_topology = recomp_image.control_graph().shape()
         if orig_topology is None or recomp_topology is None:
             return False
         for index, (orig_row, recomp_row) in enumerate(zip(orig_rows, recomp_rows)):

@@ -128,17 +128,18 @@ def test_indirect_call_destination_expression_is_modeled():
 
 def test_recognized_switch_table_completes_indirect_jump():
     row = disasm_detail(bytes.fromhex("ff248500100000"), 0x1000)[0]
+    ret = disasm_detail(b"\xc3", 0x1007)[0]
     assert row.is_jump and not row.control_flow_known
-    incomplete = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,))
-    assert not incomplete.control_flow_complete
+    incomplete = FunctionImage(0x1000, 8, ExtentKind.KNOWN, (row, ret))
+    assert incomplete.control_graph().shape() is None
     table = JumpTable(
         0x1000,
         ((0x1000, 0x1007),),
         dispatch_address=0x1000,
         index_register="eax",
     )
-    image = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,), (table,))
-    assert image.control_flow_complete
+    image = FunctionImage(0x1000, 8, ExtentKind.KNOWN, (row, ret), (table,))
+    assert image.control_graph().shape() is not None
 
 
 def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
@@ -191,10 +192,10 @@ def _switch_image(dispatch: bytes):
 def test_indexed_switch_dispatch_is_recognized():
     image = _switch_image(b"\xff\x24\x85TTTT")  # jmp [eax*4 + table]
     assert [t.index_register for t in image.jump_tables] == ["eax"]
-    assert image.control_flow_complete
+    assert image.control_graph().shape() is not None
 
 
 def test_switch_dispatch_with_base_register_is_not_recognized():
     image = _switch_image(b"\xff\xa4\x83TTTT")  # jmp [ebx + eax*4 + table]
     assert not any(t.is_recognized_switch() for t in image.jump_tables)
-    assert not image.control_flow_complete
+    assert image.control_graph().shape() is None

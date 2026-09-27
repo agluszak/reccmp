@@ -9,7 +9,6 @@ from typing import Sequence
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     FunctionImage,
-    control_flow_topology_keys,
     instruction_semantic_key,
 )
 from reccmp.compare.asm.verifier.iso_cfg import verify_isomorphic_cfg_effective_match
@@ -48,19 +47,17 @@ def compare_exact(
     orig: FunctionImage, recomp: FunctionImage
 ) -> ComparisonAnalysis | None:
     """EXACT when both images have the same semantic keys, data shape and
-    control-flow identities (including switch cases), and either the same
-    bytes or complete operand and control-flow models. This is the only
-    place a function comparison is admitted EXACT."""
+    graph shape (every edge, including switch cases, known), and either the
+    same bytes or complete operand models. This is the only place a function
+    comparison is admitted EXACT."""
     orig_rows, recomp_rows = orig.instructions, recomp.instructions
-    orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
+    orig_shape = orig.control_graph().shape()
     return admit_exact_analysis(
         bytes_equal=(
             orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
         ),
         topology_equal=(
-            orig_topology is not None
-            and orig_topology
-            == control_flow_topology_keys(recomp_rows, recomp.jump_tables)
+            orig_shape is not None and orig_shape == recomp.control_graph().shape()
         ),
         keys_equal=(
             [instruction_semantic_key(row) for row in orig_rows]
@@ -69,9 +66,6 @@ def compare_exact(
         ),
         operands_complete=all(
             row.operand_model_complete for row in (*orig_rows, *recomp_rows)
-        ),
-        control_flow_complete=(
-            orig.control_flow_complete and recomp.control_flow_complete
         ),
         coverage_incomplete=orig.coverage_incomplete or recomp.coverage_incomplete,
         extent_closed=orig.extent_closed and recomp.extent_closed,

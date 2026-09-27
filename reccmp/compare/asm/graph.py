@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cached_property
 
@@ -73,6 +73,16 @@ class FunctionGraph:
     def block_at(self, index: int) -> int:
         """The number of the block that starts at instruction ``index``."""
         return self._block_starting_at[index]
+
+    def shape(self) -> tuple[tuple[GraphEdge, ...], ...] | None:
+        """Every instruction's edges with addresses erased: two functions
+        with the same shape transfer control between the same positions.
+        None when an edge leads somewhere unknown."""
+        if any(edge.kind is EdgeKind.UNKNOWN for edges in self.edges for edge in edges):
+            return None
+        return tuple(
+            tuple(replace(edge, address=None) for edge in edges) for edges in self.edges
+        )
 
     def extent_closed(
         self, *, extent_kind: ExtentKind, coverage_incomplete: bool = False

@@ -184,7 +184,6 @@ def rows(
                 branch_target=start + target if target is not None else None,
                 # Text says nothing about implicit register effects.
                 register_access_known=False,
-                instruction_id=index,
                 control_target=control_target,
             )
         )

@@ -533,12 +533,9 @@ def decode_function(
                     bytes(value for _address, value in section.contents),
                 )
             )
-    stamped = tuple(
-        replace(row, instruction_id=index) for index, row in enumerate(instructions)
-    )
     tables = tuple(sections.jump_tables)
     stamped = rebind_local_identities(
-        stamped,
+        instructions,
         start_addr=start_addr,
         extent=len(blob),
         jump_tables=tables,

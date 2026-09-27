@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -37,12 +36,6 @@ def test_function_image_captures_excerpt_tables_and_coverage():
     assert image.extent_kind is ExtentKind.KNOWN
     assert image.coverage_incomplete is False
     assert any(row.mnemonic == "mov" for row in image.instructions)
-    stamped = image.with_instructions(
-        tuple(
-            replace(row, instruction_id=i) for i, row in enumerate(image.instructions)
-        )
-    )
-    assert all(row.instruction_id == i for i, row in enumerate(stamped.instructions))
 
 
 def test_require_source_index_scopes_and_enriches_datacmp_path(
