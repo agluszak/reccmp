@@ -30,7 +30,18 @@ from reccmp.source.index import (
     SourceDeclaration,
     SourceFunctionFacts,
     SourceMarker,
+    _layout_identity,
 )
+
+
+def test_layout_identity_ignores_type_spelling():
+    source_class = next(iter(_index_with_layout().classes.values()))
+    field = source_class.fields[0]
+    respelled = dataclasses.replace(
+        source_class,
+        fields=(dataclasses.replace(field, type="Alias"), *source_class.fields[1:]),
+    )
+    assert _layout_identity(source_class) == _layout_identity(respelled)
 
 
 def _index_with_layout() -> SourceIndex:
@@ -47,6 +58,9 @@ def _index_with_layout() -> SourceIndex:
                         SourceField(
                             name="bar",
                             type="Bar",
+                            pointer_depth=0,
+                            storage_kind="embedded_record",
+                            record_semantic_id="record:Bar",
                             source_file="foo.h",
                             line=10,
                             offset=0,
@@ -55,6 +69,8 @@ def _index_with_layout() -> SourceIndex:
                         SourceField(
                             name="flag",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="foo.h",
                             line=11,
                             offset=8,
@@ -63,6 +79,8 @@ def _index_with_layout() -> SourceIndex:
                         SourceField(
                             name="tail",
                             type="char",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="foo.h",
                             line=12,
                             offset=12,
@@ -86,6 +104,8 @@ def _index_with_layout() -> SourceIndex:
                         SourceField(
                             name="baz",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="foo.h",
                             line=3,
                             offset=0,
@@ -94,6 +114,8 @@ def _index_with_layout() -> SourceIndex:
                         SourceField(
                             name="qux",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="foo.h",
                             line=4,
                             offset=4,
@@ -159,6 +181,8 @@ def test_resolve_field_absolute_offsets_for_nested_and_bases():
                         SourceField(
                             name="base_x",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=1,
                             offset=0,
@@ -181,6 +205,8 @@ def test_resolve_field_absolute_offsets_for_nested_and_bases():
                         SourceField(
                             name="derived_y",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=5,
                             offset=4,
@@ -193,7 +219,11 @@ def test_resolve_field_absolute_offsets_for_nested_and_bases():
                     end_line=6,
                     size=8,
                     alignment=4,
-                    base_offsets=(SourceBaseOffset(name="Base", offset=0),),
+                    base_offsets=(
+                        SourceBaseOffset(
+                            name="Base", semantic_id="record:Base", offset=0
+                        ),
+                    ),
                     layout_trusted=True,
                 ),
             )
@@ -227,6 +257,8 @@ def test_field_at_searches_base_subobjects():
                         SourceField(
                             name="base_x",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=1,
                             offset=0,
@@ -249,6 +281,8 @@ def test_field_at_searches_base_subobjects():
                         SourceField(
                             name="derived_y",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=5,
                             offset=4,
@@ -261,7 +295,11 @@ def test_field_at_searches_base_subobjects():
                     end_line=6,
                     size=8,
                     alignment=4,
-                    base_offsets=(SourceBaseOffset(name="Base", offset=0),),
+                    base_offsets=(
+                        SourceBaseOffset(
+                            name="Base", semantic_id="record:Base", offset=0
+                        ),
+                    ),
                     layout_trusted=True,
                 ),
             )
@@ -289,6 +327,8 @@ def test_resolve_field_rejects_overlapping_bitfields():
                         SourceField(
                             name="a",
                             type="unsigned",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="b.h",
                             line=2,
                             offset=0,
@@ -299,6 +339,8 @@ def test_resolve_field_rejects_overlapping_bitfields():
                         SourceField(
                             name="b",
                             type="unsigned",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="b.h",
                             line=3,
                             offset=0,
@@ -335,6 +377,8 @@ def test_layout_conflict_marks_untrusted():
                 {
                     "name": "x",
                     "type": "int",
+                    "storage_kind": "scalar",
+                    "pointer_depth": 0,
                     "source_file": "a.h",
                     "line": 1,
                     "offset": 0,
@@ -360,6 +404,8 @@ def test_layout_conflict_marks_untrusted():
                 {
                     "name": "x",
                     "type": "int",
+                    "storage_kind": "scalar",
+                    "pointer_depth": 0,
                     "source_file": "b.h",
                     "line": 1,
                     "offset": 0,
@@ -400,6 +446,8 @@ def test_asserted_size_mismatch_untrusts_layout():
                 {
                     "name": "x",
                     "type": "int",
+                    "storage_kind": "scalar",
+                    "pointer_depth": 0,
                     "source_file": "a.h",
                     "line": 1,
                     "offset": 0,
@@ -470,6 +518,8 @@ def test_record_semantic_id_preferred_for_nested_lookup():
                         SourceField(
                             name="x",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="b.h",
                             line=1,
                             offset=0,
@@ -493,6 +543,8 @@ def test_record_semantic_id_preferred_for_nested_lookup():
                             # Embedded record: peeling would leave ``Bar``; the
                             # semantic id must still win over the spelling.
                             type="volatile const struct WeirdSpelling",
+                            pointer_depth=0,
+                            storage_kind="embedded_record",
                             source_file="f.h",
                             line=1,
                             offset=0,
@@ -531,6 +583,7 @@ def test_pointer_and_reference_fields_are_layout_leaves():
                         SourceField(
                             name="next",
                             type="Node *",
+                            storage_kind="pointer",
                             source_file="n.h",
                             line=2,
                             offset=0,
@@ -554,6 +607,8 @@ def test_pointer_and_reference_fields_are_layout_leaves():
                         SourceField(
                             name="value",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="c.h",
                             line=2,
                             offset=0,
@@ -575,6 +630,7 @@ def test_pointer_and_reference_fields_are_layout_leaves():
                         SourceField(
                             name="ptr",
                             type="Child *",
+                            storage_kind="pointer",
                             source_file="h.h",
                             line=2,
                             offset=0,
@@ -585,6 +641,8 @@ def test_pointer_and_reference_fields_are_layout_leaves():
                         SourceField(
                             name="ref",
                             type="Child &",
+                            pointer_depth=0,
+                            storage_kind="reference",
                             source_file="h.h",
                             line=3,
                             offset=4,
@@ -634,6 +692,8 @@ def test_untrusted_nested_layout_is_not_published():
                         SourceField(
                             name="value",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="c.h",
                             line=2,
                             offset=0,
@@ -655,6 +715,8 @@ def test_untrusted_nested_layout_is_not_published():
                         SourceField(
                             name="child",
                             type="Child",
+                            pointer_depth=0,
+                            storage_kind="embedded_record",
                             source_file="p.h",
                             line=2,
                             offset=0,
@@ -692,6 +754,8 @@ def test_cross_target_class_name_is_not_last_wins():
                             SourceField(
                                 name="a",
                                 type="char",
+                                pointer_depth=0,
+                                storage_kind="scalar",
                                 source_file="a.h",
                                 line=1,
                                 offset=0,
@@ -718,6 +782,8 @@ def test_cross_target_class_name_is_not_last_wins():
                             SourceField(
                                 name="a",
                                 type="char",
+                                pointer_depth=0,
+                                storage_kind="scalar",
                                 source_file="a.h",
                                 line=1,
                                 offset=0,

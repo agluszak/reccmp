@@ -65,7 +65,7 @@ def _closed_assumptions(
 
 def admit_exact(
     *,
-    displays_equal: bool,
+    bytes_equal: bool,
     topology_equal: bool,
     keys_equal: bool,
     operands_complete: bool = True,
@@ -81,7 +81,7 @@ def admit_exact(
         return None
     if not keys_equal:
         return None
-    if not (displays_equal or (operands_complete and control_flow_complete)):
+    if not (bytes_equal or (operands_complete and control_flow_complete)):
         return None
     return VerificationResult(
         analysis=ComparisonAnalysis.exact(),
@@ -94,7 +94,7 @@ def admit_exact(
 
 def admit_exact_analysis(
     *,
-    displays_equal: bool,
+    bytes_equal: bool,
     topology_equal: bool,
     keys_equal: bool,
     operands_complete: bool = True,
@@ -105,17 +105,13 @@ def admit_exact_analysis(
     # pylint: disable=too-many-arguments
     """Shared EXACT admission policy for function comparison.
 
-    Strategies may propose identical displays or IR keys; this is the only
-    gate that mints ``ComparisonStatus.EXACT``. Incomplete reachable coverage
-    or an unclosed estimated extent never admits EXACT. Identical display text
-    is not enough: local branch destinations (instruction ids, not encodings)
-    must also agree, and match keys (which include reference identities) must
-    not disagree. Callers must pass ``keys_equal`` and ``extent_closed``
-    explicitly so a forgotten semantic or extent obligation cannot default
-    into a proof.
+    This is the only gate that mints ``ComparisonStatus.EXACT``. Incomplete
+    models require identical machine bytes; diagnostic text cannot substitute
+    for missing operand or control-flow facts. Local branch topology and
+    reference identities must also agree.
     """
     minted = admit_exact(
-        displays_equal=displays_equal,
+        bytes_equal=bytes_equal,
         topology_equal=topology_equal,
         keys_equal=keys_equal,
         operands_complete=operands_complete,

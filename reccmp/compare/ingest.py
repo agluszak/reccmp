@@ -114,6 +114,17 @@ def load_cvdump(cvdump_analysis: CvdumpAnalysis, db: EntityDb, recomp_bin: PEIma
                     symbol=sym.decorated_name,
                     size=sym.size(),
                 )
+                if sym.parent_function is not None and recomp_bin.is_valid_section(
+                    sym.parent_function.section
+                ):
+                    batch.set(
+                        ImageId.RECOMP,
+                        addr,
+                        static_var=True,
+                        parent_function=recomp_bin.get_abs_addr(
+                            sym.parent_function.section, sym.parent_function.offset
+                        ),
+                    )
 
                 # Set the cvdump type key so it can be referenced later.
                 if sym.node_type == EntityType.DATA and sym.data_type is not None:
@@ -226,7 +237,13 @@ def load_markers(
                 batch.set(ImageId.ORIG, fun.offset, name=fun.name)
 
         for var in codebase.iter_variables():
-            batch.set(ImageId.ORIG, var.offset, name=var.name, type=EntityType.DATA)
+            batch.set(
+                ImageId.ORIG,
+                var.offset,
+                name=var.name,
+                type=EntityType.DATA,
+                semantic_id=var.semantic_id,
+            )
             if var.is_static and var.parent_function is not None:
                 batch.set(
                     ImageId.ORIG,

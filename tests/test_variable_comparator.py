@@ -545,6 +545,8 @@ def test_compare_uses_source_layout_field_paths(db: EntityDb):
                         SourceField(
                             name="bar",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=2,
                             offset=0,
@@ -553,6 +555,8 @@ def test_compare_uses_source_layout_field_paths(db: EntityDb):
                         SourceField(
                             name="baz",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=3,
                             offset=4,
@@ -575,6 +579,8 @@ def test_compare_uses_source_layout_field_paths(db: EntityDb):
                     semantic_id="gFoo",
                     qualified_name="gFoo",
                     type="Foo",
+                    storage_kind="embedded_record",
+                    record_semantic_id="record:Foo",
                     linkage="external",
                     storage_class="none",
                     definition_kind="definition",
@@ -620,6 +626,7 @@ def test_compare_raw_only_uses_trusted_source_layout(
                         SourceField(
                             name="ptr",
                             type="int *",
+                            storage_kind="pointer",
                             source_file="a.h",
                             line=2,
                             offset=0,
@@ -629,6 +636,8 @@ def test_compare_raw_only_uses_trusted_source_layout(
                         SourceField(
                             name="val",
                             type="int",
+                            pointer_depth=0,
+                            storage_kind="scalar",
                             source_file="a.h",
                             line=3,
                             offset=4,
@@ -651,6 +660,8 @@ def test_compare_raw_only_uses_trusted_source_layout(
                     semantic_id="gFoo",
                     qualified_name="gFoo",
                     type="Foo",
+                    storage_kind="embedded_record",
+                    record_semantic_id="record:Foo",
                     linkage="external",
                     storage_class="none",
                     definition_kind="definition",

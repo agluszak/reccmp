@@ -6,18 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from reccmp.compare.asm.ir import (
-    AsmStream,
-    ResolvedAsm,
-    instruction_at,
-    is_data_row,
-    resolve_asm_stream,
-)
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Instruction,
-    Reject,
-)
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_semantic_key
+from reccmp.compare.asm.model import REGISTERS, Reject
 from reccmp.compare.asm.verifier.addresses import mem_disjoint
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
@@ -63,7 +53,7 @@ _RMW_BINOPS = frozenset(
 _X87_MEM_WRITERS = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbstp"})
 
 
-def _line_base_effects(ins: Instruction) -> LineEffects:
+def _line_base_effects(ins: DecodedInstruction) -> LineEffects:
     """Effect summary for one instruction: register families, flags, x87
     use and barriers. Memory accesses are filled in by sequence_effects.
     Anything not modeled (calls, jumps, string ops) is a scheduling
@@ -190,22 +180,16 @@ def _havoc(state: SideState, idx: int) -> None:
     state.x87 = X87Stack(epoch=-idx - 1)
 
 
-def sequence_effects(asm: AsmStream) -> list[LineEffects] | None:
+def sequence_effects(rows: Sequence[DecodedInstruction]) -> list[LineEffects] | None:
     """Symbolically execute one instruction sequence and return a per-line
     effect summary with memory addresses resolved to symbolic values.
     Returns None if the sequence cannot be analyzed at all."""
-    stream = resolve_asm_stream(asm)
     state = SideState(rename_slots=False)
     ctx = Context()
     result = []
     try:
-        for idx in range(len(stream)):
-            ins: Instruction | None = None
-            if not is_data_row(stream, idx):
-                try:
-                    ins = instruction_at(stream, idx)
-                except (Reject, IndexError, KeyError, ValueError, TypeError):
-                    ins = None
+        for idx, row in enumerate(rows):
+            ins = row if row.is_code else None
             base = BARRIER if ins is None else _line_base_effects(ins)
             ctx.trace = []
             failed = False
@@ -291,17 +275,14 @@ def flags_dead_at(effects_list: list[LineEffects], start: int) -> bool:
 
 def undo_relocations(
     codes: Sequence[DiffOpcode],
-    orig_asm: AsmStream,
-    recomp_asm: AsmStream,
-    orig_addrs: Sequence[int | None] | None = None,
-) -> ResolvedAsm | None:
-    """If every diff insertion can be paired with an equal-text deletion
-    whose move is proven independent of all crossed instructions, return
-    recomp_asm reordered into orig's instruction order. Returns None when
-    the diffs are not (only) relocations."""
+    orig: Sequence[DecodedInstruction],
+    recomp: Sequence[DecodedInstruction],
+) -> list[DecodedInstruction] | None:
+    """If every diff insertion can be paired with an equal deletion whose
+    move is proven independent of all crossed instructions, return recomp
+    reordered into orig's instruction order. Returns None when the diffs
+    are not (only) relocations."""
     # pylint: disable=too-many-return-statements
-    orig = resolve_asm_stream(orig_asm)
-    recomp = resolve_asm_stream(recomp_asm)
     if len(orig) != len(recomp):
         return None
 
@@ -310,8 +291,8 @@ def undo_relocations(
     deletes = sorted(
         i for code, i1, i2, _, __ in codes for i in range(i1, i2) if code == "delete"
     )
-    # `i1` is the index of the orig_asm list where this line will be inserted.
-    # This is not necessarily equal to `j1`, the index of the inserted line in recomp_asm.
+    # `i1` is the index of the orig list where this line will be inserted.
+    # This is not necessarily equal to `j1`, the index of the inserted line in recomp.
     # Therefore we need to save `i1` so that we verify each line between the start and end of the move. (GH #332)
     inserts = [
         (i1, j)
@@ -327,21 +308,16 @@ def undo_relocations(
     if effects is None:
         return None
 
-    addr_index: dict[int, int] | None = None
-    if orig_addrs is not None:
-        addr_index = {addr: k for k, addr in enumerate(orig_addrs) if addr is not None}
-
+    orig_keys = [instruction_semantic_key(row) for row in orig]
     pairs: dict[int, int] = {}
     remaining = list(deletes)
     for orig_dest, j in inserts:
-        line = recomp.displays[j]
+        key_r = instruction_semantic_key(recomp[j])
         matched = None
         for i in remaining:
-            if orig.displays[i] != line:
+            if orig_keys[i] != key_r:
                 continue
-            if _can_relocate(
-                effects, orig.displays, i, orig_dest, orig_addrs, addr_index
-            ):
+            if _can_relocate(effects, orig, i, orig_dest):
                 matched = i
                 break
         if matched is None:
@@ -367,17 +343,16 @@ def undo_relocations(
         return None
 
     order = sorted(range(len(recomp)), key=key.__getitem__)
-    reordered = recomp.reorder(order)
-    return None if reordered.displays == recomp.displays else reordered
+    if order == list(range(len(recomp))):
+        return None
+    return [recomp[j] for j in order]
 
 
-def _can_relocate(  # pylint: disable=too-many-positional-arguments
+def _can_relocate(
     effects: list[LineEffects],
-    orig_asm: list[str],
+    orig: Sequence[DecodedInstruction],
     i: int,
     orig_dest: int,
-    orig_addrs: Sequence[int | None] | None,
-    addr_index: dict[int, int] | None,
 ) -> bool:
     """May the instruction at orig index `i` move to position `orig_dest`?
     Only if it is independent of every instruction it crosses: no register
@@ -402,9 +377,7 @@ def _can_relocate(  # pylint: disable=too-many-positional-arguments
             # the crossed region. The moved instruction then executes on
             # both the taken and the fallthrough path in both placements
             # (and it must not touch the flags the jump reads).
-            if not moved.writes_flags and _forward_jcc_within(
-                orig_asm, k, reloc_end, orig_addrs, addr_index
-            ):
+            if not moved.writes_flags and _forward_jcc_within(orig, k, reloc_end):
                 continue
             return False
         if effects_conflict(moved, other):
@@ -424,31 +397,21 @@ def _can_relocate(  # pylint: disable=too-many-positional-arguments
 
 
 def _forward_jcc_within(
-    orig_asm: list[str],
-    k: int,
-    reloc_end: int,
-    orig_addrs: Sequence[int | None] | None,
-    addr_index: dict[int, int] | None,
+    orig: Sequence[DecodedInstruction], k: int, reloc_end: int
 ) -> bool:
-    """Is orig_asm[k] a forward conditional jump whose target is at or
-    before index reloc_end? Requires instruction addresses to resolve the
-    displacement."""
-    if orig_addrs is None or addr_index is None or k + 1 >= len(orig_addrs):
+    """Is orig[k] a forward conditional jump whose target is at or before
+    index reloc_end?"""
+    row = orig[k]
+    if row.mnemonic not in JCC_MNEMONICS or row.branch_target is None:
         return False
-
-    mnemonic, _, op_str = orig_asm[k].partition(" ")
-    if mnemonic not in JCC_MNEMONICS:
+    if row.address is None or row.branch_target <= row.address:
         return False
-    try:
-        displacement = int(op_str, 16)
-    except ValueError:
-        return False
-    if displacement <= 0:
-        return False
-
-    next_addr = orig_addrs[k + 1]
-    if next_addr is None:
-        return False
-
-    target = addr_index.get(next_addr + displacement)
+    target = next(
+        (
+            index
+            for index, other in enumerate(orig)
+            if other.address == row.branch_target
+        ),
+        None,
+    )
     return target is not None and k < target <= reloc_end

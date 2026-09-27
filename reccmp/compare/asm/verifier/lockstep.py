@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-from reccmp.compare.asm.instgen import InstructionMeta
-from reccmp.compare.asm.ir import (
-    AsmStream,
-    instruction_at,
-    is_data_row,
-    resolve_asm_stream,
-)
+from collections.abc import Sequence
+
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_semantic_key
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.evidence import (
     record_observable_difference,
     record_operand_candidate,
 )
 from reccmp.compare.asm.verifier.obligations import (
-    addrs_from_meta,
     admit_unsupported_identical,
     aligned_indices,
     callee_save_swap,
@@ -41,38 +36,29 @@ from reccmp.compare.diagnosis import AnalysisRecorder
 
 
 def verify_effective_match(
-    orig_asm: AsmStream,
-    recomp_asm: AsmStream,
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
     codes=None,
     metadata: FunctionMetadata | None = None,
-    orig_meta: list[InstructionMeta | None] | None = None,
-    recomp_meta: list[InstructionMeta | None] | None = None,
     recorder: AnalysisRecorder | None = None,
 ) -> bool:
     """True if the two instruction sequences can be proven equivalent
     modulo register allocation, frame-slot layout, commutative-operand
-    order and inverted compare/jump conditions.
-
-    Prefer ``DecodedInstruction`` / ``ResolvedAsm`` streams so structured
-    operands are used directly. Legacy ``list[str]`` still reparses.
-
-    `orig_meta` (optional, aligned with orig_asm) provides structured
-    capstone facts; with them, an unmodeled register-only instruction can
-    be stepped over precisely instead of requiring full synchronization."""
+    order and inverted compare/jump conditions, pairing them by position
+    or by the diff's ``codes``. The rows' Capstone effects let an unmodeled
+    register-only instruction be stepped over precisely instead of
+    requiring full synchronization."""
     # pylint: disable=too-many-branches,too-many-return-statements,too-many-statements
     # pylint: disable=too-many-locals
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
-    orig_stream = resolve_asm_stream(orig_asm)
-    recomp_stream = resolve_asm_stream(recomp_asm)
-    aligned = aligned_indices(codes, len(orig_stream), len(recomp_stream))
+    aligned = aligned_indices(codes, len(orig_rows), len(recomp_rows))
     if aligned is None:
         if recorder is not None:
             recorder.mark_inconclusive(
                 "alignment_failure",
                 facts={
                     "stage": "stream_alignment",
-                    "orig_instruction_count": len(orig_stream),
-                    "recomp_instruction_count": len(recomp_stream),
+                    "orig_instruction_count": len(orig_rows),
+                    "recomp_instruction_count": len(recomp_rows),
                 },
             )
         return False
@@ -82,45 +68,17 @@ def verify_effective_match(
     ctx = Context(metadata=metadata, recorder=recorder)
     last_index_o: int | None = None
     last_index_r: int | None = None
-    orig_cf_addrs = (
-        recorder.orig_addrs
-        if recorder is not None and recorder.orig_addrs is not None
-        else addrs_from_meta(orig_meta)
-    )
-    recomp_cf_addrs = (
-        recorder.recomp_addrs
-        if recorder is not None and recorder.recomp_addrs is not None
-        else addrs_from_meta(recomp_meta)
-    )
+    orig_cf_addrs = [row.address for row in orig_rows]
+    recomp_cf_addrs = [row.address for row in recomp_rows]
 
     try:
         for idx, (index_o, index_r) in enumerate(aligned):
             last_index_o, last_index_r = index_o, index_r
-            line_o = orig_stream.displays[index_o] if index_o is not None else None
-            line_r = recomp_stream.displays[index_r] if index_r is not None else None
-            if line_o is None or line_r is None:
-                side = recomp if line_o is None else orig
-                other_side = orig if line_o is None else recomp
-                line = line_r if line_o is None else line_o
-                side_stream = recomp_stream if line_o is None else orig_stream
-                side_index = index_r if line_o is None else index_o
-                assert line is not None and side_index is not None
-                side_ins = None
-                side_data = is_data_row(side_stream, side_index)
-                if not side_data:
-                    try:
-                        side_ins = instruction_at(side_stream, side_index)
-                    except (Reject, IndexError, KeyError, ValueError, TypeError):
-                        side_ins = None
-                if not one_sided_ok(
-                    side,
-                    other_side,
-                    ctx,
-                    idx,
-                    line,
-                    ins=side_ins,
-                    is_data=side_data,
-                ):
+            if index_o is None or index_r is None:
+                side = recomp if index_o is None else orig
+                other_side = orig if index_o is None else recomp
+                row = recomp_rows[index_r] if index_o is None else orig_rows[index_o]  # type: ignore[index]
+                if not one_sided_ok(side, other_side, ctx, idx, row):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "alignment_failure",
@@ -131,15 +89,14 @@ def verify_effective_match(
                     return False
                 continue
 
-            assert index_o is not None and index_r is not None
-            if is_data_row(orig_stream, index_o) or is_data_row(recomp_stream, index_r):
-                if line_o != line_r:
+            ins_o, ins_r = orig_rows[index_o], recomp_rows[index_r]
+            same = instruction_semantic_key(ins_o) == instruction_semantic_key(ins_r)
+            if not ins_o.is_code or not ins_r.is_code:
+                if not same:
                     return False
                 continue
 
             try:
-                ins_o = instruction_at(orig_stream, index_o)
-                ins_r = instruction_at(recomp_stream, index_r)
                 record_operand_candidate(
                     ctx, index_o, index_r, ins_o, ins_r, (orig, recomp)
                 )
@@ -152,27 +109,17 @@ def verify_effective_match(
                 execute(orig, ctx, idx, ins_o, obs_o)
                 execute(recomp, ctx, idx, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
-                # Unsupported or malformed instruction: only allowed if
-                # both sides are textually identical, and then only when
-                # its precise effects are known (capstone metadata) or the
-                # two symbolic states are fully synchronized.
-                if line_o != line_r:
+                # Unsupported instruction: only allowed if both sides are
+                # the same instruction, and then only when its precise
+                # effects are known (capstone) or the two symbolic states
+                # are fully synchronized.
+                if not same:
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "unsupported_instruction", index_o, index_r
                         )
                     return False
-                meta_o = (
-                    orig_meta[index_o]
-                    if orig_meta is not None and index_o is not None
-                    else None
-                )
-                meta_r = (
-                    recomp_meta[index_r]
-                    if recomp_meta is not None and index_r is not None
-                    else None
-                )
-                if admit_unsupported_identical(orig, recomp, ctx, idx, meta_o, meta_r):
+                if admit_unsupported_identical(orig, recomp, ctx, idx, ins_o, ins_r):
                     continue
                 if recorder is not None:
                     recorder.mark_inconclusive(
@@ -183,10 +130,8 @@ def verify_effective_match(
             guard_state_size(orig, ctx)
             guard_state_size(recomp, ctx)
 
-            meta_o = orig_meta[index_o] if orig_meta is not None else None
-            meta_r = recomp_meta[index_r] if recomp_meta is not None else None
-            rewrite_control_observables(obs_o, meta_o, orig_cf_addrs)
-            rewrite_control_observables(obs_r, meta_r, recomp_cf_addrs)
+            rewrite_control_observables(obs_o, ins_o, orig_cf_addrs)
+            rewrite_control_observables(obs_r, ins_r, recomp_cf_addrs)
 
             if callee_save_swap(ctx, ins_o, ins_r, obs_o, obs_r, orig, recomp):
                 # The pushed values differ (that is the point of the swap),
@@ -195,26 +140,8 @@ def verify_effective_match(
                 continue
 
             if not observations_agree(ctx, obs_o, obs_r):
-                meta_o = (
-                    orig_meta[index_o]
-                    if orig_meta is not None and index_o is not None
-                    else None
-                )
-                meta_r = (
-                    recomp_meta[index_r]
-                    if recomp_meta is not None and index_r is not None
-                    else None
-                )
                 record_observable_difference(
-                    ctx,
-                    index_o,
-                    index_r,
-                    ins_o,
-                    ins_r,
-                    obs_o,
-                    obs_r,
-                    meta_o,
-                    meta_r,
+                    ctx, index_o, index_r, ins_o, ins_r, obs_o, obs_r
                 )
                 return False
             invalidate_save_slots(ctx, obs_o)

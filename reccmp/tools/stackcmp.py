@@ -6,22 +6,15 @@ import colorama
 import reccmp
 import reccmp.color
 from reccmp.compare import Compare
-from reccmp.compare.diff import (
-    CombinedDiffOutput,
-    MatchingOrMismatchingBlock,
-    raw_diff_to_udiff,
-)
+from reccmp.compare.diff import RawDiffOutput
 from reccmp.compare.stack_layout import (
+    StackLayoutResult,
     StackPair,
-    StackPairs,
     StackRegisterOffset,
     StackSymbol,
     Warnings,
-    analyze_diff_block,
     annotate_canonical_refs,
     annotate_recomp_symbols,
-    collect_stack_pairs,
-    extract_stack_offset_from_instruction,
 )
 from reccmp.cvdump.symbols import SymbolsEntry
 from reccmp.project.detect import (
@@ -45,23 +38,6 @@ SWAP_ICON = f"{reccmp.color.Fore.YELLOW}⇄{reccmp.color.Style.RESET_ALL}"
 ERROR_ICON = f"{reccmp.color.Fore.RED}✗{reccmp.color.Style.RESET_ALL}"
 UNCLEAR_ICON = f"{reccmp.color.Fore.BLUE}?{reccmp.color.Style.RESET_ALL}"
 
-# Re-exports for tests / callers that imported these from the tool module.
-__all__ = [
-    "StackSymbol",
-    "StackRegisterOffset",
-    "StackPair",
-    "StackPairs",
-    "Warnings",
-    "extract_stack_offset_from_instruction",
-    "analyze_diff",
-    "compare_function_stacks",
-    "main",
-]
-
-
-def analyze_diff(diff: MatchingOrMismatchingBlock, warnings: Warnings) -> StackPairs:
-    return analyze_diff_block(diff, warnings)
-
 
 def print_bijective_match(left: str, right: str, exact: bool):
     icon = CHECK_ICON if exact else SWAP_ICON
@@ -84,32 +60,25 @@ def format_list_of_offsets(offsets: list[StackRegisterOffset]) -> str:
     return str([str(x) for x in offsets])
 
 
-def compare_function_stacks(udiff: CombinedDiffOutput, fn_symbol: SymbolsEntry):
-    warnings = Warnings()
-    stack_pairs, collected_warnings = collect_stack_pairs(udiff)
-    warnings.structural_mismatches_present = (
-        collected_warnings.structural_mismatches_present
-    )
+def log_structural_mismatches(rdiff: RawDiffOutput) -> None:
+    """Show each replaced block whose two sides differ in length: the
+    stack comparison could not pair its instructions."""
+    for tag, i1, i2, j1, j2 in rdiff.codes:
+        if tag == "equal" or (i2 - i1) == (j2 - j1):
+            continue
+        orig = rdiff.orig_inst[i1:i2]
+        recomp = rdiff.recomp_inst[j1:j2]
+        location = f"orig={orig[0][0]}" if orig else f"recomp={recomp[0][0]}"
+        logging.error(
+            "Structural mismatch at %s:\n%s",
+            location,
+            print_structural_mismatch(orig, recomp),
+        )
 
-    # Preserve prior logging for structural mismatches in mismatch blocks.
-    for block in udiff:
-        for diff in block[1]:
-            if "both" in diff:
-                continue
-            assert "orig" in diff and "recomp" in diff
-            orig = diff["orig"]
-            recomp = diff["recomp"]
-            if len(orig) != len(recomp):
-                if orig:
-                    mismatch_location = f"orig={orig[0][0]}"
-                else:
-                    mismatch_location = f"recomp={recomp[0][0]}"
-                logging.error(
-                    "Structural mismatch at %s:\n%s",
-                    mismatch_location,
-                    print_structural_mismatch(orig, recomp),
-                )
 
+def compare_function_stacks(layout: StackLayoutResult, fn_symbol: SymbolsEntry):
+    warnings = Warnings(structural_mismatches_present=layout.structural_mismatch)
+    stack_pairs = set(layout.pairs)
     stack_symbols = annotate_recomp_symbols(stack_pairs, fn_symbol)
     annotate_canonical_refs(stack_pairs)
 
@@ -234,11 +203,11 @@ def main() -> int:
         print(f"Failed to find a match at address 0x{args.address:x}")
         return 1
 
-    assert match.rdiff is not None
-    # Analyze the entire function, including long sections that already match.
-    # This comment explains why this is necessary:
-    # https://github.com/isledecomp/reccmp/pull/307#issuecomment-3796146436
-    udiff = raw_diff_to_udiff(match.rdiff, grouped=False)
+    if match.stack_layout is None:
+        print(f"No stack slots to compare at address 0x{args.address:x}")
+        return 0
+    if match.rdiff is not None:
+        log_structural_mismatches(match.rdiff)
 
     function_data = next(
         (y for y in compare.cvdump_analysis.nodes if y.addr == match.recomp_addr),
@@ -247,7 +216,7 @@ def main() -> int:
     assert function_data is not None
     assert function_data.symbol_entry is not None
 
-    compare_function_stacks(udiff, function_data.symbol_entry)
+    compare_function_stacks(match.stack_layout, function_data.symbol_entry)
     return 0
 
 

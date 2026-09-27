@@ -342,21 +342,23 @@ class Indexer {
     return depth;
   }
 
-  void describeStorage(llvm::json::Object& entry, QualType type) const {
+  static const char* storageKind(QualType type) {
     QualType current = type.getCanonicalType();
-    if (current->getAs<ReferenceType>()) {
-      entry["storage_kind"] = "reference";
-      return;
-    }
-    if (current->getAs<PointerType>() || pointerDepth(type) > 0) {
-      entry["storage_kind"] = "pointer";
-      return;
-    }
-      if (const ArrayType* array = current->getAsArrayTypeUnsafe()) {
+    if (current->getAs<ReferenceType>()) return "reference";
+    if (current->getAs<PointerType>() || pointerDepth(type) > 0) return "pointer";
+    if (current->getAsArrayTypeUnsafe()) return "array";
+    if (current->getAsCXXRecordDecl()) return "embedded_record";
+    return "scalar";
+  }
+
+  void describeStorage(llvm::json::Object& entry, QualType type) const {
+    const char* kind = storageKind(type);
+    entry["storage_kind"] = kind;
+    if (const ArrayType* array = type.getCanonicalType()->getAsArrayTypeUnsafe()) {
       QualType element = array->getElementType();
-      entry["storage_kind"] = "array";
       entry["array_element_type"] = typeName(element);
-      if (!element->isDependentType() && element->isConstantSizeType()) {
+      if (!element->isDependentType() && !element->isIncompleteType() &&
+          element->isConstantSizeType()) {
         entry["array_stride"] = context_.getTypeSizeInChars(element).getQuantity();
       }
       if (const auto* constant = dyn_cast<ConstantArrayType>(array)) {
@@ -374,13 +376,7 @@ class Indexer {
       } else {
         entry["array_element_kind"] = "scalar";
       }
-      return;
     }
-    if (current->getAsCXXRecordDecl()) {
-      entry["storage_kind"] = "embedded_record";
-      return;
-    }
-    entry["storage_kind"] = "scalar";
   }
 
   // Semantic id of the CXX record a type ultimately refers to (after peeling
@@ -792,15 +788,13 @@ class Indexer {
       semanticKind = scope.empty() ? "free_function" : "namespace_function";
     }
 
-    std::string functionType = typeName(function->getType());
     // The record's compared identity dissolves typedef and elaborated
     // spellings; the display signature keeps the spelled form.
     std::string returnType;
     std::string spelledReturn;
     if (semanticKind != "constructor" && semanticKind != "destructor") {
       returnType = canonicalName(function->getReturnType());
-      spelledReturn =
-          llvm::StringRef(functionType).take_until([](char c) { return c == '('; }).trim().str();
+      spelledReturn = typeName(function->getReturnType());
     }
 
     std::vector<std::string> parameters = parameterTypes(function);
@@ -898,6 +892,7 @@ class Indexer {
     };
     std::string recordId = recordSemanticId(variable->getType());
     if (!recordId.empty()) payload["record_semantic_id"] = recordId;
+    payload["storage_kind"] = storageKind(variable->getType());
     emit(std::move(payload));
   }
 
@@ -1491,6 +1486,7 @@ class Indexer {
         if (base.isVirtual()) continue;
         baseOffsets.push_back(llvm::json::Object{
             {"name", typeName(base.getType())},
+            {"semantic_id", recordSemanticId(base.getType())},
             {"offset", layout->getBaseClassOffset(baseRecord).getQuantity()},
         });
       }

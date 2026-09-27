@@ -1,4 +1,5 @@
 import dataclasses
+from typing import TYPE_CHECKING
 from typing import Iterable, Sequence
 from typing_extensions import NotRequired, TypedDict
 from reccmp.difflib import DiffOpcode, get_grouped_opcodes
@@ -12,6 +13,10 @@ from reccmp.compare.diagnosis import (
 from reccmp.compare.inlines import InlineExpansionEvidence
 
 CombinedDiffInput = list[tuple[str, str]]
+
+
+if TYPE_CHECKING:
+    from reccmp.compare.stack_layout import StackLayoutResult
 
 
 @dataclasses.dataclass
@@ -35,6 +40,8 @@ class EntityCompareResult:
     inline_expansions: tuple[InlineExpansionEvidence, ...] = ()
     accuracy_modulo_inline: float | None = None
     diagnostic_normalizations: tuple[DiagnosticNormalization, ...] = ()
+    # The stack slots the paired instructions use (see stack_layout).
+    stack_layout: "StackLayoutResult | None" = None
 
     def __post_init__(self) -> None:
         self.refresh_diagnostic_normalizations()

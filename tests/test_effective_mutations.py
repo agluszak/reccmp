@@ -16,8 +16,8 @@ import pytest
 from reccmp.compare.asm.verifier import (
     CallFacts,
     FunctionMetadata,
-    verify_effective_match,
 )
+from tests.asm_rows import verify_effective_match
 
 CDECL = CallFacts(uses_ecx=False, uses_edx=False)
 
@@ -94,7 +94,8 @@ ACCEPTED_PAIRS = [
             "call Helper (FUNCTION)",
         ],
         FunctionMetadata(
-            return_kind="void", call_facts={"Helper (FUNCTION)": CDECL}.get
+            return_kind="void",
+            call_facts=lambda key: CDECL if key == "Helper (FUNCTION)" else None,
         ),
     ),
     (

@@ -6,7 +6,6 @@ instruction towards the original order only past instructions it provably
 does not depend on.
 """
 
-from reccmp.compare.asm.ir import resolve_asm_stream
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.asm.verifier.schedule import schedule_like
 
@@ -31,7 +30,7 @@ REP_STOSD = "f3ab"  # rep stosd (not modelled)
 
 def _stream(*instructions: str):
     code = bytes.fromhex("".join(instructions))
-    return resolve_asm_stream(ParseAsm().parse_asm(code, 0x1000))
+    return ParseAsm().parse_asm(code, 0x1000)
 
 
 def _schedule(orig: tuple[str, ...], recomp: tuple[str, ...]) -> list[int]:

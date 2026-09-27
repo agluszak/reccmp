@@ -1,9 +1,8 @@
 """Capstone detail-mode decode into canonical ``DecodedInstruction`` rows.
 
-One disassembly pass produces both the structured meta previously collected by
-``collect_instruction_meta`` and the ``(addr, size, mnemonic, op_str)`` tuples
-``InstructGen`` uses for section discovery.  Typed operands are filled from
-Capstone detail here; address sanitization happens later in ``ParseAsm``.
+The one disassembly pass: typed operands, register and flag effects and
+branch targets come from Capstone's detail here; address sanitization
+happens later in ``ParseAsm``.
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from .ir import AsmRole, DecodedInstruction
 from .model import (
     REGISTERS,
     ST_RE,
-    format_operand,
     split_mnemonic_prefix,
 )
 
@@ -138,8 +136,9 @@ def capstone_operand(
             ),
             size_known,
         )
-    # Rare / unsupported (e.g. invalid): keep a unique opaque identity.
-    return ("opaque", op.type, str(insn.op_str), operand_index), False
+    # Rare / unsupported: machine bytes distinguish unknown operands without
+    # letting Capstone's display spelling influence matching.
+    return ("opaque", op.type, bytes(insn.bytes), operand_index), False
 
 
 def from_capstone(insn) -> DecodedInstruction:
@@ -173,19 +172,15 @@ def from_capstone(insn) -> DecodedInstruction:
         not (isinstance(operand, tuple) and operand and operand[0] == "opaque")
         for operand in operands
     )
-    # Indirect control transfers have no absolute branch_target at decode time.
-    # CFG may still recover switch tables via JumpTable metadata later.
+    # An indirect call's destination expression is its modeled operand; it
+    # needs no absolute branch_target for an exact instruction comparison.
+    # An indirect jump still needs a recovered switch table or destination
+    # before its local control-flow topology is known.
     if control_flow_known and (is_jump or is_call) and branch_target is None:
         if is_jump:
             control_flow_known = False
-        elif not any(
-            isinstance(op, tuple) and op and op[0] in ("imm", "sym", "reg")
-            for op in operands
-        ):
+        elif not operands:
             control_flow_known = False
-        elif any(isinstance(op, tuple) and op and op[0] == "mem" for op in operands):
-            control_flow_known = False
-    raw_operands = tuple(format_operand(op) for op in operands)
 
     # Preserve Capstone's own display text (including combined rep mnemonic).
     # Zero-operand lines keep a trailing space to match historical
@@ -201,7 +196,6 @@ def from_capstone(insn) -> DecodedInstruction:
         mnemonic=mnemonic,
         prefix=prefix,
         operands=operands,
-        raw_operands=raw_operands,
         display=display,
         role=AsmRole.CODE,
         regs_read=regs_read,
@@ -216,7 +210,6 @@ def from_capstone(insn) -> DecodedInstruction:
         register_access_known=register_access_known,
         operand_model_complete=operand_model_complete,
         control_flow_known=control_flow_known,
-        raw_op_str=insn.op_str,
     )
 
 
@@ -229,13 +222,3 @@ def disasm_detail(
         from_capstone(insn)
         for insn in stop_at_int3_detail(disassembler.disasm(blob, start))
     ]
-
-
-def as_lite_tuple(insn: DecodedInstruction) -> tuple[int, int, str, str]:
-    """Compatibility view for InstructGen section analysis."""
-    assert insn.address is not None
-    # InstructGen expects Capstone's combined mnemonic (e.g. ``rep movsd``).
-    mnemonic = (
-        f"{insn.prefix} {insn.mnemonic}".strip() if insn.prefix else insn.mnemonic
-    )
-    return (insn.address, insn.size, mnemonic, insn.raw_op_str)

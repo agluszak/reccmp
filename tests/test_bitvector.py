@@ -1,7 +1,8 @@
 """Bit-vector equivalence of the verifier's symbolic values (z3)."""
 
-from reccmp.compare.asm.verifier import bitvector, verify_effective_match
+from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.state import FunctionMetadata
+from tests.asm_rows import verify_effective_match
 
 EAX = ("init", "a")
 ECX = ("init", "c")

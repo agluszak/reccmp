@@ -6,6 +6,7 @@ base only declares what they may use, for type checking.
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,12 +34,10 @@ class ComparatorState:
     is_32bit: bool
     orig_sanitize: ParseAsm
     recomp_sanitize: ParseAsm
-    _call_facts_cache: dict[str, CallFacts | None] | None
+    _call_facts_cache: dict[Hashable, CallFacts | None] | None
     _fp_cache: dict
     _helper_catalog: list[HelperCatalogEntry] | None
     _helper_by_orig: dict[int, HelperCatalogEntry | None]
-    _helper_identity_index: dict[str, int] | None
-    _helper_identity_ambiguous: set[str] | None
 
     # Provided by FunctionComparator, which comes earlier in the MRO;
     # declared here only for type checking.

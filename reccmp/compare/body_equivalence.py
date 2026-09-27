@@ -1,12 +1,20 @@
 """Body-equivalence proofs for bodies that are not annotated pairs: folded
 COMDAT aliases, stale jmp islands and uniquely discoverable pairs."""
 
-import re
+from typing import Callable
 
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.decode import decode_one, direct_branch_target
+from reccmp.compare.asm.decode import decode_one, from_capstone
 from reccmp.compare.asm.instgen import InstructGen, SectionType
-from reccmp.compare.asm.ir import local_destination_keys
+from reccmp.compare.asm.ir import (
+    DecodedInstruction,
+    ExtentKind,
+    FunctionImage,
+    instruction_semantic_key,
+    local_destination_keys,
+)
+from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.inlines import Fingerprint, FingerprintRow
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
 from reccmp.compare.equivalence import canonical_orig_addr
@@ -19,23 +27,22 @@ from reccmp.types import EntityType, ImageId
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
 
 
-def _code_instructions(
+def _code_rows(
     raw: bytes, addr: int, is_32bit: bool
-) -> list[tuple[int, int, str, str]] | None:
-    """The body's raw instruction tuples, or None when the body carries
-    non-code sections (jump-table data) that would break the positional
-    pairing with the sanitized excerpt."""
-    instructions: list[tuple[int, int, str, str]] = []
+) -> list[DecodedInstruction] | None:
+    """The body's decoded instructions, or None when the body carries
+    non-code sections (jump-table data)."""
+    rows: list[DecodedInstruction] = []
     for section in InstructGen(bytes(raw), addr, is_32bit).sections:
         if section.type != SectionType.CODE:
             return None
-        instructions.extend(section.contents)
-    return instructions
+        rows.extend(section.contents)
+    return rows
 
 
 def _code_shape(raw: bytes, start: int) -> tuple | None:
     """The instructions of ``raw`` at ``start``, with direct branches inside
-    the body as offsets and every other operand as spelled; None when it
+    the body as offsets and every other operand as decoded; None when it
     does not decode exactly."""
     shape: list[tuple] = []
     offset = 0
@@ -43,15 +50,24 @@ def _code_shape(raw: bytes, start: int) -> tuple | None:
         insn = decode_one(raw[offset : offset + 16], start + offset)
         if insn is None:
             return None
-        target = direct_branch_target(insn)
+        decoded = from_capstone(insn)
+        target = decoded.branch_target
+        head = (decoded.prefix, decoded.mnemonic)
         if target is None:
-            shape.append((insn.mnemonic, insn.op_str))
+            shape.append((*head, _frozen(decoded.operands)))
         elif start <= target < start + len(raw):
-            shape.append((insn.mnemonic, "local", target - start))
+            shape.append((*head, "local", target - start))
         else:
-            shape.append((insn.mnemonic, "far", target))
+            shape.append((*head, "far", target))
         offset += insn.size
     return tuple(shape) if offset == len(raw) else None
+
+
+def _frozen(value):
+    match value:
+        case list() | tuple():
+            return tuple(_frozen(item) for item in value)
+    return value
 
 
 def _identical_code(image, first: int, second: int, size: int) -> bool:
@@ -67,6 +83,18 @@ def _identical_code(image, first: int, second: int, size: int) -> bool:
     return shape is not None and shape == _code_shape(b, second)
 
 
+def _erase_addresses(operand, valid_addr: Callable[[int], bool]):
+    """An operand with the values the image calls addresses erased."""
+    match operand:
+        case ("imm", int() as value) if valid_addr(value):
+            return ("imm", "<ADDR>")
+        case ("mem", size, seg, reg_terms, int() as disp, syms) if disp and valid_addr(
+            abs(disp)
+        ):
+            return ("mem", size, seg, _frozen(reg_terms), "<ADDR>", syms)
+    return _frozen(operand)
+
+
 def _is_bare_jmp_island(raw: bytes) -> bool:
     """True when the function body is a lone `jmp rel32` followed only by
     padding: the shape an incremental link leaves at a moved/folded symbol's
@@ -78,6 +106,10 @@ def _is_bare_jmp_island(raw: bytes) -> bool:
 
 class BodyEquivalenceMixin(ComparatorState):
     """Part of FunctionComparator; relies on its attributes."""
+
+    orig_sanitize: ParseAsm
+    recomp_sanitize: ParseAsm
+    _load_function_image: Callable[..., FunctionImage]
 
     def raw_pair_alias_equivalent(
         self,
@@ -179,74 +211,61 @@ class BodyEquivalenceMixin(ComparatorState):
                 _active=active,
                 _proved=proved,
             )
-        orig_asm = self.orig_sanitize.parse_asm(orig_raw, orig_addr)
-        orig_topology = local_destination_keys(
-            orig_asm,
-            self.orig_sanitize.jump_tables,
-            start_addr=orig_addr,
-            extent=size,
+        orig_image = self._load_function_image(
+            self.orig_sanitize, orig_raw, orig_addr, size, ExtentKind.KNOWN
         )
-        recomp_asm = self.recomp_sanitize.parse_asm(recomp_raw, recomp_addr)
-        recomp_topology = local_destination_keys(
-            recomp_asm,
-            self.recomp_sanitize.jump_tables,
-            start_addr=recomp_addr,
-            extent=size,
+        recomp_image = self._load_function_image(
+            self.recomp_sanitize, recomp_raw, recomp_addr, size, ExtentKind.KNOWN
         )
-        if not orig_asm or len(orig_asm) != len(recomp_asm):
+        orig_rows, recomp_rows = orig_image.excerpt, recomp_image.excerpt
+        if not orig_rows or len(orig_rows) != len(recomp_rows):
             return False
+        orig_topology = local_destination_keys(
+            orig_rows, orig_image.jump_tables, start_addr=orig_addr, extent=size
+        )
+        recomp_topology = local_destination_keys(
+            recomp_rows, recomp_image.jump_tables, start_addr=recomp_addr, extent=size
+        )
         if orig_topology is None or recomp_topology is None:
             return False
-        orig_insts = _code_instructions(orig_raw, orig_addr, self.is_32bit)
-        recomp_insts = _code_instructions(recomp_raw, recomp_addr, self.is_32bit)
-        if (
-            orig_insts is None
-            or recomp_insts is None
-            or len(orig_insts) != len(orig_asm)
-            or len(recomp_insts) != len(orig_asm)
-        ):
-            return False
-        for index, (orig_row, recomp_row) in enumerate(zip(orig_asm, recomp_asm)):
-            orig_line = orig_row.display
-            recomp_line = recomp_row.display
+        for index, (orig_row, recomp_row) in enumerate(zip(orig_rows, recomp_rows)):
             # Local branches must reach the same instruction id: equal
-            # displacement text does not imply that when encodings differ.
+            # displacements do not imply that when encodings differ.
             if (
-                orig_line == recomp_line
-                and "<OFFSET" not in orig_line
+                instruction_semantic_key(orig_row)
+                == instruction_semantic_key(recomp_row)
                 and orig_topology[index] == recomp_topology[index]
             ):
                 continue
             if not self._transfer_targets_alias_equivalent(
-                orig_insts[index], recomp_insts[index], depth, active, proved
+                orig_row, recomp_row, depth, active, proved
             ):
                 return False
         return True
 
     def _transfer_targets_alias_equivalent(
         self,
-        orig_inst: tuple[int, int, str, str],
-        recomp_inst: tuple[int, int, str, str],
+        orig_row: DecodedInstruction,
+        recomp_row: DecodedInstruction,
         depth: int,
         active: set[tuple[int, int]],
         proved: dict[tuple[int, int], bool],
     ) -> bool:
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
         """Whether a diverging instruction pair is a direct transfer whose
         two targets are themselves alias-equivalent bodies. The target size
         comes from the annotated recomp entity; an unknown target is not
         evidence."""
-
-        _, _, orig_mnemonic, orig_op = orig_inst
-        _, _, recomp_mnemonic, recomp_op = recomp_inst
-        if orig_mnemonic != recomp_mnemonic:
+        if (orig_row.prefix, orig_row.mnemonic) != (
+            recomp_row.prefix,
+            recomp_row.mnemonic,
+        ):
             return False
-        if orig_mnemonic != "call" and orig_mnemonic not in JUMP_MNEMONICS:
+        if orig_row.mnemonic != "call" and orig_row.mnemonic not in JUMP_MNEMONICS:
             return False
-        try:
-            orig_target = int(orig_op, 16)
-            recomp_target = int(recomp_op, 16)
-        except ValueError:
-            return False  # indirect or composite operand
+        orig_target, recomp_target = orig_row.branch_target, recomp_row.branch_target
+        if orig_target is None or recomp_target is None:
+            return False  # indirect
         entity = self.db.get(ImageId.RECOMP, recomp_target)
         target_size = entity.size(ImageId.RECOMP) if entity is not None else None
         if target_size is None or target_size <= 0:
@@ -361,28 +380,25 @@ class BodyEquivalenceMixin(ComparatorState):
                 recomp_raw = self.recomp_bin.read(caller.recomp_addr, recomp_size)
             except (InvalidVirtualAddressError, InvalidVirtualReadError):
                 continue
-            orig_ins = _code_instructions(orig_raw, caller.orig_addr, self.is_32bit)
-            recomp_ins = _code_instructions(
-                recomp_raw, caller.recomp_addr, self.is_32bit
-            )
+            orig_ins = _code_rows(orig_raw, caller.orig_addr, self.is_32bit)
+            recomp_ins = _code_rows(recomp_raw, caller.recomp_addr, self.is_32bit)
             if (
                 orig_ins is None
                 or recomp_ins is None
                 or len(orig_ins) != len(recomp_ins)
-                or any(a[2] != b[2] for a, b in zip(orig_ins, recomp_ins))
+                or any(
+                    (a.prefix, a.mnemonic) != (b.prefix, b.mnemonic)
+                    for a, b in zip(orig_ins, recomp_ins)
+                )
             ):
                 continue
             for orig_instruction, recomp_instruction in zip(orig_ins, recomp_ins):
-                if orig_instruction[2] != "call":
+                if not orig_instruction.is_call:
                     continue
-                orig_operand = re.fullmatch(r"0x([0-9a-fA-F]+)", orig_instruction[3])
-                recomp_operand = re.fullmatch(
-                    r"0x([0-9a-fA-F]+)", recomp_instruction[3]
-                )
-                if orig_operand is None or recomp_operand is None:
+                orig_target = orig_instruction.branch_target
+                recomp_target = recomp_instruction.branch_target
+                if orig_target is None or recomp_target is None:
                     continue
-                orig_target = int(orig_operand.group(1), 16)
-                recomp_target = int(recomp_operand.group(1), 16)
                 if (
                     orig_target in orig_candidates
                     and recomp_target in recomp_candidates
@@ -413,7 +429,7 @@ class BodyEquivalenceMixin(ComparatorState):
 
     def _alias_fingerprint(
         self, image_id: ImageId, addr: int, size: int
-    ) -> tuple[tuple[str, str], ...] | None:
+    ) -> Fingerprint | None:
         """Cheap body shape used only to limit alias-equivalence proofs.
 
         Address operands are erased only when the image identifies them as a
@@ -440,22 +456,18 @@ class BodyEquivalenceMixin(ComparatorState):
             if memo is not None:
                 memo[cache_key] = None
             return None
-        instructions = _code_instructions(raw, addr, self.is_32bit)
-        if instructions is None:
-            if memo is not None:
-                memo[cache_key] = None
-            return None
-
-        def normalize_operand(operand: str) -> str:
-            def replace(match: re.Match[str]) -> str:
-                value = int(match.group(0), 16)
-                return "<ADDR>" if valid_addr(value) else match.group(0)
-
-            return re.sub(r"0x[0-9a-fA-F]+", replace, operand)
-
-        fingerprint = tuple(
-            (mnemonic, normalize_operand(operand))
-            for _, _, mnemonic, operand in instructions
+        rows = _code_rows(raw, addr, self.is_32bit)
+        fingerprint = (
+            None
+            if rows is None
+            else tuple(
+                FingerprintRow(
+                    row.prefix,
+                    row.mnemonic,
+                    tuple(_erase_addresses(op, valid_addr) for op in row.operands),
+                )
+                for row in rows
+            )
         )
         if memo is not None:
             memo[cache_key] = fingerprint
@@ -469,9 +481,7 @@ class BodyEquivalenceMixin(ComparatorState):
     ) -> bool:
         """Classify one image's remaining bodies against canonical pairs."""
         added = False
-        canonical_groups: dict[
-            tuple[int, tuple[tuple[str, str], ...]], list[ReccmpMatch]
-        ] = {}
+        canonical_groups: dict[tuple[int, Fingerprint], list[ReccmpMatch]] = {}
         # Every duplicate is proven against the pair's recompiled body, whose
         # extent the PDB states: an original duplicate across the images, a
         # recompiled one within the recompiled image (retail ICF folded
@@ -507,8 +517,8 @@ class BodyEquivalenceMixin(ComparatorState):
 
     def _unpaired_function_candidates(
         self, image_id: ImageId
-    ) -> dict[tuple[int, tuple[tuple[str, str], ...]], list[int]]:
-        groups: dict[tuple[int, tuple[tuple[str, str], ...]], list[int]] = {}
+    ) -> dict[tuple[int, Fingerprint], list[int]]:
+        groups: dict[tuple[int, Fingerprint], list[int]] = {}
         for entity in self.db.unexplained(image_id):
             if entity.entity_type != EntityType.FUNCTION:
                 continue

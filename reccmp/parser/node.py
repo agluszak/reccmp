@@ -68,6 +68,7 @@ class ParserFunction(ParserSymbol):
 class ParserVariable(ParserSymbol):
     is_static: bool = False
     parent_function: int | None = None
+    semantic_id: str | None = None
 
 
 @dataclass

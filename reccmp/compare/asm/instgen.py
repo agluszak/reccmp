@@ -1,40 +1,13 @@
 """Pre-parser for x86 instructions. Will identify data/jump tables used with
 switch statements and local jump/call destinations."""
 
-import re
 import bisect
 import struct
-from dataclasses import dataclass
-from functools import cache
 from enum import Enum, auto
-from collections.abc import Hashable
-from typing import Iterable, Literal, NamedTuple
-from capstone import (  # type: ignore
-    CS_ARCH_X86,
-    CS_MODE_16,
-    CS_MODE_32,
-    Cs,
-)
+from typing import Literal, NamedTuple
 from .const import JUMP_MNEMONICS
-from .decode import as_lite_tuple, disasm_detail
+from .decode import disasm_detail
 from .ir import DecodedInstruction, JumpTable
-
-
-@cache
-def get_disassembler(is_32: bool = True) -> Cs:
-    return Cs(CS_ARCH_X86, CS_MODE_32 if is_32 else CS_MODE_16)
-
-
-DisasmLiteTuple = tuple[int, int, str, str]
-"""Raw tuple returned by capstone's disasm_lite() function.
-The fields are:
-    - address
-    - size (of instruction, in bytes)
-    - mnemonic
-    - op_str (all operands, comma-delimited)
-"""
-
-displacement_regex = re.compile(r".*\+ (0x[0-9a-f]+)\]")
 
 
 class SectionType(Enum):
@@ -45,7 +18,7 @@ class SectionType(Enum):
 
 class CodeSection(NamedTuple):
     type: Literal[SectionType.CODE]
-    contents: list[DisasmLiteTuple]
+    contents: list[DecodedInstruction]
 
 
 TabSectionType = Literal[SectionType.DATA_TAB] | Literal[SectionType.ADDR_TAB]
@@ -59,17 +32,16 @@ class TabSection(NamedTuple):
 FuncSection = CodeSection | TabSection
 
 
-def stop_at_int3(
-    disasm_lite_gen: Iterable[DisasmLiteTuple],
-) -> Iterable[DisasmLiteTuple]:
-    """Wrapper for capstone disasm_lite generator. We want to stop reading
-    instructions if we hit the int3 instruction."""
-    for inst in disasm_lite_gen:
-        # inst[2] is the mnemonic
-        if inst[2] == "int3":
-            break
-
-        yield inst
+def _table_displacement(insn: DecodedInstruction) -> int | None:
+    """The displacement of an indexed memory operand, ``[reg*4 + table]``:
+    where a jump or a load reads a table of addresses or bytes."""
+    for operand in insn.operands:
+        match operand:
+            case ("mem", _, _, reg_terms, int() as displacement, _) if (
+                reg_terms and displacement > 0
+            ):
+                return displacement
+    return None
 
 
 class InstructGen:
@@ -80,7 +52,7 @@ class InstructGen:
         self.start = start
         self.end = len(blob) + start
         self.section_end: int = self.end
-        self.code_tracks: list[list[DisasmLiteTuple]] = []
+        self.code_tracks: list[list[DecodedInstruction]] = []
         # Canonical IR from the same Capstone detail pass as code_tracks.
         self.decoded_by_addr: dict[int, DecodedInstruction] = {}
 
@@ -96,7 +68,7 @@ class InstructGen:
         self.coverage_incomplete: bool = False
         self.analysis()
 
-    def _finish_code_section(self, contents: list[DisasmLiteTuple]):
+    def _finish_code_section(self, contents: list[DecodedInstruction]):
         self.sections.append(CodeSection(SectionType.CODE, contents))
 
     def _finish_tab_section(self, type_: TabSectionType, stuff: list[tuple[int, int]]):
@@ -193,13 +165,13 @@ class InstructGen:
 
         return new_type
 
-    def _get_code_for(self, addr: int) -> list[DisasmLiteTuple]:
+    def _get_code_for(self, addr: int) -> list[DecodedInstruction]:
         """Start disassembling at the given address (single Capstone detail pass)."""
         # If we are reading a code block beyond the first, see if we already
         # have disassembled instructions beginning at the specified address.
         for track in self.code_tracks:
             for i, inst in enumerate(track):
-                if inst[0] == addr:
+                if inst.address == addr:
                     return track[i:]
 
         blob_cropped = self.blob[addr - self.start :]
@@ -207,22 +179,16 @@ class InstructGen:
         for insn in decoded:
             assert insn.address is not None
             self.decoded_by_addr[insn.address] = insn
-        instructions = [as_lite_tuple(insn) for insn in decoded]
-        self.code_tracks.append(instructions)
-        return instructions
+        self.code_tracks.append(decoded)
+        return decoded
 
-    def _handle_jump(self, op_str: str):
-        # If this is a regular jump and its destination is within the
-        # bounds of the binary data (i.e. presumed function size)
-        # add it to our list of confirmed addresses.
-        if op_str[0] == "0":
-            value = int(op_str, 16)
-            self._insert_confirmed_addr(value, SectionType.CODE)
-
-        # If this is jumping into a table of addresses, save the destination
-        elif (match := displacement_regex.match(op_str)) is not None:
-            value = int(match.group(1), 16)
-            self._insert_confirmed_addr(value, SectionType.ADDR_TAB)
+    def _handle_jump(self, insn: DecodedInstruction):
+        # A direct jump inside the function's bytes starts code there.
+        if insn.branch_target is not None:
+            self._insert_confirmed_addr(insn.branch_target, SectionType.CODE)
+        # An indexed jump reads a table of addresses there.
+        elif (table := _table_displacement(insn)) is not None:
+            self._insert_confirmed_addr(table, SectionType.ADDR_TAB)
 
     def analysis(self):
         self.cur_addr = self.start
@@ -269,24 +235,26 @@ class InstructGen:
                     self.cur_addr += 1
                     continue
 
-                for _, inst_size, inst_mnemonic, inst_op_str in instructions:
+                for insn in instructions:
                     # section_end is updated as we read instructions.
                     # If we are into a jump/data table and would read
                     # a junk instruction, stop here.
                     if self.cur_addr >= self.section_end:
                         break
 
-                    if inst_mnemonic in JUMP_MNEMONICS:
-                        self._handle_jump(inst_op_str)
-                    elif inst_mnemonic in ("mov", "movzx"):
-                        if (match := displacement_regex.match(inst_op_str)) is not None:
-                            value = int(match.group(1), 16)
-                            self._insert_confirmed_addr(value, SectionType.DATA_TAB)
+                    if insn.mnemonic in JUMP_MNEMONICS:
+                        self._handle_jump(insn)
+                    elif insn.mnemonic in ("mov", "movzx"):
+                        # An indexed load reads a table of bytes there.
+                        if (table := _table_displacement(insn)) is not None:
+                            self._insert_confirmed_addr(table, SectionType.DATA_TAB)
 
-                    self.cur_addr += inst_size
+                    self.cur_addr += insn.size
 
                 instruction_slice = [
-                    inst for inst in instructions if inst[0] < self.section_end
+                    inst
+                    for inst in instructions
+                    if inst.address is not None and inst.address < self.section_end
                 ]
                 self._finish_code_section(instruction_slice)
 
@@ -323,78 +291,8 @@ class InstructGen:
                 # Visited if any finished CODE section contains this address.
                 if not any(
                     section.type == SectionType.CODE
-                    and any(inst[0] == addr for inst in section.contents)
+                    and any(inst.address == addr for inst in section.contents)
                     for section in self.sections
                 ):
                     self.coverage_incomplete = True
                     break
-
-
-@dataclass(frozen=True)
-class InstructionMeta:
-    """Structured facts about one instruction, captured from capstone's
-    detail mode at disassembly time: register accesses including implicit
-    ones, flags effects, memory access, control-flow class and the branch
-    target. Consumed privately by the effective-match verifier.
-
-    Prefer reading these fields from ``DecodedInstruction`` directly; this
-    dataclass remains as a projection for callers that still pass parallel
-    meta lists into the verifier.
-    """
-
-    # pylint: disable=too-many-instance-attributes
-
-    address: int
-    size: int
-    mnemonic: str
-    regs_read: tuple[str, ...]
-    regs_written: tuple[str, ...]
-    reads_flags: bool
-    writes_flags: bool
-    accesses_memory: bool
-    is_jump: bool
-    is_call: bool
-    is_ret: bool
-    branch_target: int | None
-    register_access_known: bool = True
-    operand_model_complete: bool = True
-    control_flow_known: bool = True
-    control_target: Hashable | None = None
-
-
-def meta_from_decoded(insn: DecodedInstruction) -> InstructionMeta:
-    assert insn.address is not None
-    return InstructionMeta(
-        address=insn.address,
-        size=insn.size,
-        mnemonic=insn.mnemonic,
-        regs_read=insn.regs_read,
-        regs_written=insn.regs_written,
-        reads_flags=insn.reads_flags,
-        writes_flags=insn.writes_flags,
-        accesses_memory=insn.accesses_memory,
-        is_jump=insn.is_jump,
-        is_call=insn.is_call,
-        is_ret=insn.is_ret,
-        branch_target=insn.branch_target,
-        register_access_known=insn.register_access_known,
-        operand_model_complete=insn.operand_model_complete,
-        control_flow_known=insn.control_flow_known,
-        control_target=insn.control_target,
-    )
-
-
-def collect_instruction_meta(
-    blob: bytes, start: int, sections: list[FuncSection], is_32bit: bool = True
-) -> dict[int, InstructionMeta]:
-    """Project CODE-section IR into the legacy meta map via ``InstructGen``.
-
-    Honours embedded jump/data tables the same way as ``parse_asm``.
-    """
-    del sections  # InstructGen rediscovers section bounds from the blob.
-    ig = InstructGen(blob, start, is_32bit)
-    return {
-        addr: meta_from_decoded(insn)
-        for addr, insn in ig.decoded_by_addr.items()
-        if insn.address is not None
-    }

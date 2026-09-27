@@ -1,16 +1,21 @@
 """Decode path fills structured operands from Capstone detail."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from dataclasses import replace
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_32  # type: ignore[import-untyped]
-from capstone import x86_const
+from capstone import x86_const  # type: ignore[import-untyped]
 
-from reccmp.compare.asm.decode import capstone_operand, disasm_detail, from_capstone
-from reccmp.compare.asm.ir import AsmRole, DecodedInstruction, instruction_match_key
-from reccmp.compare.asm.model import parse_instruction
+from reccmp.compare.asm.decode import capstone_operand, disasm_detail
+from reccmp.compare.asm.ir import (
+    AsmRole,
+    DecodedInstruction,
+    ExtentKind,
+    FunctionImage,
+    JumpTable,
+    instruction_match_key,
+)
+from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.diagnosis import ComparisonStatus
-from reccmp.compare.functions import FunctionComparator
 
 
 def test_from_capstone_mem_operand_without_display_parse():
@@ -27,20 +32,16 @@ def test_from_capstone_mem_operand_without_display_parse():
     )
     # Display may be Capstone's text; operands must not depend on reparsing it.
     assert insn.operands != ()
-    assert insn.raw_operands == ("eax", "dword ptr [ebx + ecx*4 + 0x10]")
     assert insn.operand_model_complete is True
 
 
-def test_from_capstone_matches_parse_of_display_for_mem():
+def test_display_does_not_change_decoded_memory_semantics():
     blob = bytes.fromhex("8b4508")  # mov eax, [ebp+8]
-    cs = Cs(CS_ARCH_X86, CS_MODE_32)
-    cs.detail = True
-    (cs_insn,) = cs.disasm(blob, 0x1000)
-    decoded = from_capstone(cs_insn)
-    parsed = parse_instruction(decoded.display)
-    assert decoded.mnemonic == parsed.mnemonic
-    assert decoded.prefix == parsed.prefix
-    assert decoded.operands == parsed.operands
+    decoded = disasm_detail(blob, 0x1000)[0]
+    assert decoded.operands[1] == ("mem", "dword", "", [("ebp", 1)], 8, ())
+    assert instruction_match_key(decoded) == instruction_match_key(
+        replace(decoded, display="diagnostic text changed")
+    )
 
 
 def test_from_capstone_lea_omits_mem_size():
@@ -66,13 +67,20 @@ def test_from_capstone_rep_prefix():
 
 def test_opaque_operands_remain_distinct_in_match_keys():
     """Unsupported Capstone kinds must not collapse to a shared ``("sym", "?")``."""
-    insn_a = SimpleNamespace(op_str="mystery_a")
-    insn_b = SimpleNamespace(op_str="mystery_b")
+    insn_a = SimpleNamespace(op_str="mystery_a", bytes=b"\x00\x01")
+    insn_b = SimpleNamespace(op_str="mystery_b", bytes=b"\x00\x02")
     op = SimpleNamespace(type=x86_const.X86_OP_INVALID)
     left, left_ok = capstone_operand(insn_a, op, "ud2", 0)
     right, right_ok = capstone_operand(insn_b, op, "ud2", 0)
+    same_bytes, _ = capstone_operand(
+        SimpleNamespace(op_str="another rendering", bytes=b"\x00\x01"),
+        op,
+        "ud2",
+        0,
+    )
     assert left_ok is False and right_ok is False
     assert left != right
+    assert left == same_bytes
     assert isinstance(left, tuple) and isinstance(right, tuple)
     assert left[0] == "opaque" and right[0] == "opaque"
 
@@ -82,7 +90,6 @@ def test_opaque_operands_remain_distinct_in_match_keys():
         mnemonic="ud2",
         prefix="",
         operands=(left,),
-        raw_operands=("mystery_a",),
         display="ud2 mystery_a",
         role=AsmRole.CODE,
         operand_model_complete=False,
@@ -94,7 +101,6 @@ def test_opaque_operands_remain_distinct_in_match_keys():
         mnemonic="ud2",
         prefix="",
         operands=(right,),
-        raw_operands=("mystery_b",),
         display="ud2 mystery_b",
         role=AsmRole.CODE,
         operand_model_complete=False,
@@ -114,6 +120,30 @@ def test_unknown_mem_size_stays_distinct_and_incomplete():
     assert operand[1] == "size3"
 
 
+def test_indirect_call_destination_expression_is_modeled():
+    row = disasm_detail(bytes.fromhex("ff5208"), 0x1000)[0]
+    assert row.is_call
+    assert row.branch_target is None
+    assert row.operands == (("mem", "dword", "", [("edx", 1)], 8, ()),)
+    assert row.operand_model_complete
+    assert row.control_flow_known
+
+
+def test_recognized_switch_table_completes_indirect_jump():
+    row = disasm_detail(bytes.fromhex("ff248500100000"), 0x1000)[0]
+    assert row.is_jump and not row.control_flow_known
+    incomplete = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,))
+    assert not incomplete.control_flow_complete
+    table = JumpTable(
+        0x1000,
+        ((0x1000, 0x1007),),
+        dispatch_address=0x1000,
+        index_register="eax",
+    )
+    image = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,), (table,))
+    assert image.control_flow_complete
+
+
 def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
     """ratio==1.0 from IR keys must not yield EXACT when models are incomplete
     and displays differ (the old collapsed ``?`` failure mode)."""
@@ -126,7 +156,6 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
         mnemonic="nop",
         prefix="",
         operands=(opaque_a,),
-        raw_operands=("a",),
         display="nop a",
         role=AsmRole.CODE,
         operand_model_complete=False,
@@ -137,26 +166,13 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
         mnemonic="nop",
         prefix="",
         operands=(opaque_b,),
-        raw_operands=("b",),
         display="nop b",
         role=AsmRole.CODE,
         operand_model_complete=False,
     )
     assert instruction_match_key(row_a) == instruction_match_key(row_b)
 
-    comparator = FunctionComparator(
-        db=MagicMock(),
-        lines_db=MagicMock(),
-        orig_bin=MagicMock(),
-        recomp_bin=MagicMock(),
-        report=MagicMock(),
-        types=MagicMock(),
-    )
-    result = comparator._compare_function_assembly(  # pylint: disable=protected-access
-        [row_a],
-        [row_b],
-        [],
-        include_diff=False,
-    )
-    assert result.match_ratio == 1.0
-    assert result.analysis.status != ComparisonStatus.EXACT
+    original = FunctionImage(0x1000, 1, ExtentKind.KNOWN, (row_a,))
+    recompiled = FunctionImage(0x2000, 1, ExtentKind.KNOWN, (row_b,))
+    analysis = analyze_effective_match([], original, recompiled)
+    assert analysis.status != ComparisonStatus.EXACT

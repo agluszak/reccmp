@@ -13,7 +13,6 @@ the execution buckets); instruction shapes need the two binaries.
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
@@ -89,26 +88,22 @@ def instruction_shape(code: bytes, address: int) -> str | None:
     return f"{insn.mnemonic} {', '.join(kinds)}".strip()
 
 
-_SUMMARY_HEAD = re.compile(r"^[('\s]*([A-Za-z_][A-Za-z_0-9]*)")
-
-
 def _fact_shape(facts: Mapping[str, Any]) -> str:
     """The leading tags of a side's facts: `lt_u` for a predicate, `load`
     for a value, `IMPORT_THUNK` for a callee."""
     parts = []
-    for name in ("predicate", "value", "register"):
-        value = facts.get(name)
-        if isinstance(value, str):
-            head = _SUMMARY_HEAD.match(value)
-            parts.append(f"{name}={head.group(1) if head else '?'}")
-    target = facts.get("target_name")
-    if isinstance(target, str):
-        callee = re.search(
-            r"\((IMPORT_THUNK|IMPORT|FUNCTION|THUNK|VTORDISP|UNK)\)", target
-        )
-        parts.append(f"callee={callee.group(1) if callee else 'other'}")
-        if target.startswith("dword ptr ["):
-            parts.append("indirect")
+    for name in ("predicate", "value"):
+        tag = facts.get(f"{name}_tag")
+        if isinstance(tag, str):
+            parts.append(f"{name}={tag}")
+    register = facts.get("register")
+    if isinstance(register, str):
+        parts.append(f"register={register}")
+    callee = facts.get("target_entity_type")
+    if isinstance(callee, str):
+        parts.append(f"callee={callee}")
+    if facts.get("target_indirect") is True:
+        parts.append("indirect")
     return " ".join(parts)
 
 

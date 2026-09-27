@@ -9,8 +9,7 @@ from reccmp.types import EntityType, ImageId
 from reccmp.compare.db import EntityDb
 from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.asm.replacement import (
-    create_name_lookup,
-    NameReplacementProtocol,
+    create_resolver,
 )
 from reccmp.cvdump.types import CvdumpTypeKey
 from reccmp.formats.textfile import TextFile
@@ -81,14 +80,20 @@ def create_lookup(
     db: EntityDb,
     image_id: ImageId,
     groups: dict[int, int] | None = None,
-) -> NameReplacementProtocol:
+):
     def bin_lookup(_: int) -> int | None:
         return None
 
     def offset_lookup(_: CvdumpTypeKey, __: int) -> str:
         return ""
 
-    return create_name_lookup(db, image_id, bin_lookup, offset_lookup, groups)
+    resolve = create_resolver(db, image_id, bin_lookup, offset_lookup, groups)
+
+    def name(addr: int, exact: bool = False, indirect: bool = False) -> str | None:
+        result = resolve(addr, exact=exact, indirect=indirect)
+        return result.name if result is not None else None
+
+    return name
 
 
 def make_folded_db(db: EntityDb) -> None:

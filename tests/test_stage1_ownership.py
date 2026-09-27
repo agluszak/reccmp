@@ -85,6 +85,8 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
                             SourceField(
                                 name="bar",
                                 type="int",
+                                pointer_depth=0,
+                                storage_kind="scalar",
                                 source_file="a.h",
                                 line=2,
                                 offset=0,
@@ -93,6 +95,7 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
                             SourceField(
                                 name="ptr",
                                 type="int *",
+                                storage_kind="pointer",
                                 source_file="a.h",
                                 line=3,
                                 offset=4,
@@ -136,6 +139,8 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
                         semantic_id="gFoo",
                         qualified_name="gFoo",
                         type="Foo",
+                        storage_kind="embedded_record",
+                        record_semantic_id="record:Foo",
                         linkage="external",
                         storage_class="none",
                         definition_kind="definition",

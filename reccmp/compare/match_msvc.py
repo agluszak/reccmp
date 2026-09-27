@@ -335,71 +335,58 @@ def match_vtables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
 def match_static_variables(
     db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
 ):
-    """To match a static variable, we need the following:
-    1. Orig entity function with symbol
-    2. Orig entity variable with:
-        - name = name of variable
-        - static_var = True
-        - parent_function = orig address of function
-    3. Recomp entity for the static variable with symbol
+    """Match local static variables by their matched function and local name.
 
-    Requirement #1 is most likely to be met by matching the entity with recomp data.
-    Therefore, this function should be called after match_symbols or match_functions."""
-    symbols = {}
-
+    Both ownership links come from input records: Clang's marker anchor on
+    the original side and S_LDATA32 inside S_GPROC32 on the PDB side.
+    """
+    static_index: dict[tuple[int, str], list[int]] = {}
     for recomp_ent in db.unmatched(ImageId.RECOMP):
-        if recomp_ent.get("type") and recomp_ent.get("type") != EntityType.DATA:
+        if not recomp_ent.get("static_var"):
             continue
-
-        recomp_sym = recomp_ent.get("symbol")
-        if not recomp_sym:
+        parent = recomp_ent.get("parent_function")
+        name = recomp_ent.get("name")
+        if parent is None or not name:
             continue
-
         assert recomp_ent.recomp_addr is not None
-        symbols[recomp_ent.recomp_addr] = recomp_sym
+        static_index.setdefault((parent, name), []).append(recomp_ent.recomp_addr)
+
+    orig_variables = [
+        ent for ent in db.unmatched(ImageId.ORIG) if ent.get("static_var")
+    ]
+    orig_counts: dict[tuple[int, str], int] = {}
+    for ent in orig_variables:
+        parent = ent.get("parent_function")
+        name = ent.get("name")
+        if parent is not None and name:
+            key = (parent, name)
+            orig_counts[key] = orig_counts.get(key, 0) + 1
 
     with db.batch() as batch:
-        for variable_ent in db.unmatched(ImageId.ORIG):
+        for variable_ent in orig_variables:
             variable_addr = variable_ent.orig_addr
             assert variable_addr is not None
-
-            if not variable_ent.get("static_var"):
-                continue
-
             variable_name = variable_ent.get("name")
-            if not variable_name:
-                continue
-
-            function_name = None
-            function_symbol = None
-
             parent_addr = variable_ent.get("parent_function")
-            if parent_addr:
-                parent_ent = db.get(ImageId.ORIG, parent_addr)
-                if parent_ent is not None:
-                    function_name = parent_ent.get("name")
-                    function_symbol = parent_ent.get("symbol")
-
-            # If we could not find the parent function, or if it has no symbol:
-            if function_symbol is None:
+            parent_match = (
+                db.get_one_match(parent_addr) if parent_addr is not None else None
+            )
+            if not variable_name or parent_match is None:
                 report(
                     ReccmpEvent.NO_MATCH,
                     variable_addr,
-                    msg=f"No function for static variable '{variable_name}'",
+                    msg=f"No matched function for static variable '{variable_name}'",
                 )
                 continue
-
-            for recomp_addr, recomp_sym in symbols.items():
-                if function_symbol in recomp_sym and variable_name in recomp_sym:
-                    batch.match(variable_addr, recomp_addr)
-                    del symbols[recomp_addr]
-                    break
-            else:
+            candidates = static_index.get((parent_match.recomp_addr, variable_name), [])
+            if len(candidates) != 1 or orig_counts[(parent_addr, variable_name)] != 1:
                 report(
                     ReccmpEvent.NO_MATCH,
                     variable_addr,
-                    msg=f"Failed to match static variable {variable_name} from function {function_name} annotated with 0x{variable_addr:x}",
+                    msg=f"Expected one static variable '{variable_name}' in function 0x{parent_match.recomp_addr:x}; found {len(candidates)}",
                 )
+                continue
+            batch.match(variable_addr, candidates[0])
 
 
 def match_variables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop):

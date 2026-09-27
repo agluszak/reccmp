@@ -576,7 +576,7 @@ class Compare:
             match_ratio=ratio,
             analysis=(
                 admit_exact_analysis(
-                    displays_equal=ratio == 1.0,
+                    bytes_equal=False,
                     topology_equal=True,
                     keys_equal=ratio == 1.0,
                     extent_closed=True,
@@ -671,6 +671,7 @@ class Compare:
             inline_expansions=result.inline_expansions,
             accuracy_modulo_inline=result.accuracy_modulo_inline,
             diagnostic_normalizations=result.diagnostic_normalizations,
+            stack_layout=result.stack_layout,
         )
 
     @property

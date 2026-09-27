@@ -1,6 +1,6 @@
 import difflib
-from reccmp.compare.asm.verifier import analyze_effective_match
 from reccmp.compare.diagnosis import ComparisonStatus
+from tests.asm_rows import analyze_effective_match
 
 
 def is_effective_match(*args, **kwargs) -> bool:
@@ -743,6 +743,7 @@ def test_relocate_across_forward_jcc_with_addresses():
         "mov word ptr [esi], ax",
     ]
     orig_addrs = [0, 6, 13, 17, 20, 22, 29]
+    recomp_addrs = [0x2000, 0x2006, 0x200D, 0x2011, 0x2013, 0x201A, 0x201C]
 
     diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
     codes = diff.get_opcodes()
@@ -751,7 +752,14 @@ def test_relocate_across_forward_jcc_with_addresses():
     # stays a barrier and the match is conservatively rejected.
     assert is_effective_match(codes, orig_asm, recomp_asm) is False
     assert (
-        is_effective_match(codes, orig_asm, recomp_asm, orig_addrs=orig_addrs) is True
+        is_effective_match(
+            codes,
+            orig_asm,
+            recomp_asm,
+            orig_addrs=orig_addrs,
+            recomp_addrs=recomp_addrs,
+        )
+        is True
     )
 
 

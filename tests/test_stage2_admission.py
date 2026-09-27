@@ -8,10 +8,10 @@ from reccmp.compare.diagnosis import ComparisonStatus
 from reccmp.compare.verification import admit_effective, admit_exact_analysis
 
 
-def test_admit_exact_requires_coverage_topology_and_models_or_displays():
+def test_admit_exact_requires_coverage_topology_and_models_or_bytes():
     assert (
         admit_exact_analysis(
-            displays_equal=True,
+            bytes_equal=True,
             topology_equal=True,
             keys_equal=True,
             extent_closed=True,
@@ -20,7 +20,7 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
     )
     assert (
         admit_exact_analysis(
-            displays_equal=True,
+            bytes_equal=True,
             topology_equal=False,
             keys_equal=True,
             extent_closed=True,
@@ -29,7 +29,7 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
     )
     assert (
         admit_exact_analysis(
-            displays_equal=True,
+            bytes_equal=True,
             topology_equal=True,
             keys_equal=True,
             coverage_incomplete=True,
@@ -39,7 +39,7 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
     )
     assert (
         admit_exact_analysis(
-            displays_equal=False,
+            bytes_equal=False,
             topology_equal=True,
             keys_equal=True,
             operands_complete=False,
@@ -49,7 +49,7 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
         is None
     )
     admitted = admit_exact_analysis(
-        displays_equal=False,
+        bytes_equal=False,
         topology_equal=True,
         keys_equal=True,
         operands_complete=True,
@@ -63,7 +63,7 @@ def test_admit_exact_requires_coverage_topology_and_models_or_displays():
 def test_admit_exact_does_not_default_keys_equal():
     with pytest.raises(TypeError):
         admit_exact_analysis(  # type: ignore[call-arg]  # pylint: disable=missing-kwoa
-            displays_equal=True, topology_equal=True, extent_closed=True
+            bytes_equal=True, topology_equal=True, extent_closed=True
         )
 
 

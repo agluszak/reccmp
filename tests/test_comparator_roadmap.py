@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 from reccmp.compare.asm.ir import (
     instruction_match_key,
-    rewrite_stack_displacements,
     stack_normalized_key,
 )
 from reccmp.compare.diagnosis import (
@@ -33,23 +32,24 @@ from reccmp.compare.stack_layout import (
     StackRegisterOffset,
     accuracy_after_stack_map,
     build_slot_bijection,
-    extract_stack_offset_from_instruction,
+    extract_stack_offset_from_operands,
 )
+from tests.asm_rows import fingerprint, rows
 
 
 def test_instruction_match_key_ignores_display_whitespace_equivalence():
-    a = instruction_match_key("mov eax, dword ptr [ebp - 0x18]")
-    b = instruction_match_key("mov eax, dword ptr [ebp - 0x18]")
+    a = instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0])
+    b = instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0])
     assert a == b
-    assert a != instruction_match_key("mov ecx, dword ptr [ebp - 0x18]")
+    assert a != instruction_match_key(rows(["mov ecx, dword ptr [ebp - 0x18]"])[0])
 
 
 def test_stack_normalized_key_collapses_frame_displacements():
-    a = stack_normalized_key("mov eax, dword ptr [ebp - 0x18]")
-    b = stack_normalized_key("mov eax, dword ptr [ebp - 0x24]")
+    a = stack_normalized_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0])
+    b = stack_normalized_key(rows(["mov eax, dword ptr [ebp - 0x24]"])[0])
     assert a == b
-    assert instruction_match_key("mov eax, dword ptr [ebp - 0x18]") != (
-        instruction_match_key("mov eax, dword ptr [ebp - 0x24]")
+    assert instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0]) != (
+        instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x24]"])[0])
     )
 
 
@@ -58,8 +58,8 @@ def test_ir_keyed_sequence_matcher_matches_string_ratio_for_identical_streams():
     recomp = list(orig)
     string_ratio = SequenceMatcherWithPins(orig, recomp, []).ratio()
     key_ratio = SequenceMatcherWithPins(
-        [instruction_match_key(x) for x in orig],
-        [instruction_match_key(x) for x in recomp],
+        [instruction_match_key(x) for x in rows(orig)],
+        [instruction_match_key(x) for x in rows(recomp)],
         [],
     ).ratio()
     assert string_ratio == key_ratio == 1.0
@@ -97,16 +97,18 @@ def test_accuracy_after_stack_map_reaches_one():
         ("ebp", -0x24): ("ebp", -0x18),
         ("ebp", -0x18): ("ebp", -0x24),
     }
-    assert accuracy_after_stack_map(orig, recomp, mapping) == 1.0
+    assert accuracy_after_stack_map(rows(orig), rows(recomp), mapping) == 1.0
 
 
 def test_rewrite_stack_displacements():
-    line = "mov eax, dword ptr [ebp - 0x24]"
-    rewritten = rewrite_stack_displacements(line, {("ebp", -0x24): ("ebp", -0x18)})
-    assert "ebp - 0x18" in rewritten
-    assert extract_stack_offset_from_instruction(rewritten) == StackRegisterOffset(
-        "ebp", -0x18
+    orig = rows(["mov eax, dword ptr [ebp - 0x24]"])
+    recomp = rows(["mov eax, dword ptr [ebp - 0x18]"])
+    assert (
+        accuracy_after_stack_map(orig, recomp, {("ebp", -0x24): ("ebp", -0x18)}) == 1.0
     )
+    assert extract_stack_offset_from_operands(
+        recomp[0].operands
+    ) == StackRegisterOffset("ebp", -0x18)
 
 
 def test_derive_diagnostic_normalizations():
@@ -146,23 +148,14 @@ def test_derive_diagnostic_normalizations():
 
 def test_strip_helper_epilog_drops_trailing_ret():
 
-    body = (("mov", "eax, ecx"), ("add", "eax, 1"), ("imul", "eax, 2"), ("ret", ""))
+    body = fingerprint(["mov eax, ecx", "add eax, 1", "imul eax, 2", "ret"])
     assert strip_helper_epilog(body) == body[:-1]
 
 
 def test_find_inline_expansions_detects_subsequence():
-    helper = (
-        ("mov", "eax, ecx"),
-        ("add", "eax, 1"),
-        ("imul", "eax, 2"),
-        ("ret", ""),
-    )
-    host = (
-        ("push", "ebp"),
-        ("mov", "eax, ecx"),
-        ("add", "eax, 1"),
-        ("imul", "eax, 2"),
-        ("pop", "ebp"),
+    helper = fingerprint(["mov eax, ecx", "add eax, 1", "imul eax, 2", "ret"])
+    host = fingerprint(
+        ["push ebp", "mov eax, ecx", "add eax, 1", "imul eax, 2", "pop ebp"]
     )
 
     def fingerprint_of(addr: int, _size: int):
@@ -221,16 +214,13 @@ def test_analyze_inline_layout_call_vs_inline():
             orig_addr=0x100,
             recomp_addr=0x200,
             name="Foo::setX",
-            fingerprint=(
-                ("mov", "eax, ecx"),
-                ("add", "eax, 1"),
-                ("imul", "eax, 2"),
-            ),
+            fingerprint=fingerprint(["mov eax, ecx", "add eax, 1", "imul eax, 2"]),
+            identity=("fixture", "Foo::setX"),
             byte_size=16,
             uniqueness=1.0,
         )
     ]
-    result = analyze_inline_layout(orig, recomp, helpers)
+    result = analyze_inline_layout(rows(orig), rows(recomp), helpers)
     assert result.accuracy_modulo_inline == 1.0
     assert len(result.expansions) == 1
     assert result.expansions[0].helper_name == "Foo::setX"
@@ -258,14 +248,13 @@ def test_analyze_inline_layout_repeated_calls():
             orig_addr=0x100,
             recomp_addr=0x200,
             name="Foo::setX",
-            fingerprint=tuple(
-                (line.partition(" ")[0], line.partition(" ")[2]) for line in body
-            ),
+            fingerprint=fingerprint(body),
+            identity=("fixture", "Foo::setX"),
             byte_size=16,
             uniqueness=1.0,
         )
     ]
-    result = analyze_inline_layout(orig, recomp, helpers)
+    result = analyze_inline_layout(rows(orig), rows(recomp), helpers)
     assert result.accuracy_modulo_inline == 1.0
     assert len(result.expansions) == 2
     assert {e.counterpart_offset for e in result.expansions} == {1, 3}

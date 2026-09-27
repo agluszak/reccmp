@@ -7,14 +7,13 @@ bugs. They fail on the buggy baseline and pass once Stage 0 repairs land.
 from __future__ import annotations
 
 import difflib
+from dataclasses import replace
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.verifier import (
-    verify_effective_match,
-)
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.asm.instgen import InstructGen, InstructionMeta, SectionType
+from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
+from reccmp.compare.asm.instgen import InstructGen, SectionType
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonStatus
@@ -22,6 +21,8 @@ from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.cvdump.types import CvdumpTypesParser
+from tests.asm_rows import verify_effective_match
+from tests.asm_rows import image_from_bytes, rows
 
 # --- A1: reachable code after jmp-over-int3 must not vanish -----------------
 
@@ -29,15 +30,14 @@ _A1_ORIG = bytes.fromhex("EB01CCB801000000C3")  # jmp +1; int3; mov eax,1; ret
 _A1_RECOMP = bytes.fromhex("EB01CCB802000000C3")  # jmp +1; int3; mov eax,2; ret
 
 
-def _code_mnemonics(blob: bytes, base: int = 0x1000) -> list[tuple[str, str]]:
-    """Collect (mnemonic, op_str) from InstructGen CODE sections."""
-    rows: list[tuple[str, str]] = []
-    for section in InstructGen(blob, base).sections:
-        if section.type != SectionType.CODE:
-            continue
-        for _addr, _size, mnemonic, op_str in section.contents:
-            rows.append((mnemonic, op_str))
-    return rows
+def _code_mnemonics(blob: bytes, base: int = 0x1000) -> list[tuple[str, tuple]]:
+    """Collect (mnemonic, operands) from InstructGen CODE sections."""
+    return [
+        (insn.mnemonic, insn.operands)
+        for section in InstructGen(blob, base).sections
+        if section.type == SectionType.CODE
+        for insn in section.contents
+    ]
 
 
 def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
@@ -60,7 +60,11 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
     assert orig_asm != recomp_asm
 
     codes = difflib.SequenceMatcher(None, orig_asm, recomp_asm).get_opcodes()
-    analysis = analyze_effective_match(codes, orig_asm, recomp_asm)
+    analysis = analyze_images(
+        codes,
+        image_from_bytes(_A1_ORIG),
+        image_from_bytes(_A1_RECOMP),
+    )
     assert analysis.status != ComparisonStatus.EXACT
     assert analysis.is_effective is False
 
@@ -68,10 +72,10 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
 def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
     """Prefer detail/InstructGen coverage of the mov after the forward jmp."""
     # Linear Capstone stop-at-int3 may still truncate; InstructGen must not.
-    for blob, imm in ((_A1_ORIG, "1"), (_A1_RECOMP, "2")):
-        ig_movs = [op for m, op in _code_mnemonics(blob) if m == "mov"]
+    for blob, imm in ((_A1_ORIG, 1), (_A1_RECOMP, 2)):
+        ig_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
         assert ig_movs, "InstructGen must decode the mov after jmp-over-int3"
-        assert any(imm in op for op in ig_movs)
+        assert any(("imm", imm) in ops for ops in ig_movs)
 
         detail = disasm_detail(blob, 0x1000)
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
@@ -79,7 +83,7 @@ def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
             # Accept InstructGen-only coverage until the shared detail walker
             # also drains pending targets; still require unequal ParseAsm lists.
             continue
-        assert any(imm in insn.display for insn in detail_movs)
+        assert any(("imm", imm) in insn.operands for insn in detail_movs)
 
 
 # --- A2: matched-node membership is not live-out proof at a branch ----------
@@ -244,13 +248,14 @@ def test_a5b_sahf_preserves_overflow_flag_difference():
 # --- A6: unsupported path requires compatible meta on both sides ------------
 
 
-def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> InstructionMeta:
-    return InstructionMeta(
+def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstruction:
+    return replace(
+        rows(["bswap ecx"])[0],
         address=4,
         size=2,
-        mnemonic="bswap",
         regs_read=reads,
         regs_written=writes,
+        register_access_known=True,
         reads_flags=False,
         writes_flags=False,
         accesses_memory=False,

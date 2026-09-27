@@ -13,17 +13,17 @@ and every crossing branch displacement.
 # pylint: disable=too-many-lines
 
 import difflib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.ir import ExtentKind, FunctionImage, rebind_local_identities
+from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
-    analyze_effective_match,
-    verify_cfg_effective_match,
-    verify_effective_match,
-    verify_isomorphic_cfg_effective_match,
 )
 from reccmp.compare.asm.verifier.dataflow import (
     CfgState,
@@ -32,8 +32,39 @@ from reccmp.compare.asm.verifier.dataflow import (
 from reccmp.compare.asm.verifier.state import SideState
 from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
+from tests.asm_rows import (
+    verify_effective_match,
+    verify_cfg_effective_match,
+    verify_isomorphic_cfg_effective_match,
+)
 
 SAMPLES = Path(__file__).parent / "samples"
+
+
+def _sample_relocations(rows, raw, base):
+    """The binary fixtures omit relocation records; pair their rel32 slots."""
+    result = []
+    ordinal = 0
+    for row in rows:
+        if row.is_call and row.branch_target == row.address + row.size:
+            offset = row.address - base
+            assert raw[offset : offset + 5] == b"\xe8\x00\x00\x00\x00"
+            identity = ("sample_relocation", ordinal)
+            ordinal += 1
+            result.append(
+                replace(
+                    row,
+                    operands=(
+                        ("sym", Reference(row.operands[0][1].display, identity)),
+                    ),
+                    control_target=identity,
+                    branch_target=None,
+                )
+            )
+        else:
+            result.append(row)
+    assert ordinal == 6
+    return tuple(result)
 
 
 def require_inconclusive_location(analysis):
@@ -56,26 +87,46 @@ def fixture_wobble_analysis():
     recomp_parser = ParseAsm()
     orig = orig_parser.parse_asm(orig_raw, base)
     recomp = recomp_parser.parse_asm(recomp_raw, base)
-    orig_meta_by_addr = orig_parser.collect_instruction_meta(orig_raw, base)
-    recomp_meta_by_addr = recomp_parser.collect_instruction_meta(recomp_raw, base)
 
     orig_asm = [x.display for x in orig]
     recomp_asm = [x.display for x in recomp]
     codes = SequenceMatcherWithPins(orig_asm, recomp_asm, []).get_opcodes()
-    return analyze_effective_match(
+    return analyze_images(
         codes,
-        orig_asm,
-        recomp_asm,
-        orig_addrs=[x.address for x in orig],
-        orig_meta=[
-            orig_meta_by_addr.get(row.address) if row.address is not None else None
-            for row in orig
-        ],
-        recomp_addrs=[x.address for x in recomp],
-        recomp_meta=[
-            recomp_meta_by_addr.get(row.address) if row.address is not None else None
-            for row in recomp
-        ],
+        FunctionImage(
+            base,
+            len(orig_raw),
+            ExtentKind.KNOWN,
+            _sample_relocations(
+                rebind_local_identities(
+                    orig,
+                    start_addr=base,
+                    extent=len(orig_raw),
+                    jump_tables=orig_parser.jump_tables,
+                ),
+                orig_raw,
+                base,
+            ),
+            tuple(orig_parser.jump_tables),
+            raw=orig_raw,
+        ),
+        FunctionImage(
+            base,
+            len(recomp_raw),
+            ExtentKind.KNOWN,
+            _sample_relocations(
+                rebind_local_identities(
+                    recomp,
+                    start_addr=base,
+                    extent=len(recomp_raw),
+                    jump_tables=recomp_parser.jump_tables,
+                ),
+                recomp_raw,
+                base,
+            ),
+            tuple(recomp_parser.jump_tables),
+            raw=recomp_raw,
+        ),
     )
 
 
@@ -530,18 +581,6 @@ def test_empty_control_flow_identifies_the_empty_side():
         "side": "orig",
         "instruction_count": 0,
     }
-
-
-def test_invalid_control_flow_target_is_located():
-    recorder = AnalysisRecorder(orig_addrs=[0x1000], recomp_addrs=[0x2000])
-    assert not verify_isomorphic_cfg_effective_match(
-        ["jmp 0x10"], ["jmp 0x10"], [2], [2], recorder=recorder
-    )
-    analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "invalid_control_flow_target"
-    location = require_inconclusive_location(analysis)
-    assert location.address == 0x1000
-    assert location.facts["target_instruction_index"] == 2
 
 
 def test_indirect_jump_is_located():

@@ -6,16 +6,14 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from reccmp.compare.asm.instgen import InstructionMeta
+from collections.abc import Sequence
+
 from reccmp.compare.asm.ir import (
-    AsmRole,
-    AsmStream,
-    ResolvedAsm,
-    instruction_at,
-    is_data_row,
-    resolve_asm_stream,
+    DecodedInstruction,
+    JumpTable,
+    instruction_semantic_key,
 )
-from reccmp.compare.asm.model import Instruction, Reject
+from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.addresses import unwind_spadd
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.block_align import (
@@ -69,18 +67,12 @@ if TYPE_CHECKING:
 
 
 def verify_isomorphic_cfg_effective_match(
-    orig_asm: AsmStream,
-    recomp_asm: AsmStream,
-    orig_targets: list[int | None],
-    recomp_targets: list[int | None],
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
+    orig_tables: Sequence[JumpTable] = (),
+    recomp_tables: Sequence[JumpTable] = (),
     metadata: FunctionMetadata | None = None,
-    orig_meta: list[InstructionMeta | None] | None = None,
-    recomp_meta: list[InstructionMeta | None] | None = None,
     recorder: AnalysisRecorder | None = None,
-    orig_addrs: list[int | None] | None = None,
-    recomp_addrs: list[int | None] | None = None,
-    orig_roles: list[AsmRole] | None = None,
-    recomp_roles: list[AsmRole] | None = None,
 ) -> bool:
     """CFG verification that tolerates different instruction counts:
     per-side block graphs matched structurally, block contents aligned
@@ -91,49 +83,14 @@ def verify_isomorphic_cfg_effective_match(
     Recognized switch jump tables become ``caseN`` edges so isomorphic
     pairing compares entry count and case→block topology.
     """
-    # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
-    # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments,too-many-positional-arguments
-    orig_stream = resolve_asm_stream(orig_asm)
-    recomp_stream = resolve_asm_stream(recomp_asm)
-    if orig_roles is not None and len(orig_roles) == len(orig_stream):
-        orig_stream = ResolvedAsm(
-            orig_stream.displays,
-            orig_stream.instructions,
-            list(orig_roles),
-            from_ir=True,
-            jump_tables=orig_stream.jump_tables,
-            instruction_ids=orig_stream.instruction_ids,
-        )
-    if recomp_roles is not None and len(recomp_roles) == len(recomp_stream):
-        recomp_stream = ResolvedAsm(
-            recomp_stream.displays,
-            recomp_stream.instructions,
-            list(recomp_roles),
-            from_ir=True,
-            jump_tables=recomp_stream.jump_tables,
-            instruction_ids=recomp_stream.instruction_ids,
-        )
-    orig_asm = orig_stream.displays
-    recomp_asm = recomp_stream.displays
-    cfg_o = build_side_cfg(
-        orig_stream,
-        orig_targets,
-        recorder=recorder,
-        side="orig",
-        addrs=orig_addrs,
-    )
-    cfg_r = build_side_cfg(
-        recomp_stream,
-        recomp_targets,
-        recorder=recorder,
-        side="recomp",
-        addrs=recomp_addrs,
-    )
+    cfg_o = build_side_cfg(orig_rows, orig_tables, recorder=recorder, side="orig")
+    cfg_r = build_side_cfg(recomp_rows, recomp_tables, recorder=recorder, side="recomp")
     if cfg_o is None or cfg_r is None:
         return False
-    cfg_o = canonicalize_side_cfg(cfg_o, orig_asm)
-    cfg_r = canonicalize_side_cfg(cfg_r, recomp_asm)
+    cfg_o = canonicalize_side_cfg(cfg_o, orig_rows)
+    cfg_r = canonicalize_side_cfg(cfg_r, recomp_rows)
+    addrs = ([row.address for row in orig_rows], [row.address for row in recomp_rows])
     # Without a one-to-one pairing of the blocks, which blocks the product
     # pairs where the graphs differ is a guess: enough to prove the two
     # equal, but a difference found under it may be the guess's own (a
@@ -142,36 +99,18 @@ def verify_isomorphic_cfg_effective_match(
     anchored = pair_cfg_blocks(cfg_o, cfg_r) is not None
     product_recorder = recorder
     if recorder is not None and not anchored:
-        product_recorder = AnalysisRecorder(
-            orig_addrs=recorder.orig_addrs, recomp_addrs=recorder.recomp_addrs
-        )
+        product_recorder = AnalysisRecorder(*addrs)
     proved = _verify_product(
-        cfg_o,
-        cfg_r,
-        orig_stream,
-        recomp_stream,
-        metadata,
-        orig_meta,
-        recomp_meta,
-        product_recorder,
+        cfg_o, cfg_r, orig_rows, recomp_rows, metadata, product_recorder
     )
     if not proved:
         # A local may live in a stack slot on one side and in a register
         # on the other: try again with each side's frame its own (see
         # verifier.frame). Only a proof counts; the first attempt says why
         # the pair failed.
-        promoted = AnalysisRecorder(orig_addrs=orig_addrs, recomp_addrs=recomp_addrs)
+        promoted = AnalysisRecorder(*addrs)
         if _verify_product(
-            cfg_o,
-            cfg_r,
-            orig_stream,
-            recomp_stream,
-            metadata,
-            orig_meta,
-            recomp_meta,
-            promoted,
-            promote=True,
-            addrs=(orig_addrs, recomp_addrs),
+            cfg_o, cfg_r, orig_rows, recomp_rows, metadata, promoted, promote=True
         ):
             if recorder is not None:
                 recorder.reasons |= promoted.reasons | {"frame_slot_promotion"}
@@ -188,25 +127,19 @@ def verify_isomorphic_cfg_effective_match(
 def _verify_product(
     cfg_o: _SideCfg,
     cfg_r: _SideCfg,
-    orig_stream: ResolvedAsm,
-    recomp_stream: ResolvedAsm,
+    orig_rows: Sequence[DecodedInstruction],
+    recomp_rows: Sequence[DecodedInstruction],
     metadata: FunctionMetadata | None,
-    orig_meta: list[InstructionMeta | None] | None,
-    recomp_meta: list[InstructionMeta | None] | None,
     recorder: AnalysisRecorder | None,
     *,
     promote: bool = False,
-    addrs: tuple[list[int | None] | None, list[int | None] | None] = (None, None),
 ) -> bool:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-locals,too-many-statements
     """Verify the product of the two graphs from the entry blocks: every
     reachable node's aligned instructions, with state pairs flowing along
     the paired edges and joined where nodes meet. ``promote``: each side
-    keeps its private frame to itself (see verifier.frame); ``addrs`` give
-    the instructions' addresses, for the stack effects of calls."""
-    orig_asm = orig_stream.displays
-    recomp_asm = recomp_stream.displays
+    keeps its private frame to itself (see verifier.frame)."""
     blocks = len(cfg_o.starts) + len(cfg_r.starts)
     node_limit = 4 * blocks + 16
 
@@ -223,13 +156,13 @@ def _verify_product(
         indices_o = _run_indices(cfg_o, node[0])
         indices_r = _run_indices(cfg_r, node[1])
         start_o, start_r = cfg_o.starts[node[0][0]], cfg_r.starts[node[1][0]]
-        scheduled = schedule_like(orig_stream, recomp_stream, indices_o, indices_r)
+        scheduled = schedule_like(orig_rows, recomp_rows, indices_o, indices_r)
         if scheduled != indices_r:
             indices_r = scheduled
             any_shifted = True
         aligned = align_block_lines(
-            [_dp_line(orig_stream, i, promote) for i in indices_o],
-            [_dp_line(recomp_stream, i, promote) for i in indices_r],
+            [_dp_line(orig_rows[i], promote) for i in indices_o],
+            [_dp_line(recomp_rows[i], promote) for i in indices_r],
         )
         if aligned is None:
             if recorder is not None:
@@ -344,30 +277,13 @@ def _verify_product(
                 if index_o is None:
                     assert index_r is not None
                     side, other_side = recomp_state, orig_state
-                    line, position = recomp_asm[index_r], index_r
-                    side_stream = recomp_stream
+                    row, position = recomp_rows[index_r], index_r
                 else:
                     side, other_side = orig_state, recomp_state
-                    line, position = orig_asm[index_o], index_o
-                    side_stream = orig_stream
+                    row, position = orig_rows[index_o], index_o
                 # A one-sided instruction can never store (any observable
                 # rejects it), so the memory generation is unaffected.
-                side_ins = None
-                side_data = is_data_row(side_stream, position)
-                if not side_data:
-                    try:
-                        side_ins = instruction_at(side_stream, position)
-                    except (Reject, IndexError, KeyError, ValueError, TypeError):
-                        side_ins = None
-                if not one_sided_ok(
-                    side,
-                    other_side,
-                    ctx,
-                    position,
-                    line,
-                    ins=side_ins,
-                    is_data=side_data,
-                ):
+                if not one_sided_ok(side, other_side, ctx, position, row):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "alignment_failure",
@@ -378,10 +294,8 @@ def _verify_product(
                     return False
                 continue
             last_o, last_r = index_o, index_r
-            line_o, line_r = orig_asm[index_o], recomp_asm[index_r]
+            ins_o, ins_r = orig_rows[index_o], recomp_rows[index_r]
             try:
-                ins_o = instruction_at(orig_stream, index_o)
-                ins_r = instruction_at(recomp_stream, index_r)
                 record_operand_candidate(
                     ctx, index_o, index_r, ins_o, ins_r, (orig_state, recomp_state)
                 )
@@ -392,16 +306,14 @@ def _verify_product(
                 execute(orig_state, ctx, index_o, ins_o, obs_o)
                 execute(recomp_state, ctx, index_o, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
-                if line_o != line_r:
+                if instruction_semantic_key(ins_o) != instruction_semantic_key(ins_r):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             "unsupported_instruction", index_o, index_r
                         )
                     return False
-                meta_o = orig_meta[index_o] if orig_meta is not None else None
-                meta_r = recomp_meta[index_r] if recomp_meta is not None else None
                 if admit_unsupported_identical(
-                    orig_state, recomp_state, ctx, index_o, meta_o, meta_r
+                    orig_state, recomp_state, ctx, index_o, ins_o, ins_r
                 ):
                     continue
                 if recorder is not None:
@@ -428,8 +340,7 @@ def _verify_product(
             if promote and any(entry[0] == "call" for entry in obs_o):
                 # What reaches the callee from each side's own frame.
                 effects = _agreed_effects(
-                    _call_effect(metadata, addrs, 0, index_o),
-                    _call_effect(metadata, addrs, 1, index_r),
+                    _call_effect(metadata, 0, ins_o), _call_effect(metadata, 1, ins_r)
                 )
                 for state, before, entries, effect in (
                     (orig_state, state_before_o, obs_o, effects[0]),
@@ -474,10 +385,6 @@ def _verify_product(
                 (orig_state, recomp_state),
                 (ins_o, ins_r),
                 (obs_o, obs_r),
-                (
-                    orig_meta[index_o] if orig_meta is not None else None,
-                    recomp_meta[index_r] if recomp_meta is not None else None,
-                ),
             ):
                 return False
             if any(obs_entry[0] == "jmpind" for obs_entry in obs_o):
@@ -690,7 +597,7 @@ def _inverted_branch(
     obs_o: list,
     obs_r: list,
     *,
-    ins_r: Instruction,
+    ins_r: DecodedInstruction,
     state_before_r: SideState,
     exits_o: dict[str, int | str],
     exits_r: dict[str, int | str],
@@ -743,43 +650,28 @@ def _product_stop(recorder: AnalysisRecorder) -> dict[str, FactValue]:
     }
 
 
-def _dp_line(stream: ResolvedAsm, index: int, promote: bool) -> DpLine:
+def _dp_line(row: DecodedInstruction, promote: bool) -> DpLine:
     """The alignment view of an instruction. With the frame promoted, a
     store to a frame slot is no observable: it may pair with any
     instruction, or with none."""
-    line = dp_line(stream, index)
+    line = dp_line(row)
     if not promote or line.line_class != "store":
         return line
-    try:
-        ins = instruction_at(stream, index)
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        return line
-    op = ins.operands[0] if ins.operands else None
-    if (  # pylint: disable=too-many-boolean-expressions
-        ins.prefix
-        or ins.mnemonic in STRING_OPS
-        or op is None
-        or op[0] != "mem"
-        or op[2]
-        or op[5]
-        or op[3] not in ([("esp", 1)], [("ebp", 1)])
-    ):
-        return line
-    return dataclasses.replace(line, line_class="none")
+    match row.operands:
+        case (("mem", _, "", [("esp" | "ebp", 1)], _, ()), *_) if (
+            not row.prefix and row.mnemonic not in STRING_OPS
+        ):
+            return dataclasses.replace(line, line_class="none")
+    return line
 
 
 def _call_effect(
-    metadata: FunctionMetadata | None,
-    addrs: tuple[list[int | None] | None, list[int | None] | None],
-    side: int,
-    index: int,
+    metadata: FunctionMetadata | None, side: int, row: DecodedInstruction
 ) -> CallStackEffect | None:
-    """The stack effect of one side's call at ``index``, from its binary."""
-    side_addrs = addrs[side]
-    if metadata is None or metadata.stack_effects is None or side_addrs is None:
+    """The stack effect of one side's call, from its binary."""
+    if metadata is None or metadata.stack_effects is None or row.address is None:
         return None
-    address = side_addrs[index] if index < len(side_addrs) else None
-    return metadata.stack_effects[side](address) if address is not None else None
+    return metadata.stack_effects[side](row.address)
 
 
 def _agreed_effects(

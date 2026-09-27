@@ -25,11 +25,10 @@ from reccmp.compare.asm.ir import (
     JumpTable,
     compute_extent_closed,
     rebind_local_identities,
-    resolve_asm_stream,
 )
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.parse import ParseAsm
-from reccmp.compare.asm.replacement import create_name_lookup
+from reccmp.compare.asm.replacement import create_resolver
 from reccmp.compare.db import EntityDb, FrozenEntityDbError, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult
 from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
@@ -70,13 +69,13 @@ def test_instruction_ids_survive_slice_and_reorder():
     blob = bytes.fromhex("B80100000083C001C3")  # mov eax,1; add eax,1; ret
     rows = ParseAsm().parse_asm(blob, 0x1000)
     stamped = tuple(replace(row, instruction_id=100 + i) for i, row in enumerate(rows))
-    stream = resolve_asm_stream(stamped)
-    assert stream.instruction_ids == (100, 101, 102)
-    sliced = stream.slice(2)
+    image = FunctionImage(0x1000, len(blob), ExtentKind.KNOWN, stamped)
+    assert image.instruction_ids == (100, 101, 102)
+    sliced = image.with_excerpt(image.excerpt[:2])
     assert sliced.instruction_ids == (100, 101)
-    reordered = stream.reorder([2, 0, 1])
+    reordered = image.with_excerpt([image.excerpt[i] for i in (2, 0, 1)])
     assert reordered.instruction_ids == (102, 100, 101)
-    assert reordered.displays[0] == stream.displays[2]
+    assert reordered.excerpt[0].display == image.excerpt[2].display
 
 
 def test_estimated_extent_without_terminal_is_open():
@@ -155,7 +154,6 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         mnemonic="jmp",
         prefix="",
         operands=(("mem", "dword", "", (("eax", 4),), 0, ()),),
-        raw_operands=("dword ptr [eax*4]",),
         display="jmp dword ptr [eax*4]",
         role=AsmRole.CODE,
         is_jump=True,
@@ -219,7 +217,7 @@ def test_admit_proof_refuses_open_extent_and_incomplete_coverage():
     )
     assert (
         admit_exact_analysis(
-            displays_equal=True,
+            bytes_equal=True,
             topology_equal=True,
             keys_equal=True,
             extent_closed=False,
@@ -291,6 +289,7 @@ def test_source_index_scopes_variable_only_targets(tmp_path: Path):
                         semantic_id="gOnly",
                         qualified_name="gOnly",
                         type="int",
+                        storage_kind="scalar",
                         linkage="external",
                         storage_class="none",
                         definition_kind="definition",
@@ -327,6 +326,7 @@ def test_array_field_resolves_later_elements():
                         SourceField(
                             name="value",
                             type="int",
+                            pointer_depth=0,
                             source_file="a.h",
                             line=2,
                             offset=0,
@@ -350,6 +350,7 @@ def test_array_field_resolves_later_elements():
                         SourceField(
                             name="children",
                             type="Child [4]",
+                            pointer_depth=0,
                             source_file="a.h",
                             line=6,
                             offset=0,
@@ -396,7 +397,6 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         mnemonic="jmp",
         prefix="",
         operands=(("mem", "dword", "", (("eax", 1),), 0x1004, ()),),
-        raw_operands=("dword ptr [eax+0x1004]",),
         display="jmp dword ptr [eax+0x1004]",
         role=AsmRole.CODE,
         is_jump=True,
@@ -417,11 +417,10 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    stream = resolve_asm_stream(excerpt, jump_tables=(table,))
     extracted = extract_switch_tables(
-        stream,
+        excerpt,
         ["jmp", "data", "data", "ret", "ret"],
-        [0x1000, 0x1004, 0x1008, 0x1010, 0x1020],
+        (table,),
     )
     assert extracted is not None
     dests, _owned = extracted
@@ -435,7 +434,6 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         mnemonic="jmp",
         prefix="",
         operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
-        raw_operands=("dword ptr [eax*4+0x1004]",),
         display="jmp dword ptr [eax*4+0x1004]",
         role=AsmRole.CODE,
         is_jump=True,
@@ -456,11 +454,10 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    stream = resolve_asm_stream(excerpt, jump_tables=(table,))
     extracted = extract_switch_tables(
-        stream,
+        excerpt,
         ["jmp", "data", "data", "ret", "ret"],
-        [0x1000, 0x1004, 0x1008, 0x1010, 0x1020],
+        (table,),
     )
     assert extracted is not None
     dests, owned = extracted
@@ -490,7 +487,7 @@ def test_gate_mints_verification_result_not_strategy():
 
 def test_name_lookup_invalidates_when_entity_db_generation_changes():
     db = EntityDb()
-    lookup = create_name_lookup(
+    lookup = create_resolver(
         db, ImageId.ORIG, lambda _addr: None, lambda _type, _offset: ""
     )
     assert lookup(0x100) is None
@@ -595,6 +592,7 @@ def test_pointer_array_does_not_descend_into_pointee():
                         SourceField(
                             name="value",
                             type="int",
+                            pointer_depth=0,
                             source_file="a.h",
                             line=2,
                             offset=0,
@@ -618,6 +616,7 @@ def test_pointer_array_does_not_descend_into_pointee():
                         SourceField(
                             name="children",
                             type="Child *[4]",
+                            pointer_depth=0,
                             source_file="a.h",
                             line=6,
                             offset=0,
@@ -662,6 +661,7 @@ def test_scalar_array_uses_element_stride():
                         SourceField(
                             name="values",
                             type="int [4]",
+                            pointer_depth=0,
                             source_file="a.h",
                             line=2,
                             offset=0,
@@ -700,7 +700,6 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
             "eax",
             Reference("<OFFSET>", ("local", 8)),
         ),
-        raw_operands=("eax", "<OFFSET>"),
         display="lea eax, <OFFSET>",
         instruction_id=0,
     )

@@ -1,10 +1,11 @@
 """Call facts (return kind, register arguments, stack cleanup) of the
 recompiled functions, from PDB types first and decorated names second."""
 
+from collections.abc import Hashable
 from dataclasses import replace
 from typing import Callable
 
-from reccmp.compare.asm.replacement import canonical_callee_name
+from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.asm.verifier import FunctionMetadata
 from reccmp.call_facts import CallFacts, convention_facts
 from reccmp.compare.call_facts import import_facts, mangled_facts
@@ -99,13 +100,13 @@ class FunctionMetadataMixin(ComparatorState):
             return "unknown"
         return "unknown"
 
-    def _call_facts_map(self) -> dict[str, CallFacts | None]:
-        """Map from a sanitized call-target name (as the diff displays it)
-        to the callee's call facts. For a name shared by several functions,
+    def _call_facts_map(self) -> dict[Hashable, CallFacts | None]:
+        """Each callee's call facts, by the proof identity its call operand
+        carries. For an identity several functions share (an alias group),
         only the facts they agree on are known."""
         if self._call_facts_cache is not None:
             return self._call_facts_cache
-        result: dict[str, CallFacts | None] = {}
+        result: dict[Hashable, CallFacts | None] = {}
         for entity in self.db.get_all():
             if entity.entity_type != EntityType.FUNCTION:
                 continue
@@ -115,17 +116,12 @@ class FunctionMetadataMixin(ComparatorState):
             node = self.func_nodes.get(recomp_addr)
             if node is None:
                 continue
-            name = canonical_callee_name(
-                self.db,
-                ImageId.RECOMP,
-                entity,
-                self.equivalence_groups,
+            identity = entity_proof_identity(
+                self.db, ImageId.RECOMP, entity, 0, self.equivalence_groups
             )
-            if name is None:
-                continue
             facts = self._call_facts_of_node(node, entity.orig_addr)
-            previous = result.get(name, facts)
-            result[name] = None if previous is None else previous.agreed(facts)
+            previous = result.get(identity, facts)
+            result[identity] = None if previous is None else previous.agreed(facts)
         self._call_facts_cache = result
         return result
 
@@ -157,7 +153,12 @@ class FunctionMetadataMixin(ComparatorState):
         clang = self._clang_call_facts(node, orig_addr)
         if clang is not None:
             facts = facts.merged(clang)
-        if node.decorated_name:
+        if node.decorated_name and (
+            facts.uses_ecx is None
+            or facts.uses_edx is None
+            or facts.stack_cleanup is None
+            or facts.return_kind == "unknown"
+        ):
             facts = facts.merged(mangled_facts(node.decorated_name))
         return facts
 

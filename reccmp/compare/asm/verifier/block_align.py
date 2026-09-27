@@ -4,15 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from reccmp.compare.asm.ir import (
-    ResolvedAsm,
-    instruction_at,
-)
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Instruction,
-    Reject,
-)
+from collections.abc import Hashable
+
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.model import REGISTERS
 from reccmp.compare.asm.verifier.state import (
     JCC_MNEMONICS,
     STRING_OPS,
@@ -35,7 +30,8 @@ _X87_MEM_WRITERS_DP = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbst
 class DpLine:
     """Alignment view of one instruction, derived once from its structure."""
 
-    display: str
+    # The row's match key: equal keys are the same instruction.
+    key: Hashable
     # Leading token of the instruction text: the prefix when present
     # ("rep", "lock"), else the mnemonic.
     head: str
@@ -47,7 +43,7 @@ class DpLine:
     skeleton: tuple | None
 
 
-def _dp_line_class(ins: Instruction) -> str:
+def _dp_line_class(ins: DecodedInstruction) -> str:
     # pylint: disable=too-many-return-statements
     mnemonic = ins.mnemonic
     if mnemonic == "call":
@@ -67,7 +63,7 @@ def _dp_line_class(ins: Instruction) -> str:
     return "none"
 
 
-def _dp_skeleton(ins: Instruction) -> tuple:
+def _dp_skeleton(ins: DecodedInstruction) -> tuple:
     """Mnemonic plus operand kinds, keeping immediates, symbols, widths,
     displacements and scale multisets."""
     shape: list[tuple] = []
@@ -92,28 +88,17 @@ def _dp_skeleton(ins: Instruction) -> tuple:
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 
-def dp_line(stream: ResolvedAsm, index: int) -> DpLine:
-    display = stream.displays[index]
-    try:
-        ins = instruction_at(stream, index)
-    except (Reject, IndexError, KeyError, ValueError, TypeError):
-        # Only reachable for text streams the model cannot parse; decoded
-        # IR rows always carry an instruction. Calls and pushes keep their
-        # class so an unmodeled operand does not change the pairing.
-        head = display.partition(" ")[0]
-        if head in ("call", "push"):
-            line_class = head
-        elif head in STRING_OPS or head.startswith("rep"):
-            line_class = "store"
-        else:
-            line_class = "opaque"
-        return DpLine(display, head, line_class, None)
-    head = ins.prefix or ins.mnemonic
-    return DpLine(display, head, _dp_line_class(ins), _dp_skeleton(ins))
+def dp_line(row: DecodedInstruction) -> DpLine:
+    key = instruction_match_key(row)
+    if not row.is_code:
+        # Table rows pair only with an identical row.
+        return DpLine(key, "", "opaque", None)
+    head = row.prefix or row.mnemonic
+    return DpLine(key, head, _dp_line_class(row), _dp_skeleton(row))
 
 
 def _dp_sub_cost(line_o: DpLine, line_r: DpLine) -> float | None:
-    if line_o.display == line_r.display:
+    if line_o.key == line_r.key:
         return _SUB_EXACT
     if line_o.line_class != line_r.line_class or line_o.line_class == "opaque":
         return None
