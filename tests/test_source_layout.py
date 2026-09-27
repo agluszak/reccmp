@@ -23,9 +23,7 @@ from reccmp.source import (
     SourceIndex,
 )
 from reccmp.source import SourceAbi, keyed
-from reccmp.source.index import (
-    _layout_identity,
-)
+from reccmp.source.derive import _layout_identity
 from reccmp.source.records import (
     DeclarationKey,
     SourceComparison,

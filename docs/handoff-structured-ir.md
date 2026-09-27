@@ -104,6 +104,8 @@ Commits on this branch:
   boundary instead of implementing marker joins itself.
 - Trusted class layout and field-path queries now live in `source/layout.py`
   as methods of the same `SourceIndex` object.
+- Cross-TU winner selection and conflict derivation now live in
+  `source/derive.py`; `SourceIndex` assembles their results.
 - The entity catalog now seals side facts when it freezes. Matched entity
   views share the sealed records, and prepared-analysis pickle caching keeps
   them sealed after reload.
@@ -134,7 +136,7 @@ already reproduce (113 positional, 19 diff-aligned, ten relocation).
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
 machine and semantic instruction effects; finish separating source index
-cross-TU derivation and orchestration; finish typed diagnosis
+JSON IO and collector orchestration; finish typed diagnosis
 payloads. The catalog's side fact maps are sealed, though entity pairing
 objects remain mutable Python objects and the catalog still uses key-value
 facts internally.
