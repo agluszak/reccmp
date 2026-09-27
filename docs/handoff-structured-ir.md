@@ -93,6 +93,9 @@ Commits on this branch:
 - `a40e5789`: delete `AsmRole` and all fake table instructions. Test switches
   pass explicit `JumpTable` records. Alias proofs check table case destinations.
 - `bb586099`: make the report and graph tests pass CI Pylint.
+- `630941a7`: per-TU Clang observation parsing and JSON fact construction
+  moved to `source/observations.py`; `source/index.py` retains namespace
+  derivation, marker binding, layout queries, and orchestration.
 
 Full Python suite: 1,387 passed, 221 skipped, 3 expected failures. Mypy and
 Pylint pass for the latest changed production modules. The Wizardry WIZ8
@@ -114,8 +117,9 @@ deleting their implementations.
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
 machine and semantic instruction effects; make the entity catalog genuinely
-immutable before constructing comparison context; continue splitting
-`source/index.py` by responsibility; finish typed diagnosis payloads.
+immutable before constructing comparison context; finish separating source
+index marker binding, layout queries, and orchestration; finish typed
+diagnosis payloads.
 Keep cvdump and Unicorn as separate input and
 execution engines.
 
