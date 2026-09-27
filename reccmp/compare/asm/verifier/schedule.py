@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.verifier.block_align import DpLine, dp_line
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.verifier.block_align import instruction_skeleton
 from reccmp.compare.asm.verifier.relocation import (
     LineEffects,
     effects_conflict,
@@ -43,8 +43,10 @@ def _independent(moved: LineEffects, crossed: LineEffects) -> bool:
     return not (moved.writes_flags and crossed.writes_flags)
 
 
-def _same_instruction(a: DpLine, b: DpLine) -> bool:
-    return a.key == b.key or (a.skeleton is not None and a.skeleton == b.skeleton)
+def _same_instruction(a: DecodedInstruction, b: DecodedInstruction) -> bool:
+    return instruction_match_key(a) == instruction_match_key(b) or instruction_skeleton(
+        a
+    ) == instruction_skeleton(b)
 
 
 def schedule_like(
@@ -57,15 +59,13 @@ def schedule_like(
     where that only swaps independent instructions."""
     if len(indices_r) > _MAX_BLOCK or len(indices_r) < 2:
         return indices_r
-    lines_o = [dp_line(orig_rows[i]) for i in indices_o]
-    lines_r = {i: dp_line(recomp_rows[i]) for i in indices_r}
     effects = dict(zip(indices_r, _block_effects(recomp_rows, indices_r)))
 
     placed: list[int] = []
     remaining = list(indices_r)
-    for line_o in lines_o:
+    for index_o in indices_o:
         for position, candidate in enumerate(remaining):
-            if not _same_instruction(line_o, lines_r[candidate]):
+            if not _same_instruction(orig_rows[index_o], recomp_rows[candidate]):
                 continue
             moved = effects[candidate]
             if all(

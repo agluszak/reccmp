@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-
-from collections.abc import Hashable
+from enum import Enum
 
 from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
 from reccmp.compare.asm.model import REGISTERS
@@ -28,46 +28,68 @@ _GAP = 5
 _X87_MEM_WRITERS_DP = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbstp"})
 
 
-@dataclass(frozen=True)
-class DpLine:
-    """Alignment view of one instruction, derived once from its structure."""
-
-    # The row's match key: equal keys are the same instruction.
-    key: Hashable
-    # Leading token of the instruction text: the prefix when present
-    # ("rep", "lock"), else the mnemonic.
-    head: str
-    # Coarse observable class: lines with an observable effect only pair
-    # within their class and never go one-sided (the verifier would reject
-    # that anyway).
-    line_class: str
-    # Instruction shape with register identities erased; None if unknown.
-    skeleton: tuple | None
-    # Whether the verifier may accept the line on one side only.
-    one_sided: bool
+class LineClass(Enum):
+    NONE = "none"
+    PUSH = "push"
+    STORE = "store"
+    CALL = "call"
 
 
-def _dp_line_class(ins: DecodedInstruction) -> str:
+@dataclass(frozen=True, slots=True)
+class AlignedPair:
+    orig: int | None
+    recomp: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlockAlignment:
+    pairs: tuple[AlignedPair, ...]
+    cost: int
+
+
+def _base_line_class(ins: DecodedInstruction) -> LineClass:
     # pylint: disable=too-many-return-statements
     mnemonic = ins.mnemonic
     if ins.is_call:
-        return "call"
+        return LineClass.CALL
     if mnemonic == "push":
         # Pushes pair with pushes, but may also go one-sided (a scratch
         # spill on one side only); the verifier gates the soundness.
-        return "push"
+        return LineClass.PUSH
     if mnemonic in STRING_OPS or ins.prefix:
-        return "store"
+        return LineClass.STORE
     if mnemonic in _X87_MEM_WRITERS_DP:
-        return "store" if any(isinstance(op, Mem) for op in ins.operands) else "none"
+        return (
+            LineClass.STORE
+            if any(isinstance(op, Mem) for op in ins.operands)
+            else LineClass.NONE
+        )
     if mnemonic in ("cmp", "test"):
-        return "none"
+        return LineClass.NONE
     if ins.operands and isinstance(ins.operands[0], Mem) and not ins.is_jump:
-        return "store"
-    return "none"
+        return LineClass.STORE
+    return LineClass.NONE
 
 
-def _dp_skeleton(ins: DecodedInstruction) -> tuple:
+def line_class(ins: DecodedInstruction, *, promote: bool = False) -> LineClass:
+    """The instruction's observable alignment class. With the frame promoted,
+    a store to a frame slot is no observable: it may pair with any instruction,
+    or with none."""
+    classification = _base_line_class(ins)
+    if not promote or classification is not LineClass.STORE:
+        return classification
+    match ins.operands:
+        case (
+            Mem(segment="", terms=(ScaledReg("esp" | "ebp", 1),), symbols=()),
+            *_,
+        ) if (
+            not ins.prefix and ins.mnemonic not in STRING_OPS
+        ):
+            return LineClass.NONE
+    return classification
+
+
+def instruction_skeleton(ins: DecodedInstruction) -> tuple:
     """Mnemonic plus operands with register identities erased: a register
     keeps its width, a memory operand the multiset of its scales."""
     shape: list[Operand] = []
@@ -89,31 +111,40 @@ def _dp_skeleton(ins: DecodedInstruction) -> tuple:
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 
-def dp_line(row: DecodedInstruction) -> DpLine:
-    key = instruction_match_key(row)
-    head = row.prefix or row.mnemonic
-    return DpLine(
-        key, head, _dp_line_class(row), _dp_skeleton(row), may_be_one_sided(row)
-    )
-
-
-def _dp_sub_cost(line_o: DpLine, line_r: DpLine) -> float | None:
-    if line_o.key == line_r.key:
+def _sub_cost(
+    ins_o: DecodedInstruction,
+    ins_r: DecodedInstruction,
+    *,
+    promote: bool,
+) -> int | None:
+    if instruction_match_key(ins_o) == instruction_match_key(ins_r):
         return _SUB_EXACT
-    if line_o.line_class != line_r.line_class or line_o.line_class == "opaque":
+    class_o = line_class(ins_o, promote=promote)
+    class_r = line_class(ins_r, promote=promote)
+    if class_o is not class_r:
         return None
-    if line_o.skeleton is not None and line_o.skeleton == line_r.skeleton:
+    if instruction_skeleton(ins_o) == instruction_skeleton(ins_r):
         return _SUB_SKELETON
-    if line_o.head == line_r.head or (
-        line_o.head in JCC_MNEMONICS and line_r.head in JCC_MNEMONICS
-    ):
+    head_o = ins_o.prefix or ins_o.mnemonic
+    head_r = ins_r.prefix or ins_r.mnemonic
+    if head_o == head_r or (head_o in JCC_MNEMONICS and head_r in JCC_MNEMONICS):
         return _SUB_MNEMONIC
     return _SUB_CLASS
 
 
+def _gap_cost(ins: DecodedInstruction, *, promote: bool) -> int | None:
+    classification = line_class(ins, promote=promote)
+    if classification in (LineClass.NONE, LineClass.PUSH) and may_be_one_sided(ins):
+        return _GAP
+    return None
+
+
 def align_block_lines(
-    lines_o: list[DpLine], lines_r: list[DpLine]
-) -> tuple[list[tuple[int | None, int | None]], float] | None:
+    lines_o: Sequence[DecodedInstruction],
+    lines_r: Sequence[DecodedInstruction],
+    *,
+    promote: bool = False,
+) -> BlockAlignment | None:
     """Pair up two blocks' instructions with a cost-minimizing alignment.
     Returns block-local index pairs and their cost; None when the blocks
     cannot be aligned (observable-class counts differ, or the blocks are
@@ -124,48 +155,52 @@ def align_block_lines(
     inf = float("inf")
     # cost[i][j]: best cost aligning lines_o[:i] with lines_r[:j].
     cost = [[inf] * (m + 1) for _ in range(n + 1)]
-    cost[0][0] = 0.0
-    gap_classes = ("none", "push")
-    gap_o = [
-        _GAP if line.line_class in gap_classes and line.one_sided else inf
-        for line in lines_o
-    ]
-    gap_r = [
-        _GAP if line.line_class in gap_classes and line.one_sided else inf
-        for line in lines_r
-    ]
+    cost[0][0] = 0
+    gap_o = [_gap_cost(line, promote=promote) for line in lines_o]
+    gap_r = [_gap_cost(line, promote=promote) for line in lines_r]
     for i in range(1, n + 1):
-        cost[i][0] = cost[i - 1][0] + gap_o[i - 1]
+        gap = gap_o[i - 1]
+        if gap is not None:
+            cost[i][0] = cost[i - 1][0] + gap
     for j in range(1, m + 1):
-        cost[0][j] = cost[0][j - 1] + gap_r[j - 1]
+        gap = gap_r[j - 1]
+        if gap is not None:
+            cost[0][j] = cost[0][j - 1] + gap
     for i in range(1, n + 1):
         row = cost[i]
         prev = cost[i - 1]
         line_o = lines_o[i - 1]
         for j in range(1, m + 1):
-            best = min(prev[j] + gap_o[i - 1], row[j - 1] + gap_r[j - 1])
-            sub = _dp_sub_cost(line_o, lines_r[j - 1])
+            best = inf
+            gap_i = gap_o[i - 1]
+            gap_j = gap_r[j - 1]
+            if gap_i is not None:
+                best = prev[j] + gap_i
+            if gap_j is not None:
+                best = min(best, row[j - 1] + gap_j)
+            sub = _sub_cost(line_o, lines_r[j - 1], promote=promote)
             if sub is not None:
                 best = min(best, prev[j - 1] + sub)
             row[j] = best
     if cost[n][m] == inf:
         return None
     # Reconstruct.
-    result: list[tuple[int | None, int | None]] = []
+    result: list[AlignedPair] = []
     i, j = n, m
     while i > 0 or j > 0:
         if i > 0 and j > 0:
-            sub = _dp_sub_cost(lines_o[i - 1], lines_r[j - 1])
+            sub = _sub_cost(lines_o[i - 1], lines_r[j - 1], promote=promote)
             if sub is not None and cost[i][j] == cost[i - 1][j - 1] + sub:
-                result.append((i - 1, j - 1))
+                result.append(AlignedPair(i - 1, j - 1))
                 i -= 1
                 j -= 1
                 continue
-        if i > 0 and cost[i][j] == cost[i - 1][j] + gap_o[i - 1]:
-            result.append((i - 1, None))
+        gap = gap_o[i - 1] if i > 0 else None
+        if gap is not None and cost[i][j] == cost[i - 1][j] + gap:
+            result.append(AlignedPair(i - 1, None))
             i -= 1
             continue
-        result.append((None, j - 1))
+        result.append(AlignedPair(None, j - 1))
         j -= 1
     result.reverse()
-    return result, cost[n][m]
+    return BlockAlignment(tuple(result), int(cost[n][m]))

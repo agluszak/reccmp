@@ -3,7 +3,6 @@ with block-local alignment."""
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -17,15 +16,10 @@ from reccmp.compare.asm.ir import (
     instruction_semantic_key,
 )
 from reccmp.compare.asm.model import Reject
-from reccmp.compare.asm.operand import Mem, ScaledReg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import Value, unwind_spadd
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
-from reccmp.compare.asm.verifier.block_align import (
-    DpLine,
-    align_block_lines,
-    dp_line,
-)
+from reccmp.compare.asm.verifier.block_align import AlignedPair, align_block_lines
 from reccmp.compare.asm.verifier.blocks import (
     FALL,
     JUMP,
@@ -60,7 +54,6 @@ from reccmp.compare.asm.verifier.semantics import canon_condition, esp_add, exec
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
     JCC_MNEMONICS,
-    STRING_OPS,
     Context,
     FunctionMetadata,
     SideState,
@@ -172,16 +165,16 @@ def _verify_product(
     # each node's aligned instruction pairs; whether its branch pairs the
     # other side's successors swapped.
     nodes: dict[_Node, int] = {}
-    alignments: dict[_Node, list[tuple[int | None, int | None]]] = {}
+    alignments: dict[_Node, tuple[AlignedPair, ...]] = {}
     orientation: dict[_Node, bool] = {}
     any_shifted = False
 
-    def align(node: _Node) -> list[tuple[int | None, int | None]] | None:
+    def align(node: _Node) -> tuple[AlignedPair, ...] | None:
         nonlocal any_shifted
         indices_o = cfg_o.instructions(node[0])
         indices_r = cfg_r.instructions(node[1])
         start_o, start_r = cfg_o.start(node[0][0]), cfg_r.start(node[1][0])
-        lines_o = [_dp_line(orig_rows[i], promote) for i in indices_o]
+        lines_o = [orig_rows[i] for i in indices_o]
         # The recompiled block as emitted, and reordered towards the
         # original where that only swaps independent instructions: the
         # cheaper alignment of the two pairs the instructions.
@@ -193,12 +186,14 @@ def _verify_product(
             )
             if (
                 alignment := align_block_lines(
-                    lines_o, [_dp_line(recomp_rows[i], promote) for i in order]
+                    lines_o,
+                    [recomp_rows[i] for i in order],
+                    promote=promote,
                 )
             )
             is not None
         ]
-        best = min(candidates, key=lambda item: item[1][1], default=None)
+        best = min(candidates, key=lambda item: item[1].cost, default=None)
         if best is not None and best[0] != indices_r:
             any_shifted = True
         if best is None:
@@ -209,37 +204,39 @@ def _verify_product(
                 StopDetail.BLOCK_ALIGNMENT,
             )
             return None
-        indices_r, (aligned, _cost) = best
+        indices_r, alignment = best
         # The block terminators (control lines) must pair with each other:
         # a one-sided branch or return breaks the matched structure.
-        for local_o, local_r in aligned:
+        for pair in alignment.pairs:
             kind_o = (
-                _control(orig_rows[indices_o[local_o]])
-                if local_o is not None
+                _control(orig_rows[indices_o[pair.orig]])
+                if pair.orig is not None
                 else FlowKind.NORMAL
             )
             kind_r = (
-                _control(recomp_rows[indices_r[local_r]])
-                if local_r is not None
+                _control(recomp_rows[indices_r[pair.recomp]])
+                if pair.recomp is not None
                 else FlowKind.NORMAL
             )
-            if kind_o != kind_r or (local_o is None and kind_r is not FlowKind.NORMAL):
+            if kind_o != kind_r or (
+                pair.orig is None and kind_r is not FlowKind.NORMAL
+            ):
                 recorder.mark_inconclusive(
                     InconclusiveReason.ALIGNMENT_FAILURE,
-                    indices_o[local_o] if local_o is not None else None,
-                    indices_r[local_r] if local_r is not None else None,
+                    indices_o[pair.orig] if pair.orig is not None else None,
+                    indices_r[pair.recomp] if pair.recomp is not None else None,
                     StopDetail.BLOCK_TERMINATOR_ALIGNMENT,
                 )
                 return None
-        if any(local_o is None or local_r is None for local_o, local_r in aligned):
+        if any(pair.orig is None or pair.recomp is None for pair in alignment.pairs):
             any_shifted = True
-        return [
-            (
-                indices_o[local_o] if local_o is not None else None,
-                indices_r[local_r] if local_r is not None else None,
+        return tuple(
+            AlignedPair(
+                indices_o[pair.orig] if pair.orig is not None else None,
+                indices_r[pair.recomp] if pair.recomp is not None else None,
             )
-            for local_o, local_r in aligned
-        ]
+            for pair in alignment.pairs
+        )
 
     def node_at(block_o: int, block_r: int) -> _Node | None:
         """The node entered at this pair of blocks, created (and aligned)
@@ -307,7 +304,8 @@ def _verify_product(
         edges_r = cfg_r.exits(node[1][-1])
         swapped = False
         last_o = last_r = None
-        for index_o, index_r in alignments[node]:
+        for pair in alignments[node]:
+            index_o, index_r = pair.orig, pair.recomp
             if index_o is None or index_r is None:
                 if index_o is None:
                     assert index_r is not None
@@ -625,24 +623,6 @@ def _inverted_branch(
         return False
     obs_r[branch_r] = ("branch", inverted, *obs_r[branch_r][2:])
     return True
-
-
-def _dp_line(row: DecodedInstruction, promote: bool) -> DpLine:
-    """The alignment view of an instruction. With the frame promoted, a
-    store to a frame slot is no observable: it may pair with any
-    instruction, or with none."""
-    line = dp_line(row)
-    if not promote or line.line_class != "store":
-        return line
-    match row.operands:
-        case (
-            Mem(segment="", terms=(ScaledReg("esp" | "ebp", 1),), symbols=()),
-            *_,
-        ) if (
-            not row.prefix and row.mnemonic not in STRING_OPS
-        ):
-            return dataclasses.replace(line, line_class="none")
-    return line
 
 
 def _call_effect(

@@ -7,6 +7,13 @@ does not depend on.
 """
 
 from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.verifier.block_align import (
+    AlignedPair,
+    BlockAlignment,
+    LineClass,
+    align_block_lines,
+    line_class,
+)
 from reccmp.compare.asm.verifier.schedule import schedule_like
 
 # Hand-assembled 32-bit instructions.
@@ -121,3 +128,15 @@ def test_chains_of_legal_moves():
     orig = (MOV_EBX_2, MOV_EAX_1, MOV_EDX_EAX)
     recomp = (MOV_EAX_1, MOV_EDX_EAX, MOV_EBX_2)
     assert _schedule(orig, recomp) == [2, 0, 1]
+
+
+def test_block_alignment_has_typed_pairs_and_cost():
+    alignment = align_block_lines(_stream(MOV_EAX_1, MOV_EBX_2), _stream(MOV_EAX_1))
+    assert alignment == BlockAlignment((AlignedPair(0, 0), AlignedPair(1, None)), 5)
+
+
+def test_line_classes_are_typed():
+    assert line_class(_stream(MOV_EAX_1)[0]) is LineClass.NONE
+    assert line_class(_stream(PUSH_EAX)[0]) is LineClass.PUSH
+    assert line_class(_stream(STORE_THIS_4_EAX)[0]) is LineClass.STORE
+    assert line_class(_stream(CALL)[0]) is LineClass.CALL
