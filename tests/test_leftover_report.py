@@ -8,6 +8,7 @@ import json
 import pickle
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -226,11 +227,12 @@ def test_entity_db_freeze_rejects_later_pairing():
     recomp = db.get(ImageId.RECOMP, 0x20)
     assert orig is recomp
     assert orig is not None
+    assert recomp is not None
     assert orig.orig is not None and orig.recomp is not None
     with pytest.raises(TypeError):
-        orig.orig.facts["name"] = "changed"
+        cast(dict[str, object], orig.orig.facts)["name"] = "changed"
     with pytest.raises(TypeError):
-        orig.recomp.facts["name"] = "changed"
+        cast(dict[str, object], orig.recomp.facts)["name"] = "changed"
     assert recomp.fact(ImageId.ORIG, "name") == "orig"
     assert recomp.fact(ImageId.RECOMP, "name") == "recomp"
 
@@ -240,7 +242,7 @@ def test_entity_db_freeze_rejects_later_pairing():
     assert restored_match is restored.get(ImageId.RECOMP, 0x20)
     assert restored_match is not None and restored_match.orig is not None
     with pytest.raises(TypeError):
-        restored_match.orig.facts["name"] = "changed"
+        cast(dict[str, object], restored_match.orig.facts)["name"] = "changed"
 
 
 def test_source_index_is_not_auto_discovered(tmp_path: Path):

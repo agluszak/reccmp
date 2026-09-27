@@ -117,12 +117,14 @@ could not start because the browser executable is not installed locally.
 The positional CFG verifier cannot yet be removed: a product-only probe
 retained its successful proofs but lost branch-target diagnoses on 63 WIZ8
 functions when the product graph alignment failed. Of 21 effective WIZ8
-functions proved by lockstep alone, the product verifier stopped at nine
-analysis limits, six alignment failures, and two state joins. On four more it
-reported a return-value or memory-address difference despite the lockstep
-proof. Those conflicting outcomes need a soundness review before using the
-product verifier as the sole strategy. Diff-aligned and relocation paths also
-remain until their proof and diagnosis capabilities are measured and ported.
+functions the product verifier could not prove, 17 were proved by positional
+lockstep, three by diff-aligned lockstep, and one by relocation followed by
+lockstep. Product stopped at nine analysis limits, six alignment failures,
+and two state joins. On four more it reported a return-value or memory-address
+difference despite a positional lockstep proof. Those conflicting outcomes
+need a soundness review before using the product verifier as the sole
+strategy. The probe also found 142 stream-verifier proofs that product can
+already reproduce (113 positional, 19 diff-aligned, ten relocation).
 
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
