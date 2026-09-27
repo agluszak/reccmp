@@ -3,21 +3,27 @@ entry states, their joins at merge points, and convergence checks."""
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from reccmp.compare.asm.verifier.addresses import Value
+from reccmp.compare.asm.verifier.addresses import (
+    CfgMemoryPhi,
+    MemoryGeneration,
+    Phi,
+    Value,
+    X87EpochJoin,
+)
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.state import (
+    CalleeSaveSubstitution,
     FAMILIES,
+    LoadObligation,
+    ScratchPush,
     Context,
     SideState,
     clone_state,
+    is_scratch,
 )
-from reccmp.compare.diagnosis import FactValue
 
 # ---------------------------------------------------------------------------
 # CFG-aware verification
@@ -41,9 +47,9 @@ class CfgState:
 
     orig: SideState
     recomp: SideState
-    memory: int | Value
-    receiver_values: dict[tuple[Value, int | None], tuple[Value, Value]] = field(
-        default_factory=dict
+    memory: MemoryGeneration
+    receiver_values: dict[tuple[Value, int | None], tuple[MemoryGeneration, Value]] = (
+        field(default_factory=dict)
     )
     # Whether a pointer into the function's own frame may have escaped on
     # some path reaching this point (see Context.stack_escaped).
@@ -51,65 +57,39 @@ class CfgState:
     matched_nodes: set[Value] = field(default_factory=set)
     matched_ids: set[int] = field(default_factory=set)
     keepalive: list = field(default_factory=list)
-    save_stack: list[list] = field(default_factory=list)
-    scratch_pushes: list[list] = field(default_factory=list)
-    load_obligations: list[tuple] = field(default_factory=list)
-
-
-def _remap_scratch(
-    records: list[list],
-    old_orig: SideState,
-    old_recomp: SideState,
-    new_orig: SideState,
-    new_recomp: SideState,
-) -> list[list]:
-    remapped = []
-    for record in records:
-        cloned = list(record)
-        if cloned and cloned[0] is old_orig:
-            cloned[0] = new_orig
-        elif cloned and cloned[0] is old_recomp:
-            cloned[0] = new_recomp
-        remapped.append(cloned)
-    return remapped
+    save_stack: list[CalleeSaveSubstitution] = field(default_factory=list)
+    scratch_pushes: list[ScratchPush] = field(default_factory=list)
+    load_obligations: list[LoadObligation] = field(default_factory=list)
 
 
 def _scratch_keys(state: CfgState) -> tuple:
-    keys = []
-    for record in state.scratch_pushes:
-        side = "orig" if record[0] is state.orig else "recomp"
-        keys.append((side, record[1], record[2], record[3]))
-    return tuple(keys)
-
-
-def _remap_obligations(
-    records: list[tuple],
-    old_orig: SideState,
-    old_recomp: SideState,
-    new_orig: SideState,
-    new_recomp: SideState,
-) -> list[tuple]:
-    remapped = []
-    for other, *rest in records:
-        if other is old_orig:
-            other = new_orig
-        elif other is old_recomp:
-            other = new_recomp
-        remapped.append((other, *rest))
-    return remapped
+    return tuple(
+        (record.side, record.offset, record.value, record.tag)
+        for record in state.scratch_pushes
+    )
 
 
 def _obligation_keys(state: CfgState) -> tuple:
-    keys = []
-    for record in state.load_obligations:
-        other = record[0]
-        side = "orig" if other is state.orig else "recomp"
-        keys.append((side, *record[1:]))
-    return tuple(sorted(keys, key=repr))
+    return tuple(
+        sorted(
+            (
+                (
+                    record.side,
+                    record.address,
+                    record.generation,
+                )
+                for record in state.load_obligations
+            ),
+            key=repr,
+        )
+    )
 
 
 def _save_keys(state: CfgState) -> tuple:
-    return tuple(tuple(record) for record in state.save_stack)
+    return tuple(
+        (record.orig_family, record.recomp_family, record.address, record.valid)
+        for record in state.save_stack
+    )
 
 
 def clone_cfg_state(state: CfgState) -> CfgState:
@@ -124,13 +104,9 @@ def clone_cfg_state(state: CfgState) -> CfgState:
         matched_nodes=set(state.matched_nodes),
         matched_ids={id(node) for node in state.matched_nodes},
         keepalive=list(state.matched_nodes),
-        save_stack=[list(record) for record in state.save_stack],
-        scratch_pushes=_remap_scratch(
-            state.scratch_pushes, state.orig, state.recomp, orig, recomp
-        ),
-        load_obligations=_remap_obligations(
-            state.load_obligations, state.orig, state.recomp, orig, recomp
-        ),
+        save_stack=[replace(record) for record in state.save_stack],
+        scratch_pushes=list(state.scratch_pushes),
+        load_obligations=list(state.load_obligations),
     )
 
 
@@ -140,8 +116,8 @@ def seed_context_from_cfg(ctx: Context, flow: CfgState) -> None:
     ctx.matched_nodes = set(flow.matched_nodes)
     ctx.matched_ids = {id(node) for node in flow.matched_nodes}
     ctx.keepalive = list(flow.matched_nodes)
-    ctx.save_stack = [list(record) for record in flow.save_stack]
-    ctx.scratch_pushes = [list(record) for record in flow.scratch_pushes]
+    ctx.save_stack = [replace(record) for record in flow.save_stack]
+    ctx.scratch_pushes = list(flow.scratch_pushes)
     ctx.load_obligations = list(flow.load_obligations)
 
 
@@ -155,8 +131,8 @@ def capture_cfg_state(orig: SideState, recomp: SideState, ctx: Context) -> CfgSt
         matched_nodes=set(ctx.matched_nodes),
         matched_ids={id(node) for node in ctx.matched_nodes},
         keepalive=list(ctx.matched_nodes),
-        save_stack=[list(record) for record in ctx.save_stack],
-        scratch_pushes=[list(record) for record in ctx.scratch_pushes],
+        save_stack=[replace(record) for record in ctx.save_stack],
+        scratch_pushes=list(ctx.scratch_pushes),
         load_obligations=list(ctx.load_obligations),
     )
 
@@ -164,10 +140,16 @@ def capture_cfg_state(orig: SideState, recomp: SideState, ctx: Context) -> CfgSt
 _JOIN_ATTRS = ("flags", "carry", "fpu_flags")
 
 
+def _settled(value: Value, state: CfgState) -> bool:
+    """No content, or matched on both sides along the edge ``state`` flows."""
+    return is_scratch(value) or value in state.matched_nodes
+
+
 def join_states(
     entry: CfgState,
     incoming: CfgState,
     block: int,
+    equal: Callable[[Value, Value], bool] | None = None,
 ) -> CfgState | None:
     # pylint: disable=too-many-return-statements,too-many-locals
     # pylint: disable=too-many-branches
@@ -184,7 +166,9 @@ def join_states(
     registers on the two sides. A node whose value agrees on all edges
     keeps that value. Phi symbols are keyed by the class's canonical node
     index; classes can only refine as more edges arrive, so the fixpoint
-    terminates."""
+    terminates. ``equal``, when given, also puts a node in the class of an
+    earlier one whose values it holds equal edge for edge (e.g. ``x - 32``
+    and ``x + -32``): their phi is then one value too."""
     entry_o, entry_r = entry.orig, entry.recomp
     in_o, in_r = incoming.orig, incoming.recomp
     if len(entry_o.x87.known) != len(entry_r.x87.known):
@@ -210,9 +194,9 @@ def join_states(
         # x87 epochs. Control flow is paired, so both sides always arrive
         # via corresponding paths: a joined epoch keyed by the block keeps
         # deep-stack reads cross-equal (same reasoning as the memory phi).
-        joined_epoch = ("x87_epoch_phi", block)
-        out_o.x87.epoch = joined_epoch  # type: ignore[assignment]
-        out_r.x87.epoch = joined_epoch  # type: ignore[assignment]
+        joined_epoch = X87EpochJoin(block)
+        out_o.x87.epoch = joined_epoch
+        out_r.x87.epoch = joined_epoch
 
     # (entry value, incoming value, setter on the joined state)
     nodes: list[tuple[Value, Value, Callable[[Value], None]]] = []
@@ -286,13 +270,31 @@ def join_states(
         ):
             # A phi would hide which slot a pointer into the frame reaches.
             return None
-        class_id = classes.setdefault((entry_value, in_value), n)
-        setter(("phi", block, class_id))
+        key = (entry_value, in_value)
+        if key not in classes and equal is not None:
+            classes[key] = next(
+                (
+                    class_id
+                    for (entry_other, in_other), class_id in classes.items()
+                    if equal(entry_other, entry_value) and equal(in_other, in_value)
+                ),
+                n,
+            )
+        class_id = classes.setdefault(key, n)
+        # A join of values that each have no content (see is_scratch) or
+        # were already observed on their edge holds nothing unobserved.
+        setter(
+            Phi(
+                block,
+                class_id,
+                settled=_settled(entry_value, entry) and _settled(in_value, incoming),
+            )
+        )
 
     if entry.memory == incoming.memory:
         memory = entry.memory
     else:
-        memory = ("cfg_mem_phi", block)
+        memory = CfgMemoryPhi(block)
     receiver_values = {
         key: value
         for key, value in entry.receiver_values.items()
@@ -325,38 +327,10 @@ def join_states(
             id(node) for node in (entry.matched_nodes | incoming.matched_nodes)
         },
         keepalive=list(entry.matched_nodes | incoming.matched_nodes),
-        save_stack=[list(record) for record in entry.save_stack],
-        scratch_pushes=_remap_scratch(
-            entry.scratch_pushes, entry.orig, entry.recomp, out_o, out_r
-        ),
-        load_obligations=_remap_obligations(
-            chosen_obl.load_obligations,
-            chosen_obl.orig,
-            chosen_obl.recomp,
-            out_o,
-            out_r,
-        ),
+        save_stack=[replace(record) for record in entry.save_stack],
+        scratch_pushes=list(entry.scratch_pushes),
+        load_obligations=list(chosen_obl.load_obligations),
     )
-
-
-def join_failure_facts(entry: CfgState, incoming: CfgState) -> dict[str, FactValue]:
-    """Compact state-shape evidence for a failed CFG join."""
-    return {
-        "entry_orig_x87_depth": len(entry.orig.x87.known),
-        "entry_recomp_x87_depth": len(entry.recomp.x87.known),
-        "incoming_orig_x87_depth": len(incoming.orig.x87.known),
-        "incoming_recomp_x87_depth": len(incoming.recomp.x87.known),
-        "entry_x87_deep_pops_equal": (
-            entry.orig.x87.deep_pops == entry.recomp.x87.deep_pops
-        ),
-        "incoming_x87_deep_pops_equal": (
-            incoming.orig.x87.deep_pops == incoming.recomp.x87.deep_pops
-        ),
-        "entry_x87_epochs_equal": entry.orig.x87.epoch == entry.recomp.x87.epoch,
-        "incoming_x87_epochs_equal": (
-            incoming.orig.x87.epoch == incoming.recomp.x87.epoch
-        ),
-    }
 
 
 def states_equal(a: CfgState, b: CfgState) -> bool:

@@ -11,6 +11,7 @@ from dataclasses import replace
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
+from reccmp.compare.asm.operand import Imm
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.parse import decode_function
@@ -74,7 +75,7 @@ def test_a1_function_decoder_sees_mov_after_jump():
     for blob, imm in ((_A1_ORIG, 1), (_A1_RECOMP, 2)):
         decoded_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
         assert decoded_movs, "function decoder must visit the mov after jmp-over-int3"
-        assert any(("imm", imm) in ops for ops in decoded_movs)
+        assert any(Imm(imm) in ops for ops in decoded_movs)
 
         detail = disasm_detail(blob, 0x1000)
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
@@ -82,7 +83,7 @@ def test_a1_function_decoder_sees_mov_after_jump():
             # Accept function-only coverage until the shared detail walker
             # also drains pending targets; still require unequal decoded rows.
             continue
-        assert any(("imm", imm) in insn.operands for insn in detail_movs)
+        assert any(Imm(imm) in insn.operands for insn in detail_movs)
 
 
 # --- A2: matched-node membership is not live-out proof at a branch ----------
@@ -247,20 +248,19 @@ def test_a5b_sahf_preserves_overflow_flag_difference():
 # --- A6: unsupported path requires compatible meta on both sides ------------
 
 
-def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstruction:
+def _bswap_meta(register: str) -> DecodedInstruction:
+    """``bswap register``, with Capstone's facts: it reads and writes the
+    register, and nothing else."""
     return replace(
-        rows(["bswap ecx"])[0],
+        rows([f"bswap {register}"])[0],
         address=4,
         size=2,
-        regs_read=reads,
-        regs_written=writes,
+        regs_read=(register,),
+        regs_written=(register,),
         register_access_known=True,
         reads_flags=False,
         writes_flags=False,
         accesses_memory=False,
-        is_jump=False,
-        is_call=False,
-        is_ret=False,
         branch_target=None,
     )
 
@@ -282,7 +282,7 @@ _BSWAP_RECOMP = [
 def test_a6_one_sided_meta_cannot_step_divergent_unsupported_instruction():
     """``meta_o or meta_r`` must not invent agreement when only one side has meta."""
     orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
-    one_sided = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
+    one_sided = [None, None, _bswap_meta("ecx"), None]
     assert verify_effective_match(orig, recomp, orig_meta=one_sided) is False
     assert verify_effective_match(orig, recomp, recomp_meta=one_sided) is False
 
@@ -294,12 +294,12 @@ def test_meta_step_over_unmodeled_instruction():
     orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
     # Without metadata: bswap requires full sync, but eax/edx diverge.
     assert verify_effective_match(orig, recomp) is False
-    both = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
+    both = [None, None, _bswap_meta("ecx"), None]
     assert (
         verify_effective_match(orig, recomp, orig_meta=both, recomp_meta=both) is True
     )
     # If the bswap reads a diverged register, it must still reject.
-    bad = [None, None, _bswap_meta(("eax",), ("eax",)), None]
+    bad = [None, None, _bswap_meta("eax"), None]
     orig2 = [orig[0], orig[1], "bswap eax", "mov dword ptr [ebx], ecx"]
     recomp2 = [recomp[0], recomp[1], "bswap eax", "mov dword ptr [ebx], ecx"]
     assert (

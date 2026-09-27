@@ -9,11 +9,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from reccmp.compare.asm.operand import Mem, ScaledReg
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
+    DifferenceKind,
     DifferenceSide,
+    Observed,
 )
+from reccmp.types import ImageId
 from reccmp.compare.functions import FunctionComparator
 from reccmp.source import (
     SourceBaseOffset,
@@ -832,9 +836,19 @@ def test_enrich_memory_address_with_layout_facts():
 
     analysis = ComparisonAnalysis.mismatch(
         ComparisonDifference(
-            "memory_address",
-            DifferenceSide(0, 0x401010, {"displacement": 8, "base_register": "ecx"}),
-            DifferenceSide(1, 0x501010, {"displacement": 12, "base_register": "ecx"}),
+            DifferenceKind.MEMORY_ADDRESS,
+            DifferenceSide(
+                ImageId.ORIG,
+                0,
+                0x401010,
+                Observed(operand=Mem("", "", (ScaledReg("ecx", 1),), 8, ())),
+            ),
+            DifferenceSide(
+                ImageId.RECOMP,
+                1,
+                0x501010,
+                Observed(operand=Mem("", "", (ScaledReg("ecx", 1),), 12, ())),
+            ),
         )
     )
     enriched = (
@@ -843,10 +857,12 @@ def test_enrich_memory_address_with_layout_facts():
         )
     )
     assert enriched.difference is not None
-    assert enriched.difference.orig.facts["class_name"] == "Foo"
-    assert enriched.difference.orig.facts["field_name"] == "flag"
-    assert enriched.difference.orig.facts["field_offset"] == 8
-    assert enriched.difference.recomp.facts["field_name"] == "tail"
+    assert enriched.difference.orig.field is not None
+    assert enriched.difference.orig.field.class_name == "Foo"
+    assert enriched.difference.orig.field.path == ("flag",)
+    assert enriched.difference.orig.field.offset == 8
+    assert enriched.difference.recomp.field is not None
+    assert enriched.difference.recomp.field.path == ("tail",)
 
 
 def test_branch_condition_shows_the_source_comparisons_on_its_line():
@@ -915,9 +931,9 @@ def test_branch_condition_shows_the_source_comparisons_on_its_line():
     match.recomp_addr = 0x501000
     analysis = ComparisonAnalysis.mismatch(
         ComparisonDifference(
-            "branch_condition",
-            DifferenceSide(0, 0x401010, {"predicate": "lt_u:..."}),
-            DifferenceSide(0, 0x501010, {"predicate": "lt_s:..."}),
+            DifferenceKind.BRANCH_CONDITION,
+            DifferenceSide(ImageId.ORIG, 0, 0x401010, Observed(value="lt_u:...")),
+            DifferenceSide(ImageId.RECOMP, 0, 0x501010, Observed(value="lt_s:...")),
         )
     )
 
@@ -928,9 +944,6 @@ def test_branch_condition_shows_the_source_comparisons_on_its_line():
     )
 
     assert enriched.difference is not None
-    assert (
-        enriched.difference.recomp.facts["source_comparisons"]
-        == "short field < 65 as int, signed"
-    )
-    assert "source_comparisons" not in enriched.difference.orig.facts
+    assert enriched.difference.recomp.source_comparisons == (comparison,)
+    assert not enriched.difference.orig.source_comparisons
     lines_db.find_line_containing_recomp_address.assert_called_with(0x501010, 0x501000)

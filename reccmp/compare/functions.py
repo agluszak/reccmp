@@ -1,24 +1,23 @@
 # pylint: disable=too-many-lines
 import dataclasses
 from dataclasses import dataclass, field
-from functools import cache
+from functools import cache, partial
 import struct
-from itertools import pairwise
 from collections.abc import Hashable
-from typing import Callable, Iterator
+from typing import Callable
+from reccmp.compare.diagnosis import EffectiveReason
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.asm.verifier import FunctionMetadata
 from reccmp.call_facts import CallFacts
-from reccmp.compare.asm.verifier import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match, compare_exact
 from reccmp.compare.asm.parse import assert_fixup, decode_function
 from reccmp.compare.asm.render import render_function_rows
 from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
     DecodedInstruction,
-    control_flow_topology_keys,
     instruction_match_key,
     instruction_semantic_key,
 )
@@ -29,11 +28,11 @@ from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
 from reccmp.compare.verification import (
     admit_effective,
-    admit_exact_analysis,
     admit_proof,
 )
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
+    Fingerprint,
     HelperCatalogEntry,
 )
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
@@ -163,9 +162,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     def _refresh_lookup_state(self) -> None:
         """Discard lookup and proof caches after catalog mutation."""
         self._call_facts_cache: dict[Hashable, CallFacts | None] | None = None
-        self._fp_cache: dict[
-            tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
-        ] = {}
+        self._fp_cache: dict[tuple[ImageId, int, int], Fingerprint | None] = {}
         self._helper_catalog: list[HelperCatalogEntry] | None = None
         self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
         self._witness_translator = None
@@ -228,6 +225,9 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             is_32bit=self.is_32bit,
             image_id=image_id,
         )
+
+    def _calls_assert(self, image_id: ImageId, addr: int) -> bool:
+        return bool(self.db.callee_names(image_id, addr) & {"_assert", "__assert"})
 
     def compare_function(
         self,
@@ -300,11 +300,11 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
 
         # Check for assert calls only if we expect to find them
         if has_asserts(self.orig_bin):
-            assert_fixup(orig_rows)
+            assert_fixup(orig_rows, partial(self._calls_assert, ImageId.ORIG))
             orig_image = orig_image.with_instructions(orig_rows)
 
         if has_asserts(self.recomp_bin):
-            assert_fixup(recomp_rows)
+            assert_fixup(recomp_rows, partial(self._calls_assert, ImageId.RECOMP))
             recomp_image = recomp_image.with_instructions(recomp_rows)
 
         line_annotations = self._collect_line_annotations(
@@ -335,19 +335,19 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         if (
             not result.analysis.is_effective
             and match.orig_addr in self.equivalence_groups
-            and _is_bare_jmp_island(orig_raw)
+            and _is_bare_jmp_island(orig_raw, match.orig_addr)
         ):
             # The island is a modeled thunk to a grouped body; its guessed
             # byte window is not the function extent this proof depends on.
             alias = admit_effective(
-                ("folded_symbol_alias",),
+                (EffectiveReason.FOLDED_SYMBOL_ALIAS,),
                 coverage_incomplete=(
                     orig_image.coverage_incomplete or recomp_image.coverage_incomplete
                 ),
                 extent_closed=True,
             )
             if alias is not None:
-                return dataclasses.replace(result, analysis=alias.analysis)
+                return dataclasses.replace(result, analysis=alias)
 
         analysis = admit_proof(
             result.analysis,
@@ -437,31 +437,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             render_pins,
         ).ratio()
         display_similarity = render_diff.ratio()
-        operands_complete = all(
-            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
-        )
-        control_flow_complete = (
-            orig.control_flow_complete and recomp.control_flow_complete
-        )
-        orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
-        recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
-        exact = admit_exact_analysis(
-            bytes_equal=(
-                orig.raw is not None
-                and recomp.raw is not None
-                and orig.raw == recomp.raw
-            ),
-            topology_equal=(
-                orig_topology is not None and orig_topology == recomp_topology
-            ),
-            keys_equal=(
-                orig_sem == recomp_sem and orig.data_shape == recomp.data_shape
-            ),
-            operands_complete=operands_complete,
-            control_flow_complete=control_flow_complete,
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        )
+        exact = compare_exact(orig, recomp)
         if exact is not None:
             analysis = exact
         else:
@@ -603,28 +579,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 )
 
         return line_annotations_monotonous
-
-    def _split_code_on_line_annotations(
-        self,
-        orig_combined: list[DecodedInstruction],
-        recomp_combined: list[DecodedInstruction],
-        line_annotations: list[ReccmpMatch],
-    ) -> Iterator[tuple[list[DecodedInstruction], list[DecodedInstruction]]]:
-        """
-        For each given `// LINE:` annotation, splits the code into the part before,
-        the annotated line, and the part after it.
-        """
-        split_points = self._compute_split_points(
-            orig_combined, recomp_combined, line_annotations
-        )
-
-        for (orig_start, recomp_start), (orig_end, recomp_end) in pairwise(
-            split_points
-        ):
-            yield (
-                orig_combined[orig_start:orig_end],
-                recomp_combined[recomp_start:recomp_end],
-            )
 
     def _compute_split_points(
         self,

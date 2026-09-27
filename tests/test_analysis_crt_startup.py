@@ -1,4 +1,5 @@
 import struct
+from types import SimpleNamespace
 import pytest
 from reccmp.analysis.crt_startup import (
     get_function_fingerprint,
@@ -12,8 +13,10 @@ from reccmp.analysis.crt_startup import (
     unwrap_jump,
     find_initializer_atexit_helpers,
 )
+from reccmp.compare.analyze import create_imports
 from reccmp.compare.db import EntityDb
 from reccmp.formats import PEImage
+from reccmp.formats.image import ImageImport
 from reccmp.types import ImageId, EntityType
 from .raw_image import RawImage
 
@@ -284,8 +287,8 @@ def test_create_match_with_elimination():
     ]
 
 
-def test_collector_small_addrs_ignored():
-    """Limit tested addresses to those large enough to be an EXE imagebase."""
+def test_collector_keeps_only_entity_addrs():
+    """The entity test alone decides which values are addresses."""
     code = (
         b"\xc6\x05\x00\x00\x00\x00\x00"  # mov byte ptr [0x0], 0
         b"\xc6\x05\x00\x10\x00\x00\x00"  # mov byte ptr [0x1000], 0
@@ -294,7 +297,7 @@ def test_collector_small_addrs_ignored():
         b"\xc3"  # ret
     )
 
-    collector = UsedAddressCollector(lambda _: True)
+    collector = UsedAddressCollector(lambda addr: addr in (0x400000, 0x10000000))
     collector.analyze(code, 0)
 
     assert collector.seen_addrs == [
@@ -313,7 +316,7 @@ def test_collector_repeated_addrs():
         b"\xc3"  # ret
     )
 
-    collector = UsedAddressCollector(lambda _: True)
+    collector = UsedAddressCollector(lambda addr: addr >= 0x400000)
     collector.analyze(code, 0)
 
     assert collector.seen_addrs == [
@@ -333,7 +336,7 @@ def test_collector_classify_float_instructions_as_read_or_write():
         b"\xc3"  # ret
     )
 
-    collector = UsedAddressCollector(lambda _: True)
+    collector = UsedAddressCollector(lambda addr: addr >= 0x400000)
     collector.analyze(code, 0)
 
     assert collector.seen_addrs == [
@@ -350,7 +353,7 @@ def test_collector_not_all_dst_operands_are_writes():
         b"\xc3"  # ret
     )
 
-    collector = UsedAddressCollector(lambda _: True)
+    collector = UsedAddressCollector(lambda addr: addr >= 0x400000)
     collector.analyze(code, 0)
 
     assert collector.seen_addrs == [
@@ -367,7 +370,7 @@ def test_collector_calls_and_jumps():
         b"\xc3"  # ret
     )
 
-    collector = UsedAddressCollector(lambda _: True)
+    collector = UsedAddressCollector(lambda addr: addr >= 0x400000)
     # Must set start addr here because CALLs and JMPs are relative.
     collector.analyze(code, 0x400000)
 
@@ -464,3 +467,29 @@ def test_find_initializer_atexit_helpers_rejects_non_atexit_call():
     assert find_initializer_atexit_helpers(
         db, ImageId.ORIG, image, iter([initializer])  # type: ignore[arg-type]
     ) == {initializer: ()}
+
+
+def test_find_initializer_atexit_helpers_through_import_thunk():
+    """A call through an import thunk reaches the IMPORT entity, whose
+    import name (not its display name) identifies ``_atexit``."""
+    initializer, helper, thunk, iat = 0x0, 0x20, 0x30, 0x40
+    rel = thunk - (initializer + 10)
+    code = (
+        b"\x68" + struct.pack("<I", helper) + b"\xe8" + struct.pack("<i", rel) + b"\xc3"
+    )
+    image = RawImage.from_memory(code + b"\x90" * 0x40)
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, initializer, type=EntityType.FUNCTION, size=len(code))
+        batch.set(ImageId.ORIG, helper, type=EntityType.FUNCTION, size=1)
+        batch.set(ImageId.ORIG, thunk, type=EntityType.IMPORT_THUNK, size=6)
+        batch.set_ref(ImageId.ORIG, thunk, ref=iat)
+    create_imports(
+        db,
+        ImageId.ORIG,
+        SimpleNamespace(imports=[ImageImport(iat, "MSVCRT.dll", name="_atexit")]),  # type: ignore[arg-type]
+    )
+
+    assert find_initializer_atexit_helpers(
+        db, ImageId.ORIG, image, iter([initializer])  # type: ignore[arg-type]
+    ) == {initializer: (helper,)}

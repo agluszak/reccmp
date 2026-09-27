@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from unittest.mock import Mock
 
-from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
+from reccmp.compare.asm.ir import ExtentKind
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diagnosis import ComparisonStatus
@@ -132,8 +132,8 @@ def test_unresolved_call_offsets_are_not_exact_or_effective():
     recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
     assert orig_rows[0].display == recomp_rows[0].display
     assert "<OFFSET" in orig_rows[0].display
-    orig_id = orig_rows[0].operands[0][1].identity
-    recomp_id = recomp_rows[0].operands[0][1].identity
+    orig_id = orig_rows[0].operands[0].ref.identity
+    recomp_id = recomp_rows[0].operands[0].ref.identity
     assert orig_id != recomp_id
 
     result = _compare_bytes(orig, recomp)
@@ -148,13 +148,14 @@ def test_unresolved_data_offsets_are_not_exact_or_effective():
     recomp = _mov_abs_ret(0x527000)
     orig_rows = decode_function(orig, 0x200, image_id=ImageId.ORIG).instructions
     recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
-    assert orig_rows[0].display != recomp_rows[0].display
-    assert "0x401000" in orig_rows[0].display
+    orig_ref = orig_rows[0].operands[1].symbols[0].ref
+    recomp_ref = recomp_rows[0].operands[1].symbols[0].ref
+    assert orig_ref.identity == ("unresolved", "orig", 0x401000)
+    assert recomp_ref.identity == ("unresolved", "recomp", 0x527000)
 
     result = _compare_bytes(orig, recomp)
     assert result.analysis.status != ComparisonStatus.EXACT
     assert result.analysis.is_effective is False
-    assert result.display_similarity < 1.0
     assert result.match_ratio < 1.0
 
 
@@ -176,26 +177,10 @@ def test_external_jcc_displacement_is_not_proof_identity():
 
 def test_estimated_extent_jmp_past_window_is_open():
     blob = bytes.fromhex("EB05")  # jmp +5, destination is start+7
-    excerpt = decode_function(blob, 0x1000).instructions
-    assert excerpt[0].branch_target == 0x1007
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.ESTIMATED,
-        )
-        is False
-    )
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is True
-    )
+    estimated = decode_function(blob, 0x1000, extent_kind=ExtentKind.ESTIMATED)
+    assert estimated.instructions[0].branch_target == 0x1007
+    assert estimated.extent_closed is False
+    assert decode_function(blob, 0x1000).extent_closed is True
 
 
 def test_unmatched_data_display_names_are_not_proof_identity():
@@ -235,8 +220,8 @@ def test_unmatched_data_display_names_are_not_proof_identity():
     assert orig_rows[0].display == recomp_rows[0].display
     orig_mem = orig_rows[0].operands[1]
     recomp_mem = recomp_rows[0].operands[1]
-    orig_ref = orig_mem[5][0][1]
-    recomp_ref = recomp_mem[5][0][1]
+    orig_ref = orig_mem.symbols[0].ref
+    recomp_ref = recomp_mem.symbols[0].ref
     assert orig_ref.identity != recomp_ref.identity
 
     result = _compare_bytes(orig, recomp, db=db)
@@ -274,3 +259,12 @@ def db_lookup(db: EntityDb, image_id: ImageId):
         lambda _addr: None,
         lambda _key, _off: "",
     )
+
+
+def test_equal_bytes_reading_unresolved_absolute_memory_are_not_exact():
+    """``mov eax, [0x401000]`` in both images reads whatever each image
+    holds there; with nothing naming the address, equal bytes prove nothing."""
+    code = _mov_abs_ret(0x401000)
+    result = _compare_bytes(code, code)
+    assert result.analysis.status != ComparisonStatus.EXACT
+    assert result.analysis.is_effective is False

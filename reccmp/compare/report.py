@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic_core import from_json
 
+from reccmp.compare.diagnosis import InconclusiveReason
 from reccmp.types import EntityType
 
 from .comparison_json import (
@@ -59,7 +60,9 @@ class ReccmpComparedEntity:
     recomp_addr_varies is False: This entity is unmatched.
     recomp_addr_varies is True:  This entity has no fixed recomp addr."""
 
-    analysis: ComparisonAnalysis = ComparisonAnalysis.inconclusive("analysis_limit")
+    analysis: ComparisonAnalysis = ComparisonAnalysis.inconclusive(
+        InconclusiveReason.ANALYSIS_LIMIT
+    )
     is_stub: bool = False
     is_library: bool = False
     rdiff: RawDiffOutput | None = None

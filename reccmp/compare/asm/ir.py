@@ -10,15 +10,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import cached_property
 from collections.abc import Hashable, Sequence
 from typing import TYPE_CHECKING
 
 from .model import Reference
+from .operand import Mem, Operand, SignedSymbol, Sym
 
 if TYPE_CHECKING:
     from .graph import FunctionGraph
 
-_STACK_SLOT = ("stack_slot",)
+
+class FlowKind(Enum):
+    """Where execution goes after an instruction."""
+
+    NORMAL = "normal"  # the next instruction
+    CALL = "call"  # a callee, then the next instruction
+    CONDITIONAL = "conditional"  # a target or the next instruction (jcc, loop)
+    JUMP = "jump"  # a target only
+    RETURN = "return"  # the caller
+    TRAP = "trap"  # nowhere this function models (int3)
 
 
 class ExtentKind(Enum):
@@ -32,27 +43,19 @@ class ExtentKind(Enum):
 class JumpTable:
     """One switch address table discovered during function decoding.
 
-    ``entries`` are ``(entry_address, target_address)`` pairs. Optional
-    ``dispatch_address`` is the ``jmp`` that indexes the table when known.
-    ``scale`` / ``entry_width`` / ``index_register`` describe the dispatch
-    addressing form; a table is only a recognized MSVC switch when the
-    dispatch is ``jmp dword ptr [index*4 + table]``.
+    ``entries`` are ``(entry_address, target_address)`` dword pairs.
+    ``dispatch_address`` and ``index_register`` are set only when decoding
+    found the ``jmp dword ptr [index*4 + table]`` that indexes the table
+    (see ``parse.switch_index_register``); only then is it a recognized switch.
     """
 
     address: int
     entries: tuple[tuple[int, int], ...]
     dispatch_address: int | None = None
-    scale: int = 4
-    entry_width: int = 4
     index_register: str | None = None
 
     def is_recognized_switch(self) -> bool:
-        return (
-            self.scale == 4
-            and self.entry_width == 4
-            and self.dispatch_address is not None
-            and self.index_register is not None
-        )
+        return self.dispatch_address is not None and self.index_register is not None
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,13 @@ class DataRegion:
 
     address: int
     data: bytes
+
+
+def instruction_ids(rows: Sequence[DecodedInstruction]) -> dict[int, int]:
+    """Instruction position by address."""
+    return {
+        row.address: index for index, row in enumerate(rows) if row.address is not None
+    }
 
 
 def rebind_local_identities(
@@ -77,11 +87,7 @@ def rebind_local_identities(
     decoded instruction or a discovered jump table. Unpaired local data
     stays side-local.
     """
-    insn_ids = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
+    insn_ids = instruction_ids(excerpt)
     table_ids = {table.address: index for index, table in enumerate(jump_tables)}
     entry_ids: dict[int, tuple[int, int]] = {}
     for table_index, table in enumerate(jump_tables):
@@ -111,25 +117,27 @@ def rebind_local_identities(
             return ("unresolved", side, abs_addr)
         return ident
 
-    def rewrite_value(value):
-        match value:
-            case Reference(display=display, identity=identity, entity_type=entity_type):
-                bound = bind(identity)
-                return (
-                    value
-                    if bound == identity
-                    else Reference(display, bound, entity_type)
+    def rewrite_reference(ref: Reference) -> Reference:
+        bound = bind(ref.identity)
+        return ref if bound == ref.identity else replace(ref, identity=bound)
+
+    def rewrite_operand(operand: Operand) -> Operand:
+        match operand:
+            case Sym(ref):
+                return Sym(rewrite_reference(ref))
+            case Mem(symbols=symbols) if symbols:
+                return replace(
+                    operand,
+                    symbols=tuple(
+                        SignedSymbol(term.sign, rewrite_reference(term.ref))
+                        for term in symbols
+                    ),
                 )
-            case tuple():
-                return tuple(rewrite_value(item) for item in value)
-            case list():
-                return [rewrite_value(item) for item in value]
-            case _:
-                return value
+        return operand
 
     rebound: list[DecodedInstruction] = []
     for row in excerpt:
-        operands = rewrite_value(row.operands)
+        operands = tuple(rewrite_operand(operand) for operand in row.operands)
         control = bind(row.control_target) if row.control_target is not None else None
         if operands != row.operands or control != row.control_target:
             rebound.append(replace(row, operands=operands, control_target=control))
@@ -163,13 +171,14 @@ class FunctionImage:
         if any(row.size <= 0 or not row.mnemonic for row in self.instructions):
             raise ValueError("FunctionImage.instructions must contain instructions")
 
-    @property
-    def instruction_ids(self) -> tuple[int, ...]:
-        """Stable program-point ids owned by this image."""
-        return tuple(
-            row.instruction_id if row.instruction_id is not None else index
-            for index, row in enumerate(self.instructions)
-        )
+    @cached_property
+    def _ids_by_address(self) -> dict[int, int]:
+        return instruction_ids(self.instructions)
+
+    def index_of(self, address: int | None) -> int | None:
+        """The instruction at ``address``, by its position; None when no
+        instruction starts there."""
+        return None if address is None else self._ids_by_address.get(address)
 
     def with_instructions(
         self, instructions: Sequence[DecodedInstruction]
@@ -208,19 +217,6 @@ class FunctionImage:
             ),
         )
 
-    @property
-    def control_flow_complete(self) -> bool:
-        """Every transfer is decoded or backed by a recognized switch table."""
-        switches = {
-            table.dispatch_address
-            for table in self.jump_tables
-            if table.is_recognized_switch()
-        }
-        return all(
-            row.control_flow_known or (row.is_jump and row.address in switches)
-            for row in self.instructions
-        )
-
 
 @dataclass(frozen=True)
 class DecodedInstruction:
@@ -232,10 +228,7 @@ class DecodedInstruction:
     size: int
     mnemonic: str
     prefix: str
-    # Typed operands: ("reg", name), ("imm", value), ("st", index),
-    # ("sym", Reference), ("mem", size, segment, reg_terms, displacement,
-    # symbols), ("opaque", ...).
-    operands: tuple
+    operands: tuple[Operand, ...]
     # Rendered once, for humans and diffs; never read back.
     display: str
     # Capstone detail facts.
@@ -244,9 +237,7 @@ class DecodedInstruction:
     reads_flags: bool = False
     writes_flags: bool = False
     accesses_memory: bool = False
-    is_jump: bool = False
-    is_call: bool = False
-    is_ret: bool = False
+    flow: FlowKind = FlowKind.NORMAL
     branch_target: int | None = None
     # False when Capstone could not report register access (CsError). Empty
     # regs_read/regs_written then means "unknown", not "touches nothing".
@@ -256,11 +247,30 @@ class DecodedInstruction:
     operand_model_complete: bool = True
     # False when jump/call target modeling is incomplete (e.g. opaque operands).
     control_flow_known: bool = True
-    # Immutable program-point identity assigned by ``FunctionImage``.
-    instruction_id: int | None = None
     # Proof identity of a jump/call destination. Display may be a relative
     # displacement; this is never that displacement.
     control_target: Hashable | None = None
+
+    @property
+    def is_jump(self) -> bool:
+        return self.flow in (FlowKind.CONDITIONAL, FlowKind.JUMP)
+
+    @property
+    def is_conditional(self) -> bool:
+        return self.flow is FlowKind.CONDITIONAL
+
+    @property
+    def is_call(self) -> bool:
+        return self.flow is FlowKind.CALL
+
+    @property
+    def is_ret(self) -> bool:
+        return self.flow is FlowKind.RETURN
+
+    @property
+    def falls_through(self) -> bool:
+        """Whether execution may continue at the next instruction."""
+        return self.flow in (FlowKind.NORMAL, FlowKind.CALL, FlowKind.CONDITIONAL)
 
 
 # Identities private to one image: across images such references match by
@@ -268,28 +278,47 @@ class DecodedInstruction:
 _SIDE_LOCAL = frozenset({"local", "unresolved", "unmatched"})
 
 
-def _freeze(value, *, semantic: bool = False) -> Hashable:
-    match value:
-        case list() | tuple():
-            return tuple(_freeze(item, semantic=semantic) for item in value)
-        case Reference(identity=identity) if semantic:
-            return identity
-        case Reference(display=display, identity=(kind, *_)) if kind in _SIDE_LOCAL:
-            return display
-        case Reference(identity=identity):
-            return identity
-        case _:
-            return value
+def _reference_key(ref: Reference, semantic: bool) -> Reference:
+    """The reference reduced to what it compares by: its identity, or for
+    scoring, the placeholder or name a side-local reference shows."""
+    match ref.identity:
+        case (str() as kind, *_) if not semantic and kind in _SIDE_LOCAL:
+            return Reference("", ("shown", ref.display))
+    return Reference("", ref.identity)
 
 
-def instruction_match_key(row: DecodedInstruction) -> Hashable:
+def operand_key(operand: Operand, *, semantic: bool = False) -> Operand:
+    """The operand with its references reduced to what they compare by."""
+    match operand:
+        case Sym(ref):
+            return Sym(_reference_key(ref, semantic))
+        case Mem(symbols=symbols) if symbols:
+            return replace(
+                operand,
+                symbols=tuple(
+                    SignedSymbol(term.sign, _reference_key(term.ref, semantic))
+                    for term in symbols
+                ),
+            )
+    return operand
+
+
+InstructionMatchKey = tuple[str, str, str, tuple[Operand, ...]]
+
+
+def instruction_match_key(row: DecodedInstruction) -> InstructionMatchKey:
     """Hashable SequenceMatcher key for scoring and the diff.
 
     A resolved reference contributes its identity; a side-local one the
     placeholder or name it shows, so ``<OFFSET1>`` on both sides lines up.
     Proofs use ``instruction_semantic_key`` instead.
     """
-    return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
+    return ("ins", row.mnemonic, row.prefix, operand_match_key(row))
+
+
+def operand_match_key(row: DecodedInstruction) -> tuple[Operand, ...]:
+    """The operands' part of ``instruction_match_key``."""
+    return tuple(operand_key(operand) for operand in row.operands)
 
 
 def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
@@ -298,194 +327,6 @@ def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
         "ins",
         row.mnemonic,
         row.prefix,
-        _freeze(row.operands, semantic=True),
+        tuple(operand_key(operand, semantic=True) for operand in row.operands),
         row.control_target,
     )
-
-
-def _operand_identity(row: DecodedInstruction) -> Hashable:
-    match row.operands:
-        case (("sym", Reference(identity=identity)), *_):
-            return identity
-        case (operand, *_):
-            return _freeze(operand, semantic=True)
-        case _:
-            return None
-
-
-def _local_destination_id(
-    target: int | None, addr_to_id: dict[int, int]
-) -> Hashable | None:
-    if target is None:
-        return None
-    return addr_to_id.get(target)
-
-
-def _branch_proof_identity(
-    row: DecodedInstruction,
-    addr_to_id: dict[int, int],
-) -> Hashable | None:
-    """Proof identity of a direct branch, never a relative displacement."""
-    local_id = _local_destination_id(row.branch_target, addr_to_id)
-    if local_id is not None:
-        return ("local", local_id)
-    if row.control_target is not None:
-        return ("ext", row.control_target)
-    if row.branch_target is not None:
-        return ("ext", ("unresolved", None, row.branch_target))
-    ident = _operand_identity(row)
-    if ident is not None:
-        return ("ext", ident)
-    return None
-
-
-def _switch_destination_key(
-    row: DecodedInstruction,
-    addr_to_id: dict[int, int],
-    jump_tables: Sequence[JumpTable],
-) -> Hashable | None:
-    for table in jump_tables:
-        if table.dispatch_address != row.address:
-            continue
-        cases = tuple(
-            (
-                ("L", addr_to_id[target])
-                if target in addr_to_id
-                else ("ext", ("unresolved", None, target))
-            )
-            for _entry, target in table.entries
-        )
-        if cases:
-            return ("switch", cases)
-    return None
-
-
-def control_flow_topology_keys(
-    excerpt: Sequence[DecodedInstruction],
-    jump_tables: Sequence[JumpTable] = (),
-) -> tuple[Hashable, ...] | None:
-    """Per-row exact control-flow identities, or None if a transfer is unmodeled.
-
-    Ordinary instructions contribute ``()``. Local branches contribute the
-    destination instruction id in this excerpt. External branches contribute
-    a ``ControlTarget`` identity (entity, import, unmatched, or side-local
-    address) — never a relative displacement. Switch tables contribute the
-    tuple of case destination ids.
-    """
-    addr_to_id = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
-    keys: list[Hashable] = []
-    for row in excerpt:
-        if row.is_call:
-            keys.append(("call", _operand_identity(row)))
-            continue
-        if not (row.is_jump or row.is_ret):
-            keys.append(())
-            continue
-        if row.is_ret:
-            keys.append(("ret",))
-            continue
-        proof = _branch_proof_identity(row, addr_to_id)
-        if isinstance(proof, tuple) and proof[0] == "local":
-            keys.append(proof)
-            continue
-        if proof is not None and row.branch_target is not None:
-            keys.append(proof)
-            continue
-        switch_key = _switch_destination_key(row, addr_to_id, jump_tables)
-        if switch_key is not None:
-            keys.append(switch_key)
-            continue
-        return None
-    return tuple(keys)
-
-
-def local_destination_keys(
-    excerpt: Sequence[DecodedInstruction],
-    *,
-    start_addr: int,
-    extent: int,
-) -> tuple[Hashable, ...] | None:
-    """Per-row instruction ids of local branch and switch-case destinations.
-
-    Rows without a local destination contribute ``()``. Displays show local
-    branches as byte displacements, which identify the same instruction on
-    both sides only if every crossed instruction has the same encoding
-    length; these keys make the destination explicit. Returns None when a
-    destination falls inside the extent but not on an instruction boundary.
-    """
-    addr_to_id = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
-
-    def key(target: int | None, tag: str) -> Hashable | None:
-        if target is None or not start_addr <= target < start_addr + extent:
-            return ()
-        local_id = addr_to_id.get(target)
-        return None if local_id is None else (tag, local_id)
-
-    keys: list[Hashable] = []
-    for row in excerpt:
-        if row.is_jump:
-            item = key(row.branch_target, "local")
-        else:
-            item = ()
-        if item is None:
-            return None
-        keys.append(item)
-    return tuple(keys)
-
-
-def compute_extent_closed(
-    excerpt: Sequence[DecodedInstruction],
-    *,
-    start_addr: int,
-    extent: int,
-    coverage_incomplete: bool = False,
-    jump_tables: Sequence[JumpTable] = (),
-    extent_kind: ExtentKind = ExtentKind.KNOWN,
-) -> bool:
-    # pylint: disable=import-outside-toplevel
-    """Extent closure from the same control-flow graph used by comparison."""
-    from .graph import build_function_graph
-
-    return build_function_graph(
-        excerpt, jump_tables, start_addr=start_addr, extent=extent
-    ).extent_closed(extent_kind=extent_kind, coverage_incomplete=coverage_incomplete)
-
-
-def _normalize_operand_stack(operand) -> Hashable:
-    """An operand with a stack slot's displacement erased."""
-    match operand:
-        case ("mem", size, seg, reg_terms, _, ()) if {
-            name for name, _scale in reg_terms
-        } & {"ebp", "esp"}:
-            return ("mem", size, seg, _freeze(reg_terms), _STACK_SLOT, ())
-        case _:
-            return _freeze(operand)
-
-
-def stack_normalized_key(row: DecodedInstruction) -> Hashable:
-    """The match key of a row with its stack slots' displacements erased."""
-    operands = tuple(_normalize_operand_stack(op) for op in row.operands)
-    return ("ins", row.mnemonic, row.prefix, operands)
-
-
-def local_branch_targets(rows: Sequence[DecodedInstruction]) -> list[int | None]:
-    """Each row's local branch destination, as the index of the row it
-    reaches; None for a row that is not a jump inside the rows (calls are
-    not local control flow)."""
-    index_of = {row.address: i for i, row in enumerate(rows) if row.address is not None}
-    return [
-        (
-            index_of.get(row.branch_target)
-            if row.branch_target is not None and not row.is_call
-            else None
-        )
-        for row in rows
-    ]

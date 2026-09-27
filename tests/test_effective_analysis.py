@@ -1,5 +1,10 @@
 import difflib
 from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.asm.ir import instruction_match_key
+from reccmp.compare.asm.model import ResolvedAddress
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.verifier import verify_effective_match
+from reccmp.compare.asm.verifier.relocation import undo_relocations
 from tests.asm_rows import analyze_effective_match
 
 
@@ -606,244 +611,129 @@ def test_commutative_x87_chain_swap_mov_after_fld_invalid():
 
 # The following tests cover the dependency-aware relocate_instructions:
 # an instruction may only move across instructions it does not depend on.
+# They are machine code: register and flag effects come from Capstone.
 
 
-def _diff_and_match(orig_asm: list[str], recomp_asm: list[str]) -> bool:
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    return is_effective_match(diff.get_opcodes(), orig_asm, recomp_asm)
+def _resolve_global(addr: int, exact: bool = False, indirect: bool = False):
+    del exact, indirect
+    return ResolvedAddress(f"g_{addr:x}", ("entity", addr, 0))
+
+
+def _relocation_match(orig_hex: str, recomp_hex: str) -> bool:
+    """Whether undoing the relocations in two byte sequences makes them
+    verify in lockstep; addresses outside the bodies name the same globals."""
+    orig, recomp = (
+        decode_function(bytes.fromhex(code), start, resolver=_resolve_global)
+        for code, start in ((orig_hex, 0x1000), (recomp_hex, 0x2000))
+    )
+    codes = difflib.SequenceMatcher(
+        None,
+        [instruction_match_key(row) for row in orig.instructions],
+        [instruction_match_key(row) for row in recomp.instructions],
+    ).get_opcodes()
+    relocated = undo_relocations(codes, orig.instructions, recomp.instructions)
+    return relocated is not None and verify_effective_match(
+        orig.instructions, relocated
+    )
+
+
+_CALL_GLOBAL = "ff1500005000"  # call dword ptr [0x500000]
 
 
 def test_relocate_independent_load():
     """Two independent loads scheduled in opposite order."""
-    orig_asm = [
-        "mov eax, dword ptr [ebp - 4]",
-        "mov ecx, dword ptr [ebp - 8]",
-        "push ecx",
-        "push eax",
-        "call <OFFSET1>",
-    ]
-    recomp_asm = [
-        "mov ecx, dword ptr [ebp - 8]",
-        "mov eax, dword ptr [ebp - 4]",
-        "push ecx",
-        "push eax",
-        "call <OFFSET1>",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is True
+    load_eax, load_ecx = "8b45fc", "8b4df8"  # mov eax/ecx, [ebp - 4/8]
+    tail = "51" + "50" + _CALL_GLOBAL + "c3"  # push ecx; push eax; call; ret
+    assert _relocation_match(load_eax + load_ecx + tail, load_ecx + load_eax + tail)
 
 
 def test_relocate_rejects_store_across_aliasing_load():
     """A store may not move across a load of the same address."""
-    orig_asm = [
-        "mov dword ptr [ebp - 4], eax",
-        "mov ecx, dword ptr [ebp - 4]",
-        "push ecx",
-        "push esi",
-    ]
-    recomp_asm = [
-        "mov ecx, dword ptr [ebp - 4]",
-        "mov dword ptr [ebp - 4], eax",
-        "push ecx",
-        "push esi",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is False
+    store, load = "8945fc", "8b4dfc"  # mov [ebp - 4], eax; mov ecx, [ebp - 4]
+    tail = "51" + "56" + "c3"  # push ecx; push esi; ret
+    assert not _relocation_match(store + load + tail, load + store + tail)
 
 
 def test_relocate_store_across_disjoint_frame_slot():
     """Stores to provably distinct ebp frame slots may reorder."""
-    orig_asm = [
-        "mov dword ptr [ebp - 4], eax",
-        "mov dword ptr [ebp - 8], ecx",
-        "push esi",
-        "push edi",
-    ]
-    recomp_asm = [
-        "mov dword ptr [ebp - 8], ecx",
-        "mov dword ptr [ebp - 4], eax",
-        "push esi",
-        "push edi",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is True
+    first, second = "8945fc", "894df8"  # mov [ebp - 4], eax; mov [ebp - 8], ecx
+    tail = "56" + "57" + "c3"  # push esi; push edi; ret
+    assert _relocation_match(first + second + tail, second + first + tail)
 
 
 def test_relocate_rejects_move_across_call():
     """A call is a barrier: memory and registers may change."""
-    orig_asm = [
-        "mov eax, dword ptr [g_state (DATA)]",
-        "call <OFFSET1>",
-        "push eax",
-        "push esi",
-    ]
-    recomp_asm = [
-        "call <OFFSET1>",
-        "mov eax, dword ptr [g_state (DATA)]",
-        "push eax",
-        "push esi",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is False
+    load = "a100004000"  # mov eax, [0x400000]
+    tail = "50" + "56" + "c3"  # push eax; push esi; ret
+    assert not _relocation_match(load + _CALL_GLOBAL + tail, _CALL_GLOBAL + load + tail)
 
 
 def test_relocate_rejects_flags_consumed_after_move():
     """Both the moved instruction and a crossed instruction write flags,
     and a jump reads them afterward: the move changes the branch."""
-    orig_asm = [
-        "cmp eax, 1",
-        "add ecx, 2",
-        "je 0x8",
-        "push esi",
-    ]
-    recomp_asm = [
-        "add ecx, 2",
-        "cmp eax, 1",
-        "je 0x8",
-        "push esi",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is False
+    cmp, add = "83f801", "83c102"  # cmp eax, 1; add ecx, 2
+    tail = "7401" + "56" + "c3"  # je +1; push esi; ret
+    assert not _relocation_match(cmp + add + tail, add + cmp + tail)
 
 
 def test_relocate_rejects_x87_reorder():
     """x87 instructions depend on the fp stack order: fadd and fmul on
     st(0) do not commute with each other."""
-    orig_asm = [
-        "fadd dword ptr [g_floatA (DATA)]",
-        "fmul dword ptr [g_floatB (DATA)]",
-        "pop esi",
-        "pop edi",
-    ]
-    recomp_asm = [
-        "fmul dword ptr [g_floatB (DATA)]",
-        "fadd dword ptr [g_floatA (DATA)]",
-        "pop esi",
-        "pop edi",
-    ]
-    assert _diff_and_match(orig_asm, recomp_asm) is False
+    fadd, fmul = "d80500004000", "d80d04004000"  # fadd/fmul dword ptr [global]
+    tail = "5e" + "5f" + "c3"  # pop esi; pop edi; ret
+    assert not _relocation_match(fadd + fmul + tail, fmul + fadd + tail)
 
 
-def test_relocate_across_forward_jcc_with_addresses():
+def test_relocate_across_forward_jcc():
     """A store may cross a forward conditional jump whose target lies
     within the crossed region (both placements execute it on both paths),
     plus an inc that is provably disjoint through the lea-resolved base.
-    Requires instruction addresses. (Imperialism 0x4dd1b0 shape)"""
-    orig_asm = [
-        "lea esi, [ebx + 0x1c6]",
-        "mov ax, word ptr [esi + 0x8a]",
-        "cmp ax, 0xffff",
-        "mov word ptr [esi], ax",
-        "jne 0x7",
-        "inc word ptr [ebx + 0xb0]",
-        "mov ecx, ebx",
-    ]
-    recomp_asm = [
-        "lea esi, [ebx + 0x1c6]",
-        "mov ax, word ptr [esi + 0x8a]",
-        "cmp ax, 0xffff",
-        "jne 0x7",
-        "inc word ptr [ebx + 0xb0]",
-        "mov ecx, ebx",
-        "mov word ptr [esi], ax",
-    ]
-    orig_addrs = [0, 6, 13, 17, 20, 22, 29]
-    recomp_addrs = [0x2000, 0x2006, 0x200D, 0x2011, 0x2013, 0x201A, 0x201C]
-
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    codes = diff.get_opcodes()
-
-    # Without addresses the jump displacement cannot be resolved: the jcc
-    # stays a barrier and the match is conservatively rejected.
-    assert is_effective_match(codes, orig_asm, recomp_asm) is False
-    assert (
-        is_effective_match(
-            codes,
-            orig_asm,
-            recomp_asm,
-            orig_addrs=orig_addrs,
-            recomp_addrs=recomp_addrs,
-        )
-        is True
+    (Imperialism 0x4dd1b0 shape)"""
+    # lea esi, [ebx + 0x1c6]; mov ax, [esi + 0x8a]; cmp ax, -1
+    head = "8db3c6010000" + "668b868a000000" + "6683f8ff"
+    store = "668906"  # mov word ptr [esi], ax
+    # jne +7 (over the inc); inc word ptr [ebx + 0xb0]; mov ecx, ebx
+    crossed = "7507" + "66ff83b0000000" + "89d9"
+    assert _relocation_match(
+        head + store + crossed + "c3", head + crossed + store + "c3"
     )
 
 
 def test_relocate_rejects_backward_jcc():
     """A backward jump is a loop edge: never cross it."""
-    orig_asm = [
-        "mov dword ptr [esi], 1",
-        "jne -0x10",
-        "mov dword ptr [edi], 2",
-        "push eax",
-    ]
-    recomp_asm = [
-        "jne -0x10",
-        "mov dword ptr [edi], 2",
-        "mov dword ptr [esi], 1",
-        "push eax",
-    ]
-    orig_addrs = [0, 6, 8, 14]
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    assert (
-        is_effective_match(
-            diff.get_opcodes(), orig_asm, recomp_asm, orig_addrs=orig_addrs
-        )
-        is False
-    )
+    # mov dword ptr [esi], 1; jne -0x10; mov dword ptr [edi], 2; push eax; ret
+    orig = "c70601000000" + "75f0" + "c70702000000" + "50" + "c3"
+    recomp = "75f0" + "c70702000000" + "c70601000000" + "50" + "c3"
+    assert not _relocation_match(orig, recomp)
 
 
 def test_relocate_rejects_jcc_target_beyond_move():
     """A forward jump whose target lies beyond the moved instruction's new
     position would skip the instruction on the taken path."""
-    orig_asm = [
-        "mov dword ptr [esi], 1",
-        "jne 0x14",
-        "mov dword ptr [edi], 2",
-        "push eax",
-    ]
-    recomp_asm = [
-        "jne 0x14",
-        "mov dword ptr [edi], 2",
-        "mov dword ptr [esi], 1",
-        "push eax",
-    ]
-    orig_addrs = [0, 6, 8, 14]
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    assert (
-        is_effective_match(
-            diff.get_opcodes(), orig_asm, recomp_asm, orig_addrs=orig_addrs
-        )
-        is False
-    )
+    # mov dword ptr [esi], 1; jne ret; mov dword ptr [edi], 2; push eax; ret
+    orig = "c70601000000" + "7507" + "c70702000000" + "50" + "c3"
+    recomp = "750d" + "c70702000000" + "c70601000000" + "50" + "c3"
+    assert not _relocation_match(orig, recomp)
 
 
 def test_relocate_store_across_push():
     """A store through an unknown pointer must not cross a push: nothing
     proves the pointer cannot equal the pushed slot's address."""
-    orig_asm = [
-        "mov dword ptr [esi + 8], eax",
-        "push ecx",
-        "push edx",
-        "call <OFFSET1>",
-    ]
-    recomp_asm = [
-        "push ecx",
-        "push edx",
-        "mov dword ptr [esi + 8], eax",
-        "call <OFFSET1>",
-    ]
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    assert is_effective_match(diff.get_opcodes(), orig_asm, recomp_asm) is False
+    store, pushes = "894608", "51" + "52"  # mov [esi + 8], eax; push ecx; push edx
+    tail = _CALL_GLOBAL + "c3"
+    assert not _relocation_match(store + pushes + tail, pushes + store + tail)
 
 
 def test_relocate_rejects_esp_read_across_push():
     """An esp-relative read may not cross a push that writes the same slot."""
-    orig_asm = [
-        "mov eax, dword ptr [esp - 4]",
-        "push ecx",
-        "push eax",
-        "call <OFFSET1>",
-    ]
-    recomp_asm = [
-        "push ecx",
-        "mov eax, dword ptr [esp - 4]",
-        "push eax",
-        "call <OFFSET1>",
-    ]
-    diff = difflib.SequenceMatcher(None, orig_asm, recomp_asm)
-    assert is_effective_match(diff.get_opcodes(), orig_asm, recomp_asm) is False
+    load, push = "8b4424fc", "51"  # mov eax, [esp - 4]; push ecx
+    tail = "50" + _CALL_GLOBAL + "c3"  # push eax; call; ret
+    assert not _relocation_match(load + push + tail, push + load + tail)
+
+
+def test_diff_codes_must_cover_every_row():
+    """Opcodes that leave rows unpaired prove nothing about those rows."""
+    orig = decode_function(bytes.fromhex("b801000000c3"), 0x1000).instructions
+    recomp = decode_function(bytes.fromhex("b802000000c3"), 0x2000).instructions
+    assert not verify_effective_match(orig, recomp, [])
+    assert not verify_effective_match(orig, recomp, [("equal", 1, 2, 1, 2)])

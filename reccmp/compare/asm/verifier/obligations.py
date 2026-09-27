@@ -4,18 +4,32 @@ swaps, frame slots and the end-of-run admission checklist."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.model import FAMILY_REGISTER, REGISTERS, Reject
+from reccmp.compare.asm.operand import Mem, Reg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
+    Constant,
+    Init,
+    Insert,
+    Load,
+    MemoryClobber,
+    OpaqueKind,
+    OpaqueValue,
+    RegisterPart,
+    Resync,
+    ScratchStore,
     Value,
+    X87Slot,
     mem_disjoint,
     unwind_spadd,
 )
 from reccmp.compare.asm.verifier.evidence import (
-    diagnostic_summaries,
     record_observable_difference,
 )
+from reccmp.compare.asm.verifier.render import render
 from reccmp.compare.asm.verifier.semantics import (
     esp_add,
     execute,
@@ -23,12 +37,18 @@ from reccmp.compare.asm.verifier.semantics import (
     read_operand,
 )
 from reccmp.compare.asm.verifier.state import (
+    Branch,
+    CalleeSaveSubstitution,
+    JCC_MNEMONICS,
+    LoadObligation,
+    Observation,
+    ScratchPush,
+    Store,
+    STRING_OPS,
+    is_scratch,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
-    CONTROL_TAGS,
     FAMILIES,
-    JCC_MNEMONICS,
-    STRING_OPS,
     WIDTHS,
     Context,
     SideState,
@@ -37,9 +57,17 @@ from reccmp.compare.asm.verifier.state import (
     frame_pointer_value,
     guard_state_size,
     memory_load_tag,
+    observation_values,
     vsort,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import (
+    AnalysisRecorder,
+    DifferenceKind,
+    EffectiveReason,
+    InconclusiveReason,
+    Observed,
+)
+from reccmp.types import ImageId
 
 # ---------------------------------------------------------------------------
 # Lockstep driver
@@ -48,11 +76,10 @@ from reccmp.compare.diagnosis import AnalysisRecorder
 def switch_index_observation(state: SideState, ins: DecodedInstruction) -> tuple:
     """Index register values that select a recognized switch-table case."""
     op = ins.operands[0]
-    assert isinstance(op, tuple) and op[0] == "mem"
-    reg_terms = op[3]
+    assert isinstance(op, Mem)
     return tuple(
-        (scale, state.read_reg(reg))
-        for reg, scale in sorted(reg_terms, key=lambda t: (-t[1], t[0]))
+        (term.scale, state.read_reg(term.register))
+        for term in sorted(op.terms, key=lambda t: (-t.scale, t.register))
     )
 
 
@@ -77,12 +104,14 @@ def resync(states: tuple[SideState, SideState], idx: int, ctx: Context) -> None:
     paired value so no stale claims survive."""
     for state in states:
         for family in FAMILIES:
-            state.regs[family] = ("resync", idx, family)
-        state.flags = ("resync_flags", idx)
-        state.carry = ("resync_cf", idx)
-        state.fpu_flags = ("resync_fpuflags", idx)
-        state.x87.known = [("resync_st", idx, i) for i in range(len(state.x87.known))]
-    commit_clobber(ctx, ("resync", idx))
+            state.regs[family] = Resync(idx, family)
+        state.flags = Resync(idx, "flags")
+        state.carry = Resync(idx, "carry")
+        state.fpu_flags = Resync(idx, "fpuflags")
+        state.x87.known = [
+            Resync(idx, X87Slot(index)) for index in range(len(state.x87.known))
+        ]
+    commit_clobber(ctx, MemoryClobber(Resync(idx, "memory")))
 
 
 def _contained(value: Value, ctx: Context) -> bool:
@@ -90,7 +119,7 @@ def _contained(value: Value, ctx: Context) -> bool:
 
 
 def _dead_or_contained(value: Value, ctx: Context) -> bool:
-    return _is_scratch(value) or _contained(value, ctx)
+    return is_scratch(value) or _contained(value, ctx)
 
 
 def _assembled(value: Value, ctx: Context) -> bool:
@@ -98,17 +127,23 @@ def _assembled(value: Value, ctx: Context) -> bool:
     (`and al, 1` on a loaded value: the load and the new byte were observed;
     or a constant under the new byte), so the register holds nothing
     unobserved."""
-    if not (
-        isinstance(value, tuple)
-        and len(value) == 3
-        and str(value[0]).startswith("ins_")
-    ):
+    if not isinstance(value, Insert):
         return False
-    old = value[1]
-    old_ok = (isinstance(old, tuple) and old[:1] == ("imm",)) or _dead_or_contained(
-        old, ctx
-    )
-    return old_ok and _dead_or_contained(value[2], ctx)
+    old_ok = isinstance(value.old, Constant) or _dead_or_contained(value.old, ctx)
+    return old_ok and _dead_or_contained(value.new, ctx)
+
+
+def _returned_insert(value: Value, ctx: Context) -> bool:
+    """eax holding a returned ``al`` or ``ax`` (see FunctionMetadata's
+    return_kind) inserted over other bits: the bits outside the return are
+    dead, and the returned part is already observed."""
+    kind = ctx.metadata.return_kind if ctx.metadata is not None else "unknown"
+    match value:
+        case Insert(RegisterPart.LOW8, _, part) if kind == "i8":
+            return _contained(part, ctx)
+        case Insert(RegisterPart.LOW16, _, part) if kind == "i16":
+            return _contained(part, ctx)
+    return False
 
 
 def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
@@ -117,20 +152,29 @@ def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
     garbage as long as they came from consumed computations or are a
     constant (`xor eax, eax` before `setcc al`)."""
     return (
-        isinstance(value_o, tuple)
-        and isinstance(value_r, tuple)
-        and len(value_o) == 3
-        and len(value_r) == 3
-        and value_o[0] == value_r[0]
-        and str(value_o[0]).startswith("ins_")
-        and value_o[2] == value_r[2]
-        and _old_bits_ok(value_o[1], ctx)
-        and _old_bits_ok(value_r[1], ctx)
+        isinstance(value_o, Insert)
+        and isinstance(value_r, Insert)
+        and value_o.part is value_r.part
+        and value_o.new == value_r.new
+        and _old_bits_ok(value_o.old, ctx)
+        and _old_bits_ok(value_r.old, ctx)
     )
 
 
+def _inserted_over(value: Value, base: Value, ctx: Context) -> bool:
+    """``value`` is ``base`` with parts overwritten by constants or observed
+    values (`mov cl, [...]` over the other side's ecx): the two differ in
+    nothing unobserved."""
+    match value:
+        case _ if value == base:
+            return True
+        case Insert(old=old, new=new):
+            return _old_bits_ok(new, ctx) and _inserted_over(old, base, ctx)
+    return False
+
+
 def _old_bits_ok(value: Value, ctx: Context) -> bool:
-    is_constant = isinstance(value, tuple) and value[:1] == ("imm",)
+    is_constant = isinstance(value, Constant)
     return is_constant or _dead_or_contained(value, ctx)
 
 
@@ -155,73 +199,25 @@ def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> b
         if value_o == value_r:
             continue
         if (
-            isinstance(value_o, tuple)
-            and isinstance(value_r, tuple)
-            and len(value_o) == 3
-            and len(value_r) == 3
-            and value_o[0] == value_r[0]
-            and str(value_o[0]).startswith("ins_")
-            and value_o[2] == value_r[2]
-            and _is_scratch(value_o[1])
-            and _is_scratch(value_r[1])
+            isinstance(value_o, Insert)
+            and isinstance(value_r, Insert)
+            and value_o.part is value_r.part
+            and value_o.new == value_r.new
+            and is_scratch(value_o.old)
+            and is_scratch(value_r.old)
         ):
             continue
-        if _is_scratch(value_o) and _is_scratch(value_r):
+        if is_scratch(value_o) and is_scratch(value_r):
             continue
-        if family in CALLER_SAVED and (_is_scratch(value_o) or _is_scratch(value_r)):
+        if family in CALLER_SAVED and (is_scratch(value_o) or is_scratch(value_r)):
             continue
         return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
     for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-        if slot_o != slot_r and not (_is_scratch(slot_o) and _is_scratch(slot_r)):
+        if slot_o != slot_r and not (is_scratch(slot_o) and is_scratch(slot_r)):
             return False
     return True
-
-
-def _control_destination(
-    raw_operand: object,
-    row: DecodedInstruction,
-    addrs: list[int | None],
-) -> object:
-    """Prefer local instruction-id; never a relative displacement."""
-    if row.branch_target is not None:
-        try:
-            return ("L", addrs.index(row.branch_target))
-        except ValueError:
-            pass
-    if row.control_target is not None:
-        return ("ext", row.control_target)
-    if row.branch_target is not None:
-        return ("ext", ("unresolved", None, row.branch_target))
-    return raw_operand
-
-
-def rewrite_control_observables(
-    obs: list, row: DecodedInstruction, addrs: list[int | None]
-) -> None:
-    """A branch observation's destination as a row index or an identity."""
-    for index, entry in enumerate(obs):
-        if entry and entry[0] in CONTROL_TAGS - {"jmpind"}:
-            obs[index] = (*entry[:-1], _control_destination(entry[-1], row, addrs))
-
-
-def _is_scratch(value: Value) -> bool:
-    """Values with no computational content: the untouched initial register
-    value, or the clobbered result of a call or string instruction. If such
-    a value is left in a caller-saved register while the other side holds
-    something else, the register is simply dead."""
-    return (
-        isinstance(value, tuple)
-        and bool(value)
-        and value[0]
-        in (
-            "init",
-            "callret",
-            "strres",
-            "resync",
-        )
-    )
 
 
 CALLEE_SAVED = ("b", "si", "di")
@@ -233,7 +229,8 @@ def aligned_indices(
     """Pair up the two sequences (by index) for lockstep verification.
     Without diff opcodes, the sequences must have equal length. With them,
     unmatched insertions/deletions become one-sided entries, which the
-    verifier only accepts for whitelisted unobservable instructions."""
+    verifier only accepts for whitelisted unobservable instructions. None
+    unless every row of both sequences is visited once, in order."""
     if codes is None:
         if orig_len != recomp_len:
             return None
@@ -249,6 +246,10 @@ def aligned_indices(
             result.extend((i, None) for i in range(i1, i2))
         elif tag == "insert":
             result.extend((None, j) for j in range(j1, j2))
+    orig_order = [i for i, _ in result if i is not None]
+    recomp_order = [j for _, j in result if j is not None]
+    if orig_order != list(range(orig_len)) or recomp_order != list(range(recomp_len)):
+        return None
     return result
 
 
@@ -333,12 +334,12 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
         return False
 
     for family in written_families:
-        value = ("metastep", idx, family)
+        value = OpaqueValue(OpaqueKind.META_RESULT, idx, family)
         orig.regs[family] = value
         recomp.regs[family] = value
     if meta.writes_flags:
-        orig.flags = recomp.flags = ("metastep_flags", idx)
-        orig.carry = recomp.carry = ("metastep_cf", idx)
+        orig.flags = recomp.flags = OpaqueValue(OpaqueKind.META_FLAGS, idx)
+        orig.carry = recomp.carry = OpaqueValue(OpaqueKind.META_CARRY, idx)
 
     return True
 
@@ -346,7 +347,7 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
 # One-sided instructions that are never unobservable: control flow, the
 # stack discipline (push/pop/leave/enter), x87 (stack-shape effects), and
 # instructions that can fault on operand values (division).
-_ONE_SIDED_BLACKLIST = frozenset(
+_NEVER_ONE_SIDED = frozenset(
     {"leave", "enter", "call", "ret", "jmp", "int3", "div", "idiv"}
     | set(JCC_MNEMONICS)
     | {"loop", "loope", "loopne", "jcxz", "jecxz"}
@@ -354,7 +355,18 @@ _ONE_SIDED_BLACKLIST = frozenset(
 )
 
 
-def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
+def may_be_one_sided(ins: DecodedInstruction) -> bool:
+    """Whether the verifier may accept ``ins`` on one side only (see
+    obligations.one_sided_ok): never control flow, stack frame setup, x87,
+    string or prefixed instructions, or potentially-faulting division."""
+    return not (
+        ins.prefix or ins.mnemonic in _NEVER_ONE_SIDED or ins.mnemonic.startswith("f")
+    )
+
+
+def _one_sided_push_ok(
+    side: ImageId, state: SideState, ctx: Context, ins, idx: int
+) -> bool:
     """One side spills a register the other side never needed (a save
     around a region, or a scratch spill). The slot is private: it lies
     strictly below the entry stack pointer, no frame pointer has escaped,
@@ -364,49 +376,52 @@ def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     value = read_operand(state, ctx, ins.operands[0])
     new_esp = esp_add(state.read_reg("esp"), -4)
     root, offset = unwind_spadd(new_esp)
-    if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
+    if root != Init("sp") or offset >= 0 or ctx.stack_escaped:
         return False
     if frame_pointer_value(value):
         return False
-    obs = [("store", new_esp, "stack", value)]
+    obs: list[Observation] = [Store(new_esp, "stack", value)]
     state.write_reg("esp", new_esp)
-    tag = ("mem", ("scratch", idx), 0)
+    tag = ScratchStore(idx)
     ctx.mem_events.append((tag, (new_esp, 4, "push")))
     ctx.gen = tag
-    ctx.scratch_pushes.append([state, offset, value, tag])
+    ctx.scratch_pushes.append(ScratchPush(side, offset, value, tag))
     invalidate_save_slots(ctx, obs)
-    ctx.categories.add("callee_save_substitution")
+    ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
     return True
 
 
-def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
+def _one_sided_pop_ok(side: ImageId, state: SideState, ctx: Context, ins) -> bool:
     """Reclaim of a one-sided spill (or a plain scratch read): only from
     the function's own private scratch. When it provably reads back an
     intact one-sided push, the popped register regains the exact pushed
     value, so callee-save round-trips stay externally clean."""
-    if ins.operands[0][0] != "reg":
-        return False
+    match ins.operands[0]:
+        case Reg(name):
+            register = name
+        case _:
+            return False
     esp = state.read_reg("esp")
     root, offset = unwind_spadd(esp)
-    if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
+    if root != Init("sp") or offset >= 0 or ctx.stack_escaped:
         return False
     tag = memory_load_tag(ctx, esp, 4, "pop")
-    value: Value = ("load", esp, "stack", tag)
+    value: Value = Load(esp, "stack", tag)
     for k, record in enumerate(ctx.scratch_pushes):
-        if record[0] is state and record[1] == offset:
-            if record[3] == tag:
-                value = record[2]
+        if record.side is side and record.offset == offset:
+            if record.tag == tag:
+                value = record.value
             del ctx.scratch_pushes[k]
             break
-    state.write_reg(ins.operands[0][1], value)
+    state.write_reg(register, value)
     state.write_reg("esp", esp_add(esp, 4))
-    ctx.categories.add("callee_save_substitution")
+    ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
     return True
 
 
 def one_sided_ok(
+    side: ImageId,
     state: SideState,
-    other: SideState,
     ctx: Context,
     idx: int,
     ins: DecodedInstruction,
@@ -420,24 +435,22 @@ def one_sided_ok(
     read the same address at the same memory generation somewhere in the
     same verification scope (the folded-load case). Control flow, stack
     adjustments, x87 and potentially-faulting arithmetic stay excluded."""
-    if ins.prefix or ins.mnemonic in _ONE_SIDED_BLACKLIST:
+    if not may_be_one_sided(ins):
         return False
     if ins.mnemonic == "nop":
-        ctx.categories.add("dead_operation")
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
         return True
-    if ins.mnemonic.startswith("f"):
-        return False
     try:
         # With the frame promoted, a push or pop is a slot like any other.
         if state.frame is None and ins.mnemonic == "push" and len(ins.operands) == 1:
-            return _one_sided_push_ok(state, ctx, ins, idx)
+            return _one_sided_push_ok(side, state, ctx, ins, idx)
         if state.frame is None and ins.mnemonic == "pop" and len(ins.operands) == 1:
-            return _one_sided_pop_ok(state, ctx, ins)
+            return _one_sided_pop_ok(side, state, ctx, ins)
     except (Reject, IndexError, KeyError, ValueError, TypeError):
         return False
     reads_before = len(state.load_log)
     log_snapshot = set(state.load_log) if state.load_log else set()
-    obs: list = []
+    obs: list[Observation] = []
     try:
         execute(state, ctx, idx, ins, obs)
         guard_state_size(state, ctx)
@@ -446,20 +459,23 @@ def one_sided_ok(
     if obs:
         return False
     if len(state.load_log) > reads_before:
-        for entry in state.load_log - log_snapshot:
-            ctx.load_obligations.append((other, *entry))
-        ctx.categories.add("load_folding")
+        other_side = ImageId.RECOMP if side is ImageId.ORIG else ImageId.ORIG
+        for address, generation in state.load_log - log_snapshot:
+            ctx.load_obligations.append(LoadObligation(other_side, address, generation))
+        ctx.categories.add(EffectiveReason.LOAD_FOLDING)
     else:
-        ctx.categories.add("dead_operation")
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
     return True
 
 
-def _load_obligations_met(ctx: Context) -> bool:
+def _load_obligations_met(ctx: Context, orig: SideState, recomp: SideState) -> bool:
     """Discharge the trap-parity obligations of one-sided memory reads:
     the other side must have read the same address at the same memory
     generation somewhere in the current verification scope."""
+    states = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
     return all(
-        (address, gen) in other.load_log for other, address, gen in ctx.load_obligations
+        (obligation.address, obligation.generation) in states[obligation.side].load_log
+        for obligation in ctx.load_obligations
     )
 
 
@@ -494,44 +510,52 @@ def discharge_run_obligations(
             continue
         if family not in CALLER_SAVED:
             if recorder is not None:
-                summary_o, summary_r = diagnostic_summaries(value_o, value_r)
                 recorder.record_difference(
-                    "preserved_state",
+                    DifferenceKind.PRESERVED_STATE,
                     last_index_o,
                     last_index_r,
-                    {"register": family, "value": summary_o},
-                    {"register": family, "value": summary_r},
+                    Observed(value=render(value_o), register=FAMILY_REGISTER[family]),
+                    Observed(value=render(value_r), register=FAMILY_REGISTER[family]),
                 )
             return False
-        if _ins_split_ok(value_o, value_r, ctx):
+        if (
+            _ins_split_ok(value_o, value_r, ctx)
+            or _inserted_over(value_o, value_r, ctx)
+            or _inserted_over(value_r, value_o, ctx)
+        ):
             dead_register_difference = True
             continue
         for value in (value_o, value_r):
-            if _is_scratch(value):
+            if is_scratch(value):
                 dead_register_difference = True
+                continue
+            if family == "a" and _returned_insert(value, ctx):
                 continue
             if not (_contained(value, ctx) or _assembled(value, ctx)):
                 if recorder is not None:
-                    recorder.mark_inconclusive("analysis_limit")
+                    recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
                 return False
             dead_register_difference = True
-    if dead_register_difference and "register_allocation" not in ctx.categories:
-        ctx.categories.add("dead_operation")
+    if (
+        dead_register_difference
+        and EffectiveReason.REGISTER_ALLOCATION not in ctx.categories
+    ):
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
 
     if ctx.save_stack:
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
-    if not _load_obligations_met(ctx):
+    if not _load_obligations_met(ctx, orig, recomp):
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
     if not _slots_consistent(orig, recomp):
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
     if _uses_frame_slot_layout(orig, recomp):
-        ctx.categories.add("frame_slot_layout")
+        ctx.categories.add(EffectiveReason.FRAME_SLOT_LAYOUT)
 
     if orig.x87.state_key()[1:] != recomp.x87.state_key()[1:]:
         return False
@@ -569,7 +593,15 @@ def admit_unsupported_identical(
     return True
 
 
-def callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> bool:
+def callee_save_swap(
+    ctx: Context,
+    ins_o,
+    ins_r,
+    obs_o: list[Observation],
+    obs_r: list[Observation],
+    orig,
+    recomp,
+) -> bool:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-boolean-expressions
     """Detect a balanced callee-save substitution: one side saves and
@@ -578,73 +610,82 @@ def callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> 
     bookkeeping and make the matching pops restore the initial values."""
     if ins_o.mnemonic != ins_r.mnemonic:
         return False
+    stores = (
+        obs_o[0] if len(obs_o) == 1 and isinstance(obs_o[0], Store) else None,
+        obs_r[0] if len(obs_r) == 1 and isinstance(obs_r[0], Store) else None,
+    )
     if (
         ins_o.mnemonic == "push"
-        and len(obs_o) == 1
-        and len(obs_r) == 1
-        and obs_o[0][0] == obs_r[0][0] == "store"
-        and obs_o[0][1] == obs_r[0][1]
-        and obs_o[0][3][0] == obs_r[0][3][0] == "init"
-        and obs_o[0][3][1] in CALLEE_SAVED
-        and obs_r[0][3][1] in CALLEE_SAVED
-        and obs_o[0][3] != obs_r[0][3]
+        and stores[0] is not None
+        and stores[1] is not None
+        and stores[0].address == stores[1].address
+        and isinstance(stores[0].value, Init)
+        and isinstance(stores[1].value, Init)
+        and stores[0].value.family in CALLEE_SAVED
+        and stores[1].value.family in CALLEE_SAVED
+        and stores[0].value != stores[1].value
     ):
-        ctx.save_stack.append([obs_o[0][3][1], obs_r[0][3][1], obs_o[0][1], True])
-        ctx.categories.add("callee_save_substitution")
+        ctx.save_stack.append(
+            CalleeSaveSubstitution(
+                stores[0].value.family, stores[1].value.family, stores[0].address
+            )
+        )
+        ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
         return True
-    if (
-        ins_o.mnemonic == "pop"
-        and ctx.save_stack
-        and ins_o.operands
-        and ins_r.operands
-        and ins_o.operands[0][0] == "reg"
-        and ins_r.operands[0][0] == "reg"
-    ):
-        family_o = REGISTERS[ins_o.operands[0][1]][0]
-        family_r = REGISTERS[ins_r.operands[0][1]][0]
-        saved_o, saved_r, slot_addr, valid = ctx.save_stack[-1]
-        popped_o = orig.regs.get(family_o)
-        popped_r = recomp.regs.get(family_r)
-        if (
-            (saved_o, saved_r) == (family_o, family_r)
-            and valid
-            # A frame address that escaped could have reached the saved
-            # slot through a pointer we cannot see.
-            and not orig.slots_escaped
-            and not recomp.slots_escaped
-            and isinstance(popped_o, tuple)
-            and popped_o
-            and popped_o[0] == "load"
-            and popped_o[1] == slot_addr
-            and isinstance(popped_r, tuple)
-            and popped_r
-            and popped_r[0] == "load"
-            and popped_r[1] == slot_addr
+    match ins_o.operands, ins_r.operands:
+        case (Reg(name_o),), (Reg(name_r),) if (
+            ins_o.mnemonic == "pop" and ctx.save_stack
         ):
-            ctx.save_stack.pop()
-            orig.regs[family_o] = ("init", family_o)
-            recomp.regs[family_r] = ("init", family_r)
-            return True
+            return _restores_swapped_save(
+                ctx, orig, recomp, REGISTERS[name_o][0], REGISTERS[name_r][0]
+            )
     return False
 
 
-def invalidate_save_slots(ctx: Context, obs: list) -> None:
+def _restores_swapped_save(
+    ctx: Context, orig: SideState, recomp: SideState, family_o: str, family_r: str
+) -> bool:
+    """A pair of pops that restores the innermost substituted callee save:
+    both read back its intact slot, so each register regains its initial
+    value."""
+    substitution = ctx.save_stack[-1]
+    popped_o = orig.regs.get(family_o)
+    popped_r = recomp.regs.get(family_r)
+    if not (
+        (substitution.orig_family, substitution.recomp_family) == (family_o, family_r)
+        and substitution.valid
+        # A frame address that escaped could have reached the saved
+        # slot through a pointer we cannot see.
+        and not orig.slots_escaped
+        and not recomp.slots_escaped
+        and isinstance(popped_o, Load)
+        and popped_o.address == substitution.address
+        and isinstance(popped_r, Load)
+        and popped_r.address == substitution.address
+    ):
+        return False
+    ctx.save_stack.pop()
+    orig.regs[family_o] = Init(family_o)
+    recomp.regs[family_r] = Init(family_r)
+    return True
+
+
+def invalidate_save_slots(ctx: Context, obs: Sequence[Observation]) -> None:
     """Any store that cannot be proven disjoint from a pending callee-save
     slot invalidates that record: the pop can no longer be trusted to
     restore the pushed value."""
     if not ctx.save_stack:
         return
     for entry in obs:
-        if entry[0] != "store":
+        if not isinstance(entry, Store):
             continue
-        address, size = entry[1], entry[2]
-        if size == "stack":
-            access: tuple = (address, 4, "push")
+        if entry.size == "stack":
+            access: tuple = (entry.address, 4, "push")
         else:
-            access = (address, WIDTHS.get(size), False)
+            access = (entry.address, WIDTHS.get(entry.size), False)
         for record in ctx.save_stack:
-            if record[3] and not mem_disjoint((record[2], 4, "pop"), access):
-                record[3] = False
+            if record.valid and not mem_disjoint((record.address, 4, "pop"), access):
+                record.valid = False
 
 
 def _slots_consistent(orig: SideState, recomp: SideState) -> bool:
@@ -712,9 +753,9 @@ def _commutative_order_used(
         return False
     try:
         for operand_o, operand_r in zip(ins_o.operands, ins_r.operands):
-            if operand_o[0] == operand_r[0] == "mem":
-                terms_o = operand_o[3]
-                terms_r = operand_r[3]
+            if isinstance(operand_o, Mem) and isinstance(operand_r, Mem):
+                terms_o = operand_o.terms
+                terms_r = operand_r.terms
                 if terms_o != terms_r and sorted(terms_o) == sorted(terms_r):
                     if mem_address(before_o, operand_o) == mem_address(
                         before_r, operand_r
@@ -765,18 +806,23 @@ def _same_meta_effects(
         return False
     if not orig.control_flow_known or not recomp.control_flow_known:
         return False
-    fields = (
-        "mnemonic",
-        "regs_read",
-        "regs_written",
-        "reads_flags",
-        "writes_flags",
-        "accesses_memory",
-        "is_jump",
-        "is_call",
-        "is_ret",
+    return (
+        orig.mnemonic,
+        orig.regs_read,
+        orig.regs_written,
+        orig.reads_flags,
+        orig.writes_flags,
+        orig.accesses_memory,
+        orig.flow,
+    ) == (
+        recomp.mnemonic,
+        recomp.regs_read,
+        recomp.regs_written,
+        recomp.reads_flags,
+        recomp.writes_flags,
+        recomp.accesses_memory,
+        recomp.flow,
     )
-    return all(getattr(orig, field) == getattr(recomp, field) for field in fields)
 
 
 def record_pair_categories(
@@ -787,8 +833,8 @@ def record_pair_categories(
     after_r: SideState,
     ins_o: DecodedInstruction,
     ins_r: DecodedInstruction,
-    obs_o: list,
-    obs_r: list,
+    obs_o: list[Observation],
+    obs_r: list[Observation],
 ) -> None:
     """Name the compiler entropy an agreeing instruction pair relied on."""
     # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -799,18 +845,20 @@ def record_pair_categories(
         for family_r, value_r in after_r.regs.items()
         if value_r is not before_r.regs[family_r]
     ):
-        ctx.categories.add("register_allocation")
+        ctx.categories.add(EffectiveReason.REGISTER_ALLOCATION)
     if _commutative_order_used(before_o, before_r, ctx, ins_o, ins_r):
-        ctx.categories.add("commutative_order")
+        ctx.categories.add(EffectiveReason.COMMUTATIVE_ORDER)
     if (
-        any(entry[0] == "branch" for entry in obs_o)
+        any(isinstance(entry, Branch) for entry in obs_o)
         and obs_o == obs_r
         and (ins_o.mnemonic != ins_r.mnemonic or before_o.flags != before_r.flags)
     ):
-        ctx.categories.add("condition_inversion")
+        ctx.categories.add(EffectiveReason.CONDITION_INVERSION)
 
 
-def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
+def observations_agree(
+    ctx: Context, obs_o: list[Observation], obs_r: list[Observation]
+) -> bool:
     """Equal observations, or, where the configuration allows algebraic
     identities, observations whose values z3 proves equal as bit-vectors.
     Such a proof is recorded as an algebraic identity, and both sides'
@@ -821,9 +869,10 @@ def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
         return False
     if not bitvector.observations_equal(obs_o, obs_r):
         return False
-    ctx.categories.add("algebraic_identity")
+    ctx.categories.add(EffectiveReason.ALGEBRAIC_IDENTITY)
     for entry in obs_r:
-        ctx.add_matched(entry)
+        for value in observation_values(entry):
+            ctx.add_matched(value)
     return True
 
 
@@ -834,7 +883,7 @@ def accept_agreeing_pair(
     before: tuple[SideState, SideState],
     after: tuple[SideState, SideState],
     ins: tuple[DecodedInstruction, DecodedInstruction],
-    obs: tuple[list, list],
+    obs: tuple[list[Observation], list[Observation]],
 ) -> bool:
     """CFG strategies' per-pair check: the observables must agree; then the
     pair's effects become matched evidence. Records the difference and
@@ -848,6 +897,7 @@ def accept_agreeing_pair(
         return False
     invalidate_save_slots(ctx, obs_o)
     for obs_entry in obs_o:
-        ctx.add_matched(obs_entry)
+        for value in observation_values(obs_entry):
+            ctx.add_matched(value)
     record_pair_categories(ctx, *before, *after, *ins, obs_o, obs_r)
     return True

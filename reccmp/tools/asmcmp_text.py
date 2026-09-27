@@ -7,6 +7,7 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     DifferenceSide,
+    StopLocation,
 )
 from reccmp.compare.report import ReccmpComparedEntity, format_address
 from reccmp.utils import percent_string
@@ -31,30 +32,30 @@ def inconclusive_diagnostic_text(analysis: ComparisonAnalysis) -> str | None:
     """Render the structured reason, location, and facts for an inconclusive result."""
     if analysis.status != ComparisonStatus.INCONCLUSIVE:
         return None
-    reason = (analysis.inconclusive_reason or "analysis_limit").replace("_", " ")
-    lines = [f"semantic analysis inconclusive: {reason}"]
+    assert analysis.inconclusive_reason is not None
+    lines = [f"semantic analysis inconclusive: {analysis.inconclusive_reason.value}"]
     location = analysis.inconclusive_location
     if location is not None:
         if location.address is not None:
             lines.append(f"  location: {format_address(location.address)}")
         elif location.instruction_index is not None:
             lines.append(f"  instruction index: {location.instruction_index}")
-        for key, value in sorted(location.facts.items()):
-            lines.append(f"  {key.replace('_', ' ')}: {value}")
+        if location.detail is not None:
+            lines.append(f"  stage: {location.detail.value}")
+        if location.source is not None:
+            lines.append(f"  source: {location.source.path}:{location.source.line}")
     return "\n".join(lines)
 
 
-def _side_text(side: DifferenceSide) -> str:
-    if side.address is not None:
-        text = format_address(side.address)
-    elif side.instruction_index is not None:
-        text = f"instruction {side.instruction_index}"
+def _where_text(where: DifferenceSide | StopLocation) -> str:
+    if where.address is not None:
+        text = format_address(where.address)
+    elif where.instruction_index is not None:
+        text = f"instruction {where.instruction_index}"
     else:
         text = "function exit"
-    path = side.facts.get("source_path")
-    line = side.facts.get("source_line")
-    if isinstance(path, str) and isinstance(line, int):
-        text += f" ({path}:{line})"
+    if where.source is not None:
+        text += f" ({where.source.path}:{where.source.line})"
     return text
 
 
@@ -64,20 +65,20 @@ def strategy_attempts_text(analysis: ComparisonAnalysis) -> str | None:
         return None
     lines = ["verifier strategies:"]
     for attempt in analysis.attempts:
-        name = attempt.strategy.replace("_", " ")
+        name = attempt.strategy.value
         if attempt.difference is not None:
-            kind = attempt.difference.kind.replace("_", " ")
-            where = _side_text(attempt.difference.orig)
-            note = "" if attempt.trusted_alignment else " (heuristic pairing)"
+            kind = attempt.difference.kind.value
+            where = _where_text(attempt.difference.orig)
+            note = "" if attempt.strategy.trusted_alignment else " (heuristic pairing)"
             lines.append(f"  {name}: {kind} difference at {where}{note}")
         else:
-            reason = (attempt.blocker or "analysis_limit").replace("_", " ")
+            assert attempt.blocker is not None
             where = (
-                f" at {_side_text(attempt.location)}"
+                f" at {_where_text(attempt.location)}"
                 if attempt.location is not None
                 else ""
             )
-            lines.append(f"  {name}: blocked by {reason}{where}")
+            lines.append(f"  {name}: blocked by {attempt.blocker.value}{where}")
     return "\n".join(lines)
 
 
@@ -86,12 +87,10 @@ def mismatch_source_pin_text(match: ReccmpComparedEntity) -> str | None:
     difference = match.analysis.difference
     if difference is None:
         return None
-    facts = difference.recomp.facts
-    path = facts.get("source_path")
-    line = facts.get("source_line")
-    if isinstance(path, str) and isinstance(line, int):
-        return f"probable first source-level discrepancy: {path}:{line}"
-    return None
+    source = difference.recomp.source
+    if source is None:
+        return None
+    return f"probable first source-level discrepancy: {source.path}:{source.line}"
 
 
 def stack_layout_text(match: ReccmpComparedEntity) -> str | None:
@@ -162,7 +161,7 @@ def witness_text(analysis: ComparisonAnalysis) -> str | None:
         )
     return (
         f"refuted by execution (seed {witness.seed}): "
-        f"{witness.kind.replace('_', ' ')} at {where}: "
+        f"{witness.kind.value} at {where}: "
         f"orig {witness.orig_value}, recomp {witness.recomp_value}\n"
         "  callees modelled, input not checked for reachability"
     )

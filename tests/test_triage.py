@@ -1,121 +1,209 @@
 """Clustering comparison verdicts (reccmp.compare.triage)."""
 
+import dataclasses
+
 from reccmp.compare import triage
+from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import Imm, Mem, Reg, SignedSymbol, Sym
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonDifference,
+    DifferenceKind,
+    DifferenceSide,
+    ExecutionEvidence,
+    InconclusiveReason,
+    Observed,
+    RefutationWitness,
+    StopDetail,
+    StopLocation,
+    Strategy,
+    StrategyAttempt,
+    WitnessKind,
+)
+from reccmp.compare.report import ReccmpComparedEntity
+from reccmp.types import ImageId
 
 
-def _mismatch(address, kind, orig_facts, recomp_facts, execution=None, *, witness=None):
-    difference = {
-        "kind": kind,
-        "orig": {"address": 0x401000, "facts": orig_facts, "image": "orig"},
-        "recomp": {"address": 0x501000, "facts": recomp_facts, "image": "recomp"},
-    }
-    comparison = {
-        "status": "mismatch",
-        "difference": difference,
-        "attempts": [{"strategy": "lockstep", "difference": difference}],
-    }
-    if execution is not None:
-        comparison["execution"] = execution
-    if witness is not None:
-        comparison["witness"] = witness
-    return {"address": address, "name": f"f{address}", "comparison": comparison}
+def _entity(address: int, analysis: ComparisonAnalysis) -> ReccmpComparedEntity:
+    return ReccmpComparedEntity(address, f"f{address:#x}", 0.5, analysis=analysis)
 
 
-AGREED = {"runs": 16, "agreeing": 16, "reached_location": 12}
-NOT_REACHED = {"runs": 16, "agreeing": 16, "reached_location": 0}
+def _mismatch(
+    address: int,
+    kind: DifferenceKind,
+    orig: Observed,
+    recomp: Observed,
+    execution: ExecutionEvidence | None = None,
+    *,
+    witness: RefutationWitness | None = None,
+) -> ReccmpComparedEntity:
+    difference = ComparisonDifference(
+        kind,
+        DifferenceSide(ImageId.ORIG, address=0x401000, observed=orig),
+        DifferenceSide(ImageId.RECOMP, address=0x501000, observed=recomp),
+    )
+    analysis = ComparisonAnalysis(
+        status=ComparisonAnalysis.mismatch(difference).status,
+        difference=difference,
+        attempts=(StrategyAttempt(Strategy.LOCKSTEP, difference=difference),),
+        witness=witness,
+        execution=execution,
+    )
+    return _entity(address, analysis)
+
+
+AGREED = ExecutionEvidence(16, 16, reached_location=12)
+NOT_REACHED = ExecutionEvidence(16, 16, reached_location=0)
 
 
 def test_buckets():
-    assert triage.bucket_of({"status": "exact"}) is None
-    assert triage.bucket_of({"status": "mismatch"}) == triage.NOT_EXECUTED
-    assert triage.bucket_of({"status": "mismatch", "execution": NOT_REACHED}) == (
-        triage.NEVER_REACHED
+    difference = ComparisonDifference(
+        DifferenceKind.RETURN_VALUE,
+        DifferenceSide(ImageId.ORIG),
+        DifferenceSide(ImageId.RECOMP),
     )
-    assert triage.bucket_of({"status": "mismatch", "execution": AGREED}) == (
-        triage.AGREED_THROUGH_DIFFERENCE
+    assert triage.bucket_of(ComparisonAnalysis.exact()) is None
+    assert (
+        triage.bucket_of(ComparisonAnalysis.mismatch(difference))
+        == triage.Bucket.NOT_EXECUTED
     )
-    refuted = {"status": "mismatch", "execution": AGREED, "witness": {"kind": "x"}}
-    assert triage.bucket_of(refuted) == triage.REFUTED
-    assert triage.bucket_of({"status": "inconclusive", "execution": AGREED}) == (
-        triage.AGREED_THROUGH_BLOCKER
+    assert (
+        triage.bucket_of(
+            dataclasses.replace(
+                ComparisonAnalysis.mismatch(difference), execution=NOT_REACHED
+            )
+        )
+        == triage.Bucket.NEVER_REACHED
     )
-    assert triage.bucket_of({"status": "inconclusive"}) == triage.INCONCLUSIVE
+    assert (
+        triage.bucket_of(
+            dataclasses.replace(
+                ComparisonAnalysis.mismatch(difference), execution=AGREED
+            )
+        )
+        == triage.Bucket.AGREED_THROUGH_DIFFERENCE
+    )
+    witness = RefutationWitness(0, WitnessKind.RETURN_VALUE, "eax", "1", "2")
+    assert (
+        triage.bucket_of(
+            dataclasses.replace(
+                ComparisonAnalysis.mismatch(difference),
+                execution=AGREED,
+                witness=witness,
+            )
+        )
+        == triage.Bucket.REFUTED
+    )
+    assert (
+        triage.bucket_of(
+            dataclasses.replace(
+                ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT),
+                execution=AGREED,
+            )
+        )
+        == triage.Bucket.AGREED_THROUGH_BLOCKER
+    )
+    assert (
+        triage.bucket_of(
+            ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
+        )
+        == triage.Bucket.INCONCLUSIVE
+    )
 
 
 def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
-    strict = {"predicate": "lt_u:load:initial:sp+4,65", "predicate_tag": "lt_u"}
-    loose = {"predicate": "le_u:load:initial:sp+4,64", "predicate_tag": "le_u"}
+    strict = Observed(value="lt_u:load:initial:sp+4,65")
+    loose = Observed(value="le_u:load:initial:sp+4,64")
+    import_ref = Reference("arbitrary text", ("import", "a"), "IMPORT")
+    thunk_ref = Reference("arbitrary text", ("import", "a"), "IMPORT_THUNK")
     entities = [
-        _mismatch("0x1", "branch_condition", strict, loose, AGREED),
-        _mismatch("0x2", "branch_condition", strict, loose, AGREED),
-        _mismatch("0x3", "branch_condition", strict, loose),
+        _mismatch(1, DifferenceKind.BRANCH_CONDITION, strict, loose, AGREED),
+        _mismatch(2, DifferenceKind.BRANCH_CONDITION, strict, loose, AGREED),
+        _mismatch(3, DifferenceKind.BRANCH_CONDITION, strict, loose),
         _mismatch(
-            "0x4",
-            "call_target",
-            {
-                "target_name": "arbitrary text",
-                "target_entity_type": "IMPORT",
-                "target_indirect": True,
-            },
-            {"target_name": "arbitrary text", "target_entity_type": "IMPORT_THUNK"},
+            4,
+            DifferenceKind.CALL_TARGET,
+            Observed(operand=Mem("dword", "", (), 0, (SignedSymbol(1, import_ref),))),
+            Observed(operand=Sym(thunk_ref)),
             AGREED,
         ),
-        {"address": "0x5", "name": "g", "comparison": {"status": "exact"}},
+        _entity(5, ComparisonAnalysis.exact()),
     ]
 
-    def shape(image: str, _address: int) -> str:
-        return "jb imm" if image == "orig" else "jbe imm"
+    def shape(image: ImageId, _address: int) -> triage.InstructionShape:
+        return triage.InstructionShape("jb" if image is ImageId.ORIG else "jbe", (Imm,))
 
     clusters = triage.triage(entities, shape)
 
     first, second, third = clusters
-    assert first.key.bucket == triage.AGREED_THROUGH_DIFFERENCE and first.count == 2
-    assert (first.key.orig, first.key.recomp) == (
-        "jb imm | predicate=lt_u",
-        "jbe imm | predicate=le_u",
+    assert first.key.bucket == triage.Bucket.AGREED_THROUGH_DIFFERENCE
+    assert first.count == 2
+    assert (triage.side_text(first.key.orig), triage.side_text(first.key.recomp)) == (
+        "jb imm",
+        "jbe imm",
     )
-    assert first.key.strategy == "lockstep"
-    assert "callee=IMPORT indirect" in second.key.orig
-    assert "callee=IMPORT_THUNK" in second.key.recomp
-    assert third.key.bucket == triage.NOT_EXECUTED
+    assert first.key.strategy == Strategy.LOCKSTEP
+    assert "callee=IMPORT | indirect" in triage.side_text(second.key.orig)
+    assert "callee=IMPORT_THUNK" in triage.side_text(second.key.recomp)
+    assert third.key.bucket == triage.Bucket.NOT_EXECUTED
     assert triage.bucket_counts(clusters) == {
-        triage.AGREED_THROUGH_DIFFERENCE: 3,
-        triage.NOT_EXECUTED: 1,
+        triage.Bucket.AGREED_THROUGH_DIFFERENCE: 3,
+        triage.Bucket.NOT_EXECUTED: 1,
     }
     assert "e.g. 0x1 f0x1" in triage.triage_text(clusters)
 
 
 def test_non_isomorphic_graphs_cluster_by_where_the_product_stopped():
-    def blocked(address, stop):
-        location = {
-            "address": 0x401000,
-            "image": "orig",
-            "facts": {"failure": "edge_roles", "product_stop": stop},
-        }
-        return {
-            "address": address,
-            "name": f"f{address}",
-            "comparison": {
-                "status": "inconclusive",
-                "inconclusive_reason": "non_isomorphic_cfg",
-                "inconclusive_location": location,
-                "attempts": [{"strategy": "isomorphic_cfg", "location": location}],
-            },
-        }
+    location = StopLocation(ImageId.ORIG, address=0x401000)
 
+    def blocked(address: int, product: StrategyAttempt) -> ReccmpComparedEntity:
+        analysis = dataclasses.replace(
+            ComparisonAnalysis.inconclusive(
+                InconclusiveReason.NON_ISOMORPHIC_CFG, location
+            ),
+            attempts=(
+                StrategyAttempt(
+                    Strategy.ISOMORPHIC_CFG,
+                    blocker=InconclusiveReason.NON_ISOMORPHIC_CFG,
+                    location=location,
+                ),
+                product,
+            ),
+        )
+        return _entity(address, analysis)
+
+    alignment = StrategyAttempt(
+        Strategy.UNANCHORED_PRODUCT,
+        blocker=InconclusiveReason.ALIGNMENT_FAILURE,
+        location=StopLocation(ImageId.ORIG, detail=StopDetail.BLOCK_ALIGNMENT),
+    )
+    difference = ComparisonDifference(
+        DifferenceKind.MEMORY_ADDRESS,
+        DifferenceSide(ImageId.ORIG),
+        DifferenceSide(ImageId.RECOMP),
+    )
     clusters = triage.triage(
         [
-            blocked("0x1", "alignment_failure/block_alignment"),
-            blocked("0x2", "alignment_failure/block_alignment"),
-            blocked("0x3", "memory_address"),
+            blocked(1, alignment),
+            blocked(2, alignment),
+            blocked(
+                3,
+                StrategyAttempt(Strategy.UNANCHORED_PRODUCT, difference=difference),
+            ),
         ]
     )
-    assert [(cluster.key.detail, cluster.count) for cluster in clusters] == [
-        ("product: alignment_failure/block_alignment", 2),
+    assert [
+        (triage.details_text(cluster.key), cluster.count) for cluster in clusters
+    ] == [
+        ("product: alignment_failure at block_alignment", 2),
         ("product: memory_address", 1),
     ]
 
 
 def test_instruction_shape():
-    assert triage.instruction_shape(bytes.fromhex("83f841"), 0x1000) == "cmp reg, imm"
-    assert triage.instruction_shape(bytes.fromhex("894104"), 0x1000) == "mov mem, reg"
+    assert triage.instruction_shape(
+        bytes.fromhex("83f841"), 0x1000
+    ) == triage.InstructionShape("cmp", (Reg, Imm))
+    assert triage.instruction_shape(
+        bytes.fromhex("894104"), 0x1000
+    ) == triage.InstructionShape("mov", (Mem, Reg))

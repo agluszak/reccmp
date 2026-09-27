@@ -13,8 +13,10 @@ from reccmp.compare.asm.ir import (
     JumpTable,
     instruction_match_key,
 )
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.asm.operand import Mem, Opaque, Reg, ScaledReg, St
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.verifier import analyze_effective_match, compare_exact
+from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 
 
 def test_from_capstone_mem_operand_without_display_parse():
@@ -26,8 +28,8 @@ def test_from_capstone_mem_operand_without_display_parse():
     insn = rows[0]
     assert insn.mnemonic == "mov"
     assert insn.operands == (
-        ("reg", "eax"),
-        ("mem", "dword", "", [("ebx", 1), ("ecx", 4)], 0x10, ()),
+        Reg("eax"),
+        Mem("dword", "", (ScaledReg("ebx", 1), ScaledReg("ecx", 4)), 0x10),
     )
     # Display may be Capstone's text; operands must not depend on reparsing it.
     assert insn.operands != ()
@@ -37,7 +39,7 @@ def test_from_capstone_mem_operand_without_display_parse():
 def test_display_does_not_change_decoded_memory_semantics():
     blob = bytes.fromhex("8b4508")  # mov eax, [ebp+8]
     decoded = disasm_detail(blob, 0x1000)[0]
-    assert decoded.operands[1] == ("mem", "dword", "", [("ebp", 1)], 8, ())
+    assert decoded.operands[1] == Mem("dword", "", (ScaledReg("ebp", 1),), 8)
     assert instruction_match_key(decoded) == instruction_match_key(
         replace(decoded, display="diagnostic text changed")
     )
@@ -46,14 +48,14 @@ def test_display_does_not_change_decoded_memory_semantics():
 def test_from_capstone_lea_omits_mem_size():
     blob = bytes.fromhex("8d4508")  # lea eax, [ebp+8]
     rows = disasm_detail(blob, 0x1000)
-    assert rows[0].operands[1] == ("mem", "", "", [("ebp", 1)], 8, ())
+    assert rows[0].operands[1] == Mem("", "", (ScaledReg("ebp", 1),), 8)
     assert rows[0].operand_model_complete is True
 
 
 def test_from_capstone_st_register():
     blob = bytes.fromhex("d9c1")  # fld st(1)
     rows = disasm_detail(blob, 0x1000)
-    assert rows[0].operands == (("st", 1),)
+    assert rows[0].operands == (St(1),)
 
 
 def test_from_capstone_rep_prefix():
@@ -61,11 +63,11 @@ def test_from_capstone_rep_prefix():
     rows = disasm_detail(blob, 0x1000)
     assert rows[0].prefix == "rep"
     assert rows[0].mnemonic == "movsd"
-    assert rows[0].operands[0][0] == "mem"
+    assert isinstance(rows[0].operands[0], Mem)
 
 
 def test_opaque_operands_remain_distinct_in_match_keys():
-    """Unsupported Capstone kinds must not collapse to a shared ``("sym", "?")``."""
+    """Unsupported Capstone kinds must not collapse to one shared operand."""
     insn_a = SimpleNamespace(op_str="mystery_a", bytes=b"\x00\x01")
     insn_b = SimpleNamespace(op_str="mystery_b", bytes=b"\x00\x02")
     op = SimpleNamespace(type=x86_const.X86_OP_INVALID)
@@ -80,8 +82,7 @@ def test_opaque_operands_remain_distinct_in_match_keys():
     assert left_ok is False and right_ok is False
     assert left != right
     assert left == same_bytes
-    assert isinstance(left, tuple) and isinstance(right, tuple)
-    assert left[0] == "opaque" and right[0] == "opaque"
+    assert isinstance(left, Opaque) and isinstance(right, Opaque)
 
     row_a = DecodedInstruction(
         address=0x1000,
@@ -112,40 +113,40 @@ def test_unknown_mem_size_stays_distinct_and_incomplete():
     op = SimpleNamespace(type=x86_const.X86_OP_MEM, size=3, mem=mem)
     operand, complete = capstone_operand(insn, op, "mov", 0)
     assert complete is False
-    assert isinstance(operand, tuple)
-    assert operand[0] == "mem"
-    assert operand[1] == "size3"
+    assert isinstance(operand, Mem)
+    assert operand.size == "size3"
 
 
 def test_indirect_call_destination_expression_is_modeled():
     row = disasm_detail(bytes.fromhex("ff5208"), 0x1000)[0]
     assert row.is_call
     assert row.branch_target is None
-    assert row.operands == (("mem", "dword", "", [("edx", 1)], 8, ()),)
+    assert row.operands == (Mem("dword", "", (ScaledReg("edx", 1),), 8),)
     assert row.operand_model_complete
     assert row.control_flow_known
 
 
 def test_recognized_switch_table_completes_indirect_jump():
     row = disasm_detail(bytes.fromhex("ff248500100000"), 0x1000)[0]
+    ret = disasm_detail(b"\xc3", 0x1007)[0]
     assert row.is_jump and not row.control_flow_known
-    incomplete = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,))
-    assert not incomplete.control_flow_complete
+    incomplete = FunctionImage(0x1000, 8, ExtentKind.KNOWN, (row, ret))
+    assert incomplete.control_graph().shape() is None
     table = JumpTable(
         0x1000,
         ((0x1000, 0x1007),),
         dispatch_address=0x1000,
         index_register="eax",
     )
-    image = FunctionImage(0x1000, 7, ExtentKind.KNOWN, (row,), (table,))
-    assert image.control_flow_complete
+    image = FunctionImage(0x1000, 8, ExtentKind.KNOWN, (row, ret), (table,))
+    assert image.control_graph().shape() is not None
 
 
 def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
     """ratio==1.0 from IR keys must not yield EXACT when models are incomplete
     and displays differ (the old collapsed ``?`` failure mode)."""
-    opaque_a = ("opaque", x86_const.X86_OP_INVALID, "a", 0)
-    opaque_b = ("opaque", x86_const.X86_OP_INVALID, "a", 0)
+    opaque_a = Opaque(x86_const.X86_OP_INVALID, b"a", 0)
+    opaque_b = Opaque(x86_const.X86_OP_INVALID, b"a", 0)
     # Same opaque identity → same match key, but different displays.
     row_a = DecodedInstruction(
         address=0x1000,
@@ -169,5 +170,32 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
 
     original = FunctionImage(0x1000, 1, ExtentKind.KNOWN, (row_a,))
     recompiled = FunctionImage(0x2000, 1, ExtentKind.KNOWN, (row_b,))
+    assert compare_exact(original, recompiled) is None
     analysis = analyze_effective_match([], original, recompiled)
     assert analysis.status != ComparisonStatus.EXACT
+
+
+def test_only_compare_exact_admits_exact():
+    image = decode_function(b"\xb8\x01\x00\x00\x00\xc3", 0x1000)
+    assert compare_exact(image, image) == ComparisonAnalysis.exact()
+    assert analyze_effective_match([], image, image).status != ComparisonStatus.EXACT
+
+
+def _switch_image(dispatch: bytes):
+    # dispatch; ret; two table entries pointing at the ret.
+    table = 0x1000 + len(dispatch) + 1
+    code = dispatch.replace(b"TTTT", table.to_bytes(4, "little")) + b"\xc3"
+    entry = (0x1000 + len(dispatch)).to_bytes(4, "little")
+    return decode_function(code + entry + entry, 0x1000)
+
+
+def test_indexed_switch_dispatch_is_recognized():
+    image = _switch_image(b"\xff\x24\x85TTTT")  # jmp [eax*4 + table]
+    assert [t.index_register for t in image.jump_tables] == ["eax"]
+    assert image.control_graph().shape() is not None
+
+
+def test_switch_dispatch_with_base_register_is_not_recognized():
+    image = _switch_image(b"\xff\xa4\x83TTTT")  # jmp [ebx + eax*4 + table]
+    assert not any(t.is_recognized_switch() for t in image.jump_tables)
+    assert image.control_graph().shape() is None

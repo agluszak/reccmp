@@ -1,5 +1,5 @@
-"""Strategy orchestration: EXACT admission, then each verifier strategy in
-turn, and the choice of the reported difference or blocker when none proves
+"""Function comparison: the one EXACT admission, then each verifier
+strategy in turn, and the choice of the reported difference or blocker when none proves
 equivalence."""
 
 import dataclasses
@@ -10,9 +10,7 @@ from reccmp.compare.asm.ir import (
     DecodedInstruction,
     FunctionImage,
     instruction_semantic_key,
-    local_branch_targets,
 )
-from reccmp.compare.asm.verifier.cfg import verify_cfg_effective_match
 from reccmp.compare.asm.verifier.iso_cfg import verify_isomorphic_cfg_effective_match
 from reccmp.compare.asm.verifier.lockstep import verify_effective_match
 from reccmp.compare.asm.verifier.relocation import undo_relocations
@@ -21,6 +19,9 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
+    EffectiveReason,
+    InconclusiveReason,
+    Strategy,
 )
 from reccmp.compare.pinned_sequences import DiffOpcode
 from reccmp.compare.verification import admit_effective, admit_exact_analysis
@@ -45,6 +46,35 @@ def _trim_padding(rows: Sequence[DecodedInstruction]) -> Sequence[DecodedInstruc
     return rows
 
 
+def compare_exact(
+    orig: FunctionImage, recomp: FunctionImage
+) -> ComparisonAnalysis | None:
+    """EXACT when both images have the same semantic keys, data shape and
+    graph shape (every edge, including switch cases, known), and either the
+    same bytes or complete operand models. This is the only place a function
+    comparison is admitted EXACT."""
+    orig_rows, recomp_rows = orig.instructions, recomp.instructions
+    orig_shape = orig.control_graph().shape()
+    return admit_exact_analysis(
+        bytes_equal=(
+            orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
+        ),
+        topology_equal=(
+            orig_shape is not None and orig_shape == recomp.control_graph().shape()
+        ),
+        keys_equal=(
+            [instruction_semantic_key(row) for row in orig_rows]
+            == [instruction_semantic_key(row) for row in recomp_rows]
+            and orig.data_shape == recomp.data_shape
+        ),
+        operands_complete=all(
+            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
+        ),
+        coverage_incomplete=orig.coverage_incomplete or recomp.coverage_incomplete,
+        extent_closed=orig.extent_closed and recomp.extent_closed,
+    )
+
+
 def analyze_effective_match(
     codes: Sequence[DiffOpcode],
     orig: FunctionImage,
@@ -52,7 +82,8 @@ def analyze_effective_match(
     metadata: FunctionMetadata | None = None,
 ) -> ComparisonAnalysis:
     # pylint: disable=too-many-locals,too-many-return-statements
-    """Canonical semantic analysis of two decoded functions.
+    """Semantic analysis of two decoded functions ``compare_exact`` did not
+    admit: EFFECTIVE, MISMATCH or INCONCLUSIVE, never EXACT.
 
     The relational verifier (see the verifier package) proves equivalence modulo
     register allocation, commutative-operand order and inverted compare/jump
@@ -65,47 +96,20 @@ def analyze_effective_match(
     coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
     extent_closed = orig.extent_closed and recomp.extent_closed
     orig_rows, recomp_rows = orig.instructions, recomp.instructions
-    exact = admit_exact_analysis(
-        bytes_equal=(
-            orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
-        ),
-        topology_equal=local_branch_targets(orig_rows)
-        == local_branch_targets(recomp_rows),
-        keys_equal=(
-            [instruction_semantic_key(row) for row in orig_rows]
-            == [instruction_semantic_key(row) for row in recomp_rows]
-            and orig.data_shape == recomp.data_shape
-        ),
-        operands_complete=all(
-            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
-        ),
-        control_flow_complete=(
-            orig.control_flow_complete and recomp.control_flow_complete
-        ),
-        coverage_incomplete=coverage_incomplete,
-        extent_closed=extent_closed,
-    )
-    if exact is not None:
-        return exact
 
     # Embedded bytes can be read through indexed operands without appearing
     # as instruction effects. Until those reads are modeled against regions,
     # a change to the data cannot be admitted by a code-only proof.
-    orig_data = tuple(
-        (region.address - orig.start_addr, region.data) for region in orig.data_regions
-    )
-    recomp_data = tuple(
-        (region.address - recomp.start_addr, region.data)
-        for region in recomp.data_regions
-    )
-    embedded_data_differs = orig_data != recomp_data
+    embedded_data_differs = orig.data_shape[0] != recomp.data_shape[0]
 
     def finish_effective(reasons) -> ComparisonAnalysis:
         if embedded_data_differs:
-            return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
+            return ComparisonAnalysis.inconclusive(
+                InconclusiveReason.EMBEDDED_DATA_MISMATCH
+            )
         reason_set = set(reasons)
         if not reason_set:
-            reason_set.add("instruction_reorder")
+            reason_set.add(EffectiveReason.INSTRUCTION_REORDER)
         admitted = admit_effective(
             reason_set,
             coverage_incomplete=coverage_incomplete,
@@ -113,14 +117,11 @@ def analyze_effective_match(
         )
         if admitted is None:
             return ComparisonAnalysis.inconclusive(
-                "incomplete_coverage" if coverage_incomplete else "open_extent"
+                InconclusiveReason.INCOMPLETE_COVERAGE
+                if coverage_incomplete
+                else InconclusiveReason.OPEN_EXTENT
             )
-        return admitted.analysis
-
-    addrs = ([row.address for row in orig_rows], [row.address for row in recomp_rows])
-
-    def new_recorder() -> AnalysisRecorder:
-        return AnalysisRecorder(*addrs)
+        return admitted
 
     # Plain lockstep pairing first (with trailing alignment padding
     # trimmed): for equal-length sequences the diff's insert/delete blocks
@@ -131,84 +132,81 @@ def analyze_effective_match(
         recomp_rows
     )
     relocated = undo_relocations(codes, orig_rows, recomp_rows)
-    lockstep = new_recorder()
+    lockstep = AnalysisRecorder(orig, recomp)
     if verify_effective_match(
         trimmed_orig, trimmed_recomp, metadata=metadata, recorder=lockstep
     ):
         logger.debug("effective match: lockstep")
-        extra_reasons = {"padding"} if padding else set()
+        extra_reasons = {EffectiveReason.PADDING} if padding else set()
         if relocated is not None:
-            extra_reasons.add("instruction_reorder")
+            extra_reasons.add(EffectiveReason.INSTRUCTION_REORDER)
         return finish_effective(lockstep.effective_reasons(extra_reasons))
 
     # Diff-aligned pairing: handles length differences (one-sided entries
     # for whitelisted unobservable instructions, e.g. a redundant
     # register copy) and transposed independent lines.
-    diff_aligned = new_recorder()
+    diff_aligned = AnalysisRecorder(orig, recomp)
     if verify_effective_match(
         orig_rows, recomp_rows, codes, metadata=metadata, recorder=diff_aligned
     ):
         logger.debug("effective match: diff-aligned")
         return finish_effective(diff_aligned.effective_reasons())
 
-    relocation = new_recorder()
+    # Its instruction positions are those of the reordered sequence.
+    relocation = AnalysisRecorder(
+        orig, recomp.with_instructions(relocated) if relocated is not None else recomp
+    )
     if relocated is not None and verify_effective_match(
         orig_rows, relocated, metadata=metadata, recorder=relocation
     ):
         logger.debug("effective match: instruction relocation")
-        return finish_effective(relocation.effective_reasons({"instruction_reorder"}))
-
-    # CFG-aware verification with the lines paired by position.
-    cfg = new_recorder()
-    if verify_cfg_effective_match(
-        trimmed_orig, trimmed_recomp, metadata=metadata, recorder=cfg
-    ):
-        logger.debug("effective match: cfg")
-        return finish_effective(cfg.effective_reasons({"padding"} if padding else ()))
+        return finish_effective(
+            relocation.effective_reasons({EffectiveReason.INSTRUCTION_REORDER})
+        )
 
     # Isomorphic-CFG verification: per-side block graphs matched by
     # structure. Tolerates different instruction counts (folded loads,
     # elided copies) and the shifted branch displacements they cause.
-    iso = new_recorder()
-    if verify_isomorphic_cfg_effective_match(
-        orig,
-        recomp,
-        metadata=metadata,
-        recorder=iso,
-    ):
+    product = verify_isomorphic_cfg_effective_match(orig, recomp, metadata)
+    iso = product.recorder
+    if product.proved:
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
 
-    attempts = [lockstep.attempt("lockstep"), diff_aligned.attempt("diff_aligned")]
+    attempts = [
+        lockstep.attempt(Strategy.LOCKSTEP),
+        diff_aligned.attempt(Strategy.DIFF_ALIGNED),
+    ]
     if relocated is not None:
-        attempts.append(relocation.attempt("relocation"))
-    attempts.append(cfg.attempt("cfg"))
-    attempts.append(iso.attempt("isomorphic_cfg"))
+        attempts.append(relocation.attempt(Strategy.RELOCATION))
+    attempts.append(iso.attempt(Strategy.ISOMORPHIC_CFG))
+    if product.unanchored is not None:
+        attempts.append(product.unanchored.attempt(Strategy.UNANCHORED_PRODUCT))
 
     def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
         return dataclasses.replace(
             recorder.failure_analysis(), attempts=tuple(attempts)
         )
 
-    # Only positional lockstep and the two CFG strategies establish trusted
+    # Only positional lockstep and the product CFG pairing establish trusted
     # program points. Diff alignment and relocation are proof-only. Of
     # those, report an observed difference (a value, store or control
     # transfer that differs) before an operand candidate, and the product
-    # pairing's, which follows both layouts, before the positional ones',
-    # which also stop at a mere layout difference.
-    trusted = (iso, lockstep, cfg)
+    # pairing's, which follows both layouts, before lockstep's, which also
+    # stops at a mere layout difference.
+    trusted = (iso, lockstep)
     for recorder in trusted:
         if recorder.difference is not None:
             return failed(recorder)
     for recorder in trusted:
         if recorder.best_difference is not None:
             return failed(recorder)
-    for candidate in (iso, cfg, lockstep):
+    for candidate in (iso, lockstep):
         if candidate.inconclusive_reason is not None:
             inconclusive = candidate
             break
     else:
-        inconclusive = cfg
+        inconclusive = lockstep
     analysis = failed(inconclusive)
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
     return analysis

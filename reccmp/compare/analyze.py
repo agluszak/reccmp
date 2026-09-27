@@ -251,6 +251,8 @@ def create_imports(db: EntityDb, image_id: ImageId, binfile: Image):
                 image_id,
                 imp.addr,
                 name=import_name,
+                import_module=imp.module,
+                import_name=imp.name or None,
                 size=4,
                 type=EntityType.IMPORT,
             )

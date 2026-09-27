@@ -272,9 +272,6 @@ class EntityBatch:
     def match(self, orig: int, recomp: int):
         self._matches.append((orig, recomp))
 
-    def set_recomp_addr(self, orig: int, recomp: int):
-        self.match(orig, recomp)
-
     def _finalized_matches(self) -> Iterator[tuple[int, int]]:
         """Reduce the list of matches so that each orig and recomp addr appears once.
         If an address is repeated, retain the first pair where it is used and ignore any others.
@@ -642,6 +639,20 @@ class EntityDb:
             addr = prev_addr
 
         return self._entities[img].get(addr)
+
+    def callee_names(self, img: ImageId, addr: int) -> set[str]:
+        """The symbol, name and import name of the entity a call to ``addr``
+        reaches, following thunk references to their target."""
+        ref_key = "ref_orig" if img == ImageId.ORIG else "ref_recomp"
+        seen: set[int] = set()
+        while addr not in seen and (entity := self.get(img, addr)) is not None:
+            seen.add(addr)
+            ref = entity.get(ref_key)
+            if not isinstance(ref, int):
+                names = (entity.get("symbol"), entity.name, entity.get("import_name"))
+                return {name for name in names if isinstance(name, str)}
+            addr = ref
+        return set()
 
     def get_functions(self) -> Iterator[ReccmpMatch]:
         """Return all function-like matched entities. Previously, all functions

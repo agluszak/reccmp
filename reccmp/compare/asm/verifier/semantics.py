@@ -5,13 +5,52 @@ from __future__ import annotations
 from collections.abc import Hashable
 
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Reject,
-    operand_identity,
-)
+from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.operand import Imm, Mem, Operand, Reg, ScaledReg, St, Sym
 from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    AddressValue,
+    CallResult,
+    CallStack,
+    CallThrough,
+    CarryCleared,
+    CarryResult,
+    Compare,
+    CompareFlags,
+    CompareKind,
+    ConditionCode,
+    Constant,
+    DivideResult,
+    Extend,
+    ExtendKind,
+    FlagsResult,
+    FloatCompare,
+    FloatConstant,
+    FloatConstantKind,
+    FloatControlWord,
+    FloatOperation,
+    FloatOperationKind,
+    FloatStatusWord,
+    Load,
+    MemoryAddress,
+    MultiplyResult,
+    OpaqueKind,
+    OpaqueValue,
+    Operation,
+    OperationKind,
+    ProductPart,
+    ReceiverLoad,
+    Select,
+    SetCondition,
+    SahfCarry,
+    SahfFlags,
+    StackOffset,
+    StringResult,
+    SymbolValue,
+    TestFlags,
+    UnaryOperation,
     Value,
+    VirtualCall,
     flatten_mem,
     stack_rooted,
     unwind_spadd,
@@ -23,17 +62,32 @@ from reccmp.compare.asm.verifier.frame import (
     write_slot,
 )
 from reccmp.compare.asm.verifier.state import (
+    Branch,
+    Call,
     CARRY_BINOPS,
     CC_CANON,
     COMMUTATIVE_BINOPS,
+    IndirectJump,
     JCC_MNEMONICS,
+    Jump,
+    LoadControlWord,
+    Loop,
+    LoopKind,
+    Observation,
     ORDERED_BINOPS,
+    ReturnFpu,
+    ReturnSaved,
+    ReturnStack,
+    ReturnValue,
+    Store,
     STRING_OPS,
+    StringOperation,
     WIDTHS,
     X87_CONSTANTS,
     X87_UNARY,
     ZERO_FLAGS,
     Context,
+    ExternalDestination,
     SideState,
     register_arguments,
     X87Stack,
@@ -47,70 +101,75 @@ from reccmp.compare.asm.verifier.state import (
 
 
 def mem_address(
-    state: SideState, op, escape: bool = False, write: bool = False
+    state: SideState, op: Mem, escape: bool = False, write: bool = False
 ) -> Value:
     # pylint: disable=too-many-boolean-expressions
-    _, size, seg, reg_terms, disp, syms = op
-    disp_key: Value | int = disp
+    disp_key: Value | int = op.displacement
     if (
         state.rename_slots
-        and not seg
-        and not syms
-        and disp < 0
-        and any(reg == "ebp" for reg, _ in reg_terms)
+        and not op.segment
+        and not op.symbols
+        and op.displacement < 0
+        and any(term.register == "ebp" for term in op.terms)
         and stack_rooted(state.regs["bp"])
     ):
-        if not escape and reg_terms == [("ebp", 1)]:
+        if not escape and op.terms == (ScaledReg("ebp", 1),):
             # A plain frame-local slot: alpha-renamable across the sides.
-            disp_key = state.slot_ref(disp, size, write)
+            disp_key = state.slot_ref(op.displacement, op.size, write)
         else:
             # The slot's address escapes (lea) or the access is indexed
             # (a local array): renaming frame slots is no longer safe.
             state.slots_escaped = True
-    pairs = [(state.read_reg(reg), scale) for reg, scale in reg_terms]
+    pairs = [
+        AddressTerm(state.read_reg(term.register), term.scale) for term in op.terms
+    ]
     if isinstance(disp_key, int):
         # Fold constant stack-pointer adjustments into the displacement so
         # that e.g. [esp + 8] before a push and [esp + 0xc] after it denote
         # the same address. Skipped for alpha-renamed frame slots, whose
         # key is the slot id rather than an offset.
         folded = []
-        for value, scale in pairs:
-            base, offset = unwind_spadd(value)
+        for term in pairs:
+            base, offset = unwind_spadd(term.value)
             if offset:
-                disp_key += scale * offset
-                value = base
-            folded.append((value, scale))
+                disp_key += term.scale * offset
+            folded.append(AddressTerm(base, term.scale))
         pairs = folded
     terms = tuple(sorted(pairs, key=repr))
-    if escape and any(stack_rooted(value) for value, _ in terms):
+    if escape and any(stack_rooted(term.value) for term in terms):
         # A stack address escapes into a register: pointers derived from it
         # could reach frame slots or saved registers on the stack.
         state.slots_escaped = True
-    return ("mem", seg, terms, disp_key, syms)
+    return MemoryAddress(op.segment, terms, disp_key, op.symbols)
 
 
-def read_operand(state: SideState, ctx: Context, op) -> Value:
-    kind = op[0]
-    if kind == "reg":
-        return state.read_reg(op[1])
-    if kind == "imm":
-        return ("imm", op[1])
-    if kind == "sym":
-        return ("sym", operand_identity(op[1]))
-    if kind == "st":
-        return state.x87.read(op[1])
-    if kind == "mem":
-        address = mem_address(state, op)
-        width = WIDTHS.get(op[1])
-        offset = frame_offset(state, ctx, address, width, slot=False)
-        if offset is not None:
-            assert width is not None
-            return read_slot(state, offset, width)
-        if ctx.trace is not None:
-            ctx.trace.append(("r", address, width, False))
-        tag = memory_load_tag(ctx, address, width, False)
-        state.load_log.add((address, tag))
-        return ("load", address, op[1], tag)
+def read_operand(state: SideState, ctx: Context, op: Operand) -> Value:
+    # pylint: disable=too-many-return-statements
+    match op:
+        case Reg(name) if name in REGISTERS:
+            return state.read_reg(name)
+        case Reg(name):
+            # A register outside the model (a segment register) reads as a
+            # fixed symbol of the function.
+            return SymbolValue(name)
+        case Imm(value):
+            return Constant(value)
+        case Sym(ref):
+            return SymbolValue(ref.identity)
+        case St(index):
+            return state.x87.read(index)
+        case Mem(size=size):
+            address = mem_address(state, op)
+            width = WIDTHS.get(size)
+            offset = frame_offset(state, ctx, address, width, slot=False)
+            if offset is not None:
+                assert width is not None
+                return read_slot(state, offset, width)
+            if ctx.trace is not None:
+                ctx.trace.append(("r", address, width, False))
+            tag = memory_load_tag(ctx, address, width, False)
+            state.load_log.add((address, tag))
+            return Load(address, size, tag)
     raise Reject
 
 
@@ -124,15 +183,14 @@ def _canonical_address_value(address: Value) -> Value:
     by ADD itself.
     """
     mem = flatten_mem(address)
-    _, seg, terms, disp, syms = mem
-    if seg or syms or not isinstance(disp, int):
-        return ("addr", mem)
-    if any(scale != 1 or stack_rooted(value) for value, scale in terms):
-        return ("addr", mem)
+    if mem.segment or mem.symbols or not isinstance(mem.displacement, int):
+        return AddressValue(mem)
+    if any(term.scale != 1 or stack_rooted(term.value) for term in mem.terms):
+        return AddressValue(mem)
 
-    values = [value for value, _ in terms]
-    if disp or not values:
-        values.append(("imm", disp))
+    values = [term.value for term in mem.terms]
+    if mem.displacement or not values:
+        values.append(Constant(mem.displacement))
     if len(values) == 1:
         return values[0]
 
@@ -145,19 +203,14 @@ def _canonical_address_value(address: Value) -> Value:
 def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
     """Canonical receiver identity independent of reload generation tags."""
     seen: set[int] = set()
-    while (
-        isinstance(receiver, tuple)
-        and len(receiver) == 4
-        and receiver[0] == "load"
-        and id(receiver) not in seen
-    ):
+    while isinstance(receiver, Load) and id(receiver) not in seen:
         seen.add(id(receiver))
-        address, size = receiver[1], WIDTHS.get(receiver[2])
+        address, size = receiver.address, WIDTHS.get(receiver.width)
         forwarded = ctx.receiver_values.get((address, size))
         if forwarded is None:
-            return ("receiver_load", address, receiver[2])
+            return ReceiverLoad(address, receiver.width)
         store_tag, stored_value = forwarded
-        load_tag = receiver[3]
+        load_tag = receiver.generation
         event_tags = [tag for tag, _ in ctx.mem_events]
         if store_tag == load_tag:
             receiver = stored_value
@@ -165,9 +218,9 @@ def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
             if event_tags.index(store_tag) < event_tags.index(load_tag):
                 receiver = stored_value
             else:
-                return ("receiver_load", address, receiver[2])
+                return ReceiverLoad(address, receiver.width)
         else:
-            return ("receiver_load", address, receiver[2])
+            return ReceiverLoad(address, receiver.width)
     return receiver
 
 
@@ -179,58 +232,75 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     register allocation, moved equivalent loads, and equivalent phi inputs
     transparent while retaining the receiver and slot as the call identity.
     """
-    if not (isinstance(target, tuple) and len(target) == 4 and target[0] == "load"):
+    if not isinstance(target, Load):
         return None
 
-    call_mem = flatten_mem(target[1])
-    _, call_seg, call_terms, slot, call_syms = call_mem
-    if call_seg or call_syms or not isinstance(slot, int) or len(call_terms) != 1:
-        return None
-    vtable, scale = call_terms[0]
-    if scale != 1 or not (
-        isinstance(vtable, tuple) and len(vtable) == 4 and vtable[0] == "load"
-    ):
-        return None
-
-    receiver_mem = flatten_mem(vtable[1])
-    _, receiver_seg, receiver_terms, receiver_disp, receiver_syms = receiver_mem
+    call_mem = flatten_mem(target.address)
     if (
-        receiver_seg
-        or receiver_syms
-        or receiver_disp != 0
-        or len(receiver_terms) != 1
-        or receiver_terms[0][1] != 1
+        call_mem.segment
+        or call_mem.symbols
+        or not isinstance(call_mem.displacement, int)
+        or len(call_mem.terms) != 1
     ):
         return None
-    receiver = receiver_equivalence_class(receiver_terms[0][0], ctx)
-    return ("vcall", receiver, slot)
+    vtable = call_mem.terms[0]
+    if vtable.scale != 1 or not isinstance(vtable.value, Load):
+        return None
+
+    receiver_mem = flatten_mem(vtable.value.address)
+    if (
+        receiver_mem.segment
+        or receiver_mem.symbols
+        or receiver_mem.displacement != 0
+        or len(receiver_mem.terms) != 1
+        or receiver_mem.terms[0].scale != 1
+    ):
+        return None
+    receiver = receiver_equivalence_class(receiver_mem.terms[0].value, ctx)
+    return VirtualCall(receiver, call_mem.displacement)
 
 
-def write_operand(state: SideState, ctx: Context, op, value: Value, obs: list) -> None:
-    kind = op[0]
-    if kind == "reg":
-        state.write_reg(op[1], value)
-    elif kind == "mem":
-        address = mem_address(state, op, write=True)
-        width = WIDTHS.get(op[1])
-        offset = frame_offset(state, ctx, address, width, slot=False)
-        if offset is not None:
-            assert width is not None
-            write_slot(state, offset, width, value)
-            return
-        if ctx.trace is not None:
-            ctx.trace.append(("w", address, WIDTHS.get(op[1]), False))
-        obs.append(("store", address, op[1], value))
-    elif kind == "st":
-        state.x87.write(op[1], value)
-    else:
-        raise Reject
+def write_operand(
+    state: SideState,
+    ctx: Context,
+    op: Operand,
+    value: Value,
+    obs: list[Observation],
+) -> None:
+    match op:
+        case Reg(name):
+            state.write_reg(name, value)
+        case Mem(size=size):
+            address = mem_address(state, op, write=True)
+            width = WIDTHS.get(size)
+            offset = frame_offset(state, ctx, address, width, slot=False)
+            if offset is not None:
+                assert width is not None
+                write_slot(state, offset, width, value)
+                return
+            if ctx.trace is not None:
+                ctx.trace.append(("w", address, width, False))
+            obs.append(Store(address, size, value))
+        case St(index):
+            state.x87.write(index, value)
+        case _:
+            raise Reject
 
 
-def _mul_registers(op) -> tuple[str, str]:
+def _operand_width(op: Operand) -> str:
+    """A memory operand's size keyword, or a register's part."""
+    match op:
+        case Mem(size=size):
+            return size
+        case Reg(name):
+            return REGISTERS[name][1]
+    raise Reject
+
+
+def _mul_registers(op: Operand) -> tuple[str, str]:
     """Accumulator/high register pair for single-operand mul/imul/div/idiv,
     depending on the operand width."""
-    width = op[1] if op[0] == "mem" else REGISTERS[op[1]][1]
+    width = _operand_width(op)
     if width in ("byte", "l8", "h8"):
         return "al", "ah"
     if width in ("word", "r16"):
@@ -238,11 +308,18 @@ def _mul_registers(op) -> tuple[str, str]:
     return "eax", "edx"
 
 
+def _st_index(op: Operand) -> int:
+    match op:
+        case St(index):
+            return index
+    raise Reject
+
+
 def esp_add(value: Value, delta: int) -> Value:
-    if isinstance(value, tuple) and value[0] == "spadd":
-        base, offset = value[1], value[2] + delta
-        return base if offset == 0 else ("spadd", base, offset)
-    return ("spadd", value, delta)
+    if isinstance(value, StackOffset):
+        offset = value.offset + delta
+        return value.base if offset == 0 else StackOffset(value.base, offset)
+    return StackOffset(value, delta)
 
 
 # Condition codes whose outcome depends on the carry flag.
@@ -255,43 +332,43 @@ def _import_call(target: Value) -> Value:
     at the same point; both run X with the same return address. Only the
     call target is unified: the thunk's address and the slot's content are
     different pointer values."""
-    if not isinstance(target, tuple) or len(target) < 2:
-        return target
-    if target[0] == "sym" and isinstance(target[1], tuple):
-        if target[1][:1] == ("jmp_through",):
-            return ("call_through", target[1][1])
-    if target[0] == "load" and len(target) >= 3 and target[2] == "dword":
-        slot = _absolute_symbol(target[1])
-        if slot is not None:
-            return ("call_through", slot)
+    match target:
+        case SymbolValue(("jmp_through", slot)):
+            return CallThrough(slot)
+        case Load(address, "dword"):
+            slot = _absolute_symbol(address)
+            if slot is not None:
+                return CallThrough(slot)
     return target
 
 
 def _absolute_symbol(address: Value) -> Hashable | None:
     """The identity of `[symbol]`: an address with no registers, no
     displacement and one symbol."""
-    if not isinstance(address, tuple) or not address:
+    if isinstance(address, SymbolValue):
+        return address.identity
+    if not isinstance(address, MemoryAddress):
         return None
-    if address[0] == "sym" and len(address) == 2:
-        return address[1]
-    if address[0] != "mem" or len(address) != 5:
+    if (
+        address.terms
+        or address.displacement != 0
+        or len(address.symbols) != 1
+        or address.symbols[0].sign != 1
+    ):
         return None
-    _, _, registers, displacement, symbols = address
-    if registers or displacement != 0 or len(symbols) != 1 or symbols[0][0] != 1:
-        return None
-    return operand_identity(symbols[0][1])
+    return address.symbols[0].ref.identity
 
 
-def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
+def _constant_order(pred: CompareKind, a: Value, b: Value, width) -> Compare:
     """One spelling of an order against a constant: `x < c` is `x <= c-1`
     and `c < x` is `c+1 <= x`, except at the ends of the range, and the
     constant is written in the comparison's signedness. A compiler picks
     either spelling (`cmp eax, 0x41; jb` / `cmp eax, 0x40; jbe`)."""
     if not isinstance(width, int):
-        return (pred, a, b)  # the range, and so the rewrite, is unknown
+        return Compare(pred, a, b)  # the range, and so the rewrite, is unknown
     bits = 8 * width
     mask = (1 << bits) - 1
-    signed = pred.endswith("_s")
+    signed = pred in (CompareKind.LT_S, CompareKind.LE_S)
 
     def value(constant: int) -> int:
         constant &= mask
@@ -300,19 +377,19 @@ def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
         return constant
 
     low, high = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, mask)
-    strict = pred.startswith("lt_")
-    kind = "le_s" if signed else "le_u"
-    if isinstance(b, tuple) and b[:1] == ("imm",) and isinstance(b[1], int):
-        constant = value(b[1])
+    strict = pred in (CompareKind.LT_U, CompareKind.LT_S)
+    kind = CompareKind.LE_S if signed else CompareKind.LE_U
+    if isinstance(b, Constant):
+        constant = value(b.value)
         if strict and constant > low:
-            return (kind, a, ("imm", constant - 1))
-        return (pred, a, ("imm", constant))
-    if isinstance(a, tuple) and a[:1] == ("imm",) and isinstance(a[1], int):
-        constant = value(a[1])
+            return Compare(kind, a, Constant(constant - 1), width)
+        return Compare(pred, a, Constant(constant), width)
+    if isinstance(a, Constant):
+        constant = value(a.value)
         if strict and constant < high:
-            return (kind, ("imm", constant + 1), b)
-        return (pred, ("imm", constant), b)
-    return (pred, a, b)
+            return Compare(kind, Constant(constant + 1), b, width)
+        return Compare(pred, Constant(constant), b, width)
+    return Compare(pred, a, b, width)
 
 
 def canon_condition(cc: str, state: SideState) -> Value:
@@ -320,48 +397,37 @@ def canon_condition(cc: str, state: SideState) -> Value:
     that `cmp a, b` + jg equals `cmp b, a` + jl."""
     flags = state.flags
     entry = CC_CANON.get(cc)
-    if entry is not None and isinstance(flags, tuple) and flags[0] == "cmp":
-        pred, swap = entry
-        a, b = flags[1], flags[2]
-        width = flags[3] if len(flags) > 3 else None
-        base: tuple
-        if pred in ("eq", "ne"):
-            base = (pred, vsort(a, b))
-        else:
-            base = _constant_order(*((pred, b, a) if swap else (pred, a, b)), width)
-        return base if width is None else (*base, width)
-    if (
-        cc in ("o", "no")
-        and isinstance(flags, tuple)
-        and flags[0] == "sahf"
-        and len(flags) > 2
-    ):
-        # OF is preserved across SAHF; observe the prior flag producer.
-        return ("cc", cc, flags[2])
+    match flags:
+        case CompareFlags(a, b, width) if entry is not None:
+            pred, swap = entry
+            if pred in (CompareKind.EQ, CompareKind.NE):
+                left, right = vsort(a, b)
+                return Compare(pred, left, right, width)
+            if swap:
+                return _constant_order(pred=pred, a=b, b=a, width=width)
+            return _constant_order(pred=pred, a=a, b=b, width=width)
+        case SahfFlags(previous=previous) if cc in ("o", "no"):
+            # OF is preserved across SAHF; observe the prior flag producer.
+            return ConditionCode(cc, previous)
     if cc in CF_CONDITIONS:
         # The carry flag may have a different (older) producer than the
         # rest of the flags.
-        return ("cc", cc, flags, state.carry)
-    return ("cc", cc, flags)
+        return ConditionCode(cc, flags, state.carry)
+    return ConditionCode(cc, flags)
 
 
 _PART_BYTES = {"l8": 1, "h8": 1, "r8": 1, "r8h": 1, "r16": 2, "r32": 4}
 
 
-def _compare_width(op_a, op_b) -> int | str:
+def _compare_width(op_a: Operand, op_b: Operand) -> int | str:
     """Byte width of a CMP/TEST, used so signed/unsigned outcomes stay distinct."""
     for op in (op_a, op_b):
-        if not isinstance(op, tuple) or not op:
-            continue
-        if op[0] == "reg":
-            part = REGISTERS.get(op[1], (None, None))[1]
-            if part in _PART_BYTES:
-                return _PART_BYTES[part]
-        if op[0] == "mem":
-            size = op[1]
-            if size in WIDTHS:
+        match op:
+            case Reg(name) if REGISTERS.get(name, (None, None))[1] in _PART_BYTES:
+                return _PART_BYTES[REGISTERS[name][1]]
+            case Mem(size=size) if size in WIDTHS:
                 return WIDTHS[size]
-            if isinstance(size, str) and size.startswith("size"):
+            case Mem(size=size) if size.startswith("size"):
                 try:
                     return int(size[4:])
                 except ValueError:
@@ -369,13 +435,19 @@ def _compare_width(op_a, op_b) -> int | str:
     return "unk"
 
 
-def _branch_obs_dest(ins: DecodedInstruction) -> object:
+def _branch_obs_dest(ins: DecodedInstruction) -> ExternalDestination | None:
     """Proof identity of a direct transfer; never a relative displacement."""
-    return ins.control_target
+    return (
+        None if ins.control_target is None else ExternalDestination(ins.control_target)
+    )
 
 
 def execute(
-    state: SideState, ctx: Context, idx: int, ins: DecodedInstruction, obs: list
+    state: SideState,
+    ctx: Context,
+    idx: int,
+    ins: DecodedInstruction,
+    obs: list[Observation],
 ) -> None:
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-branches,too-many-statements
@@ -387,10 +459,11 @@ def execute(
         write_operand(state, ctx, ops[0], read_operand(state, ctx, ops[1]), obs)
     elif mnemonic in ("movsx", "movzx") and len(ops) == 2:
         src = ops[1]
-        width = src[1] if src[0] == "mem" else REGISTERS[src[1]][1]
-        value = (mnemonic, width, read_operand(state, ctx, src))
+        value = Extend(
+            ExtendKind(mnemonic), _operand_width(src), read_operand(state, ctx, src)
+        )
         write_operand(state, ctx, ops[0], value, obs)
-    elif mnemonic == "lea" and len(ops) == 2 and ops[1][0] == "mem":
+    elif mnemonic == "lea" and len(ops) == 2 and isinstance(ops[1], Mem):
         address = mem_address(state, ops[1], escape=True)
         write_operand(state, ctx, ops[0], _canonical_address_value(address), obs)
     elif mnemonic == "xchg" and len(ops) == 2:
@@ -403,7 +476,7 @@ def execute(
         b = read_operand(state, ctx, ops[1])
         pair = vsort(a, b)
         if mnemonic == "xor" and a == b:
-            value = ("imm", 0)
+            value = Constant(0)
         elif mnemonic in ("and", "or") and a == b:
             # and/or of a value with itself leaves it unchanged.
             value = a
@@ -417,53 +490,61 @@ def execute(
             # SF/ZF/PF reflect the value; CF and OF are cleared: exactly
             # the flag state of `cmp value, 0`.
             width = _compare_width(ops[0], ops[0])
-            state.flags = ("cmp", a, ("imm", 0), width)
+            state.flags = CompareFlags(a, Constant(0), width)
         else:
-            state.flags = ("flags", mnemonic, *pair)
+            operation = Operation(OperationKind(mnemonic), pair)
+            state.flags = FlagsResult(operation)
         # and/or/xor clear CF; add/imul produce a carry-out.
         if mnemonic in ("and", "or", "xor"):
-            state.carry = ("cf0",)
+            state.carry = CarryCleared()
         else:
-            state.carry = ("carry", mnemonic, *pair)
+            state.carry = CarryResult(operation)
     elif mnemonic == "imul" and len(ops) == 3:
-        value = (
-            "imul3",
-            read_operand(state, ctx, ops[1]),
-            read_operand(state, ctx, ops[2]),
+        value = Operation(
+            OperationKind.IMUL3,
+            (read_operand(state, ctx, ops[1]), read_operand(state, ctx, ops[2])),
         )
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", *value)
-        state.carry = ("carry", *value)
+        state.flags = FlagsResult(value)
+        state.carry = CarryResult(value)
     elif mnemonic in ORDERED_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        value = ("imm", 0) if (mnemonic == "sub" and a == b) else (mnemonic, a, b)
+        value = (
+            Constant(0)
+            if mnemonic == "sub" and a == b
+            else Operation(OperationKind(mnemonic), (a, b))
+        )
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic == "sub" and a == b:
             # Zero idiom: same flag state as xor r, r.
             state.flags = ZERO_FLAGS
-            state.carry = ("cf0",)
+            state.carry = CarryCleared()
         else:
-            state.flags = ("flags", mnemonic, a, b)
+            state.flags = FlagsResult(value)
             # The borrow out of sub is the unsigned comparison of its operands.
             state.carry = (
-                ("lt_u", a, b) if mnemonic == "sub" else ("carry", mnemonic, a, b)
+                Compare(CompareKind.LT_U, a, b)
+                if mnemonic == "sub"
+                else CarryResult(value)
             )
     elif mnemonic in CARRY_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        value = (mnemonic, a, b, state.carry)
+        value = Operation(OperationKind(mnemonic), (a, b, state.carry))
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", *value)
-        state.carry = ("carry", *value)
+        state.flags = FlagsResult(value)
+        state.carry = CarryResult(value)
     elif mnemonic in ("inc", "dec", "neg", "not") and len(ops) == 1:
-        value = (mnemonic, read_operand(state, ctx, ops[0]))
+        value = UnaryOperation(
+            OperationKind(mnemonic), read_operand(state, ctx, ops[0])
+        )
         write_operand(state, ctx, ops[0], value, obs)
         # inc/dec rewrite the flags but preserve CF; not touches nothing.
         if mnemonic != "not":
-            state.flags = ("flags", *value)
+            state.flags = FlagsResult(value)
         if mnemonic == "neg":
-            state.carry = ("carry", *value)
+            state.carry = CarryResult(value)
     elif mnemonic == "cmp" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -471,12 +552,12 @@ def execute(
         if a == b:
             state.flags = ZERO_FLAGS
         else:
-            state.flags = ("cmp", a, b, width)
+            state.flags = CompareFlags(a, b, width)
         # `x < x` and `x < 0` (unsigned) are always false.
-        if b in (a, ("imm", 0)):
-            state.carry = ("cf0",)
+        if b in (a, Constant(0)):
+            state.carry = CarryCleared()
         else:
-            state.carry = ("lt_u", a, b, width)
+            state.carry = Compare(CompareKind.LT_U, a, b, width)
     elif mnemonic == "test" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -484,33 +565,53 @@ def execute(
         if a == b:
             # `test r, r` sets SF/ZF/PF from the value and clears CF/OF:
             # exactly the flag state of `cmp r, 0`.
-            state.flags = ("cmp", a, ("imm", 0), width)
+            state.flags = CompareFlags(a, Constant(0), width)
         else:
-            state.flags = ("test", *vsort(a, b), width)
-        state.carry = ("cf0",)
+            state.flags = TestFlags(*vsort(a, b), width)
+        state.carry = CarryCleared()
     elif mnemonic in ("mul", "imul") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         pair = vsort(state.read_reg(acc), read_operand(state, ctx, ops[0]))
-        state.write_reg(acc, (mnemonic, "lo", *pair))
-        state.write_reg(hi, (mnemonic, "hi", *pair))
-        state.flags = ("flags", mnemonic, *pair)
-        state.carry = ("carry", mnemonic, *pair)
+        signed = mnemonic == "imul"
+        state.write_reg(acc, MultiplyResult(signed, ProductPart.LOW, pair))
+        state.write_reg(hi, MultiplyResult(signed, ProductPart.HIGH, pair))
+        operation = Operation(OperationKind(mnemonic), pair)
+        state.flags = FlagsResult(operation)
+        state.carry = CarryResult(operation)
     elif mnemonic in ("div", "idiv") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         divisor = read_operand(state, ctx, ops[0])
-        dividend = (state.read_reg(hi), state.read_reg(acc))
-        state.write_reg(acc, (mnemonic, "quot", dividend, divisor))
-        state.write_reg(hi, (mnemonic, "rem", dividend, divisor))
-        state.flags = ("undef_flags", idx)
-        state.carry = ("undef_cf", idx)
+        signed = mnemonic == "idiv"
+        state.write_reg(
+            acc,
+            DivideResult(
+                signed,
+                ProductPart.QUOTIENT,
+                state.read_reg(hi),
+                state.read_reg(acc),
+                divisor,
+            ),
+        )
+        state.write_reg(
+            hi,
+            DivideResult(
+                signed,
+                ProductPart.REMAINDER,
+                state.read_reg(hi),
+                state.read_reg(acc),
+                divisor,
+            ),
+        )
+        state.flags = OpaqueValue(OpaqueKind.DIVISION_FLAGS, idx)
+        state.carry = OpaqueValue(OpaqueKind.DIVISION_CARRY, idx)
     elif mnemonic == "cdq":
-        state.write_reg("edx", ("cdq", state.read_reg("eax")))
+        state.write_reg("edx", UnaryOperation(OperationKind.CDQ, state.read_reg("eax")))
     elif mnemonic == "cwde":
-        state.write_reg("eax", ("cwde", state.read_reg("ax")))
+        state.write_reg("eax", UnaryOperation(OperationKind.CWDE, state.read_reg("ax")))
     elif mnemonic == "sahf":
         # SAHF loads SF/ZF/AF/PF/CF from AH; OF is preserved.
-        state.flags = ("sahf", state.read_reg("ah"), state.flags)
-        state.carry = ("sahf_cf", state.read_reg("ah"))
+        state.flags = SahfFlags(state.read_reg("ah"), state.flags)
+        state.carry = SahfCarry(state.read_reg("ah"))
     elif mnemonic == "push" and len(ops) == 1:
         value = read_operand(state, ctx, ops[0])
         new_esp = esp_add(state.read_reg("esp"), -4)
@@ -521,7 +622,7 @@ def execute(
         else:
             if ctx.trace is not None:
                 ctx.trace.append(("w", new_esp, 4, "push"))
-            obs.append(("store", new_esp, "stack", value))
+            obs.append(Store(new_esp, "stack", value))
     elif mnemonic == "pop" and len(ops) == 1:
         esp = state.read_reg("esp")
         offset = frame_offset(state, ctx, esp, 4, slot=True)
@@ -530,7 +631,7 @@ def execute(
         else:
             if ctx.trace is not None:
                 ctx.trace.append(("r", esp, 4, "pop"))
-            popped = ("load", esp, "stack", memory_load_tag(ctx, esp, 4, "pop"))
+            popped = Load(esp, "stack", memory_load_tag(ctx, esp, 4, "pop"))
         write_operand(state, ctx, ops[0], popped, obs)
         state.write_reg("esp", esp_add(esp, 4))
     elif mnemonic == "leave":
@@ -542,7 +643,7 @@ def execute(
             if ctx.trace is not None:
                 ctx.trace.append(("r", ebp, 4, "pop"))
             state.write_reg(
-                "ebp", ("load", ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
+                "ebp", Load(ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
             )
         state.write_reg("esp", esp_add(ebp, 4))
     elif mnemonic == "call" and len(ops) == 1:
@@ -552,84 +653,88 @@ def execute(
         # not match; otherwise it must match exactly.
         facts = None
         if ctx.metadata is not None and ctx.metadata.call_facts is not None:
-            if ops[0][0] == "sym":
-                facts = ctx.metadata.call_facts(operand_identity(ops[0][1]))
+            if isinstance(ops[0], Sym):
+                facts = ctx.metadata.call_facts(ops[0].ref.identity)
         ecx_argument, edx_argument = register_arguments(facts)
         target = _import_call(read_operand(state, ctx, ops[0]))
         virtual_target = _canonical_virtual_target(target, ctx)
-        entry = ["call", virtual_target or target]
+        arguments = []
         # A known virtual target is not proof that arguments agree. Always
         # observe the actual this/receiver (ecx). Include edx only when the
         # ABI says it is an argument — never merely because the call looked
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
-            entry.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
+            arguments.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
             if facts is not None and facts.uses_edx:
-                entry.append(state.read_reg("edx"))
+                arguments.append(state.read_reg("edx"))
         else:
             if ecx_argument:
-                entry.append(state.read_reg("ecx"))
+                arguments.append(state.read_reg("ecx"))
             if edx_argument:
-                entry.append(state.read_reg("edx"))
-        obs.append(tuple(entry))
+                arguments.append(state.read_reg("edx"))
+        obs.append(Call(virtual_target or target, tuple(arguments)))
         incoming_esp = state.read_reg("esp")
         for reg in ("eax", "ecx", "edx"):
-            state.write_reg(reg, ("callret", idx, reg))
+            state.write_reg(reg, CallResult(idx, reg))
         # Preserve dependence on incoming SP; unknown cleanup must not
         # erase a pre-call stack discrepancy.
-        state.write_reg("esp", ("callesp", idx, incoming_esp))
-        state.flags = ("callflags", idx)
-        state.carry = ("callcf", idx)
+        state.write_reg("esp", CallStack(idx, incoming_esp))
+        state.flags = OpaqueValue(OpaqueKind.CALL_FLAGS, idx)
+        state.carry = OpaqueValue(OpaqueKind.CALL_CARRY, idx)
         state.x87 = X87Stack(epoch=idx + 1)
     elif mnemonic == "ret":
-        obs.append(("retstack", ins.operands, state.x87.state_key()[1:]))
+        obs.append(ReturnStack(ins.operands, state.x87.state_key()[1:]))
         # Externally observable machine state at return must match exactly:
         # the callee-saved registers, the stack pointer, and the return
         # value as determined by the function's return kind. Without
         # return-type metadata from the PDB, eax must match exactly.
         obs.append(
-            (
-                "retsaved",
-                tuple(state.regs[f] for f in ("b", "si", "di", "bp", "sp")),
-            )
+            ReturnSaved(tuple(state.regs[f] for f in ("b", "si", "di", "bp", "sp")))
         )
         kind = ctx.metadata.return_kind if ctx.metadata is not None else "unknown"
         if kind == "void":
             pass
         elif kind == "float":
-            obs.append(("retfpu", state.x87.read(0)))
+            obs.append(ReturnFpu(state.x87.read(0)))
         elif kind == "i8":
-            obs.append(("retval", state.read_reg("al")))
+            obs.append(ReturnValue((state.read_reg("al"),)))
         elif kind == "i16":
-            obs.append(("retval", state.read_reg("ax")))
+            obs.append(ReturnValue((state.read_reg("ax"),)))
         elif kind == "i64":
-            obs.append(("retval", state.read_reg("eax"), state.read_reg("edx")))
+            obs.append(ReturnValue((state.read_reg("eax"), state.read_reg("edx"))))
         elif state.x87.known:
             # x87 return value: st(0) must match; eax is scratch.
-            obs.append(("retfpu", state.x87.known[0]))
+            obs.append(ReturnFpu(state.x87.known[0]))
         else:
-            obs.append(("retval", state.read_reg("eax")))
+            obs.append(ReturnValue((state.read_reg("eax"),)))
     elif mnemonic in JCC_MNEMONICS and len(ops) == 1:
         pred = canon_condition(JCC_MNEMONICS[mnemonic], state)
-        obs.append(("branch", pred, _branch_obs_dest(ins)))
+        obs.append(Branch(pred, _branch_obs_dest(ins)))
     elif mnemonic == "jmp" and len(ops) == 1:
-        if ops[0][0] == "mem":
-            obs.append(("jmpind", read_operand(state, ctx, ops[0])))
+        if isinstance(ops[0], Mem):
+            obs.append(IndirectJump(read_operand(state, ctx, ops[0])))
         else:
-            obs.append(("jmp", _branch_obs_dest(ins)))
+            obs.append(Jump(_branch_obs_dest(ins)))
     elif mnemonic in ("loop", "loope", "loopne", "jcxz", "jecxz") and len(ops) == 1:
         obs.append(
-            (mnemonic, state.read_reg("ecx"), state.flags, _branch_obs_dest(ins))
+            Loop(
+                LoopKind(mnemonic),
+                state.read_reg("ecx"),
+                state.flags,
+                _branch_obs_dest(ins),
+            )
         )
         if mnemonic.startswith("loop"):
-            state.write_reg("ecx", ("loopdec", state.read_reg("ecx")))
+            state.write_reg(
+                "ecx",
+                UnaryOperation(OperationKind.LOOP_DECREMENT, state.read_reg("ecx")),
+            )
     elif mnemonic.startswith("set") and mnemonic[3:] in CC_CANON and len(ops) == 1:
         pred = canon_condition(mnemonic[3:], state)
-        write_operand(state, ctx, ops[0], ("setcc", pred), obs)
+        write_operand(state, ctx, ops[0], SetCondition(pred), obs)
     elif mnemonic.startswith("cmov") and mnemonic[4:] in JCC_MNEMONICS.values():
         pred = canon_condition(mnemonic[4:], state)
-        value = (
-            "cmov",
+        value = Select(
             pred,
             read_operand(state, ctx, ops[0]),
             read_operand(state, ctx, ops[1]),
@@ -641,20 +746,19 @@ def execute(
             maybe_frame_pointer(state.regs[family]) for family in ("si", "di")
         ):
             raise Reject  # it may read or write a promoted slot
-        key = (mnemonic, ins.prefix)
-        observed = [key]
-        for family in reads.split():
-            observed.append(state.regs[family])
+        observed = [state.regs[family] for family in reads.split()]
         if ins.prefix:
             observed.append(state.regs["c"])
-        obs.append(tuple(observed))
+        obs.append(
+            StringOperation(mnemonic, ins.prefix, tuple(observed), _writes_memory)
+        )
         for family in writes.split():
-            state.regs[family] = ("strres", idx, family)
+            state.regs[family] = StringResult(idx, family)
         if ins.prefix:
-            state.regs["c"] = ("strres", idx, "c")
+            state.regs["c"] = StringResult(idx, "c")
         if mnemonic.startswith(("scas", "cmps")):
-            state.flags = ("strflags", idx)
-            state.carry = ("strcf", idx)
+            state.flags = OpaqueValue(OpaqueKind.STRING_FLAGS, idx)
+            state.carry = OpaqueValue(OpaqueKind.STRING_CARRY, idx)
 
     elif mnemonic in ("nop", "int3"):
         pass
@@ -665,7 +769,10 @@ def execute(
 
 
 def execute_x87(
-    state: SideState, ctx: Context, ins: DecodedInstruction, obs: list
+    state: SideState,
+    ctx: Context,
+    ins: DecodedInstruction,
+    obs: list[Observation],
 ) -> None:
     # pylint: disable=too-many-branches,too-many-statements
     mnemonic = ins.mnemonic
@@ -675,79 +782,93 @@ def execute_x87(
     if mnemonic in ("fld", "fild") and len(ops) == 1:
         x87.push(read_operand(state, ctx, ops[0]))
     elif mnemonic in X87_CONSTANTS and not ops:
-        x87.push(("fconst", mnemonic))
+        x87.push(FloatConstant(FloatConstantKind(mnemonic)))
     elif mnemonic in ("fst", "fstp", "fist", "fistp") and len(ops) == 1:
         value = x87.read(0)
         if mnemonic.startswith("fist"):
-            value = ("fist", value)
+            value = FloatOperation(FloatOperationKind.TO_INTEGER, (value,))
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic.endswith("p"):
             x87.pop()
     elif mnemonic in ("fadd", "fmul", "faddp", "fmulp", "fiadd", "fimul"):
-        op = "f" + ("add" if "add" in mnemonic else "mul")
+        op = FloatOperationKind("f" + ("add" if "add" in mnemonic else "mul"))
         if mnemonic in ("faddp", "fmulp"):
-            dest = ops[0][1] if ops else 1
-            value = (op, *vsort(x87.read(dest), x87.read(0)))
+            dest = _st_index(ops[0]) if ops else 1
+            value = FloatOperation(op, vsort(x87.read(dest), x87.read(0)))
             x87.write(dest, value)
             x87.pop()
-        elif len(ops) == 2 and ops[0] == ("st", 0):
-            x87.write(0, (op, *vsort(x87.read(0), x87.read(ops[1][1]))))
-        elif len(ops) == 2 and ops[1] == ("st", 0):
-            dest = ops[0][1]
-            x87.write(dest, (op, *vsort(x87.read(dest), x87.read(0))))
+        elif len(ops) == 2 and ops[0] == St(0):
+            x87.write(
+                0,
+                FloatOperation(op, vsort(x87.read(0), x87.read(_st_index(ops[1])))),
+            )
+        elif len(ops) == 2 and ops[1] == St(0):
+            dest = _st_index(ops[0])
+            x87.write(dest, FloatOperation(op, vsort(x87.read(dest), x87.read(0))))
         elif len(ops) == 1:
-            x87.write(0, (op, *vsort(x87.read(0), read_operand(state, ctx, ops[0]))))
+            x87.write(
+                0,
+                FloatOperation(
+                    op, vsort(x87.read(0), read_operand(state, ctx, ops[0]))
+                ),
+            )
         else:
             raise Reject
     elif (
         mnemonic in ("fsub", "fsubr", "fdiv", "fdivr", "fisub", "fidiv")
         and len(ops) == 1
     ):
-        op = "fsub" if "sub" in mnemonic else "fdiv"
+        op = FloatOperationKind("fsub" if "sub" in mnemonic else "fdiv")
         other = read_operand(state, ctx, ops[0])
         if mnemonic.endswith("r"):
-            x87.write(0, (op, other, x87.read(0)))
+            x87.write(0, FloatOperation(op, (other, x87.read(0))))
         else:
-            x87.write(0, (op, x87.read(0), other))
+            x87.write(0, FloatOperation(op, (x87.read(0), other)))
     elif mnemonic in ("fsubp", "fsubrp", "fdivp", "fdivrp"):
-        op = "fsub" if "sub" in mnemonic else "fdiv"
-        dest = ops[0][1] if ops else 1
+        op = FloatOperationKind("fsub" if "sub" in mnemonic else "fdiv")
+        dest = _st_index(ops[0]) if ops else 1
         if "r" in mnemonic[4:]:
-            value = (op, x87.read(0), x87.read(dest))
+            value = FloatOperation(op, (x87.read(0), x87.read(dest)))
         else:
-            value = (op, x87.read(dest), x87.read(0))
+            value = FloatOperation(op, (x87.read(dest), x87.read(0)))
         x87.write(dest, value)
         x87.pop()
     elif mnemonic in X87_UNARY and not ops:
-        x87.write(0, (mnemonic, x87.read(0)))
+        x87.write(
+            0,
+            FloatOperation(FloatOperationKind(mnemonic), (x87.read(0),)),
+        )
     elif mnemonic == "fxch":
-        i = ops[0][1] if ops else 1
+        i = _st_index(ops[0]) if ops else 1
         a, b = x87.read(0), x87.read(i)
         x87.write(0, b)
         x87.write(i, a)
     elif mnemonic in ("fcom", "fcomp", "fucom", "fucomp", "ficom", "ficomp"):
         other = read_operand(state, ctx, ops[0]) if ops else x87.read(1)
-        state.fpu_flags = ("fcom", x87.read(0), other)
+        state.fpu_flags = FloatCompare(x87.read(0), other)
         if mnemonic.endswith("p"):
             x87.pop()
     elif mnemonic in ("fcompp", "fucompp"):
-        state.fpu_flags = ("fcom", x87.read(0), x87.read(1))
+        state.fpu_flags = FloatCompare(x87.read(0), x87.read(1))
         x87.pop()
         x87.pop()
     elif mnemonic == "ftst":
-        state.fpu_flags = ("fcom", x87.read(0), ("imm", 0))
-    elif mnemonic == "fnstsw" and ops == (("reg", "ax"),):
-        state.write_reg("ax", ("fsw", state.fpu_flags))
+        state.fpu_flags = FloatCompare(x87.read(0), Constant(0))
+    elif mnemonic == "fnstsw" and ops == (Reg("ax"),):
+        state.write_reg("ax", FloatStatusWord(state.fpu_flags))
     elif mnemonic == "fnstcw" and len(ops) == 1:
-        write_operand(state, ctx, ops[0], ("fcw",), obs)
+        write_operand(state, ctx, ops[0], FloatControlWord(), obs)
     elif mnemonic == "fldcw" and len(ops) == 1:
         # Loading the control word affects rounding of subsequent operations;
         # the loaded value flows in via a checked channel only if it differs.
-        obs.append(("fldcw", read_operand(state, ctx, ops[0])))
+        obs.append(LoadControlWord(read_operand(state, ctx, ops[0])))
     elif mnemonic in ("fprem", "fscale"):
-        x87.write(0, (mnemonic, x87.read(0), x87.read(1)))
+        x87.write(
+            0,
+            FloatOperation(FloatOperationKind(mnemonic), (x87.read(0), x87.read(1))),
+        )
     elif mnemonic in ("fpatan", "fyl2x"):
-        value = (mnemonic, x87.read(0), x87.read(1))
+        value = FloatOperation(FloatOperationKind(mnemonic), (x87.read(0), x87.read(1)))
         x87.pop()
         x87.write(0, value)
     else:

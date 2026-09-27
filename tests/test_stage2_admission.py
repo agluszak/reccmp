@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.diagnosis import ComparisonStatus, EffectiveReason
 from reccmp.compare.verification import admit_effective, admit_exact_analysis
 
 
@@ -43,7 +43,6 @@ def test_admit_exact_requires_coverage_topology_and_models_or_bytes():
             topology_equal=True,
             keys_equal=True,
             operands_complete=False,
-            control_flow_complete=True,
             extent_closed=True,
         )
         is None
@@ -53,7 +52,6 @@ def test_admit_exact_requires_coverage_topology_and_models_or_bytes():
         topology_equal=True,
         keys_equal=True,
         operands_complete=True,
-        control_flow_complete=True,
         extent_closed=True,
     )
     assert admitted is not None
@@ -70,16 +68,20 @@ def test_admit_exact_does_not_default_keys_equal():
 def test_admit_effective_requires_closed_extent():
     with pytest.raises(TypeError):
         admit_effective(  # type: ignore[call-arg]  # pylint: disable=missing-kwoa
-            {"register_allocation"}
+            {EffectiveReason.REGISTER_ALLOCATION}
         )
     minted = admit_effective(
-        {"register_allocation"}, coverage_incomplete=False, extent_closed=True
+        {EffectiveReason.REGISTER_ALLOCATION},
+        coverage_incomplete=False,
+        extent_closed=True,
     )
     assert minted is not None
-    assert minted.proof_kind == ComparisonStatus.EFFECTIVE
+    assert minted.status == ComparisonStatus.EFFECTIVE
     assert (
         admit_effective(
-            {"register_allocation"}, coverage_incomplete=True, extent_closed=True
+            {EffectiveReason.REGISTER_ALLOCATION},
+            coverage_incomplete=True,
+            extent_closed=True,
         )
         is None
     )

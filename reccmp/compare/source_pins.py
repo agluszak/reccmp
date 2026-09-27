@@ -4,31 +4,19 @@ import dataclasses
 
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
+from reccmp.types import ImageId
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
+    DifferenceKind,
     DifferenceSide,
-    FactValue,
+    FieldAt,
+    SourceLine,
+    StopLocation,
     StrategyAttempt,
 )
-from reccmp.source.records import SourceComparison, SourceComparisonOperand
+from reccmp.compare.asm.operand import Mem
 from reccmp.source.observations import SourceIndexError
-
-
-def _describe_operand(operand: SourceComparisonOperand) -> str:
-    if operand.constant is not None:
-        return str(operand.constant)
-    return f"{operand.type} field" if operand.field else operand.type
-
-
-def _describe_comparison(comparison: SourceComparison) -> str:
-    """`short field < 65 as int, signed`"""
-    left, right = (_describe_operand(item) for item in comparison.operands)
-    if comparison.signed is not None:
-        how = "signed" if comparison.signed else "unsigned"
-    else:
-        how = "floating" if comparison.floating else "other"
-    return f"{left} {comparison.operator} {right} as {comparison.type}, {how}"
 
 
 class SourcePinMixin(ComparatorState):
@@ -51,25 +39,17 @@ class SourcePinMixin(ComparatorState):
         ):
             diff = analysis.difference
             orig_side = diff.orig
-            recomp_side = self._enrich_side_with_source(diff.recomp, recomp=True)
-            if diff.kind == "branch_condition":
+            recomp_side = self._with_recomp_source_line(diff.recomp)
+            if diff.kind == DifferenceKind.BRANCH_CONDITION:
                 recomp_side = self._with_source_comparisons(recomp_side, match)
-            if diff.kind == "memory_address":
+            if diff.kind == DifferenceKind.MEMORY_ADDRESS:
                 class_name = self._owning_class_for_match(match)
-                orig_layout = self._layout_facts_for_displacement(
-                    class_name, orig_side.facts
+                orig_side = dataclasses.replace(
+                    orig_side, field=self._field_at(class_name, orig_side)
                 )
-                recomp_layout = self._layout_facts_for_displacement(
-                    class_name, recomp_side.facts
+                recomp_side = dataclasses.replace(
+                    recomp_side, field=self._field_at(class_name, recomp_side)
                 )
-                if orig_layout:
-                    orig_side = dataclasses.replace(
-                        orig_side, facts={**orig_side.facts, **orig_layout}
-                    )
-                if recomp_layout:
-                    recomp_side = dataclasses.replace(
-                        recomp_side, facts={**recomp_side.facts, **recomp_layout}
-                    )
             enriched = dataclasses.replace(diff, orig=orig_side, recomp=recomp_side)
             return dataclasses.replace(
                 analysis,
@@ -81,9 +61,7 @@ class SourcePinMixin(ComparatorState):
             return dataclasses.replace(
                 analysis,
                 inconclusive_location=(
-                    self._enrich_side_with_source(location)
-                    if location is not None
-                    else None
+                    self._with_source_line(location) if location is not None else None
                 ),
                 attempts=self._enrich_attempts_with_source(analysis.attempts),
             )
@@ -100,48 +78,40 @@ class SourcePinMixin(ComparatorState):
                     attempt,
                     difference=dataclasses.replace(
                         diff,
-                        recomp=self._enrich_side_with_source(diff.recomp, recomp=True),
+                        recomp=self._with_recomp_source_line(diff.recomp),
                     ),
                 )
             elif attempt.location is not None:
                 attempt = dataclasses.replace(
-                    attempt, location=self._enrich_side_with_source(attempt.location)
+                    attempt, location=self._with_source_line(attempt.location)
                 )
             enriched.append(attempt)
         return tuple(enriched)
 
-    def _enrich_side_with_source(
-        self, side: DifferenceSide, *, recomp: bool = False
-    ) -> DifferenceSide:
-        """Attach PDB line info for the recomp address of this location.
+    def _with_recomp_source_line(self, side: DifferenceSide) -> DifferenceSide:
+        """A recompiled side with the source line of its address."""
+        return dataclasses.replace(side, source=self._source_line(side.address))
 
-        Orig-side locations are pinned through their recorded recomp
-        counterpart; an orig address is never looked up in the recomp PDB.
-        """
-        recomp_address = (
-            side.address
-            if recomp or side.image == "recomp"
-            else side.facts.get("recomp_address")
+    def _with_source_line(self, location: StopLocation) -> StopLocation:
+        """The location with the recompiled source line of it, or of its
+        recompiled counterpart; an orig address is never looked up in the
+        recomp PDB."""
+        source = self._source_line(
+            location.address
+            if location.image is ImageId.RECOMP
+            else location.counterpart_address
         )
-        if not isinstance(recomp_address, int) or isinstance(recomp_address, bool):
-            return side
-        extra = self._source_facts_of_recomp_addr(recomp_address)
-        if not extra:
-            return side
-        return dataclasses.replace(side, facts={**side.facts, **extra})
+        return (
+            location if source is None else dataclasses.replace(location, source=source)
+        )
 
-    def _source_facts_of_recomp_addr(
-        self, recomp_addr: int | None
-    ) -> dict[str, FactValue]:
+    def _source_line(self, recomp_addr: int | None) -> SourceLine | None:
         if recomp_addr is None:
-            return {}
+            return None
         path_line_pair = self.lines_db.find_line_of_recomp_address(recomp_addr)
         if path_line_pair is None:
-            return {}
-        return {
-            "source_path": path_line_pair[0].name,
-            "source_line": path_line_pair[1],
-        }
+            return None
+        return SourceLine(path_line_pair[0].name, path_line_pair[1])
 
     def _with_source_comparisons(
         self, side: DifferenceSide, match: ReccmpMatch | None
@@ -169,15 +139,7 @@ class SourcePinMixin(ComparatorState):
         comparisons = facts.comparisons_on_line(line) if facts else ()
         if not comparisons:
             return side
-        return dataclasses.replace(
-            side,
-            facts={
-                **side.facts,
-                "source_comparisons": "; ".join(
-                    _describe_comparison(item) for item in comparisons
-                ),
-            },
-        )
+        return dataclasses.replace(side, source_comparisons=tuple(comparisons))
 
     def _owning_class_for_match(self, match: ReccmpMatch | None) -> str | None:
         """Resolve the class that owns ``this`` for layout enrichment."""
@@ -206,26 +168,26 @@ class SourcePinMixin(ComparatorState):
             return name.rsplit("::", 1)[0]
         return None
 
-    def _layout_facts_for_displacement(
-        self, class_name: str | None, facts: dict[str, FactValue]
-    ) -> dict[str, FactValue]:
+    def _field_at(self, class_name: str | None, side: DifferenceSide) -> FieldAt | None:
+        """The field of ``class_name`` a side's memory operand displacement
+        reaches, in the recovered layout."""
+        match side.observed.operand:
+            case Mem(displacement=displacement):
+                pass
+            case _:
+                return None
         if (
             self.source_index is None
             or not class_name
-            or not isinstance(facts.get("displacement"), int)
+            or not self.source_index.has_layout(class_name)
         ):
-            return {}
-        if not self.source_index.has_layout(class_name):
-            return {}
-        displacement = facts["displacement"]
-        assert isinstance(displacement, int)
+            return None
         resolved = self.source_index.resolve_field(class_name, displacement)
         if resolved is None:
-            return {}
-        return {
-            "class_name": resolved.root_class,
-            "field_name": resolved.leaf.name,
-            "field_offset": resolved.absolute_offset,
-            "field_type": resolved.leaf.type,
-            "field_path": ".".join(resolved.path) or resolved.leaf.name,
-        }
+            return None
+        return FieldAt(
+            resolved.root_class,
+            tuple(resolved.path) or (resolved.leaf.name,),
+            resolved.absolute_offset,
+            resolved.leaf.type,
+        )

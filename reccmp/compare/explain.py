@@ -13,172 +13,155 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import (
+    Imm,
+    Mem,
+    Operand,
+    SignedSymbol,
+    Sym,
+    format_operand,
+)
 from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    AddressValue,
+    CallStack,
+    CarryResult,
+    Compare,
+    CompareFlags,
+    CompareKind,
+    ConditionCode,
+    Constant,
+    DivideResult,
+    Extend,
+    ExtendKind,
+    Extract,
+    FlagsResult,
+    FloatCompare,
+    FloatOperation,
+    FloatStatusWord,
+    Init,
+    Insert,
+    Load,
+    MemoryAddress,
+    MultiplyResult,
+    Operation,
+    OperationKind,
+    Phi,
+    ReceiverLoad,
+    SahfCarry,
+    SahfFlags,
+    Select,
+    SetCondition,
+    StackOffset,
+    SymbolValue,
+    TestFlags,
+    UnaryOperation,
+    VirtualCall,
+    is_value,
+    value_children,
+)
+from reccmp.compare.asm.verifier.render import render, render_number
+from reccmp.source.records import SourceComparison, SourceComparisonOperand
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
     ComparisonStatus,
+    DifferenceKind,
     DifferenceSide,
+    SolverResult,
 )
 
-_REGISTER = {
-    "a": "eax",
-    "b": "ebx",
-    "c": "ecx",
-    "d": "edx",
-    "si": "esi",
-    "di": "edi",
-    "bp": "ebp",
-    "sp": "esp",
+_SIGN_SWAP = {
+    CompareKind.LT_U: CompareKind.LT_S,
+    CompareKind.LE_U: CompareKind.LE_S,
+    CompareKind.LT_S: CompareKind.LT_U,
+    CompareKind.LE_S: CompareKind.LE_U,
 }
-_BINARY = {
-    "and": "&",
-    "or": "|",
-    "xor": "^",
-    "sub": "-",
-    "imul": "*",
-    "imul3": "*",
-    "shl": "<<",
-    "shr": ">>u",
-    "sar": ">>s",
-}
-_PREDICATE = {
-    "eq": "==",
-    "ne": "!=",
-    "lt_u": "<u",
-    "le_u": "<=u",
-    "lt_s": "<s",
-    "le_s": "<=s",
-}
-_SIGN_SWAP = {"lt_u": "lt_s", "le_u": "le_s", "lt_s": "lt_u", "le_s": "le_u"}
-_UNARY = {"inc": "{} + 1", "dec": "{} - 1", "neg": "-{}", "not": "~{}"}
-_PART = {"l8": "low8", "h8": "bits8_15", "r16": "low16"}
-_INSERT = {"ins_l8": "al", "ins_h8": "ah", "ins_r16": "ax"}
-
-
-def _number(value: int) -> str:
-    return str(value) if -10 < value < 10 else hex(value)
-
-
-_ENTRY_SP = (("init", "sp"), 1)
-
-
-def render(value: Any, depth: int = 0) -> str:
-    """A C-like spelling of a verifier symbolic value."""
-    # pylint: disable=too-many-return-statements,too-many-branches
-    if depth > 8:
-        return "…"
-
-    def inner(item: Any) -> str:
-        return render(item, depth + 1)
-
-    match value:
-        case ("imm", int() as number):
-            return _number(number)
-        case ("init", family):
-            return f"{_REGISTER.get(family, family)}@entry"
-        case ("load", ("mem", "", (entry,), int() as displacement, ()), "dword", _) if (
-            entry == _ENTRY_SP and displacement > 0 and displacement % 4 == 0
-        ):
-            return f"arg{displacement // 4}"
-        case ("load", address, size, *_):
-            return f"{size}[{_address(address, depth + 1)}]"
-        case ("mem", *_):
-            return _address(value, depth)
-        case ("addr", address):
-            return f"&[{_address(address, depth + 1)}]"
-        case ("sym", identity):
-            return _symbol(identity)
-        case ("spadd", base, int() as offset):
-            return f"{inner(base)} {'+' if offset >= 0 else '-'} {_number(abs(offset))}"
-        case (tag, whole) if tag in _PART:
-            return f"{_PART[tag]}({inner(whole)})"
-        case (tag, old, new) if tag in _INSERT:
-            return f"({inner(old)} with {_INSERT[tag]} = {inner(new)})"
-        case ("add", *terms) if len(terms) >= 2:
-            return "(" + " + ".join(inner(term) for term in terms) + ")"
-        case (tag, left, right) if tag in _BINARY:
-            return f"({inner(left)} {_BINARY[tag]} {inner(right)})"
-        case (tag, operand) if tag in _UNARY:
-            return "(" + _UNARY[tag].format(inner(operand)) + ")"
-        case ("movzx", _, operand):
-            return f"zext({inner(operand)})"
-        case ("movsx", _, operand):
-            return f"sext({inner(operand)})"
-        case ("callret", call, family):
-            return f"{_REGISTER.get(family, family)} after call@{call}"
-        case ("phi", block, klass):
-            return f"join{block}#{klass}"
-        case ("eq" | "ne" as tag, (left, right), *width):
-            return _comparison(tag, left, right, width, depth)
-        case (tag, left, right, *width) if tag in _PREDICATE:
-            return _comparison(tag, left, right, width, depth)
-        case ("cc", condition, flags, *_):
-            return f"{condition} of {inner(flags)}"
-        case (tag, *operands):
-            return f"{tag}(" + ", ".join(inner(item) for item in operands[:2]) + ")"
-        case _:
-            return repr(value)
-
-
-def _comparison(tag: str, left: Any, right: Any, width: list, depth: int) -> str:
-    match width:
-        case [int() as size]:
-            bits = f" ({8 * size}-bit)"
-        case _:
-            bits = ""
-    return (
-        f"{render(left, depth + 1)} {_PREDICATE[tag]} {render(right, depth + 1)}{bits}"
-    )
-
-
-def _symbol(identity: Any) -> str:
-    match identity:
-        case ("entity", int() as address, int() as offset):
-            return f"entity@0x{address:x}" + (f"+{_number(offset)}" if offset else "")
-        case ("import", name):
-            return str(name)
-        case (*parts,) if parts:
-            return "/".join(str(part) for part in parts)
-        case _:
-            return str(identity)
-
-
-def _address(mem: Any, depth: int) -> str:
-    match mem:
-        case ("mem", segment, terms, displacement, symbols):
-            pass
-        case _:
-            return render(mem, depth)
-    parts = [
-        render(term, depth + 1) if scale == 1 else f"{render(term, depth + 1)}*{scale}"
-        for term, scale in terms
-    ]
-    parts += [str(token) for _, token in symbols]
-    match displacement:
-        case 0 if parts:
-            pass
-        case int() as number:
-            parts.append(_number(number))
-        case other:
-            parts.append(str(other))
-    text = " + ".join(parts).replace("+ -", "- ")
-    return f"{segment}:{text}" if segment else text
 
 
 def _where(side: DifferenceSide) -> str:
     text = f"0x{side.address:x}" if side.address is not None else "function exit"
-    match side.facts.get("source_path"), side.facts.get("source_line"):
-        case str() as path, int() as line:
-            text += f" ({path}:{line})"
+    if side.source is not None:
+        text += f" ({side.source.path}:{side.source.line})"
     return text
 
 
+def _symbol_ref(operand: Operand | None) -> Reference | None:
+    """The reference an operand names: a symbol, or the one symbol of an
+    absolute memory operand."""
+    match operand:
+        case Sym(ref) | Mem(symbols=(SignedSymbol(1, ref),)):
+            return ref
+    return None
+
+
+def _identity_kind(operand: Operand | None) -> str | None:
+    match _symbol_ref(operand):
+        case Reference(identity=(str() as kind, *_)):
+            return kind
+    return None
+
+
+def _retail_address(operand: Operand | None) -> int | None:
+    """The original address an entity reference reaches (both sides'
+    entity identities are in the original's address space)."""
+    match _symbol_ref(operand):
+        case Reference(identity=("entity", int() as entity, int() as offset)):
+            return entity + offset
+    return None
+
+
+def _base_register(operand: Operand | None) -> str | None:
+    match operand:
+        case Mem(terms=terms):
+            return next((term.register for term in terms if term.scale == 1), None)
+    return None
+
+
+def _describe_operand(operand: SourceComparisonOperand) -> str:
+    if operand.constant is not None:
+        return str(operand.constant)
+    return f"{operand.type} field" if operand.field else operand.type
+
+
+def _describe_comparison(comparison: SourceComparison) -> str:
+    """`short field < 65 as int, signed`"""
+    left, right = (_describe_operand(item) for item in comparison.operands)
+    if comparison.signed is not None:
+        how = "signed" if comparison.signed else "unsigned"
+    else:
+        how = "floating" if comparison.floating else "other"
+    return f"{left} {comparison.operator} {right} as {comparison.type}, {how}"
+
+
+def observed_text(side: DifferenceSide) -> str:
+    """What one side has at a difference, for people."""
+    observed = side.observed
+    parts = []
+    if observed.operand is not None:
+        parts.append(format_operand(observed.operand))
+    if observed.register is not None:
+        parts.append(f"{observed.register} =")
+    if observed.value is not None:
+        parts.append(observed.value)
+    if side.field is not None:
+        parts.append(f"({side.field.class_name}::{'.'.join(side.field.path)})")
+    if side.source_comparisons:
+        parts.append(
+            "(source: "
+            + "; ".join(_describe_comparison(item) for item in side.source_comparisons)
+            + ")"
+        )
+    return " ".join(parts)
+
+
 def _equal(values: tuple) -> bool:
-    return bitvector.compare(values).result == "proved"
+    return bitvector.compare(values).result is SolverResult.PROVED
 
 
 def _swap_signedness(value: Any) -> Any:
@@ -186,16 +169,49 @@ def _swap_signedness(value: Any) -> Any:
     other signedness."""
     # pylint: disable=too-many-return-statements
     match value:
-        case (tag, *rest) if tag in _SIGN_SWAP:
-            return (_SIGN_SWAP[tag], *rest)
-        case ("movzx", width, operand):
-            return ("movsx", width, _swap_signedness(operand))
-        case ("movsx", width, operand):
-            return ("movzx", width, _swap_signedness(operand))
-        case ("shr", operand, count):
-            return ("sar", _swap_signedness(operand), count)
-        case ("sar", operand, count):
-            return ("shr", _swap_signedness(operand), count)
+        case Compare(kind, left, right, width):
+            return Compare(
+                _SIGN_SWAP.get(kind, kind),
+                _swap_signedness(left),
+                _swap_signedness(right),
+                width,
+            )
+        case Extend(ExtendKind.MOVZX, width, operand):
+            return Extend(ExtendKind.MOVSX, width, _swap_signedness(operand))
+        case Extend(ExtendKind.MOVSX, width, operand):
+            return Extend(ExtendKind.MOVZX, width, _swap_signedness(operand))
+        case Operation(OperationKind.SHR, (operand, count)):
+            return Operation(
+                OperationKind.SAR,
+                (_swap_signedness(operand), count),
+            )
+        case Operation(OperationKind.SAR, (operand, count)):
+            return Operation(
+                OperationKind.SHR,
+                (_swap_signedness(operand), count),
+            )
+        case Operation(kind, operands):
+            return Operation(kind, tuple(_swap_signedness(item) for item in operands))
+        case UnaryOperation(kind, operand):
+            return UnaryOperation(kind, _swap_signedness(operand))
+        case Extract(part, whole):
+            return Extract(part, _swap_signedness(whole))
+        case Insert(part, old, new):
+            return Insert(part, _swap_signedness(old), _swap_signedness(new))
+        case SetCondition(predicate):
+            return SetCondition(_swap_signedness(predicate))
+        case Select(predicate, fallthrough, taken):
+            return Select(
+                _swap_signedness(predicate),
+                _swap_signedness(fallthrough),
+                _swap_signedness(taken),
+            )
+        case ConditionCode(condition, flags, carry):
+            return ConditionCode(
+                condition,
+                _swap_signedness(flags),
+                None if carry is None else _swap_signedness(carry),
+            )
         case (*items,):
             return tuple(_swap_signedness(item) for item in items)
         case _:
@@ -203,32 +219,58 @@ def _swap_signedness(value: Any) -> Any:
 
 
 # not (a < b) is b <= a, and not (a <= b) is b < a.
-_NEGATED_ORDER = {"lt_u": "le_u", "le_u": "lt_u", "lt_s": "le_s", "le_s": "lt_s"}
+_NEGATED_ORDER = {
+    CompareKind.LT_U: CompareKind.LE_U,
+    CompareKind.LE_U: CompareKind.LT_U,
+    CompareKind.LT_S: CompareKind.LE_S,
+    CompareKind.LE_S: CompareKind.LT_S,
+}
 
 
 def _negate(predicate: Any) -> Any:
     """The predicate taken exactly when ``predicate`` is not."""
     match predicate:
-        case ("eq", *rest):
-            return ("ne", *rest)
-        case ("ne", *rest):
-            return ("eq", *rest)
-        case (tag, left, right, *rest) if tag in _NEGATED_ORDER:
-            return (_NEGATED_ORDER[tag], right, left, *rest)
+        case Compare(CompareKind.EQ, left, right, width):
+            return Compare(CompareKind.NE, left, right, width)
+        case Compare(CompareKind.NE, left, right, width):
+            return Compare(CompareKind.EQ, left, right, width)
+        case Compare(kind, left, right, width) if kind in _NEGATED_ORDER:
+            return Compare(_NEGATED_ORDER[kind], right, left, width)
         case _:
             return None
 
 
-# Who has to act on a cause: the recovered source ("logic"), the matching
-# annotations ("annotation"), or nobody, because the comparison itself
-# cannot tell ("tooling").
-LOGIC, ANNOTATION, TOOLING = "logic", "annotation", "tooling"
+class Group(Enum):
+    """Who has to act on a divergence."""
+
+    LOGIC = "logic"  # the recovered source
+    ANNOTATION = "annotation"  # the matching annotations
+    TOOLING = "tooling"  # nobody: the comparison itself cannot tell
+    UNEXPLAINED = "unexplained"
+
+
+class CauseCode(Enum):
+    FIELD_OFFSET = "field_offset"
+    CONSTANT = "constant"
+    OTHER_INPUT = "other_input"
+    SYMBOL_OFFSET = "symbol_offset"
+    OTHER_ENTITY = "other_entity"
+    UNIDENTIFIED_ADDRESS = "unidentified_address"
+    UNPAIRED_ENTITY = "unpaired_entity"
+    SIGNEDNESS = "signedness"
+    INVERTED = "inverted"
+    WIDTH = "width"
+    JOIN_VALUE = "join_value"
+    OVERLAPPING_GLOBAL = "overlapping_global"
+    OTHER_GLOBAL = "other_global"
+    UNPAIRED_CALLEE = "unpaired_callee"
+    OTHER_CALLEE = "other_callee"
 
 
 @dataclass(frozen=True)
 class Cause:
-    code: str
-    group: str
+    code: CauseCode
+    group: Group
     text: str
 
 
@@ -239,37 +281,255 @@ def _identity_kinds(value: Any) -> set[str]:
     stack = [value]
     while stack:
         match node := stack.pop():
-            case Reference(identity=(kind, *_)):
+            case Reference(identity=(kind, *_)) | SignedSymbol(
+                ref=Reference(identity=(kind, *_))
+            ):
                 kinds.add(str(kind))
-            case ("sym", (kind, *_)):
+            case SymbolValue((kind, *_)):
                 kinds.add(str(kind))
+            case Load(address):
+                stack.append(address)
+            case AddressValue(address):
+                stack.append(address)
+            case MemoryAddress(terms=terms, displacement=displacement):
+                stack.extend(term.value for term in terms)
+                stack.append(displacement)
+            case StackOffset(base):
+                stack.append(base)
             case tuple() if id(node) not in seen:
                 seen.add(id(node))
                 stack.extend(node)
+            case _ if is_value(node) and id(node) not in seen:
+                seen.add(id(node))
+                stack.extend(value_children(node))
     return kinds
 
 
 def _without_joins(value: Any) -> Any:
     """``value`` with every join's identity erased."""
+    # pylint: disable=too-many-return-statements,too-many-locals
     match value:
-        case ("phi", *_):
-            return ("phi",)
+        case Phi():
+            return Phi(0, 0)
+        case Load(address, width, generation):
+            return Load(_without_joins(address), width, generation)
+        case AddressValue(address):
+            return AddressValue(_without_joins(address))
+        case MemoryAddress(segment, terms, displacement, symbols):
+            return MemoryAddress(
+                segment,
+                tuple(
+                    AddressTerm(_without_joins(term.value), term.scale)
+                    for term in terms
+                ),
+                (
+                    displacement
+                    if isinstance(displacement, int)
+                    else _without_joins(displacement)
+                ),
+                symbols,
+            )
+        case StackOffset(base, offset):
+            return StackOffset(_without_joins(base), offset)
+        case Operation(kind, operands):
+            return Operation(kind, tuple(_without_joins(item) for item in operands))
+        case UnaryOperation(kind, operand):
+            return UnaryOperation(kind, _without_joins(operand))
+        case Extract(part, whole):
+            return Extract(part, _without_joins(whole))
+        case Insert(part, old, new):
+            return Insert(part, _without_joins(old), _without_joins(new))
+        case Extend(kind, width, source):
+            return Extend(kind, width, _without_joins(source))
+        case Compare(kind, left, right, width):
+            return Compare(kind, _without_joins(left), _without_joins(right), width)
+        case ConditionCode(condition, flags, carry):
+            return ConditionCode(
+                condition,
+                _without_joins(flags),
+                None if carry is None else _without_joins(carry),
+            )
+        case SetCondition(predicate):
+            return SetCondition(_without_joins(predicate))
+        case Select(predicate, fallthrough, taken):
+            return Select(
+                _without_joins(predicate),
+                _without_joins(fallthrough),
+                _without_joins(taken),
+            )
+        case MultiplyResult(signed, part, operands):
+            return MultiplyResult(
+                signed, part, tuple(_without_joins(item) for item in operands)
+            )
+        case DivideResult(signed, part, high, low, divisor):
+            return DivideResult(
+                signed,
+                part,
+                _without_joins(high),
+                _without_joins(low),
+                _without_joins(divisor),
+            )
+        case FlagsResult(operation) | CarryResult(operation):
+            return type(value)(_without_joins(operation))
+        case CompareFlags(left, right, width) | TestFlags(left, right, width):
+            return type(value)(_without_joins(left), _without_joins(right), width)
+        case SahfFlags(source, previous):
+            return SahfFlags(_without_joins(source), _without_joins(previous))
+        case SahfCarry(source) | FloatStatusWord(source):
+            return type(value)(_without_joins(source))
+        case FloatOperation(kind, operands):
+            return FloatOperation(
+                kind, tuple(_without_joins(item) for item in operands)
+            )
+        case FloatCompare(left, right):
+            return FloatCompare(_without_joins(left), _without_joins(right))
+        case CallStack(site, incoming):
+            return CallStack(site, _without_joins(incoming))
+        case ReceiverLoad(address, width):
+            return ReceiverLoad(_without_joins(address), width)
+        case VirtualCall(receiver, displacement):
+            return VirtualCall(_without_joins(receiver), displacement)
         case (*items,):
             return tuple(_without_joins(item) for item in items)
         case _:
             return value
 
 
+def _difference_in_children(
+    parent: Any, children_o: tuple[Any, ...], children_r: tuple[Any, ...]
+) -> tuple[Any, Any, Any] | None:
+    differing = [
+        (child_o, child_r)
+        for child_o, child_r in zip(children_o, children_r)
+        if child_o != child_r
+    ]
+    if len(differing) != 1:
+        return None
+    inner = first_difference(*differing[0])
+    return inner if inner is not None else (parent, *differing[0])
+
+
 def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
+    # pylint: disable=too-many-locals
     """The smallest subterms where two values differ, with the node that
     holds them: ``(parent, orig part, recomp part)``. None when the two
     differ in shape (another operation) above any single part."""
+    result: tuple[Any, Any, Any] | None = None
     match orig, recomp:
         case _ if orig == recomp:
-            return None
-        case ("sym", _), ("sym", _):
-            # A reference is compared whole, not by its identity's parts.
-            return (None, orig, recomp)
+            pass
+        case (SymbolValue(), SymbolValue()) | (Constant(), Constant()):
+            result = (None, orig, recomp)
+        case AddressValue(address_o), AddressValue(address_r):
+            result = first_difference(address_o, address_r)
+        case Load(address_o, width_o, generation_o), Load(
+            address_r, width_r, generation_r
+        ) if (width_o, generation_o) == (width_r, generation_r):
+            result = first_difference(address_o, address_r)
+        case StackOffset(base_o, offset_o), StackOffset(base_r, offset_r) if (
+            offset_o == offset_r
+        ):
+            result = first_difference(base_o, base_r)
+        case MemoryAddress(
+            segment_o, terms_o, displacement_o, symbols_o
+        ), MemoryAddress(segment_r, terms_r, displacement_r, symbols_r) if (
+            segment_o,
+            terms_o,
+            symbols_o,
+        ) == (
+            segment_r,
+            terms_r,
+            symbols_r,
+        ):
+            result = (orig, displacement_o, displacement_r)
+        case Operation(kind_o, operands_o), Operation(
+            kind_r, operands_r
+        ) if kind_o == kind_r and len(operands_o) == len(operands_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case UnaryOperation(kind_o, operand_o), UnaryOperation(kind_r, operand_r) if (
+            kind_o == kind_r
+        ):
+            result = _difference_in_children(orig, (operand_o,), (operand_r,))
+        case Extract(part_o, whole_o), Extract(part_r, whole_r) if part_o == part_r:
+            result = _difference_in_children(orig, (whole_o,), (whole_r,))
+        case Insert(part_o, old_o, new_o), Insert(part_r, old_r, new_r) if (
+            part_o == part_r
+        ):
+            result = _difference_in_children(orig, (old_o, new_o), (old_r, new_r))
+        case Extend(kind_o, width_o, source_o), Extend(kind_r, width_r, source_r) if (
+            kind_o,
+            width_o,
+        ) == (kind_r, width_r):
+            result = _difference_in_children(orig, (source_o,), (source_r,))
+        case Compare(kind_o, left_o, right_o, width_o), Compare(
+            kind_r, left_r, right_r, width_r
+        ) if (kind_o, width_o) == (kind_r, width_r):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case ConditionCode(condition_o, flags_o, carry_o), ConditionCode(
+            condition_r, flags_r, carry_r
+        ) if condition_o == condition_r and (carry_o is None) == (carry_r is None):
+            children_o = (flags_o,) if carry_o is None else (flags_o, carry_o)
+            children_r = (flags_r,) if carry_r is None else (flags_r, carry_r)
+            result = _difference_in_children(orig, children_o, children_r)
+        case SetCondition(predicate_o), SetCondition(predicate_r):
+            result = _difference_in_children(orig, (predicate_o,), (predicate_r,))
+        case Select(predicate_o, old_o, new_o), Select(predicate_r, old_r, new_r):
+            result = _difference_in_children(
+                orig,
+                (predicate_o, old_o, new_o),
+                (predicate_r, old_r, new_r),
+            )
+        case MultiplyResult(signed_o, part_o, operands_o), MultiplyResult(
+            signed_r, part_r, operands_r
+        ) if (signed_o, part_o) == (signed_r, part_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case DivideResult(signed_o, part_o, high_o, low_o, divisor_o), DivideResult(
+            signed_r, part_r, high_r, low_r, divisor_r
+        ) if (signed_o, part_o) == (signed_r, part_r):
+            result = _difference_in_children(
+                orig,
+                (high_o, low_o, divisor_o),
+                (high_r, low_r, divisor_r),
+            )
+        case (FlagsResult(operation_o) | CarryResult(operation_o)), (
+            FlagsResult(operation_r) | CarryResult(operation_r)
+        ) if type(orig) is type(recomp):
+            result = _difference_in_children(orig, (operation_o,), (operation_r,))
+        case (
+            CompareFlags(left_o, right_o, width_o) | TestFlags(left_o, right_o, width_o)
+        ), (
+            CompareFlags(left_r, right_r, width_r) | TestFlags(left_r, right_r, width_r)
+        ) if (
+            type(orig) is type(recomp) and width_o == width_r
+        ):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case SahfFlags(source_o, previous_o), SahfFlags(source_r, previous_r):
+            result = _difference_in_children(
+                orig, (source_o, previous_o), (source_r, previous_r)
+            )
+        case (SahfCarry(source_o) | FloatStatusWord(source_o)), (
+            SahfCarry(source_r) | FloatStatusWord(source_r)
+        ) if type(orig) is type(recomp):
+            result = _difference_in_children(orig, (source_o,), (source_r,))
+        case FloatOperation(kind_o, operands_o), FloatOperation(
+            kind_r, operands_r
+        ) if kind_o == kind_r and len(operands_o) == len(operands_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case FloatCompare(left_o, right_o), FloatCompare(left_r, right_r):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case CallStack(site_o, incoming_o), CallStack(site_r, incoming_r) if (
+            site_o == site_r
+        ):
+            result = _difference_in_children(orig, (incoming_o,), (incoming_r,))
+        case ReceiverLoad(address_o, width_o), ReceiverLoad(address_r, width_r) if (
+            width_o == width_r
+        ):
+            result = _difference_in_children(orig, (address_o,), (address_r,))
+        case VirtualCall(receiver_o, displacement_o), VirtualCall(
+            receiver_r, displacement_r
+        ):
+            if displacement_o == displacement_r:
+                result = _difference_in_children(orig, (receiver_o,), (receiver_r,))
         case (tag_o, *items_o), (tag_r, *items_r) if tag_o == tag_r and len(
             items_o
         ) == len(items_r):
@@ -280,15 +540,13 @@ def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
             ]
             if len(differing) == 1:
                 inner = first_difference(*differing[0])
-                return inner if inner is not None else (orig, *differing[0])
-            return None
-        case _:
-            return None
+                result = inner if inner is not None else (orig, *differing[0])
+    return result
 
 
 def _identity(part: Any) -> Any:
     match part:
-        case Reference(identity=identity) | ("sym", identity):
+        case Reference(identity=identity) | SymbolValue(identity):
             return identity
         case _:
             return None
@@ -298,25 +556,25 @@ def _part_cause(parent: Any, part_o: Any, part_r: Any) -> Cause | None:
     """What the one differing part of two otherwise equal values means."""
     # pylint: disable=too-many-return-statements
     match parent, part_o, part_r:
-        case ("mem", *_), int(), int():
+        case MemoryAddress(), int(), int():
             return Cause(
-                "field_offset",
-                LOGIC,
-                f"the same address expression at offset {_number(part_o)} vs "
-                f"{_number(part_r)}: the wrong field or element, or a layout "
+                CauseCode.FIELD_OFFSET,
+                Group.LOGIC,
+                f"the same address expression at offset {render_number(part_o)} vs "
+                f"{render_number(part_r)}: the wrong field or element, or a layout "
                 "that places it elsewhere",
             )
-        case _, ("imm", int() as value_o), ("imm", int() as value_r):
+        case _, Constant(value_o), Constant(value_r):
             return Cause(
-                "constant",
-                LOGIC,
-                f"only a constant differs ({_number(value_o)} vs "
-                f"{_number(value_r)}): a wrong literal, bound, enum value or size",
+                CauseCode.CONSTANT,
+                Group.LOGIC,
+                f"only a constant differs ({render_number(value_o)} vs "
+                f"{render_number(value_r)}): a wrong literal, bound, enum value or size",
             )
-        case _, ("init", _), ("init", _):
+        case _, Init(), Init():
             return Cause(
-                "other_input",
-                LOGIC,
+                CauseCode.OTHER_INPUT,
+                Group.LOGIC,
                 f"it reads {render(part_o)} on one side and {render(part_r)} on "
                 "the other: a different argument or register",
             )
@@ -330,26 +588,28 @@ def _part_cause(parent: Any, part_o: Any, part_r: Any) -> Cause | None:
             base_o == base_r
         ):
             return Cause(
-                "symbol_offset",
-                ANNOTATION,
-                f"the same entity at offset {_number(offset_o)} vs "
-                f"{_number(offset_r)}: its annotated address is off by "
-                f"{_number(offset_o - offset_r)} on one side (a vtable annotated "
+                CauseCode.SYMBOL_OFFSET,
+                Group.ANNOTATION,
+                f"the same entity at offset {render_number(offset_o)} vs "
+                f"{render_number(offset_r)}: its annotated address is off by "
+                f"{render_number(offset_o - offset_r)} on one side (a vtable annotated "
                 "at its RTTI slot, say), or the source takes another element",
             )
         case ("entity", *_), ("entity", *_):
             return Cause(
-                "other_entity",
-                LOGIC,
+                CauseCode.OTHER_ENTITY,
+                Group.LOGIC,
                 f"a different global, vtable or function: {render(part_o)} vs "
                 f"{render(part_r)} — the wrong variable or class",
             )
         case (("unresolved", *_), _) | (_, ("unresolved", *_)):
-            return Cause("unidentified_address", ANNOTATION, _UNIDENTIFIED_TEXT)
+            return Cause(
+                CauseCode.UNIDENTIFIED_ADDRESS, Group.ANNOTATION, _UNIDENTIFIED_TEXT
+            )
         case (kind_o, *_), (kind_r, *_) if "entity" in (kind_o, kind_r):
             return Cause(
-                "unpaired_entity",
-                ANNOTATION,
+                CauseCode.UNPAIRED_ENTITY,
+                Group.ANNOTATION,
                 f"{render(part_o)} vs {render(part_r)}: one side's global has no "
                 "counterpart; pair it (or a constant is pooled differently) "
                 "before judging the logic",
@@ -375,8 +635,8 @@ def _value_causes(values: tuple) -> list[Cause]:
         if _equal((value_o, _swap_signedness(value_r), None, "predicate")):
             causes.append(
                 Cause(
-                    "signedness",
-                    LOGIC,
+                    CauseCode.SIGNEDNESS,
+                    Group.LOGIC,
                     "the same comparison with the other signedness: an operand is "
                     "signed on one side and unsigned on the other (the variable's "
                     "or field's type, or a cast)",
@@ -386,8 +646,8 @@ def _value_causes(values: tuple) -> list[Cause]:
         if negated is not None and _equal((value_o, negated, None, "predicate")):
             causes.append(
                 Cause(
-                    "inverted",
-                    LOGIC,
+                    CauseCode.INVERTED,
+                    Group.LOGIC,
                     "the condition is inverted: the recovered test is the negation "
                     "of retail's (an `if` sense or a `!` flipped)",
                 )
@@ -402,8 +662,8 @@ def _value_causes(values: tuple) -> list[Cause]:
             ):
                 causes.append(
                     Cause(
-                        "width",
-                        LOGIC,
+                        CauseCode.WIDTH,
+                        Group.LOGIC,
                         f"the low {narrow} bits agree and only the upper bits "
                         f"differ: a {narrow}-bit type on one side and a {width}-bit "
                         "one on the other (a return, field or argument type such "
@@ -414,8 +674,8 @@ def _value_causes(values: tuple) -> list[Cause]:
         if _equal((_swap_signedness(value_o), value_r, bits, kind)):
             causes.append(
                 Cause(
-                    "signedness",
-                    LOGIC,
+                    CauseCode.SIGNEDNESS,
+                    Group.LOGIC,
                     "equal with the other signedness of an extension or shift: "
                     "a signed/unsigned type mismatch",
                 )
@@ -423,108 +683,101 @@ def _value_causes(values: tuple) -> list[Cause]:
     if not causes and _without_joins(value_o) == _without_joins(value_r):
         causes.append(
             Cause(
-                "join_value",
-                TOOLING,
+                CauseCode.JOIN_VALUE,
+                Group.TOOLING,
                 "the same expression over values merged differently at an earlier "
                 "join: the difference, if any, is upstream where paths meet",
             )
         )
     if "unresolved" in _identity_kinds(value_o) | _identity_kinds(value_r):
-        causes.append(Cause("unidentified_address", ANNOTATION, _UNIDENTIFIED_TEXT))
+        causes.append(
+            Cause(CauseCode.UNIDENTIFIED_ADDRESS, Group.ANNOTATION, _UNIDENTIFIED_TEXT)
+        )
     return causes
-
-
-def _retail_address(facts: dict) -> int | None:
-    """The original address an entity reference reaches (both sides'
-    entity identities are in the original's address space)."""
-    match facts.get("symbol_entity"), facts.get("symbol_offset"):
-        case int() as entity, int() as offset:
-            return entity + offset
-        case int() as entity, _:
-            return entity
-        case _:
-            return None
 
 
 def _fact_causes(difference: ComparisonDifference) -> list[Cause]:
     # pylint: disable=too-many-return-statements
-    facts_o, facts_r = difference.orig.facts, difference.recomp.facts
+    operand_o = difference.orig.observed.operand
+    operand_r = difference.recomp.observed.operand
     kind = difference.kind
-    kinds = {
-        facts.get(key)
-        for facts in (facts_o, facts_r)
-        for key in ("symbol_kind", "target_kind")
-    }
+    kinds = {_identity_kind(operand_o), _identity_kind(operand_r)}
     if "unresolved" in kinds:
-        return [Cause("unidentified_address", ANNOTATION, _UNIDENTIFIED_TEXT)]
-    if kind in ("memory_address", "symbol_resolution"):
-        at_o, at_r = _retail_address(facts_o), _retail_address(facts_r)
-        if at_o is not None and at_o == at_r:
+        return [
+            Cause(CauseCode.UNIDENTIFIED_ADDRESS, Group.ANNOTATION, _UNIDENTIFIED_TEXT)
+        ]
+    if kind in (DifferenceKind.MEMORY_ADDRESS, DifferenceKind.SYMBOL_RESOLUTION):
+        at_o, at_r = _retail_address(operand_o), _retail_address(operand_r)
+        named_o, named_r = _symbol_ref(operand_o), _symbol_ref(operand_r)
+        if at_o is not None and at_o == at_r and named_o and named_r:
             return [
                 Cause(
-                    "overlapping_global",
-                    ANNOTATION,
-                    f"both reach retail 0x{at_o:x}, named `{facts_o.get('symbol')}` "
-                    f"on one side and `{facts_r.get('symbol')}` on the other: two "
+                    CauseCode.OVERLAPPING_GLOBAL,
+                    Group.ANNOTATION,
+                    f"both reach retail 0x{at_o:x}, named `{named_o.display}` "
+                    f"on one side and `{named_r.display}` on the other: two "
                     "annotated globals overlap",
                 )
             ]
-        if at_o is not None and at_r is not None:
+        if at_o is not None and at_r is not None and named_o and named_r:
             return [
                 Cause(
-                    "other_global",
-                    LOGIC,
-                    f"a different global: retail `{facts_o.get('symbol')}` "
-                    f"(0x{at_o:x}), recompiled `{facts_r.get('symbol')}` "
+                    CauseCode.OTHER_GLOBAL,
+                    Group.LOGIC,
+                    f"a different global: retail `{named_o.display}` "
+                    f"(0x{at_o:x}), recompiled `{named_r.display}` "
                     f"(retail 0x{at_r:x}) — the wrong variable",
                 )
             ]
-        if facts_o.get("base_register") == facts_r.get("base_register") and (
-            facts_o.get("displacement") != facts_r.get("displacement")
-        ):
-            field_name = facts_r.get("field_path") or facts_r.get("field_name")
-            where = (
-                f" (recompiled: {facts_r.get('class_name')}::{field_name})"
-                if field_name
-                else ""
-            )
-            return [
-                Cause(
-                    "field_offset",
-                    LOGIC,
-                    f"the same base at offset {facts_o.get('displacement')} vs "
-                    f"{facts_r.get('displacement')}{where}: the wrong field, or a "
-                    "struct layout that places it elsewhere",
+        match operand_o, operand_r:
+            case Mem(displacement=displacement_o), Mem(displacement=displacement_r) if (
+                _base_register(operand_o) == _base_register(operand_r)
+                and displacement_o != displacement_r
+            ):
+                field_at = difference.recomp.field
+                where = (
+                    f" (recompiled: {field_at.class_name}::{'.'.join(field_at.path)})"
+                    if field_at is not None
+                    else ""
                 )
-            ]
-    if kind == "call_target":
-        kind_o, kind_r = facts_o.get("target_kind"), facts_r.get("target_kind")
+                return [
+                    Cause(
+                        CauseCode.FIELD_OFFSET,
+                        Group.LOGIC,
+                        f"the same base at offset {displacement_o} vs "
+                        f"{displacement_r}{where}: the wrong field, or a "
+                        "struct layout that places it elsewhere",
+                    )
+                ]
+    if kind == DifferenceKind.CALL_TARGET:
+        kind_o, kind_r = _identity_kind(operand_o), _identity_kind(operand_r)
         if "entity" in (kind_o, kind_r) and kind_o != kind_r:
             return [
                 Cause(
-                    "unpaired_callee",
-                    ANNOTATION,
+                    CauseCode.UNPAIRED_CALLEE,
+                    Group.ANNOTATION,
                     f"one callee has no counterpart on the other side ({kind_o} vs "
                     f"{kind_r}): pair it, or check which function the source calls",
                 )
             ]
         return [
             Cause(
-                "other_callee",
-                LOGIC,
+                CauseCode.OTHER_CALLEE,
+                Group.LOGIC,
                 "a different function is called: the wrong callee, overload or "
                 "virtual slot",
             )
         ]
-    if kind == "immediate_value":
-        return [
-            Cause(
-                "constant",
-                LOGIC,
-                f"a different constant ({facts_o.get('value')} vs "
-                f"{facts_r.get('value')}): a wrong literal, enum value, size or offset",
-            )
-        ]
+    match kind, operand_o, operand_r:
+        case DifferenceKind.IMMEDIATE_VALUE, Imm(value_o), Imm(value_r):
+            return [
+                Cause(
+                    CauseCode.CONSTANT,
+                    Group.LOGIC,
+                    f"a different constant ({value_o} vs {value_r}): a wrong "
+                    "literal, enum value, size or offset",
+                )
+            ]
     return []
 
 
@@ -534,7 +787,7 @@ class Explanation:
 
     # pylint: disable=too-many-instance-attributes
 
-    kind: str
+    kind: DifferenceKind
     orig: str
     recomp: str
     orig_value: str | None = None
@@ -543,27 +796,17 @@ class Explanation:
     causes: tuple[Cause, ...] = ()
     confirmed: str | None = None
     agreed_through: bool = False
-    facts: tuple[tuple[str, str], ...] = field(default=())
+    observed: tuple[tuple[str, str], ...] = field(default=())
 
     @property
-    def group(self) -> str:
+    def group(self) -> Group:
         """Who has to act: a cause's group, else ``logic`` when running both
         confirmed it, else ``unexplained``."""
         if self.causes:
             return self.causes[0].group
         if self.confirmed is not None:
-            return LOGIC
-        return TOOLING if self.agreed_through else "unexplained"
-
-    def json(self) -> dict[str, object]:
-        value: dict[str, object] = {
-            "group": self.group,
-            "causes": [cause.code for cause in self.causes],
-        }
-        for key in ("orig_value", "recomp_value", "example", "confirmed"):
-            if getattr(self, key) is not None:
-                value[key] = getattr(self, key)
-        return value
+            return Group.LOGIC
+        return Group.TOOLING if self.agreed_through else Group.UNEXPLAINED
 
 
 def explanation(analysis: ComparisonAnalysis) -> Explanation | None:
@@ -605,22 +848,17 @@ def explanation(analysis: ComparisonAnalysis) -> Explanation | None:
         agreed_through=bool(
             witness is None and execution is not None and execution.reached_location
         ),
-        facts=tuple(
-            (
-                name,
-                ", ".join(
-                    f"{k}={v}"
-                    for k, v in sorted(side.facts.items())
-                    if k not in ("source_path", "source_line") and v not in (None, "")
-                ),
-            )
-            for name, side in (("orig", difference.orig), ("recomp", difference.recomp))
+        observed=(
+            ("orig", observed_text(difference.orig)),
+            ("recomp", observed_text(difference.recomp)),
         ),
     )
 
 
 def _rendered_assignment(assignment: tuple[tuple[Hashable, int], ...]) -> str:
-    parts = [f"{render(term)} = {_number(value)}" for term, value in assignment[:6]]
+    parts = [
+        f"{render(term)} = {render_number(value)}" for term, value in assignment[:6]
+    ]
     if len(assignment) > 6:
         parts.append("…")
     return ", ".join(parts)
@@ -630,15 +868,15 @@ def _shown(value: int | bool) -> str:
     match value:
         case bool() as truth:
             return str(truth).lower()
-        case number:
-            return _number(number)
+        case int():
+            return render_number(value)
 
 
 _GROUP_TEXT = {
-    LOGIC: "LIKELY A LOGIC DIFFERENCE in the recovered source",
-    ANNOTATION: "LIKELY AN ANNOTATION PROBLEM (symbols/globals), not the logic",
-    TOOLING: "LIKELY NOT A SOURCE PROBLEM: a comparison artefact",
-    "unexplained": "unexplained: read the marked lines",
+    Group.LOGIC: "LIKELY A Group.LOGIC DIFFERENCE in the recovered source",
+    Group.ANNOTATION: "LIKELY AN Group.ANNOTATION PROBLEM (symbols/globals), not the logic",
+    Group.TOOLING: "LIKELY NOT A SOURCE PROBLEM: a comparison artefact",
+    Group.UNEXPLAINED: "unexplained: read the marked lines",
 }
 
 
@@ -648,7 +886,7 @@ def explain(analysis: ComparisonAnalysis) -> list[str]:
     if found is None:
         return []
     lines = [
-        f"FIRST DIVERGENCE: {found.kind.replace('_', ' ')} — {_GROUP_TEXT[found.group]}",
+        f"FIRST DIVERGENCE: {found.kind.value.replace('_', ' ')} — {_GROUP_TEXT[found.group]}",
         f"  orig   {found.orig}",
         f"  recomp {found.recomp}",
     ]
@@ -656,7 +894,7 @@ def explain(analysis: ComparisonAnalysis) -> list[str]:
         lines.append(f"  orig computes   {found.orig_value}")
         lines.append(f"  recomp computes {found.recomp_value}")
     else:
-        lines += [f"  {name:<6} {text}" for name, text in found.facts if text]
+        lines += [f"  {name:<6} {text}" for name, text in found.observed if text]
     if found.example is not None:
         lines.append(f"  e.g. {found.example}")
     if found.confirmed is not None:

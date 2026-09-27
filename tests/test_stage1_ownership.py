@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,7 +10,7 @@ from reccmp.compare.asm.ir import ExtentKind
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb
 from reccmp.compare.source_capability import (
-    load_source_index_for_target,
+    require_source_index,
     resolve_source_index_path,
 )
 from reccmp.compare.variables import VariableComparator
@@ -37,16 +36,9 @@ def test_function_image_captures_excerpt_tables_and_coverage():
     assert image.extent_kind is ExtentKind.KNOWN
     assert image.coverage_incomplete is False
     assert any(row.mnemonic == "mov" for row in image.instructions)
-    stamped = image.with_instructions(
-        tuple(
-            replace(row, instruction_id=i) for i, row in enumerate(image.instructions)
-        )
-    )
-    assert stamped.instruction_ids == tuple(range(len(stamped.instructions)))
-    assert all(row.instruction_id == i for i, row in enumerate(stamped.instructions))
 
 
-def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
+def test_require_source_index_scopes_and_enriches_datacmp_path(
     tmp_path: Path,
 ):
     """Compare session path: load index → target view → VariableComparator."""
@@ -156,7 +148,7 @@ def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(
     target.source_index = None
 
     assert resolve_source_index_path(target, explicit=index_path) == index_path
-    scoped = load_source_index_for_target(target, explicit=index_path)
+    scoped = require_source_index(target, explicit=index_path)
     assert scoped is not None
     source_class = scoped.class_named("Foo")
     assert source_class is not None and source_class.size == 8

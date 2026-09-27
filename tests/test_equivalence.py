@@ -7,6 +7,7 @@ import pytest
 
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.db import EntityDb
+from reccmp.compare.diagnosis import EffectiveReason
 from reccmp.compare.equivalence import canonical_orig_addr, parse_equivalence_groups
 from reccmp.compare.asm.replacement import (
     create_resolver,
@@ -237,7 +238,7 @@ def test_island_row_scores_effective(db: EntityDb):
     result = compare_island(db, JMP_ISLAND, REAL_BODY, groups={0x200: 0x900})
     assert result.match_ratio < 1.0
     assert result.analysis.is_effective
-    assert "folded_symbol_alias" in result.analysis.effective_reasons
+    assert EffectiveReason.FOLDED_SYMBOL_ALIAS in result.analysis.effective_reasons
 
 
 def test_island_row_with_padding_scores_effective(db: EntityDb):

@@ -10,6 +10,15 @@ from reccmp.compare.asm.verifier import (
     CallFacts,
     FunctionMetadata,
 )
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    CfgMemoryInit,
+    Init,
+    Load,
+    MemoryAddress,
+    MemoryStore,
+    SymbolValue,
+)
 from reccmp.compare.asm.verifier.semantics import (
     receiver_equivalence_class,
 )
@@ -195,9 +204,9 @@ def test_virtual_call_tolerates_equivalent_vtable_reload():
 
 
 def test_virtual_call_receiver_reload_ignores_unrelated_pointee_store():
-    address = ("mem", "", (("receiver_slot", 1),), 8, ())
-    before = ("load", address, "dword", 0)
-    after_unrelated_store = ("load", address, "dword", ("mem", 4, 0))
+    address = MemoryAddress("", (AddressTerm(SymbolValue("receiver_slot"), 1),), 8, ())
+    before = Load(address, "dword", CfgMemoryInit())
+    after_unrelated_store = Load(address, "dword", MemoryStore(4, 0))
     ctx = Context()
     assert receiver_equivalence_class(before, ctx) == receiver_equivalence_class(
         after_unrelated_store, ctx
@@ -237,13 +246,13 @@ def test_virtual_call_receiver_reload_forwards_matched_exact_store():
 
 
 def test_reject_virtual_receiver_reload_after_exact_pointer_store():
-    address = ("mem", "", (("receiver_slot", 1),), 8, ())
-    store_tag = ("mem", 1, 0)
+    address = MemoryAddress("", (AddressTerm(SymbolValue("receiver_slot"), 1),), 8, ())
+    store_tag = MemoryStore(1, 0)
     ctx = Context()
     ctx.mem_events.append((store_tag, (address, 4, False)))
-    ctx.receiver_values[(address, 4)] = (store_tag, ("init", "di"))
-    before_store = ("load", address, "dword", 0)
-    after_store = ("load", address, "dword", store_tag)
+    ctx.receiver_values[(address, 4)] = (store_tag, Init("di"))
+    before_store = Load(address, "dword", CfgMemoryInit())
+    after_store = Load(address, "dword", store_tag)
     assert receiver_equivalence_class(before_store, ctx) != receiver_equivalence_class(
         after_store, ctx
     )
@@ -1039,9 +1048,6 @@ def test_unknown_register_access_meta_cannot_step_divergent_state():
             reads_flags=False,
             writes_flags=False,
             accesses_memory=False,
-            is_jump=False,
-            is_call=False,
-            is_ret=False,
             branch_target=None,
             register_access_known=known,
         )

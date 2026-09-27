@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass, field
 from collections.abc import Hashable
-from typing import TYPE_CHECKING, Callable
+from enum import Enum
+from typing import TYPE_CHECKING, Callable, TypeAlias
 
 from reccmp.call_facts import CallFacts
 
@@ -15,21 +13,57 @@ from reccmp.compare.asm.model import (
     REGISTERS,
     Reject,
 )
+from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
+    AddressValue,
+    CallResult,
+    CfgMemoryInit,
+    CompareFlags,
+    CompareKind,
+    Constant,
+    DeepFloat,
+    Extract,
+    Init,
+    Insert,
+    MemoryClobber,
+    MemoryGeneration,
+    MemoryStore,
+    Operation,
+    OperationKind,
+    Phi,
+    Resync,
+    RegisterPart,
+    Slot,
+    StackOffset,
+    StringResult,
     Value,
+    X87EpochJoin,
     abs_stack_offset,
     constant_offset,
     flatten_mem,
+    is_value,
     mem_disjoint,
+    value_children,
     stack_rooted,
     unwind_spadd,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import AnalysisRecorder, EffectiveReason
+from reccmp.types import ImageId
 
 if TYPE_CHECKING:
     from reccmp.compare.callee_cleanup import CallStackEffect
 
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
+
+
+def is_scratch(value: object) -> bool:
+    """Whether ``value`` has no unobserved content. Left in a caller-saved
+    register while the other side holds something else, such a value marks
+    the register dead."""
+    return isinstance(value, (Init, CallResult, StringResult, Resync)) or (
+        isinstance(value, Phi) and value.settled
+    )
+
 
 COMMUTATIVE_BINOPS = {"add", "and", "or", "xor", "imul"}
 ASSOCIATIVE_COMMUTATIVE_BINOPS = {"add"}
@@ -39,21 +73,21 @@ CARRY_BINOPS = {"adc", "sbb"}
 # jcc/setcc condition codes with their operand-swap counterpart for
 # a `cmp`-produced flag state. eq/ne are symmetric under a swap.
 CC_CANON = {
-    "e": ("eq", False),
-    "ne": ("ne", False),
-    "l": ("lt_s", False),
-    "g": ("lt_s", True),
-    "le": ("le_s", False),
-    "ge": ("le_s", True),
-    "b": ("lt_u", False),
-    "a": ("lt_u", True),
-    "be": ("le_u", False),
-    "ae": ("le_u", True),
+    "e": (CompareKind.EQ, False),
+    "ne": (CompareKind.NE, False),
+    "l": (CompareKind.LT_S, False),
+    "g": (CompareKind.LT_S, True),
+    "le": (CompareKind.LE_S, False),
+    "ge": (CompareKind.LE_S, True),
+    "b": (CompareKind.LT_U, False),
+    "a": (CompareKind.LT_U, True),
+    "be": (CompareKind.LE_U, False),
+    "ae": (CompareKind.LE_U, True),
 }
 
 # Canonical flag state of every zero idiom (`xor r, r`, `sub r, r`,
 # `cmp r, r`): the result is zero, CF and OF are cleared.
-ZERO_FLAGS = ("cmp", ("imm", 0), ("imm", 0))
+ZERO_FLAGS = CompareFlags(Constant(0), Constant(0))
 
 X87_CONSTANTS = {"fld1", "fldz", "fldpi", "fldl2e", "fldl2t", "fldlg2", "fldln2"}
 X87_UNARY = {"fchs", "fabs", "fsqrt", "frndint", "fcos", "fsin", "ftan", "f2xm1"}
@@ -72,18 +106,19 @@ def commutative_result(mnemonic: str, a: Value, b: Value) -> Value:
     binary expressions by execute(): reassociation can change the flags from
     the final physical add even when the destination value is equal.
     """
+    kind = OperationKind(mnemonic)
     if mnemonic not in ASSOCIATIVE_COMMUTATIVE_BINOPS:
-        return (mnemonic, *vsort(a, b))
+        return Operation(kind, vsort(a, b))
 
     terms: list[Value] = []
     pending = [a, b]
     while pending:
         value = pending.pop()
-        if isinstance(value, tuple) and value and value[0] == mnemonic:
-            pending.extend(value[1:])
+        if isinstance(value, Operation) and value.kind is kind:
+            pending.extend(value.operands)
         else:
             terms.append(value)
-    return (mnemonic, *sorted(terms, key=repr))
+    return Operation(kind, tuple(sorted(terms, key=repr)))
 
 
 @dataclass
@@ -92,12 +127,12 @@ class X87Stack:
     # (or to a callee's float return) and are addressed by (epoch, index).
     known: list[Value] = field(default_factory=list)
     deep_pops: int = 0
-    epoch: int = 0
+    epoch: int | X87EpochJoin = 0
 
     def read(self, i: int) -> Value:
         if i < len(self.known):
             return self.known[i]
-        return ("fdeep", self.epoch, self.deep_pops + i - len(self.known))
+        return DeepFloat(self.epoch, self.deep_pops + i - len(self.known))
 
     def push(self, value: Value) -> None:
         # The physical x87 stack has 8 slots; deeper is an overflow.
@@ -126,7 +161,7 @@ class X87Stack:
 class SideState:
     # pylint: disable=too-many-instance-attributes
     regs: dict[str, Value] = field(
-        default_factory=lambda: {f: ("init", f) for f in FAMILIES}
+        default_factory=lambda: {family: Init(family) for family in FAMILIES}
     )
     # Every ordinary memory read performed by this side, as (address value,
     # memory generation). Used to discharge the trap-parity obligation of a
@@ -134,13 +169,13 @@ class SideState:
     # harmless when the other side provably reads the same address at the
     # same memory generation (e.g. folded into another instruction).
     load_log: set = field(default_factory=set)
-    flags: Value = ("init", "flags")
-    fpu_flags: Value = ("init", "fpuflags")
+    flags: Value = Init("flags")
+    fpu_flags: Value = Init("fpuflags")
     # The carry flag is tracked separately from the other integer flags:
     # inc/dec preserve CF while rewriting the rest, so a single combined
     # flag value would let e.g. `cmp a, b; inc ecx; adc ...` erase a
     # CF difference introduced by swapped cmp operands.
-    carry: Value = ("init", "carry")
+    carry: Value = Init("carry")
     x87: X87Stack = field(default_factory=X87Stack)
     # Frame-slot alpha-renaming: negative ebp displacements are replaced by
     # slot ids assigned in first-use order, so the two sides may lay out
@@ -168,7 +203,7 @@ class SideState:
             else:
                 self.slot_map[disp] = None
         slot = self.slot_map[disp]
-        return disp if slot is None else ("slot", slot)
+        return disp if slot is None else Slot(slot)
 
     def read_reg(self, name: str) -> Value:
         family, part = REGISTERS[name]
@@ -176,9 +211,10 @@ class SideState:
         if part == "r32":
             return value
         # Reading back the part that was just inserted yields that value.
-        if isinstance(value, tuple) and value and value[0] == "ins_" + part:
-            return value[2]
-        return (part, value)
+        register_part = RegisterPart(part)
+        if isinstance(value, Insert) and value.part is register_part:
+            return value.new
+        return Extract(register_part, value)
 
     def write_reg(self, name: str, value: Value) -> None:
         family, part = REGISTERS[name]
@@ -187,15 +223,16 @@ class SideState:
                 # Promotion places slots by offset from the entry stack
                 # pointer: keep stack pointers in one form.
                 root, offset = constant_offset(value)
-                if root == ("init", "sp"):
-                    value = ("spadd", root, offset) if offset else root
+                if root == Init("sp"):
+                    value = StackOffset(root, offset) if offset else root
             self.regs[family] = value
             return
         old = self.regs[family]
+        register_part = RegisterPart(part)
         # Overwriting the same part again: the previous insertion is dead.
-        if isinstance(old, tuple) and old and old[0] == "ins_" + part:
-            old = old[1]
-        self.regs[family] = ("ins_" + part, old, value)
+        if isinstance(old, Insert) and old.part is register_part:
+            old = old.old
+        self.regs[family] = Insert(register_part, old, value)
 
 
 WIDTHS = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10}
@@ -235,6 +272,189 @@ def register_arguments(facts: CallFacts | None) -> tuple[bool, bool]:
     return (facts.uses_ecx is not False, facts.uses_edx is not False)
 
 
+class LoopKind(Enum):
+    LOOP = "loop"
+    LOOPE = "loope"
+    LOOPNE = "loopne"
+    JCXZ = "jcxz"
+    JECXZ = "jecxz"
+
+
+@dataclass(frozen=True, slots=True)
+class Store:
+    address: Value
+    size: str
+    value: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Call:
+    target: Value
+    arguments: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LocalDestination:
+    key: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalDestination:
+    identity: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedDestination:
+    address: int
+
+
+Destination: TypeAlias = LocalDestination | ExternalDestination | UnresolvedDestination
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchTarget:
+    """Canonical target of an indirect jump through a recognized switch table."""
+
+
+@dataclass(frozen=True, slots=True)
+class Branch:
+    predicate: Value
+    destination: Destination | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndirectJump:
+    target: Value | SwitchTarget
+    selector: tuple[Value, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Jump:
+    destination: Destination | None
+
+
+@dataclass(frozen=True, slots=True)
+class Loop:
+    kind: LoopKind
+    counter: Value
+    flags: Value
+    destination: Destination | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnValue:
+    values: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnFpu:
+    value: Value
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnStack:
+    operands: tuple[Operand, ...]
+    x87_state: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnSaved:
+    values: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameArguments:
+    values: tuple[tuple[int, int, Value], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class StringOperation:
+    mnemonic: str
+    prefix: str
+    values: tuple[Value, ...]
+    writes_memory: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LoadControlWord:
+    value: Value
+
+
+Observation: TypeAlias = (
+    Store
+    | Call
+    | Branch
+    | IndirectJump
+    | Jump
+    | Loop
+    | ReturnValue
+    | ReturnFpu
+    | ReturnStack
+    | ReturnSaved
+    | FrameArguments
+    | StringOperation
+    | LoadControlWord
+)
+ControlObservation: TypeAlias = Branch | IndirectJump | Jump | Loop
+
+
+def is_control_observation(observation: Observation) -> bool:
+    return isinstance(observation, (Branch, IndirectJump, Jump, Loop))
+
+
+def is_conditional_observation(observation: Observation) -> bool:
+    return isinstance(observation, (Branch, Loop))
+
+
+def observation_values(observation: Observation) -> tuple[Value, ...]:
+    values: tuple[Value, ...] = ()
+    match observation:
+        case Store(address, _, value):
+            values = (address, value)
+        case Call(target, arguments):
+            values = (target, *arguments)
+        case Branch(predicate):
+            values = (predicate,)
+        case IndirectJump(target, selector):
+            values = (
+                selector if isinstance(target, SwitchTarget) else (target, *selector)
+            )
+        case Loop(_, counter, flags):
+            values = (counter, flags)
+        case ReturnValue(found) | ReturnSaved(found):
+            values = found
+        case ReturnFpu(value) | LoadControlWord(value):
+            values = (value,)
+        case FrameArguments(values=arguments) if arguments is not None:
+            values = tuple(value for _, _, value in arguments)
+        case StringOperation(values=found):
+            values = found
+    return values
+
+
+@dataclass(slots=True)
+class CalleeSaveSubstitution:
+    orig_family: str
+    recomp_family: str
+    address: Value
+    valid: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class LoadObligation:
+    side: ImageId
+    address: Value
+    generation: MemoryGeneration
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchPush:
+    side: ImageId
+    offset: int
+    value: Value
+    tag: MemoryGeneration
+
+
 @dataclass
 class Context:
     # pylint: disable=too-many-instance-attributes
@@ -242,7 +462,7 @@ class Context:
     # store/clobber event, or the scope's initial value. Used as a block's
     # outgoing memory state and as the base tag for loads that no recorded
     # store can alias.
-    gen: int | Value = 0
+    gen: MemoryGeneration = field(default_factory=CfgMemoryInit)
     # Committed memory events, newest last: (tag, access) for a store with
     # a known (address value, width, stack kind), or (tag, None) for a
     # clobber-all (call, string write, resync). A load is tagged by the
@@ -254,8 +474,8 @@ class Context:
     # receiver reloaded from its stable slot is equivalent to the saved value.
     # Unknown calls do not erase the identity of that slot; an explicit later
     # store to the same address replaces it.
-    receiver_values: dict[tuple[Value, int | None], tuple[Value, Value]] = field(
-        default_factory=dict
+    receiver_values: dict[tuple[Value, int | None], tuple[MemoryGeneration, Value]] = (
+        field(default_factory=dict)
     )
     # Whether a pointer into this function's own frame may have escaped
     # (stored to memory or passed to a callee). Until then, memory below
@@ -275,20 +495,17 @@ class Context:
     # When not None, every memory access performed by execute() is recorded
     # here as ("r"|"w", address value, width, is_stack_slot).
     trace: list | None = None
-    # Pending callee-save register substitutions: mutable records
-    # [orig family, recomp family, stack slot address, still_valid].
-    # A potentially aliasing write to the slot clears still_valid.
-    save_stack: list[list] = field(default_factory=list)
-    # Trap-parity obligations from one-sided memory reads: (other side's
-    # state, address value, memory generation). Discharged at the end of
-    # the verification scope against the other side's load_log.
-    load_obligations: list[tuple] = field(default_factory=list)
-    # Live one-sided spills: [side state, entry-sp offset, value, event
-    # tag]. Must be empty at every call: a pushed value still live at a
-    # call would be an argument the other side never passed.
-    scratch_pushes: list[list] = field(default_factory=list)
+    # Pending callee-save register substitutions. A potentially aliasing
+    # write to the slot marks the substitution invalid.
+    save_stack: list[CalleeSaveSubstitution] = field(default_factory=list)
+    # Trap-parity obligations from one-sided memory reads. Discharged at the
+    # end of the verification scope against the other side's load_log.
+    load_obligations: list[LoadObligation] = field(default_factory=list)
+    # Live one-sided spills. Must be empty at every call: a pushed value still
+    # live at a call would be an argument the other side never passed.
+    scratch_pushes: list[ScratchPush] = field(default_factory=list)
     # Which acceptance features fired, for debug/audit logging.
-    categories: set[str] = field(default_factory=set)
+    categories: set[EffectiveReason] = field(default_factory=set)
     # PDB-derived return-type and callee-convention facts, if available.
     metadata: FunctionMetadata | None = None
     # Structured evidence sink for the current verifier strategy.
@@ -303,7 +520,7 @@ class Context:
         stack = [value]
         while stack:
             node = stack.pop()
-            if not isinstance(node, tuple):
+            if not is_value(node):
                 continue
             key = id(node)
             if key in self.matched_ids:
@@ -311,7 +528,7 @@ class Context:
             self.matched_ids.add(key)
             self.keepalive.append(node)
             self.matched_nodes.add(node)
-            stack.extend(node)
+            stack.extend(value_children(node))
 
 
 # A load only needs the newest may-aliasing store. Scanning the whole event
@@ -320,7 +537,7 @@ class Context:
 _ALIAS_SCAN_LIMIT = 128
 
 
-def memory_load_tag(ctx: Context, address: Value, width, stack) -> int | Value:
+def memory_load_tag(ctx: Context, address: Value, width, stack) -> MemoryGeneration:
     """Tag identifying which memory state a load reads: the tag of the
     newest committed store that may alias it (or of any clobber), else the
     scope's initial memory tag. Two loads of the same address with the same
@@ -342,19 +559,19 @@ def frame_pointer_value(value: Value) -> bool:
     """Does this value hold a pointer into the current function's own
     frame (strictly below the entry stack pointer)? Such a value reaching
     memory or a callee makes the frame externally reachable."""
-    if not isinstance(value, tuple) or not value:
-        return False
-    if value[0] == "addr":
-        resolved = abs_stack_offset(value[1], False)
+    if isinstance(value, AddressValue):
+        resolved = abs_stack_offset(value.address, False)
         if resolved is None:
             # An escaping address we cannot resolve: assume the worst
             # when it is stack-rooted at all.
-            return any(stack_rooted(term) for term, _ in value[1][2])
+            return any(
+                stack_rooted(term.value) for term in flatten_mem(value.address).terms
+            )
         root, offset = resolved
-        return root == ("init", "sp") and offset < 0
-    if value[0] == "spadd":
+        return root == Init("sp") and offset < 0
+    if isinstance(value, StackOffset):
         root, offset = unwind_spadd(value)
-        return root == ("init", "sp") and offset < 0
+        return root == Init("sp") and offset < 0
     return False
 
 
@@ -370,53 +587,50 @@ def _store_may_alias_load(store: tuple, load: tuple, stack_escaped: bool) -> boo
             resolved = abs_stack_offset(scratch[0], scratch[2])
             if (
                 resolved is not None
-                and resolved[0] == ("init", "sp")
+                and resolved[0] == Init("sp")
                 and resolved[1] < 0
                 and not other[2]
             ):
                 other_mem = flatten_mem(other[0])
-                if not any(stack_rooted(term) for term, _ in other_mem[2]):
+                if not any(stack_rooted(term.value) for term in other_mem.terms):
                     return False
     return True
 
 
-def commit_clobber(ctx: Context, marker) -> None:
+def commit_clobber(ctx: Context, tag: MemoryClobber) -> None:
     """Record a write to unknown locations: every later load re-reads."""
-    tag = ("mem", marker, "clobber")
     ctx.mem_events.append((tag, None))
     ctx.gen = tag
 
 
-def commit_memory(ctx: Context, obs: list, marker) -> None:
+def commit_memory(ctx: Context, obs: list[Observation], marker) -> None:
     """Commit the memory effects of one verified instruction pair. Deferred
     until after both sides executed so that loads within the pair observe
     the same pre-instruction memory."""
     for k, entry in enumerate(obs):
-        kind = entry[0]
-        if kind == "store":
-            _, address, size, value = entry
-            width = 4 if size == "stack" else WIDTHS.get(size)
-            stack = "push" if size == "stack" else False
-            tag = ("mem", marker, k)
-            ctx.mem_events.append((tag, (address, width, stack)))
-            ctx.receiver_values[(address, width)] = (tag, value)
-            ctx.gen = tag
-            if frame_pointer_value(value):
-                ctx.stack_escaped = True
-        elif kind == "call":
-            if ctx.scratch_pushes:
-                # A one-sided spill still on the stack at a call would be
-                # an extra argument: not provably equivalent.
-                raise Reject
-            for argument in entry[2:]:
-                if frame_pointer_value(argument):
+        match entry:
+            case Store(address, size, value):
+                width = 4 if size == "stack" else WIDTHS.get(size)
+                stack = "push" if size == "stack" else False
+                tag = MemoryStore(marker, k)
+                ctx.mem_events.append((tag, (address, width, stack)))
+                ctx.receiver_values[(address, width)] = (tag, value)
+                ctx.gen = tag
+                if frame_pointer_value(value):
                     ctx.stack_escaped = True
-            commit_clobber(ctx, (marker, k))
-        elif isinstance(kind, tuple):
-            # String instruction: (mnemonic, prefix). Writers clobber; the
-            # data they copy was already committed by its original store.
-            if STRING_OPS.get(kind[0], ("", "", False))[2]:
-                commit_clobber(ctx, (marker, k))
+            case Call(arguments=arguments):
+                if ctx.scratch_pushes:
+                    # A one-sided spill still on the stack at a call would be
+                    # an extra argument: not provably equivalent.
+                    raise Reject
+                for argument in arguments:
+                    if frame_pointer_value(argument):
+                        ctx.stack_escaped = True
+                commit_clobber(ctx, MemoryClobber(marker, k))
+            case StringOperation(writes_memory=True):
+                # Writers clobber; the data they copy was already committed
+                # by its original store.
+                commit_clobber(ctx, MemoryClobber(marker, k))
 
 
 # Symbolic values are DAGs (a register value can feed several later values),
@@ -427,13 +641,13 @@ VALUE_SIZE_LIMIT = 50_000
 
 
 def _tree_size(value, ctx: Context) -> int:
-    if not isinstance(value, tuple):
+    if not is_value(value):
         return 1
     key = id(value)
     cached = ctx.size_cache.get(key)
     if cached is not None:
         return cached
-    size = 1 + sum(_tree_size(child, ctx) for child in value)
+    size = 1 + sum(_tree_size(child, ctx) for child in value_children(value))
     ctx.size_cache[key] = size
     ctx.keepalive.append(value)
     return size
@@ -476,12 +690,6 @@ STRING_OPS = {
     **{f"scas{s}": ("a di", "di", False) for s in "bwd"},
     **{f"cmps{s}": ("si di", "si di", False) for s in "bwd"},
 }
-
-
-# Observable tags of instructions that may transfer control locally.
-CONTROL_TAGS = frozenset(
-    {"branch", "jmp", "jmpind", "loop", "loope", "loopne", "jcxz", "jecxz"}
-)
 
 
 def clone_state(state: SideState) -> SideState:

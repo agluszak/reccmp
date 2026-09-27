@@ -111,37 +111,6 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
         memo[entity.orig_addr] = entry
         return entry
 
-    def _ensure_helper_catalog(self) -> list[HelperCatalogEntry]:
-        """Full catalog for ``find-inlines`` only — not used on the hot compare path."""
-        if self._helper_catalog is not None:
-            return self._helper_catalog
-
-        catalog: list[HelperCatalogEntry] = []
-        freq: dict[Fingerprint, int] = {}
-        for entity in self.db.get_functions():
-            entry = self._helper_entry_for_match(entity)
-            if entry is None:
-                continue
-            catalog.append(entry)
-            freq[entry.fingerprint] = freq.get(entry.fingerprint, 0) + 1
-        # Attach inverse-frequency uniqueness.
-        catalog = [
-            HelperCatalogEntry(
-                orig_addr=entry.orig_addr,
-                recomp_addr=entry.recomp_addr,
-                name=entry.name,
-                fingerprint=entry.fingerprint,
-                identity=entry.identity,
-                byte_size=entry.byte_size,
-                uniqueness=1.0 / freq[entry.fingerprint],
-                effect_summary=entry.effect_summary,
-            )
-            for entry in catalog
-        ]
-        catalog.sort(key=lambda entry: len(entry.fingerprint), reverse=True)
-        self._helper_catalog = catalog
-        return catalog
-
     def _helper_called(self, callee: Hashable) -> HelperCatalogEntry | None:
         """The paired helper a call's callee identity names, if any."""
         match callee:

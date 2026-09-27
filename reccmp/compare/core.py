@@ -6,7 +6,7 @@ from typing import Callable, Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
-from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.diagnosis import ComparisonAnalysis, InconclusiveReason
 from reccmp.compare.verification import admit_exact_analysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.marker import ProjectAliases, normalize_project_aliases
@@ -583,7 +583,7 @@ class Compare:
                     keys_equal=ratio == 1.0,
                     extent_closed=True,
                 )
-                or ComparisonAnalysis.inconclusive("analysis_limit")
+                or ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
             ),
         )
 
@@ -691,14 +691,6 @@ class Compare:
 
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
-
-    def get_unmatched(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
-        """Raw unmatched inventory, including proven duplicate bodies."""
-        return self._db.unmatched(image_id)
-
-    def get_unexplained(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
-        """Unmatched inventory excluding proven duplicate bodies."""
-        return self._db.unexplained(image_id)
 
     def get_aliases(
         self, image_id: ImageId

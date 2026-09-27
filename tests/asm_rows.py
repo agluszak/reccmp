@@ -11,19 +11,144 @@ the row each jump reaches (None for none, or outside the rows).
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Sequence
 from dataclasses import replace
 
-from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     ExtentKind,
+    FlowKind,
     FunctionImage,
     JumpTable,
 )
-from reccmp.compare.asm.model import parse_instruction
+from reccmp.compare.asm.model import REGISTERS, Reference, Reject
+from reccmp.compare.asm.operand import (
+    Imm,
+    Mem,
+    Operand,
+    Reg,
+    ScaledReg,
+    SignedSymbol,
+    St,
+    Sym,
+)
 
 START = 0x1000
+
+_CONDITIONAL_JUMPS = frozenset(
+    "ja jae jb jbe jcxz je jecxz jg jge jl jle jne jno jnp jns jo jp js "
+    "loop loope loopne".split()
+)
+
+
+def _flow_kind(mnemonic: str) -> FlowKind:
+    if mnemonic in _CONDITIONAL_JUMPS:
+        return FlowKind.CONDITIONAL
+    return {
+        "jmp": FlowKind.JUMP,
+        "call": FlowKind.CALL,
+        "ret": FlowKind.RETURN,
+        "int3": FlowKind.TRAP,
+    }.get(mnemonic, FlowKind.NORMAL)
+
+
+_ST_RE = re.compile(r"^st(?:\((\d)\))?$")
+_MEM_RE = re.compile(
+    r"^(?:(byte|word|dword|qword|tbyte|xword|xmmword) ptr )?"
+    r"(?:(cs|ds|es|fs|gs|ss):)?\[(.+)\]$"
+)
+_SCALED_REG_RE = re.compile(r"^(e[a-d]x|e[sd]i|e[bs]p)\*([1248])$")
+_NUM_RE = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
+
+
+def _split_operands(op_str: str) -> list[str]:
+    """Split on top-level ', ' only: brackets and parens may contain commas."""
+    operands = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(op_str):
+        char = op_str[i]
+        if char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif depth == 0 and op_str.startswith(", ", i):
+            operands.append(op_str[start:i])
+            start = i + 2
+            i += 2
+            continue
+        i += 1
+    operands.append(op_str[start:])
+    return [op for op in (o.strip() for o in operands) if op]
+
+
+def _reference(text: str) -> Reference:
+    """A fixture's symbol: its text is both what it shows and its identity."""
+    return Reference(text, text)
+
+
+def _parse_operand(text: str) -> Operand:
+    if text in REGISTERS:
+        return Reg(text)
+
+    st_match = _ST_RE.match(text)
+    if st_match:
+        return St(int(st_match.group(1) or 0))
+
+    if _NUM_RE.match(text):
+        return Imm(int(text, 0))
+
+    mem_match = _MEM_RE.match(text)
+    if mem_match:
+        size, seg, content = mem_match.groups()
+        registers: list[ScaledReg] = []
+        disp = 0
+        syms: list[tuple[int, str]] = []
+        tokens = re.split(r" ([+-]) ", content)
+        sign = 1
+        for k, token in enumerate(tokens):
+            if k % 2 == 1:
+                sign = 1 if token == "+" else -1
+                continue
+            token = token.strip()
+            if token in REGISTERS:
+                if sign < 0:
+                    raise Reject
+                registers.append(ScaledReg(token, 1))
+            elif (scaled := _SCALED_REG_RE.match(token)) is not None:
+                if sign < 0:
+                    raise Reject
+                registers.append(ScaledReg(scaled.group(1), int(scaled.group(2))))
+            elif _NUM_RE.match(token):
+                disp += sign * int(token, 0)
+            else:
+                syms.append((sign, token))
+        return Mem(
+            size or "",
+            seg or "",
+            tuple(registers),
+            disp,
+            tuple(SignedSymbol(sign, _reference(name)) for sign, name in sorted(syms)),
+        )
+
+    # Symbol, placeholder, or anything else we treat as an opaque token.
+    return Sym(_reference(text))
+
+
+def parse_instruction(line: str) -> tuple[str, str, tuple[Operand, ...]]:
+    """``(prefix, mnemonic, operands)`` of one line of Intel assembly text.
+
+    Only test fixtures arrive as text; reccmp decodes machine code."""
+    mnemonic, _, op_str = line.partition(" ")
+    prefix = ""
+    if mnemonic in ("rep", "repe", "repne"):
+        prefix = mnemonic
+        mnemonic, _, op_str = op_str.partition(" ")
+    raw = tuple(_split_operands(op_str)) if op_str else ()
+    return prefix, mnemonic, tuple(_parse_operand(token) for token in raw)
 
 
 def rows(
@@ -38,7 +163,8 @@ def rows(
         address = start + index
         prefix, mnemonic, operands = parse_instruction(line)
         target = targets[index] if targets is not None else None
-        is_jump = mnemonic in JUMP_MNEMONICS
+        flow = _flow_kind(mnemonic)
+        is_jump = flow in (FlowKind.CONDITIONAL, FlowKind.JUMP)
         control_target = None
         if is_jump or mnemonic == "call":
             control_target = (
@@ -54,13 +180,10 @@ def rows(
                 prefix=prefix,
                 operands=operands,
                 display=line,
-                is_jump=is_jump,
-                is_call=mnemonic == "call",
-                is_ret=mnemonic == "ret",
+                flow=flow,
                 branch_target=start + target if target is not None else None,
                 # Text says nothing about implicit register effects.
                 register_access_known=False,
-                instruction_id=index,
                 control_target=control_target,
             )
         )
@@ -102,80 +225,73 @@ def image_from_bytes(code: bytes, start: int = START) -> FunctionImage:
     return decode_function(code, start)
 
 
+def _jump_to(
+    row: DecodedInstruction, index: int, addresses: Sequence[int]
+) -> int | None:
+    """The row a relative jump at ``index`` reaches, from its displacement."""
+    match row.operands:
+        case (Imm(displacement),) if row.is_jump:
+            following = (
+                addresses[index + 1]
+                if index + 1 < len(addresses)
+                else addresses[index] + row.size
+            )
+            destination = following + displacement
+            return addresses.index(destination) if destination in addresses else None
+    return None
+
+
 def as_rows(
     value,
     *,
     targets: Sequence[int | None] | None = None,
     addresses: Sequence[int] | None = None,
-    meta: Sequence[object | None] | None = None,
+    meta: Sequence[DecodedInstruction | None] | None = None,
     start: int = START,
 ) -> tuple[DecodedInstruction, ...]:
-    """Decode literal assembly at the test boundary, then attach test facts."""
-    result = (
-        tuple(value)
+    """Decode literal assembly at the test boundary. ``addresses`` places
+    the rows (relative jumps then reach the row at their destination),
+    ``targets`` names the row each jump reaches, and a ``meta`` row stands
+    for its line with the decode facts a test gives it."""
+    result = list(
+        value
         if value and isinstance(value[0], DecodedInstruction)
         else rows(value, targets, start=start)
     )
-    updated = []
     for index, row in enumerate(result):
-        changes: dict[str, object] = {}
+        if meta is not None and meta[index] is not None:
+            row = meta[index]
         if addresses is not None:
-            changes["address"] = addresses[index]
-            if (
-                targets is None
-                and row.is_jump
-                and row.operands
-                and row.operands[0][0] == "imm"
-                and isinstance(row.operands[0][1], int)
-            ):
-                next_addr = (
-                    addresses[index + 1]
-                    if index + 1 < len(addresses)
-                    else addresses[index] + row.size
+            row = replace(row, address=addresses[index])
+            reached = _jump_to(row, index, addresses) if targets is None else None
+            if reached is not None:
+                row = replace(
+                    row,
+                    branch_target=addresses[reached],
+                    control_target=("local_insn", reached),
                 )
-                destination = next_addr + row.operands[0][1]
-                if destination in addresses:
-                    target_index = addresses.index(destination)
-                    changes["branch_target"] = destination
-                    changes["control_target"] = ("local_insn", target_index)
         target = targets[index] if targets is not None else None
         if target is not None:
-            changes["branch_target"] = (
-                addresses[target]
-                if addresses is not None and 0 <= target < len(addresses)
-                else start + target
+            row = replace(
+                row,
+                branch_target=(
+                    addresses[target]
+                    if addresses is not None and 0 <= target < len(addresses)
+                    else start + target
+                ),
+                control_target=("local_insn", target),
             )
-            changes["control_target"] = ("local_insn", target)
-        if meta is not None and meta[index] is not None:
-            facts = meta[index]
-            for name in (
-                "regs_read",
-                "regs_written",
-                "reads_flags",
-                "writes_flags",
-                "accesses_memory",
-                "is_jump",
-                "is_call",
-                "is_ret",
-                "register_access_known",
-                "operand_model_complete",
-                "control_flow_known",
-                "control_target",
-                "branch_target",
-            ):
-                if hasattr(facts, name):
-                    changes[name] = getattr(facts, name)
-        updated.append(replace(row, **changes) if changes else row)
+        result[index] = row
     if addresses is not None:
-        for index, row in enumerate(updated[:-1]):
-            following = updated[index + 1]
+        for index, row in enumerate(result[:-1]):
+            following = result[index + 1]
             if (
                 row.address is not None
                 and following.address is not None
                 and following.address > row.address
             ):
-                updated[index] = replace(row, size=following.address - row.address)
-    return tuple(updated)
+                result[index] = replace(row, size=following.address - row.address)
+    return tuple(result)
 
 
 def verify_effective_match(
@@ -183,14 +299,13 @@ def verify_effective_match(
     recomp,
     codes=None,
     metadata=None,
-    recorder=None,
     *,
     orig_addrs=None,
     recomp_addrs=None,
     orig_meta=None,
     recomp_meta=None,
 ):
-    """Call the production verifier with fixture rows."""
+    """Call the production lockstep verifier with fixture rows."""
     from reccmp.compare.asm.verifier import verify_effective_match as verify
 
     return verify(
@@ -198,81 +313,52 @@ def verify_effective_match(
         as_rows(recomp, addresses=recomp_addrs, meta=recomp_meta, start=0x2000),
         codes,
         metadata,
-        recorder,
     )
 
 
-def verify_cfg_effective_match(
-    orig, recomp, orig_targets=(), recomp_targets=(), metadata=None, recorder=None
-):
-    from reccmp.compare.asm.verifier import verify_cfg_effective_match as verify
-
-    return verify(
-        as_rows(
-            orig,
-            targets=orig_targets or None,
-            addresses=recorder.orig_addrs if recorder is not None else None,
-        ),
-        as_rows(
-            recomp,
-            targets=recomp_targets or None,
-            start=0x2000,
-            addresses=recorder.recomp_addrs if recorder is not None else None,
-        ),
-        metadata,
-        recorder,
+def _fixture_image(lines, targets, addresses, start, tables) -> FunctionImage:
+    fixture_rows = as_rows(
+        lines, targets=targets or None, addresses=addresses, start=start
     )
+    extent = max(
+        (
+            row.address + row.size - start
+            for row in fixture_rows
+            if row.address is not None
+        ),
+        default=0,
+    )
+    extent = max(
+        [extent] + [entry + 4 - start for table in tables for entry, _ in table.entries]
+    )
+    return FunctionImage(start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables))
 
 
-def verify_isomorphic_cfg_effective_match(
+def run_product(
     orig,
     recomp,
     orig_targets=(),
     recomp_targets=(),
     metadata=None,
-    recorder=None,
     *,
     orig_addrs=None,
     recomp_addrs=None,
     orig_tables=(),
     recomp_tables=(),
 ):
-    from reccmp.compare.asm.verifier import (
-        verify_isomorphic_cfg_effective_match as verify,
-    )
+    """The product verifier's result on fixture lines."""
+    from reccmp.compare.asm.verifier import verify_isomorphic_cfg_effective_match
 
-    if recorder is not None:
-        orig_addrs = orig_addrs if orig_addrs is not None else recorder.orig_addrs
-        recomp_addrs = (
-            recomp_addrs if recomp_addrs is not None else recorder.recomp_addrs
-        )
-
-    def fixture_image(lines, targets, addresses, start, tables):
-        fixture_rows = as_rows(
-            lines, targets=targets or None, addresses=addresses, start=start
-        )
-        extent = max(
-            (
-                row.address + row.size - start
-                for row in fixture_rows
-                if row.address is not None
-            ),
-            default=0,
-        )
-        extent = max(
-            [extent]
-            + [entry + 4 - start for table in tables for entry, _ in table.entries]
-        )
-        return FunctionImage(
-            start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables)
-        )
-
-    return verify(
-        fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
-        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
+    return verify_isomorphic_cfg_effective_match(
+        _fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
+        _fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
         metadata,
-        recorder,
     )
+
+
+def prove_product(*args, **kwargs) -> bool:
+    """Whether the product verifier proves fixture lines equivalent."""
+    return run_product(*args, **kwargs).proved
 
 
 def analyze_effective_match(
@@ -291,6 +377,7 @@ def analyze_effective_match(
     extent_closed=True,
 ):
     from reccmp.compare.asm.verifier import analyze_effective_match as analyze
+    from reccmp.compare.asm.verifier import compare_exact
 
     orig_rows = as_rows(orig, addresses=orig_addrs, meta=orig_meta)
     recomp_rows = as_rows(
@@ -314,4 +401,6 @@ def analyze_effective_match(
         coverage_incomplete,
         extent_closed,
     )
-    return analyze(codes, orig_image, recomp_image, metadata)
+    return compare_exact(orig_image, recomp_image) or analyze(
+        codes, orig_image, recomp_image, metadata
+    )

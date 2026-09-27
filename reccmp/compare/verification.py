@@ -7,33 +7,7 @@ proposal into ``ComparisonAnalysis`` EXACT/EFFECTIVE.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
-
-
-@dataclass(frozen=True)
-class VerificationResult:
-    """A strategy proposal after shared admission.
-
-    ``assumptions`` records coverage/extent obligations that were required
-    for the proof. ``reasons`` are effective-match categories. ``obligations``
-    are leftover checks a later strategy would still need to discharge.
-    """
-
-    analysis: ComparisonAnalysis
-    assumptions: tuple[str, ...] = ()
-    reasons: tuple[str, ...] = ()
-    obligations: tuple[str, ...] = ()
-
-    @property
-    def proof_kind(self) -> ComparisonStatus | None:
-        if self.analysis.status in (
-            ComparisonStatus.EXACT,
-            ComparisonStatus.EFFECTIVE,
-        ):
-            return self.analysis.status
-        return None
+from reccmp.compare.diagnosis import ComparisonAnalysis, InconclusiveReason
 
 
 def admit_proof(
@@ -46,50 +20,10 @@ def admit_proof(
     if not analysis.is_effective:
         return analysis
     if coverage_incomplete:
-        return ComparisonAnalysis.inconclusive("incomplete_coverage")
+        return ComparisonAnalysis.inconclusive(InconclusiveReason.INCOMPLETE_COVERAGE)
     if not extent_closed:
-        return ComparisonAnalysis.inconclusive("open_extent")
+        return ComparisonAnalysis.inconclusive(InconclusiveReason.OPEN_EXTENT)
     return analysis
-
-
-def _closed_assumptions(
-    *, coverage_incomplete: bool, extent_closed: bool
-) -> tuple[str, ...]:
-    assumptions: list[str] = []
-    if not coverage_incomplete:
-        assumptions.append("coverage_complete")
-    if extent_closed:
-        assumptions.append("extent_closed")
-    return tuple(assumptions)
-
-
-def admit_exact(
-    *,
-    bytes_equal: bool,
-    topology_equal: bool,
-    keys_equal: bool,
-    operands_complete: bool = True,
-    control_flow_complete: bool = True,
-    coverage_incomplete: bool = False,
-    extent_closed: bool,
-) -> VerificationResult | None:
-    # pylint: disable=too-many-arguments
-    """Mint an EXACT ``VerificationResult``; strategies only propose evidence."""
-    if coverage_incomplete or not extent_closed:
-        return None
-    if not topology_equal:
-        return None
-    if not keys_equal:
-        return None
-    if not (bytes_equal or (operands_complete and control_flow_complete)):
-        return None
-    return VerificationResult(
-        analysis=ComparisonAnalysis.exact(),
-        assumptions=_closed_assumptions(
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        ),
-    )
 
 
 def admit_exact_analysis(
@@ -98,7 +32,6 @@ def admit_exact_analysis(
     topology_equal: bool,
     keys_equal: bool,
     operands_complete: bool = True,
-    control_flow_complete: bool = True,
     coverage_incomplete: bool = False,
     extent_closed: bool,
 ) -> ComparisonAnalysis | None:
@@ -110,16 +43,11 @@ def admit_exact_analysis(
     for missing operand or control-flow facts. Local branch topology and
     reference identities must also agree.
     """
-    minted = admit_exact(
-        bytes_equal=bytes_equal,
-        topology_equal=topology_equal,
-        keys_equal=keys_equal,
-        operands_complete=operands_complete,
-        control_flow_complete=control_flow_complete,
-        coverage_incomplete=coverage_incomplete,
-        extent_closed=extent_closed,
-    )
-    return None if minted is None else minted.analysis
+    if coverage_incomplete or not extent_closed:
+        return None
+    if not (topology_equal and keys_equal and (bytes_equal or operands_complete)):
+        return None
+    return ComparisonAnalysis.exact()
 
 
 def admit_effective(
@@ -127,31 +55,8 @@ def admit_effective(
     *,
     coverage_incomplete: bool = False,
     extent_closed: bool,
-) -> VerificationResult | None:
-    """Mint an EFFECTIVE ``VerificationResult``; strategies only propose reasons."""
+) -> ComparisonAnalysis | None:
+    """Mint an EFFECTIVE analysis; strategies only propose reasons."""
     if coverage_incomplete or not extent_closed:
         return None
-    normalized = tuple(sorted(set(reasons)))
-    return VerificationResult(
-        analysis=ComparisonAnalysis.effective(reasons),
-        assumptions=_closed_assumptions(
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        ),
-        reasons=normalized,
-    )
-
-
-def admit_effective_analysis(
-    reasons,
-    *,
-    coverage_incomplete: bool = False,
-    extent_closed: bool,
-) -> ComparisonAnalysis | None:
-    """Shared EFFECTIVE admission; same coverage/extent obligations as exact."""
-    minted = admit_effective(
-        reasons,
-        coverage_incomplete=coverage_incomplete,
-        extent_closed=extent_closed,
-    )
-    return None if minted is None else minted.analysis
+    return ComparisonAnalysis.effective(reasons)

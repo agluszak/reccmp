@@ -3,21 +3,44 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from enum import Enum
+from functools import cached_property
 
 from .ir import DecodedInstruction, ExtentKind, JumpTable
+from .operand import Imm, Mem, Sym
 
-EdgeKind = Literal["local", "external", "fallout", "unknown"]
+
+class EdgeRole(Enum):
+    """How control leaves an instruction along an edge."""
+
+    FALL = "fall"  # to the next instruction
+    TAKEN = "taken"  # a conditional jump's target
+    JUMP = "jump"  # an unconditional jump's target
+    CASE = "case"  # one entry of a switch table
+
+
+class EdgeKind(Enum):
+    """Where an edge leads."""
+
+    LOCAL = "local"  # an instruction of this function
+    EXTERNAL = "external"  # outside the function's bytes
+    UNKNOWN = "unknown"  # inside the bytes but not an instruction, or unknown
 
 
 @dataclass(frozen=True)
 class GraphEdge:
-    label: str
+    role: EdgeRole
     kind: EdgeKind
     target: int | None = None  # instruction index for a local edge
     address: int | None = None
     modeled_external: bool = False
+    case: int | None = None  # the table entry of a CASE edge
+
+    @property
+    def falls_out(self) -> bool:
+        """Execution runs past the end of the function's bytes."""
+        return self.role is EdgeRole.FALL and self.kind is EdgeKind.EXTERNAL
 
 
 @dataclass(frozen=True)
@@ -25,6 +48,11 @@ class GraphBlock:
     start: int
     end: int
     successors: tuple[GraphEdge, ...]
+
+    @property
+    def last(self) -> int:
+        """The block's last instruction, the one its successors leave."""
+        return self.end - 1
 
 
 @dataclass(frozen=True)
@@ -38,6 +66,24 @@ class FunctionGraph:
     returns: frozenset[int]
     table_dests: tuple[tuple[int, tuple[int, ...]], ...]
 
+    @cached_property
+    def _block_starting_at(self) -> dict[int, int]:
+        return {block.start: number for number, block in enumerate(self.blocks)}
+
+    def block_at(self, index: int) -> int:
+        """The number of the block that starts at instruction ``index``."""
+        return self._block_starting_at[index]
+
+    def shape(self) -> tuple[tuple[GraphEdge, ...], ...] | None:
+        """Every instruction's edges with addresses erased: two functions
+        with the same shape transfer control between the same positions.
+        None when an edge leads somewhere unknown."""
+        if any(edge.kind is EdgeKind.UNKNOWN for edges in self.edges for edge in edges):
+            return None
+        return tuple(
+            tuple(replace(edge, address=None) for edge in edges) for edges in self.edges
+        )
+
     def extent_closed(
         self, *, extent_kind: ExtentKind, coverage_incomplete: bool = False
     ) -> bool:
@@ -48,10 +94,12 @@ class FunctionGraph:
             return self.extent <= 0
         for index in self.reachable:
             for edge in self.edges[index]:
-                if edge.kind == "local":
+                if edge.kind is EdgeKind.LOCAL:
                     continue
-                if edge.kind == "external" and (
-                    edge.modeled_external or extent_kind is ExtentKind.KNOWN
+                if (
+                    edge.kind is EdgeKind.EXTERNAL
+                    and not edge.falls_out
+                    and (edge.modeled_external or extent_kind is ExtentKind.KNOWN)
                 ):
                     continue
                 return False
@@ -78,9 +126,7 @@ def _switch_table(
     if row.address is None:
         return None
     match row.operands:
-        case (("mem", _, _, reg_terms, _, _),) if any(
-            scale == 4 for _register, scale in reg_terms
-        ):
+        case (Mem(terms=terms),) if any(term.scale == 4 for term in terms):
             return next(
                 (
                     table
@@ -108,25 +154,29 @@ def build_function_graph(
     window = range(start_addr, start_addr + extent)
     table_dests: list[tuple[int, tuple[int, ...]]] = []
 
-    def edge(label: str, address: int, row: DecodedInstruction) -> GraphEdge:
+    def edge(
+        role: EdgeRole, address: int, row: DecodedInstruction, case: int | None = None
+    ) -> GraphEdge:
         target = by_addr.get(address)
         if target is not None:
-            return GraphEdge(label, "local", target, address)
+            return GraphEdge(role, EdgeKind.LOCAL, target, address, case=case)
         if address in window:
-            return GraphEdge(label, "unknown", address=address)
-        if label == "fall":
-            return GraphEdge("fallout", "fallout", address=address)
+            return GraphEdge(role, EdgeKind.UNKNOWN, address=address, case=case)
         return GraphEdge(
-            label, "external", address=address, modeled_external=_modeled_external(row)
+            role,
+            EdgeKind.EXTERNAL,
+            address=address,
+            modeled_external=role is not EdgeRole.FALL and _modeled_external(row),
+            case=case,
         )
 
     edges: list[tuple[GraphEdge, ...]] = []
     returns: set[int] = set()
     for index, row in enumerate(rows):
         assert row.address is not None
-        if row.is_ret or row.mnemonic == "int3":
-            if row.is_ret:
-                returns.add(index)
+        if row.is_ret:
+            returns.add(index)
+        if not (row.is_jump or row.falls_through):
             edges.append(())
             continue
         fall = row.address + row.size
@@ -135,7 +185,7 @@ def build_function_graph(
             if row.branch_target is not None:
                 branches = (
                     edge(
-                        "jmp" if row.mnemonic == "jmp" else "taken",
+                        EdgeRole.TAKEN if row.is_conditional else EdgeRole.JUMP,
                         row.branch_target,
                         row,
                     ),
@@ -143,29 +193,34 @@ def build_function_graph(
             else:
                 table = _switch_table(row, jump_tables)
                 direct_external = bool(
-                    row.operands and row.operands[0][0] in ("imm", "sym")
+                    row.operands and isinstance(row.operands[0], (Imm, Sym))
                 )
                 branches = (
                     tuple(
                         (
-                            edge(f"case{case}", target, row)
+                            edge(EdgeRole.CASE, target, row, case)
                             if target in by_addr
-                            else GraphEdge(f"case{case}", "unknown", address=target)
+                            else GraphEdge(
+                                EdgeRole.CASE,
+                                EdgeKind.UNKNOWN,
+                                address=target,
+                                case=case,
+                            )
                         )
                         for case, (_entry, target) in enumerate(table.entries)
                     )
                     if table is not None and table.entries
                     else (
                         GraphEdge(
-                            "jmp" if row.mnemonic == "jmp" else "taken",
-                            "external" if direct_external else "unknown",
+                            EdgeRole.TAKEN if row.is_conditional else EdgeRole.JUMP,
+                            EdgeKind.EXTERNAL if direct_external else EdgeKind.UNKNOWN,
                         ),
                     )
                 )
                 if (
                     table is not None
                     and branches
-                    and all(branch.kind == "local" for branch in branches)
+                    and all(branch.kind is EdgeKind.LOCAL for branch in branches)
                 ):
                     table_dests.append(
                         (
@@ -178,12 +233,12 @@ def build_function_graph(
                         )
                     )
             edges.append(
-                branches
-                if row.mnemonic == "jmp"
-                else (*branches, edge("fall", fall, row))
+                (*branches, edge(EdgeRole.FALL, fall, row))
+                if row.falls_through
+                else branches
             )
             continue
-        edges.append((edge("fall", fall, row),))
+        edges.append((edge(EdgeRole.FALL, fall, row),))
 
     reachable: set[int] = set()
     pending = [0] if rows else []
@@ -195,7 +250,7 @@ def build_function_graph(
         pending.extend(
             successor.target
             for successor in edges[index]
-            if successor.kind == "local" and successor.target is not None
+            if successor.kind is EdgeKind.LOCAL and successor.target is not None
         )
 
     leaders = {0} if rows else set()
@@ -203,13 +258,13 @@ def build_function_graph(
         leaders.update(
             successor.target
             for successor in successors
-            if successor.kind == "local"
-            and (successor.label != "fall" or successor.target != index + 1)
+            if successor.kind is EdgeKind.LOCAL
+            and (successor.role is not EdgeRole.FALL or successor.target != index + 1)
             and successor.target is not None
         )
-        if (
-            rows[index].is_jump or rows[index].is_ret or rows[index].mnemonic == "int3"
-        ) and index + 1 < len(rows):
+        if (rows[index].is_jump or not rows[index].falls_through) and index + 1 < len(
+            rows
+        ):
             leaders.add(index + 1)
     order = sorted(leaders)
     blocks = tuple(

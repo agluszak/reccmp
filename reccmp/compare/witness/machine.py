@@ -24,14 +24,12 @@ import struct
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
-from capstone import CS_GRP_CALL, CsError, CsInsn  # type: ignore[import-untyped]
+from capstone import CS_GRP_CALL, CsError  # type: ignore[import-untyped]
 from capstone.x86 import (  # type: ignore
-    X86_INS_ADD,
     X86_INS_CPUID,
     X86_INS_ENTER,
     X86_INS_IN,
     X86_INS_INSB,
-    X86_INS_JMP,
     X86_INS_OUT,
     X86_INS_OUTSB,
     X86_INS_PUSH,
@@ -39,7 +37,6 @@ from capstone.x86 import (  # type: ignore
     X86_INS_RDSEED,
     X86_INS_RDTSC,
     X86_INS_RDTSCP,
-    X86_OP_IMM,
     X86_OP_MEM,
     X86_OP_REG,
     X86_REG_BP,
@@ -78,7 +75,7 @@ from unicorn.x86_const import (  # type: ignore[import-untyped]
     UC_X86_REG_ESP,
 )
 
-from reccmp.compare.asm.decode import decode_one, direct_branch_target
+from reccmp.compare.asm.decode import direct_branch_target, jump_thunk_target
 from reccmp.compare.callee_cleanup import CalleeCleanupMixin, image_imports
 from reccmp.call_facts import CallFacts
 from reccmp.compare.diagnosis import WitnessInput
@@ -393,12 +390,6 @@ class SideMachine(CalleeCleanupMixin):
 
     # -- decoding --------------------------------------------------------
 
-    def _decode(self, addr: int) -> CsInsn | None:
-        if addr not in self.image_range:
-            return None
-        offset = addr - self.image_range.start
-        return decode_one(self._pristine[offset : offset + 16], addr)
-
     def _pushed_bytes(self, recent: collections.deque[int]) -> int:
         """Bytes pushed on the executed path right before the current call:
         the pushes back to the first earlier instruction that changes esp or
@@ -421,18 +412,6 @@ class SideMachine(CalleeCleanupMixin):
             if written & _FRAME_REGISTERS:
                 break
         return total
-
-    def _caller_cleanup(self, after_call: int) -> int | None:
-        """Bytes the caller removes right after the call (cdecl)."""
-        insn = self.insn_at(after_call)
-        if (
-            insn is not None
-            and insn.id == X86_INS_ADD
-            and _is_reg(insn, 0, X86_REG_ESP)
-            and insn.operands[1].type == X86_OP_IMM
-        ):
-            return insn.operands[1].imm
-        return None
 
     # -- memory model ----------------------------------------------------
 
@@ -504,16 +483,12 @@ class SideMachine(CalleeCleanupMixin):
         for _ in range(4):
             if target not in self.image_range:
                 break
-            insn = self.insn_at(target)
-            if insn is None or insn.id != X86_INS_JMP or not insn.operands:
+            step = jump_thunk_target(
+                self.insn_at(target), lambda slot: self.read(slot, 4)
+            )
+            if step is None:
                 break
-            op = insn.operands[0]
-            if op.type == X86_OP_IMM:
-                target = op.imm
-            elif op.type == X86_OP_MEM and not op.mem.base and not op.mem.index:
-                target = self.read(op.mem.disp & 0xFFFFFFFF, 4)
-            else:
-                break
+            target = step
         return target
 
     def section_name(self, addr: int) -> str | None:
@@ -858,16 +833,6 @@ _UC_REGS = {
     X86_REG_EBP: UC_X86_REG_EBP,
     X86_REG_ESP: UC_X86_REG_ESP,
 }
-
-
-def _is_reg(insn: CsInsn, index: int, *regs: int) -> bool:
-    """Whether operand ``index`` of ``insn`` is one of the registers ``regs``."""
-    operands = insn.operands
-    return (
-        len(operands) > index
-        and operands[index].type == X86_OP_REG
-        and operands[index].reg in regs
-    )
 
 
 def _effective_address(uc: Uc, op) -> int:

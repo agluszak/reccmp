@@ -27,43 +27,86 @@ from typing import Any
 
 import z3  # type: ignore[import-untyped]
 
-from reccmp.compare.asm.model import operand_identity
-from reccmp.compare.asm.verifier.state import WIDTHS
+from reccmp.compare.asm.verifier.addresses import (
+    AddressValue,
+    CallArgument,
+    CallResult,
+    CallStack,
+    CallThrough,
+    CarryCleared,
+    CarryResult,
+    Compare,
+    CompareFlags,
+    CompareKind,
+    ConditionCode,
+    Constant,
+    DeepFloat,
+    DivideResult,
+    Extend,
+    ExtendKind,
+    Extract,
+    FlagsResult,
+    FloatCompare,
+    FloatConstant,
+    FloatControlWord,
+    FloatOperation,
+    FloatStatusWord,
+    Init,
+    Insert,
+    Load,
+    MemoryAddress,
+    MultiplyResult,
+    OpaqueValue,
+    Operation,
+    OperationKind,
+    Phi,
+    ReceiverLoad,
+    RegisterPart,
+    Resync,
+    SahfCarry,
+    SahfFlags,
+    Select,
+    SetCondition,
+    StackOffset,
+    StringResult,
+    SymbolValue,
+    TestFlags,
+    UnaryOperation,
+    VirtualCall,
+)
+from reccmp.compare.asm.verifier.state import (
+    Branch,
+    Observation,
+    ReturnValue,
+    Store,
+    WIDTHS,
+)
+from reccmp.compare.diagnosis import SolverOutcome, SolverResult
 
 # Resource units per query (see SolverOutcome.rlimit), and a wall-clock
 # backstop far above what the resource limit allows.
 _RLIMIT = 2_000_000
 _TIMEOUT_MS = 10_000
-_PART_BITS = {"l8": 8, "h8": 8, "r16": 16}
+_PART_BITS = {
+    RegisterPart.LOW8: 8,
+    RegisterPart.HIGH8: 8,
+    RegisterPart.LOW16: 16,
+}
 _EXTEND_BITS = {"byte": 8, "l8": 8, "h8": 8, "word": 16, "r16": 16}
 _LOAD_BITS = {"byte": 8, "word": 16, "dword": 32}
-_PREDICATES = {"eq", "ne", "lt_u", "le_u", "lt_s", "le_s"}
+_BINARY_OPERATIONS = {
+    OperationKind.AND: lambda a, b: a & b,
+    OperationKind.OR: lambda a, b: a | b,
+    OperationKind.XOR: lambda a, b: a ^ b,
+    OperationKind.IMUL: lambda a, b: a * b,
+    OperationKind.IMUL3: lambda a, b: a * b,
+    OperationKind.SUB: lambda a, b: a - b,
+}
+_SHIFT_OPERATIONS = {OperationKind.SHL, OperationKind.SHR, OperationKind.SAR}
 
 
 class _Unsupported(Exception):
     """A term this module cannot lower; the message says which."""
-
-
-@dataclass(frozen=True)
-class SolverOutcome:
-    """What one equivalence query found.
-
-    ``result``: ``proved`` (equal for every input), ``differs`` (Z3 found
-    leaf values under which they differ: in this abstraction, where
-    unlowered terms and loads are independent leaves, so not a refutation),
-    ``unsupported`` (a term could not be lowered) or ``unknown`` (the
-    budget ran out). ``reason`` says which term, or why Z3 gave up.
-    ``rlimit`` is the resource units the query used, a deterministic
-    measure of its cost."""
-
-    result: str
-    reason: str | None = None
-    rlimit: int | None = None
-    # For ``differs``: (leaf term, value) for each leaf Z3 constrained.
-    assignment: tuple[tuple[Hashable, int], ...] = ()
-
-    def summary(self) -> dict[str, str | int | None]:
-        return {"result": self.result, "reason": self.reason, "rlimit": self.rlimit}
 
 
 # Proof identities that end in a byte offset into their entity (see
@@ -71,11 +114,11 @@ class SolverOutcome:
 _OFFSET_IDENTITIES = frozenset({"entity", "symbol", "unmatched"})
 
 
-def _symbol_base(token: Any) -> tuple[Hashable, int]:
+def _symbol_base(identity: Hashable) -> tuple[Hashable, int]:
     """(base identity, byte offset) of a symbol in an address, from the
-    sanitizer's proof identity: `x+163` is x's identity at offset 163. A
-    token without such an identity is its own base."""
-    match operand_identity(token):
+    sanitizer's proof identity: `x+163` is x's identity at offset 163. An
+    identity without an offset is its own base."""
+    match identity:
         case (kind, *base, int() as offset) if kind in _OFFSET_IDENTITIES and base:
             return (("symbol", kind, *base), offset)
         case identity:
@@ -110,92 +153,116 @@ class _Lowering:
     # whose width its context decides.
     def value(self, value: Any):
         # pylint: disable=too-many-return-statements,too-many-branches
-        if not isinstance(value, tuple) or not value:
-            raise _Unsupported(f"value {value!r:.40}")
-        tag = value[0]
-        if tag == "imm" and isinstance(value[1], int):
-            return value[1]
-        if tag == "load":
+        if isinstance(value, Constant):
+            return value.value
+        if isinstance(value, Load):
             return self.load(value)
-        if tag == "addr" and len(value) == 2:
-            return self.address(value[1])
-        if tag == "sym" and len(value) == 2:
-            base, offset = _symbol_base(value[1])
+        if isinstance(value, AddressValue):
+            return self.address(value.address)
+        if isinstance(value, SymbolValue):
+            base, offset = _symbol_base(value.identity)
             return self.opaque(base) + offset
-        if tag in _PART_BITS and len(value) == 2:
-            whole = self.sized(value[1], 32)
-            low = 8 if tag == "h8" else 0
-            return z3.Extract(low + _PART_BITS[tag] - 1, low, whole)
-        if tag in ("ins_l8", "ins_h8", "ins_r16") and len(value) == 3:
-            return self.insert(tag[4:], value[1], value[2])
-        if tag == "add" and len(value) >= 3:
-            return self.fold(value[1:], lambda a, b: a + b)
-        if tag in ("and", "or", "xor", "imul", "sub", "imul3") and len(value) == 3:
-            operation = {
-                "and": lambda a, b: a & b,
-                "or": lambda a, b: a | b,
-                "xor": lambda a, b: a ^ b,
-                "imul": lambda a, b: a * b,
-                "imul3": lambda a, b: a * b,
-                "sub": lambda a, b: a - b,
-            }[tag]
-            return self.fold(value[1:], operation)
-        if tag in ("shl", "shr", "sar") and len(value) == 3:
-            return self.shift(tag, value[1], value[2])
-        if tag in ("inc", "dec", "neg", "not") and len(value) == 2:
-            operand = self.value(value[1])
+        if isinstance(value, StackOffset):
+            return self.sized(value.base, 32) + value.offset
+        if isinstance(value, Extract):
+            whole = self.sized(value.whole, 32)
+            low = 8 if value.part is RegisterPart.HIGH8 else 0
+            return z3.Extract(low + _PART_BITS[value.part] - 1, low, whole)
+        if isinstance(value, Insert):
+            return self.insert(value.part, value.old, value.new)
+        if isinstance(value, Operation):
+            operands = value.operands
+            if value.kind is OperationKind.ADD and len(operands) >= 2:
+                return self.fold(operands, lambda a, b: a + b)
+            if value.kind in _BINARY_OPERATIONS and len(operands) == 2:
+                return self.fold(operands, _BINARY_OPERATIONS[value.kind])
+            if value.kind in _SHIFT_OPERATIONS and len(operands) == 2:
+                return self.shift(value.kind, *operands)
+        if isinstance(value, UnaryOperation):
+            operand = self.value(value.operand)
             if isinstance(operand, int):
-                raise _Unsupported(f"{tag} of a constant")
-            return {
-                "inc": lambda x: x + 1,
-                "dec": lambda x: x - 1,
-                "neg": lambda x: -x,
-                "not": lambda x: ~x,
-            }[tag](operand)
-        if tag in ("movzx", "movsx") and len(value) == 3:
-            bits = _EXTEND_BITS.get(value[1])
+                raise _Unsupported(f"{value.kind.value} of a constant")
+            match value.kind:
+                case OperationKind.INC:
+                    return operand + 1
+                case OperationKind.DEC:
+                    return operand - 1
+                case OperationKind.NEG:
+                    return -operand
+                case OperationKind.NOT:
+                    return ~operand
+                case OperationKind.CDQ:
+                    eax = self.sized(value.operand, 32)
+                    return z3.If(eax < 0, z3.BitVecVal(-1, 32), z3.BitVecVal(0, 32))
+                case OperationKind.CWDE:
+                    return z3.SignExt(16, self.sized(value.operand, 16))
+        if isinstance(value, Extend):
+            bits = _EXTEND_BITS.get(value.width)
             if bits is None:
-                raise _Unsupported(f"{tag} from {value[1]}")
-            source = self.sized(value[2], bits)
-            extend = z3.ZeroExt if tag == "movzx" else z3.SignExt
+                raise _Unsupported(f"{value.kind.value} from {value.width}")
+            source = self.sized(value.source, bits)
+            extend = z3.ZeroExt if value.kind is ExtendKind.MOVZX else z3.SignExt
             return extend(32 - bits, source)
-        if tag == "setcc" and len(value) == 2:
+        if isinstance(value, SetCondition):
             return z3.If(
-                self.predicate(value[1]), z3.BitVecVal(1, 8), z3.BitVecVal(0, 8)
+                self.predicate(value.predicate),
+                z3.BitVecVal(1, 8),
+                z3.BitVecVal(0, 8),
             )
-        if tag == "cdq" and len(value) == 2:
-            eax = self.sized(value[1], 32)
-            return z3.If(eax < 0, z3.BitVecVal(-1, 32), z3.BitVecVal(0, 32))
-        if tag == "cwde" and len(value) == 2:
-            return z3.SignExt(16, self.sized(value[1], 16))
-        return self.opaque(value)
+        if isinstance(value, (Init, CallResult, StringResult, Resync, Phi)):
+            return self.opaque(value)
+        if isinstance(
+            value,
+            (
+                CallArgument,
+                CallStack,
+                CallThrough,
+                CarryCleared,
+                CarryResult,
+                Compare,
+                CompareFlags,
+                ConditionCode,
+                DeepFloat,
+                DivideResult,
+                FlagsResult,
+                FloatCompare,
+                FloatConstant,
+                FloatControlWord,
+                FloatOperation,
+                FloatStatusWord,
+                MemoryAddress,
+                MultiplyResult,
+                OpaqueValue,
+                ReceiverLoad,
+                SahfCarry,
+                SahfFlags,
+                Select,
+                TestFlags,
+                VirtualCall,
+            ),
+        ):
+            return self.opaque(value)
+        raise _Unsupported(f"value {value!r:.40}")
 
     def address(self, mem: Any):
-        """The 32-bit value of an address: a ``("mem", ...)`` operand's
-        registers, displacement and symbol bases, or a plain value."""
-        match mem:
-            case ("mem", _, terms, int() as displacement, symbols):
-                total = z3.BitVecVal(displacement, 32)
-                for term, scale in terms:
-                    total = total + self.sized(term, 32) * scale
-                for sign, token in symbols:
-                    base, offset = _symbol_base(token)
-                    total = total + sign * (self.opaque(base) + offset)
-                return total
-            case ("mem", *_):
-                raise _Unsupported(f"address {mem!r:.40}")
-            case _:
-                return self.sized(mem, 32)
+        """The 32-bit value of a memory address's registers, displacement
+        and symbol bases, or a plain value."""
+        if not isinstance(mem, MemoryAddress):
+            return self.sized(mem, 32)
+        if not isinstance(mem.displacement, int):
+            raise _Unsupported(f"address {mem!r:.40}")
+        total = z3.BitVecVal(mem.displacement, 32)
+        for term in mem.terms:
+            total = total + self.sized(term.value, 32) * term.scale
+        for symbol in mem.symbols:
+            base, offset = _symbol_base(symbol.ref.identity)
+            total = total + symbol.sign * (self.opaque(base) + offset)
+        return total
 
-    def load(self, value: tuple):
+    def load(self, value: Load):
         """A load: its bytes in its generation's memory, little-endian."""
-        match value:
-            case ("load", ("mem", segment, *_) as where, size, generation):
-                pass
-            case ("load", where, size, generation):
-                segment = ""
-            case _:
-                raise _Unsupported(f"load {value!r:.40}")
+        where, size, generation = value.address, value.width, value.generation
+        segment = where.segment if isinstance(where, MemoryAddress) else ""
         bits = 32 if size == "stack" else _LOAD_BITS.get(size)
         if bits is None:
             raise _Unsupported(f"load width {size}")
@@ -245,10 +312,10 @@ class _Lowering:
             result = operation(result, term)
         return result
 
-    def shift(self, tag: str, value: Any, count: Any):
+    def shift(self, kind: OperationKind, value: Any, count: Any):
         operand = self.value(value)
         if isinstance(operand, int):
-            raise _Unsupported(f"{tag} of a constant")
+            raise _Unsupported(f"{kind.value} of a constant")
         bits = operand.size()
         # x86 masks the count to five bits whatever the operand width; a
         # count past the width then shifts everything out, as in Z3.
@@ -258,47 +325,41 @@ class _Lowering:
         else:
             masked = z3.Extract(4, 0, amount) if amount.size() > 5 else amount
             shift = z3.ZeroExt(bits - masked.size(), masked)
-        if tag == "shl":
+        if kind is OperationKind.SHL:
             return operand << shift
-        if tag == "shr":
+        if kind is OperationKind.SHR:
             return z3.LShR(operand, shift)
         return operand >> shift
 
-    def insert(self, part: str, old: Any, new: Any):
+    def insert(self, part: RegisterPart, old: Any, new: Any):
         whole = self.sized(old, 32)
-        if part == "l8":
+        if part is RegisterPart.LOW8:
             return z3.Concat(z3.Extract(31, 8, whole), self.sized(new, 8))
-        if part == "h8":
+        if part is RegisterPart.HIGH8:
             return z3.Concat(
                 z3.Extract(31, 16, whole), self.sized(new, 8), z3.Extract(7, 0, whole)
             )
         return z3.Concat(z3.Extract(31, 16, whole), self.sized(new, 16))
 
     def predicate(self, predicate: Any):
-        if not isinstance(predicate, tuple) or not predicate:
-            raise _Unsupported(f"predicate {predicate!r:.40}")
-        tag = predicate[0]
-        if tag not in _PREDICATES:
+        # pylint: disable=too-many-return-statements
+        if not isinstance(predicate, Compare):
             return self.opaque_bool(predicate)
-        if tag in ("eq", "ne"):
-            if len(predicate) < 2 or len(predicate[1]) != 2:
-                raise _Unsupported(f"{tag} shape")
-            a, b = predicate[1]
-            width = predicate[2] if len(predicate) > 2 else None
-        else:
-            if len(predicate) < 3:
-                raise _Unsupported(f"{tag} shape")
-            a, b = predicate[1], predicate[2]
-            width = predicate[3] if len(predicate) > 3 else None
-        left, right = self.operands(a, b, width)
-        return {
-            "eq": lambda: left == right,
-            "ne": lambda: left != right,
-            "lt_u": lambda: z3.ULT(left, right),
-            "le_u": lambda: z3.ULE(left, right),
-            "lt_s": lambda: left < right,
-            "le_s": lambda: left <= right,
-        }[tag]()
+        left, right = self.operands(predicate.left, predicate.right, predicate.width)
+        match predicate.kind:
+            case CompareKind.EQ:
+                return left == right
+            case CompareKind.NE:
+                return left != right
+            case CompareKind.LT_U:
+                return z3.ULT(left, right)
+            case CompareKind.LE_U:
+                return z3.ULE(left, right)
+            case CompareKind.LT_S:
+                return left < right
+            case CompareKind.LE_S:
+                return left <= right
+        raise _Unsupported(f"predicate {predicate!r:.40}")
 
     def operands(self, a: Any, b: Any, width: Any):
         if isinstance(width, int):
@@ -338,12 +399,12 @@ def _query(lowering: _Lowering, differ) -> SolverOutcome:
     if total is not None:
         _counted["rlimit"] = total
     if answer == z3.unsat:
-        return SolverOutcome("proved", rlimit=used)
+        return SolverOutcome(SolverResult.PROVED, rlimit=used)
     if answer != z3.sat:
-        return SolverOutcome("unknown", solver.reason_unknown(), used)
+        return SolverOutcome(SolverResult.UNKNOWN, solver.reason_unknown(), used)
     model = solver.model()
     return SolverOutcome(
-        "differs", rlimit=used, assignment=_assignment(lowering, model)
+        SolverResult.DIFFERS, rlimit=used, assignment=_assignment(lowering, model)
     )
 
 
@@ -355,7 +416,7 @@ def _assignment(lowering: _Lowering, model) -> tuple[tuple[Hashable, int], ...]:
         if key[1] == "bool":  # type: ignore[index]
             continue
         match key[0]:  # type: ignore[index]
-            case ("symbol", *_) | ("init", "sp"):
+            case ("symbol", *_) | Init("sp"):
                 # A symbol's address is the image's, and the stack pointer
                 # the run's: neither is an input.
                 continue
@@ -378,7 +439,7 @@ def compare(values: tuple) -> SolverOutcome:
     predicates."""
     value_o, value_r, bits, kind = values
     if value_o == value_r:
-        return SolverOutcome("proved")
+        return SolverOutcome(SolverResult.PROVED)
     lowering = _Lowering()
     try:
         if kind == "predicate":
@@ -389,60 +450,52 @@ def compare(values: tuple) -> SolverOutcome:
         else:
             differ = lowering.sized(value_o, bits) != lowering.sized(value_r, bits)
     except _Unsupported as unsupported:
-        return SolverOutcome("unsupported", str(unsupported))
+        return SolverOutcome(SolverResult.UNSUPPORTED, str(unsupported))
     return _query(lowering, differ)
 
 
 def values_equal(a: Any, b: Any, bits: int | None = None) -> bool:
     """Whether two symbolic values are equal for every input (at ``bits``,
     their natural width when None). False unless proven."""
-    return compare((a, b, bits, "value")).result == "proved"
+    return compare((a, b, bits, "value")).result is SolverResult.PROVED
 
 
 def predicates_equal(a: Any, b: Any) -> bool:
     """Whether two branch predicates decide the same way for every input."""
-    return compare((a, b, None, "predicate")).result == "proved"
+    return compare((a, b, None, "predicate")).result is SolverResult.PROVED
 
 
-def entries_equal(entry_o: Any, entry_r: Any) -> bool:
+def entries_equal(entry_o: Observation, entry_r: Observation) -> bool:
     """Whether two observations agree, up to bit-vector equivalence of the
     values they carry: return values, stored values and branch predicates.
-    Every other part (tags, addresses, widths, destinations) must be equal."""
+    Every other part (types, addresses, widths, destinations) must be equal."""
     if entry_o == entry_r:
         return True
-    if not isinstance(entry_o, tuple) or not isinstance(entry_r, tuple):
-        return False
-    if not entry_o or len(entry_o) != len(entry_r) or entry_o[0] != entry_r[0]:
-        return False
-    tag = entry_o[0]
-    if tag == "retval":
-        return all(values_equal(o, r) for o, r in zip(entry_o[1:], entry_r[1:]))
-    bits = WIDTHS.get(entry_o[2]) if tag == "store" and len(entry_o) == 4 else None
-    if bits is not None:
-        return entry_o[1:3] == entry_r[1:3] and values_equal(
-            entry_o[3], entry_r[3], 8 * bits
-        )
-    return (
-        tag == "branch"
-        and len(entry_o) == 3
-        and entry_o[2] == entry_r[2]
-        and predicates_equal(entry_o[1], entry_r[1])
-    )
+    match entry_o, entry_r:
+        case ReturnValue(values_o), ReturnValue(values_r):
+            return len(values_o) == len(values_r) and all(
+                values_equal(o, r) for o, r in zip(values_o, values_r)
+            )
+        case Store(address_o, size_o, value_o), Store(address_r, size_r, value_r):
+            bits = WIDTHS.get(size_o)
+            return (
+                bits is not None
+                and (address_o, size_o) == (address_r, size_r)
+                and values_equal(value_o, value_r, 8 * bits)
+            )
+        case Branch(predicate_o, destination_o), Branch(predicate_r, destination_r):
+            return destination_o == destination_r and predicates_equal(
+                predicate_o, predicate_r
+            )
+    return False
 
 
-def observations_equal(obs_o: Sequence[Any], obs_r: Sequence[Any]) -> bool:
+def observations_equal(
+    obs_o: Sequence[Observation], obs_r: Sequence[Observation]
+) -> bool:
     return len(obs_o) == len(obs_r) and all(
         entries_equal(o, r) for o, r in zip(obs_o, obs_r)
     )
-
-
-def distinguishing_assignment(values: tuple) -> dict[Hashable, int] | None:
-    """For a verifier value difference ``(value_orig, value_recomp, bits,
-    kind)`` (see ComparisonDifference.values): values of the leaf terms
-    under which the two differ, when Z3 finds one. Leaves Z3 leaves free
-    are absent. None when they cannot differ, or the solver cannot tell."""
-    outcome = compare(values)
-    return dict(outcome.assignment) if outcome.result == "differs" else None
 
 
 @dataclass(frozen=True)
