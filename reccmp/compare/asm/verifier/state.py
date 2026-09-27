@@ -27,9 +27,24 @@ from reccmp.compare.asm.verifier.addresses import (
 from reccmp.compare.diagnosis import AnalysisRecorder
 
 if TYPE_CHECKING:
+    from reccmp.compare.asm.ir import DecodedInstruction
     from reccmp.compare.callee_cleanup import CallStackEffect
 
 FAMILIES = ("a", "b", "c", "d", "si", "di", "bp", "sp")
+
+# Values with no unobserved content: the untouched initial register value,
+# the clobbered result of a call or string instruction, a register given up
+# after an unmodeled instruction, and a join of values each of which is one
+# of these or was matched on its edge.
+SCRATCH_TAGS = frozenset({"init", "callret", "strres", "resync", "scratch_phi"})
+
+
+def is_scratch(value: object) -> bool:
+    """Whether ``value`` is one of the SCRATCH_TAGS values. Left in a
+    caller-saved register while the other side holds something else, such a
+    value marks the register dead."""
+    return isinstance(value, tuple) and bool(value) and value[0] in SCRATCH_TAGS
+
 
 COMMUTATIVE_BINOPS = {"add", "and", "or", "xor", "imul"}
 ASSOCIATIVE_COMMUTATIVE_BINOPS = {"add"}
@@ -501,3 +516,20 @@ def clone_state(state: SideState) -> SideState:
     clone.frame = dict(state.frame) if state.frame is not None else None
     clone.load_log = set(state.load_log)
     return clone
+
+
+_NEVER_ONE_SIDED = frozenset(
+    {"leave", "enter", "call", "ret", "jmp", "int3", "div", "idiv"}
+    | set(JCC_MNEMONICS)
+    | {"loop", "loope", "loopne", "jcxz", "jecxz"}
+    | set(STRING_OPS)
+)
+
+
+def may_be_one_sided(ins: DecodedInstruction) -> bool:
+    """Whether the verifier may accept ``ins`` on one side only (see
+    obligations.one_sided_ok): never control flow, stack frame setup, x87,
+    string or prefixed instructions, or potentially-faulting division."""
+    return not (
+        ins.prefix or ins.mnemonic in _NEVER_ONE_SIDED or ins.mnemonic.startswith("f")
+    )

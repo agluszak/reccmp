@@ -11,6 +11,7 @@ from reccmp.compare.asm.model import REGISTERS
 from reccmp.compare.asm.verifier.state import (
     JCC_MNEMONICS,
     STRING_OPS,
+    may_be_one_sided,
 )
 
 # Line-alignment costs (integers to keep DP ties exact): prefer exact text,
@@ -41,6 +42,8 @@ class DpLine:
     line_class: str
     # Instruction shape with register identities erased; None if unknown.
     skeleton: tuple | None
+    # Whether the verifier may accept the line on one side only.
+    one_sided: bool
 
 
 def _dp_line_class(ins: DecodedInstruction) -> str:
@@ -91,7 +94,9 @@ def _dp_skeleton(ins: DecodedInstruction) -> tuple:
 def dp_line(row: DecodedInstruction) -> DpLine:
     key = instruction_match_key(row)
     head = row.prefix or row.mnemonic
-    return DpLine(key, head, _dp_line_class(row), _dp_skeleton(row))
+    return DpLine(
+        key, head, _dp_line_class(row), _dp_skeleton(row), may_be_one_sided(row)
+    )
 
 
 def _dp_sub_cost(line_o: DpLine, line_r: DpLine) -> float | None:
@@ -110,10 +115,11 @@ def _dp_sub_cost(line_o: DpLine, line_r: DpLine) -> float | None:
 
 def align_block_lines(
     lines_o: list[DpLine], lines_r: list[DpLine]
-) -> list[tuple[int | None, int | None]] | None:
+) -> tuple[list[tuple[int | None, int | None]], float] | None:
     """Pair up two blocks' instructions with a cost-minimizing alignment.
-    Returns block-local index pairs; None when the blocks cannot be aligned
-    (observable-class counts differ, or the blocks are absurdly large)."""
+    Returns block-local index pairs and their cost; None when the blocks
+    cannot be aligned (observable-class counts differ, or the blocks are
+    absurdly large)."""
     n, m = len(lines_o), len(lines_r)
     if n * m > 1_000_000:
         return None
@@ -122,8 +128,14 @@ def align_block_lines(
     cost = [[inf] * (m + 1) for _ in range(n + 1)]
     cost[0][0] = 0.0
     gap_classes = ("none", "push")
-    gap_o = [_GAP if line.line_class in gap_classes else inf for line in lines_o]
-    gap_r = [_GAP if line.line_class in gap_classes else inf for line in lines_r]
+    gap_o = [
+        _GAP if line.line_class in gap_classes and line.one_sided else inf
+        for line in lines_o
+    ]
+    gap_r = [
+        _GAP if line.line_class in gap_classes and line.one_sided else inf
+        for line in lines_r
+    ]
     for i in range(1, n + 1):
         cost[i][0] = cost[i - 1][0] + gap_o[i - 1]
     for j in range(1, m + 1):
@@ -158,4 +170,4 @@ def align_block_lines(
         result.append((None, j - 1))
         j -= 1
     result.reverse()
-    return result
+    return result, cost[n][m]

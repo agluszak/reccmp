@@ -14,7 +14,8 @@ from reccmp.compare.asm.ir import (
     instruction_semantic_key,
 )
 from reccmp.compare.asm.model import Reject
-from reccmp.compare.asm.verifier.addresses import unwind_spadd
+from reccmp.compare.asm.verifier import bitvector
+from reccmp.compare.asm.verifier.addresses import Value, unwind_spadd
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.block_align import (
     DpLine,
@@ -159,15 +160,27 @@ def _verify_product(
         indices_o = _run_indices(cfg_o, node[0])
         indices_r = _run_indices(cfg_r, node[1])
         start_o, start_r = cfg_o.starts[node[0][0]], cfg_r.starts[node[1][0]]
-        scheduled = schedule_like(orig_rows, recomp_rows, indices_o, indices_r)
-        if scheduled != indices_r:
-            indices_r = scheduled
+        lines_o = [_dp_line(orig_rows[i], promote) for i in indices_o]
+        # The recompiled block as emitted, and reordered towards the
+        # original where that only swaps independent instructions: the
+        # cheaper alignment of the two pairs the instructions.
+        candidates = [
+            (order, alignment)
+            for order in (
+                indices_r,
+                schedule_like(orig_rows, recomp_rows, indices_o, indices_r),
+            )
+            if (
+                alignment := align_block_lines(
+                    lines_o, [_dp_line(recomp_rows[i], promote) for i in order]
+                )
+            )
+            is not None
+        ]
+        best = min(candidates, key=lambda item: item[1][1], default=None)
+        if best is not None and best[0] != indices_r:
             any_shifted = True
-        aligned = align_block_lines(
-            [_dp_line(orig_rows[i], promote) for i in indices_o],
-            [_dp_line(recomp_rows[i], promote) for i in indices_r],
-        )
-        if aligned is None:
+        if best is None:
             if recorder is not None:
                 recorder.mark_inconclusive(
                     "alignment_failure",
@@ -182,6 +195,7 @@ def _verify_product(
                     },
                 )
             return None
+        indices_r, (aligned, _cost) = best
         # The block terminators (control lines) must pair with each other:
         # a one-sided branch or return breaks the matched structure.
         for local_o, local_r in aligned:
@@ -250,6 +264,16 @@ def _verify_product(
         nodes[node] = len(nodes)
         alignments[node] = aligned
         return node
+
+    def equal(value_o: Value, value_r: Value) -> bool:
+        """Values a join may give one phi though they differ as terms."""
+        if metadata is not None and not metadata.algebraic_identities:
+            return False
+        if not bitvector.values_equal(value_o, value_r):
+            return False
+        if recorder is not None:
+            recorder.reasons.add("algebraic_identity")
+        return True
 
     first = node_at(0, 0)
     if first is None:
@@ -463,7 +487,9 @@ def _verify_product(
                 entry[successor] = clone_cfg_state(outgoing)
                 pending.append(successor)
             else:
-                joined = join_states(entry[successor], outgoing, nodes[successor])
+                joined = join_states(
+                    entry[successor], outgoing, nodes[successor], equal
+                )
                 if joined is None:
                     if recorder is not None:
                         recorder.mark_inconclusive(

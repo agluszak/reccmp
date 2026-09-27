@@ -16,6 +16,7 @@ from reccmp.compare.asm.verifier.state import (
     Context,
     SideState,
     clone_state,
+    is_scratch,
 )
 from reccmp.compare.diagnosis import FactValue
 
@@ -164,10 +165,16 @@ def capture_cfg_state(orig: SideState, recomp: SideState, ctx: Context) -> CfgSt
 _JOIN_ATTRS = ("flags", "carry", "fpu_flags")
 
 
+def _settled(value: Value, state: CfgState) -> bool:
+    """No content, or matched on both sides along the edge ``state`` flows."""
+    return is_scratch(value) or value in state.matched_nodes
+
+
 def join_states(
     entry: CfgState,
     incoming: CfgState,
     block: int,
+    equal: Callable[[Value, Value], bool] | None = None,
 ) -> CfgState | None:
     # pylint: disable=too-many-return-statements,too-many-locals
     # pylint: disable=too-many-branches
@@ -184,7 +191,9 @@ def join_states(
     registers on the two sides. A node whose value agrees on all edges
     keeps that value. Phi symbols are keyed by the class's canonical node
     index; classes can only refine as more edges arrive, so the fixpoint
-    terminates."""
+    terminates. ``equal``, when given, also puts a node in the class of an
+    earlier one whose values it holds equal edge for edge (e.g. ``x - 32``
+    and ``x + -32``): their phi is then one value too."""
     entry_o, entry_r = entry.orig, entry.recomp
     in_o, in_r = incoming.orig, incoming.recomp
     if len(entry_o.x87.known) != len(entry_r.x87.known):
@@ -286,8 +295,25 @@ def join_states(
         ):
             # A phi would hide which slot a pointer into the frame reaches.
             return None
-        class_id = classes.setdefault((entry_value, in_value), n)
-        setter(("phi", block, class_id))
+        key = (entry_value, in_value)
+        if key not in classes and equal is not None:
+            classes[key] = next(
+                (
+                    class_id
+                    for (entry_other, in_other), class_id in classes.items()
+                    if equal(entry_other, entry_value) and equal(in_other, in_value)
+                ),
+                n,
+            )
+        class_id = classes.setdefault(key, n)
+        # A join of values that each have no content (see is_scratch) or
+        # were already observed on their edge holds nothing unobserved.
+        tag = (
+            "scratch_phi"
+            if _settled(entry_value, entry) and _settled(in_value, incoming)
+            else "phi"
+        )
+        setter((tag, block, class_id))
 
     if entry.memory == incoming.memory:
         memory = entry.memory

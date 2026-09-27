@@ -23,12 +23,12 @@ from reccmp.compare.asm.verifier.semantics import (
     read_operand,
 )
 from reccmp.compare.asm.verifier.state import (
+    is_scratch,
+    may_be_one_sided,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
     CONTROL_TAGS,
     FAMILIES,
-    JCC_MNEMONICS,
-    STRING_OPS,
     WIDTHS,
     Context,
     SideState,
@@ -90,7 +90,7 @@ def _contained(value: Value, ctx: Context) -> bool:
 
 
 def _dead_or_contained(value: Value, ctx: Context) -> bool:
-    return _is_scratch(value) or _contained(value, ctx)
+    return is_scratch(value) or _contained(value, ctx)
 
 
 def _assembled(value: Value, ctx: Context) -> bool:
@@ -111,6 +111,19 @@ def _assembled(value: Value, ctx: Context) -> bool:
     return old_ok and _dead_or_contained(value[2], ctx)
 
 
+def _returned_insert(value: Value, ctx: Context) -> bool:
+    """eax holding a returned ``al`` or ``ax`` (see FunctionMetadata's
+    return_kind) inserted over other bits: the bits outside the return are
+    dead, and the returned part is already observed."""
+    kind = ctx.metadata.return_kind if ctx.metadata is not None else "unknown"
+    match value:
+        case ("ins_l8", _, part) if kind == "i8":
+            return _contained(part, ctx)
+        case ("ins_r16", _, part) if kind == "i16":
+            return _contained(part, ctx)
+    return False
+
+
 def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
     """A 16/8-bit result inserted into dead upper bits on both sides:
     the inserted part must be identical; the surrounding old bits are
@@ -127,6 +140,18 @@ def _ins_split_ok(value_o: Value, value_r: Value, ctx: Context) -> bool:
         and _old_bits_ok(value_o[1], ctx)
         and _old_bits_ok(value_r[1], ctx)
     )
+
+
+def _inserted_over(value: Value, base: Value, ctx: Context) -> bool:
+    """``value`` is ``base`` with parts overwritten by constants or observed
+    values (`mov cl, [...]` over the other side's ecx): the two differ in
+    nothing unobserved."""
+    match value:
+        case _ if value == base:
+            return True
+        case (str() as tag, old, new) if tag.startswith("ins_"):
+            return _old_bits_ok(new, ctx) and _inserted_over(old, base, ctx)
+    return False
 
 
 def _old_bits_ok(value: Value, ctx: Context) -> bool:
@@ -162,19 +187,19 @@ def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> b
             and value_o[0] == value_r[0]
             and str(value_o[0]).startswith("ins_")
             and value_o[2] == value_r[2]
-            and _is_scratch(value_o[1])
-            and _is_scratch(value_r[1])
+            and is_scratch(value_o[1])
+            and is_scratch(value_r[1])
         ):
             continue
-        if _is_scratch(value_o) and _is_scratch(value_r):
+        if is_scratch(value_o) and is_scratch(value_r):
             continue
-        if family in CALLER_SAVED and (_is_scratch(value_o) or _is_scratch(value_r)):
+        if family in CALLER_SAVED and (is_scratch(value_o) or is_scratch(value_r)):
             continue
         return False
     if len(orig.x87.known) != len(recomp.x87.known):
         return False
     for slot_o, slot_r in zip(orig.x87.known, recomp.x87.known):
-        if slot_o != slot_r and not (_is_scratch(slot_o) and _is_scratch(slot_r)):
+        if slot_o != slot_r and not (is_scratch(slot_o) and is_scratch(slot_r)):
             return False
     return True
 
@@ -204,24 +229,6 @@ def rewrite_control_observables(
     for index, entry in enumerate(obs):
         if entry and entry[0] in CONTROL_TAGS - {"jmpind"}:
             obs[index] = (*entry[:-1], _control_destination(entry[-1], row, addrs))
-
-
-def _is_scratch(value: Value) -> bool:
-    """Values with no computational content: the untouched initial register
-    value, or the clobbered result of a call or string instruction. If such
-    a value is left in a caller-saved register while the other side holds
-    something else, the register is simply dead."""
-    return (
-        isinstance(value, tuple)
-        and bool(value)
-        and value[0]
-        in (
-            "init",
-            "callret",
-            "strres",
-            "resync",
-        )
-    )
 
 
 CALLEE_SAVED = ("b", "si", "di")
@@ -351,14 +358,6 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
 # One-sided instructions that are never unobservable: control flow, the
 # stack discipline (push/pop/leave/enter), x87 (stack-shape effects), and
 # instructions that can fault on operand values (division).
-_ONE_SIDED_BLACKLIST = frozenset(
-    {"leave", "enter", "call", "ret", "jmp", "int3", "div", "idiv"}
-    | set(JCC_MNEMONICS)
-    | {"loop", "loope", "loopne", "jcxz", "jecxz"}
-    | set(STRING_OPS)
-)
-
-
 def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     """One side spills a register the other side never needed (a save
     around a region, or a scratch spill). The slot is private: it lies
@@ -425,13 +424,11 @@ def one_sided_ok(
     read the same address at the same memory generation somewhere in the
     same verification scope (the folded-load case). Control flow, stack
     adjustments, x87 and potentially-faulting arithmetic stay excluded."""
-    if ins.prefix or ins.mnemonic in _ONE_SIDED_BLACKLIST:
+    if not may_be_one_sided(ins):
         return False
     if ins.mnemonic == "nop":
         ctx.categories.add("dead_operation")
         return True
-    if ins.mnemonic.startswith("f"):
-        return False
     try:
         # With the frame promoted, a push or pop is a slot like any other.
         if state.frame is None and ins.mnemonic == "push" and len(ins.operands) == 1:
@@ -508,12 +505,18 @@ def discharge_run_obligations(
                     {"register": family, "value": summary_r},
                 )
             return False
-        if _ins_split_ok(value_o, value_r, ctx):
+        if (
+            _ins_split_ok(value_o, value_r, ctx)
+            or _inserted_over(value_o, value_r, ctx)
+            or _inserted_over(value_r, value_o, ctx)
+        ):
             dead_register_difference = True
             continue
         for value in (value_o, value_r):
-            if _is_scratch(value):
+            if is_scratch(value):
                 dead_register_difference = True
+                continue
+            if family == "a" and _returned_insert(value, ctx):
                 continue
             if not (_contained(value, ctx) or _assembled(value, ctx)):
                 if recorder is not None:

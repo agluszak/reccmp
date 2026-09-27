@@ -110,7 +110,7 @@ def render(value: Any, depth: int = 0) -> str:
             return f"sext({inner(operand)})"
         case ("callret", call, family):
             return f"{_REGISTER.get(family, family)} after call@{call}"
-        case ("phi", block, klass):
+        case ("phi" | "scratch_phi", block, klass):
             return f"join{block}#{klass}"
         case ("eq" | "ne" as tag, (left, right), *width):
             return _comparison(tag, left, right, width, depth)
@@ -252,7 +252,7 @@ def _identity_kinds(value: Any) -> set[str]:
 def _without_joins(value: Any) -> Any:
     """``value`` with every join's identity erased."""
     match value:
-        case ("phi", *_):
+        case ("phi" | "scratch_phi", *_):
             return ("phi",)
         case (*items,):
             return tuple(_without_joins(item) for item in items)
