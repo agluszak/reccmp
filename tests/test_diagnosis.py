@@ -6,11 +6,15 @@ from dataclasses import replace
 import pytest
 
 from reccmp.compare.asm.ir import DecodedInstruction, FlowKind
+from reccmp.compare.asm.operand import Imm, Mem, Sym
 from reccmp.compare.asm.verifier import CallFacts, FunctionMetadata
-from reccmp.compare.asm.verifier.evidence import diagnostic_summaries
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
+    DifferenceKind,
+    EffectiveReason,
+    InconclusiveReason,
+    Strategy,
     StrategyAttempt,
 )
 from tests.asm_rows import analyze_effective_match, rows
@@ -31,7 +35,7 @@ def test_register_allocation_reason():
         ["mov eax, dword ptr [ebp - 4]", "mov dword ptr [esi], eax"],
         ["mov ecx, dword ptr [ebp - 4]", "mov dword ptr [esi], ecx"],
     )
-    assert result.effective_reasons == ("register_allocation",)
+    assert result.effective_reasons == (EffectiveReason.REGISTER_ALLOCATION,)
 
 
 def test_frame_slot_layout_reason():
@@ -39,7 +43,7 @@ def test_frame_slot_layout_reason():
         ["mov dword ptr [ebp - 4], eax", "mov ecx, dword ptr [ebp - 4]"],
         ["mov dword ptr [ebp - 8], eax", "mov ecx, dword ptr [ebp - 8]"],
     )
-    assert result.effective_reasons == ("frame_slot_layout",)
+    assert result.effective_reasons == (EffectiveReason.FRAME_SLOT_LAYOUT,)
 
 
 def test_callee_save_substitution_reason():
@@ -59,7 +63,7 @@ def test_callee_save_substitution_reason():
             "ret",
         ],
     )
-    assert "callee_save_substitution" in result.effective_reasons
+    assert EffectiveReason.CALLEE_SAVE_SUBSTITUTION in result.effective_reasons
 
 
 def test_instruction_reorder_reason():
@@ -77,7 +81,7 @@ def test_instruction_reorder_reason():
             "push eax",
         ],
     )
-    assert "instruction_reorder" in result.effective_reasons
+    assert EffectiveReason.INSTRUCTION_REORDER in result.effective_reasons
 
 
 def test_commutative_order_reason():
@@ -93,7 +97,7 @@ def test_commutative_order_reason():
             "mov dword ptr [esi], eax",
         ],
     )
-    assert result.effective_reasons == ("commutative_order",)
+    assert result.effective_reasons == (EffectiveReason.COMMUTATIVE_ORDER,)
 
 
 def test_associative_add_order_reason():
@@ -113,7 +117,7 @@ def test_associative_add_order_reason():
         metadata=FunctionMetadata(return_kind="i32"),
     )
     assert result.status == ComparisonStatus.EFFECTIVE
-    assert result.effective_reasons == ("commutative_order",)
+    assert result.effective_reasons == (EffectiveReason.COMMUTATIVE_ORDER,)
 
 
 def test_commutative_address_term_order_reason():
@@ -121,7 +125,7 @@ def test_commutative_address_term_order_reason():
         ["mov eax, dword ptr [eax + edx]", "ret"],
         ["mov eax, dword ptr [edx + eax]", "ret"],
     )
-    assert result.effective_reasons == ("commutative_order",)
+    assert result.effective_reasons == (EffectiveReason.COMMUTATIVE_ORDER,)
 
 
 def test_condition_inversion_reason():
@@ -129,7 +133,7 @@ def test_condition_inversion_reason():
         ["cmp eax, ebx", "jg 0x2", "ret"],
         ["cmp ebx, eax", "jl 0x2", "ret"],
     )
-    assert result.effective_reasons == ("condition_inversion",)
+    assert result.effective_reasons == (EffectiveReason.CONDITION_INVERSION,)
 
 
 def test_dead_operation_reason_and_effective_precedence():
@@ -142,19 +146,21 @@ def test_dead_operation_reason_and_effective_precedence():
         ],
     )
     assert result.status == ComparisonStatus.EFFECTIVE
-    assert "dead_operation" in result.effective_reasons
+    assert EffectiveReason.DEAD_OPERATION in result.effective_reasons
 
 
 def test_padding_reason():
     result = analyze(["ret"], ["ret", "int3"])
     assert result.status == ComparisonStatus.EFFECTIVE
-    assert result.effective_reasons == ("padding",)
+    assert result.effective_reasons == (EffectiveReason.PADDING,)
 
 
 def test_call_target_difference():
     result = analyze(["call TView::Refresh"], ["call TView::Update"])
-    assert result.difference.kind == "call_target"
-    assert result.difference.orig.facts["target_name"] == "TView::Refresh"
+    assert result.difference.kind == DifferenceKind.CALL_TARGET
+    operand = result.difference.orig.observed.operand
+    assert isinstance(operand, Sym)
+    assert operand.ref.display == "TView::Refresh"
 
 
 def test_thiscall_argument_difference():
@@ -177,9 +183,9 @@ def test_thiscall_argument_difference():
         ],
         metadata=metadata,
     )
-    assert result.difference.kind == "call_argument"
-    assert result.difference.orig.facts["register"] == "ecx"
-    assert result.difference.orig.facts["value"] == "load:g_pMainView (DATA)"
+    assert result.difference.kind == DifferenceKind.CALL_ARGUMENT
+    assert result.difference.orig.observed.register == "ecx"
+    assert result.difference.orig.observed.value == "dword[g_pMainView (DATA)]"
 
 
 def test_memory_address_difference_has_components():
@@ -187,14 +193,12 @@ def test_memory_address_difference_has_components():
         ["mov eax, dword ptr [esi + 0x98]", "ret"],
         ["mov eax, dword ptr [esi + 0x9c]", "ret"],
     )
-    assert result.difference.kind == "memory_address"
-    assert result.difference.orig.facts == {
-        "base_register": "esi",
-        "index_register": None,
-        "scale": 1,
-        "displacement": 0x98,
-        "symbol": None,
-    }
+    assert result.difference.kind == DifferenceKind.MEMORY_ADDRESS
+    operand = result.difference.orig.observed.operand
+    assert isinstance(operand, Mem)
+    assert [(term.register, term.scale) for term in operand.terms] == [("esi", 1)]
+    assert operand.displacement == 0x98
+    assert not operand.symbols
 
 
 def test_memory_value_difference():
@@ -202,7 +206,7 @@ def test_memory_value_difference():
         ["mov dword ptr [esi], 1"],
         ["mov dword ptr [esi], 2"],
     )
-    assert result.difference.kind == "memory_value"
+    assert result.difference.kind == DifferenceKind.MEMORY_VALUE
 
 
 def test_immediate_value_difference():
@@ -210,8 +214,10 @@ def test_immediate_value_difference():
         ["mov eax, 4", "mov dword ptr [esi], eax"],
         ["mov eax, 5", "mov dword ptr [esi], eax"],
     )
-    assert result.difference.kind == "immediate_value"
-    assert result.difference.orig.facts["value"] == 4
+    assert result.difference.kind == DifferenceKind.IMMEDIATE_VALUE
+    operand = result.difference.orig.observed.operand
+    assert isinstance(operand, Imm)
+    assert operand.value == 4
 
 
 def test_register_renamed_constant_difference_is_a_mismatch():
@@ -237,7 +243,7 @@ def test_register_renamed_constant_difference_is_a_mismatch():
         metadata=FunctionMetadata(return_kind="void"),
     )
     assert result.status == ComparisonStatus.MISMATCH
-    assert result.difference.kind == "immediate_value"
+    assert result.difference.kind == DifferenceKind.IMMEDIATE_VALUE
 
 
 def test_branch_condition_difference():
@@ -245,7 +251,7 @@ def test_branch_condition_difference():
         ["cmp eax, ebx", "je 0x2", "ret"],
         ["cmp eax, ebx", "jne 0x2", "ret"],
     )
-    assert result.difference.kind == "branch_condition"
+    assert result.difference.kind == DifferenceKind.BRANCH_CONDITION
 
 
 def _jump_meta(address: int, target: int) -> DecodedInstruction:
@@ -274,9 +280,9 @@ def test_branch_target_difference_uses_canonical_indices():
         orig_meta=[None, _jump_meta(0x1002, 0x1005), None, None],
         recomp_meta=[None, _jump_meta(0x2002, 0x2004), None, None],
     )
-    assert result.difference.kind == "branch_target"
-    assert result.difference.orig.facts["target_instruction_index"] == 3
-    assert result.difference.recomp.facts["target_instruction_index"] == 2
+    assert result.difference.kind == DifferenceKind.BRANCH_TARGET
+    assert result.difference.orig.observed.target_index == 3
+    assert result.difference.recomp.observed.target_index == 2
 
 
 def test_typed_return_value_difference():
@@ -285,7 +291,7 @@ def test_typed_return_value_difference():
         ["mov eax, 2", "ret"],
         metadata=FunctionMetadata(return_kind="i32"),
     )
-    assert result.difference.kind == "return_value"
+    assert result.difference.kind == DifferenceKind.RETURN_VALUE
 
 
 def test_preserved_state_difference():
@@ -294,8 +300,8 @@ def test_preserved_state_difference():
         ["mov ebx, 2"],
         metadata=FunctionMetadata(return_kind="void"),
     )
-    assert result.difference.kind == "preserved_state"
-    assert result.difference.orig.facts["register"] == "b"
+    assert result.difference.kind == DifferenceKind.PRESERVED_STATE
+    assert result.difference.orig.observed.register == "ebx"
 
 
 def test_symbol_resolution_difference():
@@ -303,31 +309,37 @@ def test_symbol_resolution_difference():
         ["mov eax, g_a (DATA)", "ret"],
         ["mov eax, g_b (DATA)", "ret"],
     )
-    assert result.difference.kind == "symbol_resolution"
+    assert result.difference.kind == DifferenceKind.SYMBOL_RESOLUTION
 
 
 def test_unsupported_instruction_is_inconclusive():
     result = analyze(["bswap eax", "ret"], ["bswap ecx", "ret"])
     assert result.status == ComparisonStatus.INCONCLUSIVE
-    assert result.inconclusive_reason == "unsupported_instruction"
+    assert result.inconclusive_reason == InconclusiveReason.UNSUPPORTED_INSTRUCTION
     by_strategy = {attempt.strategy: attempt for attempt in result.attempts}
-    assert by_strategy["lockstep"].blocker == "unsupported_instruction"
-    assert by_strategy["lockstep"].location.instruction_index == 0
-    assert by_strategy["isomorphic_cfg"].blocker == "unsupported_instruction"
+    assert (
+        by_strategy[Strategy.LOCKSTEP].blocker
+        == InconclusiveReason.UNSUPPORTED_INSTRUCTION
+    )
+    assert by_strategy[Strategy.LOCKSTEP].location.instruction_index == 0
+    assert (
+        by_strategy[Strategy.ISOMORPHIC_CFG].blocker
+        == InconclusiveReason.UNSUPPORTED_INSTRUCTION
+    )
 
 
 def test_mismatch_keeps_every_strategy_attempt():
     result = analyze(["mov eax, 1", "ret"], ["mov eax, 2", "ret"])
     assert result.status == ComparisonStatus.MISMATCH
     assert [attempt.strategy for attempt in result.attempts] == [
-        "lockstep",
-        "diff_aligned",
-        "isomorphic_cfg",
+        Strategy.LOCKSTEP,
+        Strategy.DIFF_ALIGNED,
+        Strategy.ISOMORPHIC_CFG,
     ]
     lockstep = result.attempts[0]
-    assert lockstep.trusted_alignment
+    assert lockstep.strategy.trusted_alignment
     assert lockstep.difference == result.difference
-    assert not result.attempts[1].trusted_alignment
+    assert not result.attempts[1].strategy.trusted_alignment
 
 
 def test_proven_results_carry_no_attempts():
@@ -335,24 +347,26 @@ def test_proven_results_carry_no_attempts():
     with pytest.raises(ValueError):
         ComparisonAnalysis(
             ComparisonStatus.EXACT,
-            attempts=(StrategyAttempt("lockstep", blocker="missing_metadata"),),
+            attempts=(
+                StrategyAttempt(
+                    Strategy.LOCKSTEP, blocker=InconclusiveReason.MISSING_METADATA
+                ),
+            ),
         )
 
 
 def test_attempt_has_exactly_one_outcome():
     with pytest.raises(ValueError):
-        StrategyAttempt("lockstep")
+        StrategyAttempt(Strategy.LOCKSTEP)
     with pytest.raises(ValueError):
-        StrategyAttempt("unknown", blocker="analysis_limit")
+        StrategyAttempt("unknown", blocker=InconclusiveReason.ANALYSIS_LIMIT)
 
 
 def test_reason_order_is_deterministic():
-    result = ComparisonAnalysis.effective({"padding", "dead_operation"})
-    assert result.effective_reasons == ("dead_operation", "padding")
-
-
-def test_colliding_symbolic_summaries_are_disambiguated():
-    orig, recomp = diagnostic_summaries(("poison", 1), ("poison", 2))
-    assert orig.startswith("poison#")
-    assert recomp.startswith("poison#")
-    assert orig != recomp
+    result = ComparisonAnalysis.effective(
+        {EffectiveReason.PADDING, EffectiveReason.DEAD_OPERATION}
+    )
+    assert result.effective_reasons == (
+        EffectiveReason.DEAD_OPERATION,
+        EffectiveReason.PADDING,
+    )

@@ -24,7 +24,7 @@ from reccmp.compare.asm.verifier.addresses import (
     stack_rooted,
     unwind_spadd,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import AnalysisRecorder, EffectiveReason
 
 if TYPE_CHECKING:
     from reccmp.compare.callee_cleanup import CallStackEffect
@@ -302,7 +302,7 @@ class Context:
     # call would be an argument the other side never passed.
     scratch_pushes: list[list] = field(default_factory=list)
     # Which acceptance features fired, for debug/audit logging.
-    categories: set[str] = field(default_factory=set)
+    categories: set[EffectiveReason] = field(default_factory=set)
     # PDB-derived return-type and callee-convention facts, if available.
     metadata: FunctionMetadata | None = None
     # Structured evidence sink for the current verifier strategy.

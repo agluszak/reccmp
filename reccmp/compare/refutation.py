@@ -15,6 +15,7 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     ExecutionEvidence,
+    SolverResult,
 )
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.function_metadata import FunctionMetadataMixin
@@ -38,12 +39,10 @@ def _reached(result: SearchResult, analysis: ComparisonAnalysis) -> int | None:
         recomp = analysis.difference.recomp.address
     elif analysis.inconclusive_location is not None:
         location = analysis.inconclusive_location
-        recomp_fact = location.facts.get("recomp_address")
-        if location.image == "recomp":
+        if location.image is ImageId.RECOMP:
             orig, recomp = None, location.address
         else:
-            orig = location.address
-            recomp = recomp_fact if isinstance(recomp_fact, int) else None
+            orig, recomp = location.address, location.counterpart_address
     else:
         return None
     if orig is None and recomp is None:
@@ -65,9 +64,9 @@ def _solver_hints(analysis: ComparisonAnalysis) -> tuple[list[RunInput], str | N
     if difference is None or difference.values is None:
         return [], None
     outcome = bitvector.compare(difference.values)
-    if outcome.result != "differs":
+    if outcome.result is not SolverResult.DIFFERS:
         detail = f": {outcome.reason}" if outcome.reason else ""
-        return [], f"solver {outcome.result}{detail}"
+        return [], f"solver {outcome.result.value}{detail}"
     hint = input_from_assignment(
         dict(outcome.assignment), RunInput.from_seed(HINT_SEED)
     )

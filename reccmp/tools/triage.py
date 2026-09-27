@@ -2,13 +2,23 @@
 """Cluster a comparison report's verdicts by the verifier's shortcomings."""
 
 import argparse
-import dataclasses
 import json
 import logging
 from pathlib import Path
 
 import reccmp
-from reccmp.compare.triage import bucket_counts, instruction_shape, triage, triage_text
+from reccmp.compare.report import deserialize_reccmp_report
+from reccmp.compare.triage import (
+    InstructionShape,
+    Shape,
+    TriageCluster,
+    details_text,
+    side_text,
+    bucket_counts,
+    instruction_shape,
+    triage,
+    triage_text,
+)
 from reccmp.formats import detect_image
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
@@ -20,6 +30,7 @@ from reccmp.project.detect import (
     argparse_parse_project_target,
 )
 from reccmp.project.logging import argparse_add_logging_args, argparse_parse_logging
+from reccmp.types import ImageId
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _shapes(args: argparse.Namespace):
+def _shapes(args: argparse.Namespace) -> Shape | None:
     if args.no_binaries:
         return None
     try:
@@ -65,11 +76,11 @@ def _shapes(args: argparse.Namespace):
         logger.warning("no instruction shapes: %s", error.args[0])
         return None
     images = {
-        "orig": detect_image(target.original_path),
-        "recomp": detect_image(target.recompiled_path),
+        ImageId.ORIG: detect_image(target.original_path),
+        ImageId.RECOMP: detect_image(target.recompiled_path),
     }
 
-    def shape(image: str, address: int) -> str | None:
+    def shape(image: ImageId, address: int) -> InstructionShape | None:
         try:
             code = bytes(images[image].read(address, 16))
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
@@ -79,24 +90,36 @@ def _shapes(args: argparse.Namespace):
     return shape
 
 
+def _cluster_json(cluster: TriageCluster) -> dict[str, object]:
+    key = cluster.key
+    return {
+        "bucket": key.bucket.value,
+        "verdict": key.verdict.value,
+        "strategy": key.strategy.value if key.strategy is not None else None,
+        "orig": side_text(key.orig),
+        "recomp": side_text(key.recomp),
+        "details": details_text(key),
+        "count": cluster.count,
+        "samples": [
+            [f"{entity.orig_addr:#x}", entity.name] for entity in cluster.samples
+        ],
+    }
+
+
 def main() -> int:
     args = parse_args()
-    entities = json.loads(args.report.read_text(encoding="utf-8"))["data"]
-    clusters = triage(entities, _shapes(args))
+    report = deserialize_reccmp_report(args.report.read_text(encoding="utf-8"))
+    clusters = triage(report.entities.values(), _shapes(args))
     print(triage_text(clusters, limit=args.limit, samples=args.samples))
     if args.json is not None:
         args.json.write_text(
             json.dumps(
                 {
-                    "buckets": bucket_counts(clusters),
-                    "clusters": [
-                        {
-                            **dataclasses.asdict(cluster.key),
-                            "count": cluster.count,
-                            "samples": cluster.samples,
-                        }
-                        for cluster in clusters
-                    ],
+                    "buckets": {
+                        bucket.value: count
+                        for bucket, count in bucket_counts(clusters).items()
+                    },
+                    "clusters": [_cluster_json(cluster) for cluster in clusters],
                 },
                 indent=1,
             ),

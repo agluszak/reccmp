@@ -5,11 +5,12 @@ reached, or a callee could see a difference."""
 
 from reccmp.compare.asm.verifier.state import FunctionMetadata
 from reccmp.compare.callee_cleanup import CallStackEffect
-from reccmp.compare.diagnosis import AnalysisRecorder
-from tests.asm_rows import verify_isomorphic_cfg_effective_match
+from reccmp.compare.asm.verifier.iso_cfg import ProductResult
+from reccmp.compare.diagnosis import EffectiveReason
+from tests.asm_rows import run_product
 
 
-def _verify(orig, recomp, *, effects=None, recorder=None) -> bool:
+def _run(orig, recomp, *, effects=None) -> ProductResult:
     """Straight-line code: no local branch targets. ``effects`` maps a line
     index to the stack effect of the call there (the same on both sides)."""
     metadata = None
@@ -17,16 +18,19 @@ def _verify(orig, recomp, *, effects=None, recorder=None) -> bool:
         metadata = FunctionMetadata(
             stack_effects=(effects.get, effects.get), algebraic_identities=False
         )
-    return verify_isomorphic_cfg_effective_match(
+    return run_product(
         orig,
         recomp,
         [None] * len(orig),
         [None] * len(recomp),
         metadata=metadata,
-        recorder=recorder,
         orig_addrs=list(range(len(orig))),
         recomp_addrs=list(range(len(recomp))),
     )
+
+
+def _verify(orig, recomp, *, effects=None) -> bool:
+    return _run(orig, recomp, effects=effects).proved
 
 
 def test_a_local_in_a_slot_against_one_in_a_register():
@@ -46,11 +50,9 @@ def test_a_local_in_a_slot_against_one_in_a_register():
         "mov eax, ecx",
         "ret",
     ]
-    recorder = AnalysisRecorder(
-        orig_addrs=list(range(len(orig))), recomp_addrs=list(range(len(recomp)))
-    )
-    assert _verify(orig, recomp, recorder=recorder)
-    assert "frame_slot_promotion" in recorder.reasons
+    result = _run(orig, recomp)
+    assert result.proved
+    assert EffectiveReason.FRAME_SLOT_PROMOTION in result.recorder.reasons
 
 
 def test_the_slot_must_hold_what_the_register_does():

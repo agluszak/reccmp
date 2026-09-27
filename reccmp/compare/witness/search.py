@@ -29,7 +29,7 @@ from reccmp.compare.asm.ir import FunctionImage
 from reccmp.compare.asm.operand import Imm
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
-from reccmp.compare.diagnosis import RefutationWitness as Witness
+from reccmp.compare.diagnosis import RefutationWitness as Witness, WitnessKind
 from reccmp.compare.diagnosis import WitnessReplay
 from reccmp.compare.extent import EntityExtent
 from reccmp.formats.image import image_digest
@@ -462,7 +462,7 @@ def _argument_witness(
         if UNRESOLVED not in (v_o, v_r) and v_o != v_r:
             return Witness(
                 seed,
-                "call_argument",
+                WitnessKind.CALL_ARGUMENT,
                 f"call #{index} {name}",
                 _fmt(v_o),
                 _fmt(v_r),
@@ -623,7 +623,9 @@ def _compare(
             continue
         if v_o != v_r:
             return (
-                Witness(seed, "memory_value", _fmt(ident), _fmt(v_o), _fmt(v_r)),
+                Witness(
+                    seed, WitnessKind.MEMORY_VALUE, _fmt(ident), _fmt(v_o), _fmt(v_r)
+                ),
                 None,
             )
 
@@ -635,7 +637,7 @@ def _compare(
         return (
             Witness(
                 seed,
-                "stack_cleanup",
+                WitnessKind.STACK_CLEANUP,
                 "esp after return",
                 f"ret {t_o.esp_after_return - STACK_TOP - 4:#x}",
                 f"ret {t_r.esp_after_return - STACK_TOP - 4:#x}",
@@ -657,12 +659,15 @@ def _compare(
                 # the reconstruction's declaration; retail may return a bool
                 # in al with garbage above it.
                 return None, "return_upper_bits"
-            return Witness(seed, "return_value", "eax", _fmt(v_o), _fmt(v_r)), None
+            return (
+                Witness(seed, WitnessKind.RETURN_VALUE, "eax", _fmt(v_o), _fmt(v_r)),
+                None,
+            )
     if return_kind == "i64" and (t_o.eax, t_o.edx) != (t_r.eax, t_r.edx):
         return (
             Witness(
                 seed,
-                "return_value",
+                WitnessKind.RETURN_VALUE,
                 "edx:eax",
                 f"{t_o.edx:#x}:{t_o.eax:#x}",
                 f"{t_r.edx:#x}:{t_r.eax:#x}",
@@ -739,7 +744,7 @@ def find_witness(
                 result.skipped_details.setdefault(
                     "estimated_extent",
                     {
-                        "kind": estimated.kind,
+                        "kind": estimated.kind.difference,
                         "location": estimated.location,
                         "orig": estimated.orig_value,
                         "recomp": estimated.recomp_value,

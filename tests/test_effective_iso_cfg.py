@@ -1,5 +1,5 @@
 """Tests for the isomorphic-CFG effective-match verifier
-(reccmp.compare.asm.verifier.verify_isomorphic_cfg_effective_match) and the
+(reccmp.compare.asm.verifier.prove_product) and the
 flag/one-sided generalizations that support it.
 
 The centerpiece sample is a real MSVC 5.0 register-allocation wobble:
@@ -31,15 +31,24 @@ from reccmp.compare.asm.verifier.dataflow import (
     join_states,
 )
 from reccmp.compare.asm.verifier.iso_cfg import (
-    verify_isomorphic_cfg_effective_match as verify_isomorphic_cfg_effective_match_images,
+    verify_isomorphic_cfg_effective_match as verify_product_images,
 )
 from reccmp.compare.asm.verifier.state import SideState
-from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
+from reccmp.types import ImageId
+from reccmp.compare.diagnosis import (
+    ComparisonStatus,
+    EffectiveReason,
+    DifferenceKind,
+    InconclusiveReason,
+    StopDetail,
+    Strategy,
+)
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from tests.asm_rows import (
     image_from_bytes,
     verify_effective_match,
-    verify_isomorphic_cfg_effective_match,
+    prove_product,
+    run_product,
 )
 
 SAMPLES = Path(__file__).parent / "samples"
@@ -51,7 +60,7 @@ def test_embedded_data_change_cannot_pass_code_only_proof():
     recompiled = replace(original, data_regions=(DataRegion(0x1001, b"\x02"),))
     analysis = analyze_images([], original, recompiled)
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
-    assert analysis.inconclusive_reason == "embedded_data_mismatch"
+    assert analysis.inconclusive_reason == InconclusiveReason.EMBEDDED_DATA_MISMATCH
 
 
 def _sample_relocations(rows, raw, base):
@@ -113,8 +122,8 @@ def test_real_vc5_register_wobble_proves_effective(wobble_analysis):
     esi<->ebx rename composed with a folded load, an elided copy, a mirrored
     compare region and shifted branch displacements."""
     assert wobble_analysis.status == ComparisonStatus.EFFECTIVE
-    assert "register_allocation" in wobble_analysis.effective_reasons
-    assert "load_folding" in wobble_analysis.effective_reasons
+    assert EffectiveReason.REGISTER_ALLOCATION in wobble_analysis.effective_reasons
+    assert EffectiveReason.LOAD_FOLDING in wobble_analysis.effective_reasons
 
 
 # --- Distilled positives ----------------------------------------------------
@@ -145,12 +154,7 @@ def test_folded_load_with_shifted_branch():
     ]
     orig_targets = [None, None, None, None, None, None, 1, None]
     recomp_targets = [None, None, None, None, None, 1, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is True
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is True
 
 
 def test_folded_load_requires_matching_other_side_read():
@@ -170,12 +174,7 @@ def test_folded_load_requires_matching_other_side_read():
     ]
     orig_targets: list[int | None] = [None] * 4
     recomp_targets: list[int | None] = [None] * 3
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is False
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is False
 
 
 def test_elided_register_copy():
@@ -194,12 +193,7 @@ def test_elided_register_copy():
     ]
     orig_targets: list[int | None] = [None] * 4
     recomp_targets: list[int | None] = [None] * 3
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is True
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is True
 
 
 def test_back_edge_into_one_sided_line():
@@ -224,12 +218,7 @@ def test_back_edge_into_one_sided_line():
     ]
     orig_targets = [None, None, None, None, 1, None]
     recomp_targets = [None, None, None, 1, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is True
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is True
 
 
 def test_renamed_live_range_across_join():
@@ -254,12 +243,7 @@ def test_renamed_live_range_across_join():
     ]
     orig_targets = [None, None, 4, None, None, None]
     recomp_targets = [None, None, 4, None, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is True
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is True
 
 
 def test_join_through_different_call_sites():
@@ -276,12 +260,7 @@ def test_join_through_different_call_sites():
     ]
     # `je` jumps to the second call; `jmp` jumps to the shared ret.
     orig_targets: list[int | None] = [None, 4, None, 5, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, list(orig), orig_targets, list(orig_targets)
-        )
-        is True
-    )
+    assert prove_product(orig, list(orig), orig_targets, list(orig_targets)) is True
 
 
 # --- Distilled negatives ----------------------------------------------------
@@ -300,12 +279,7 @@ def test_reject_one_sided_store_iso():
     ]
     no_targets_orig: list[int | None] = [None] * 3
     no_targets_recomp: list[int | None] = [None] * 2
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, no_targets_orig, no_targets_recomp
-        )
-        is False
-    )
+    assert prove_product(orig, recomp, no_targets_orig, no_targets_recomp) is False
 
 
 def test_reject_different_store_value_after_join():
@@ -328,10 +302,7 @@ def test_reject_different_store_value_after_join():
         "ret",
     ]
     targets = [None, None, 4, None, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(orig, recomp, targets, list(targets))
-        is False
-    )
+    assert prove_product(orig, recomp, targets, list(targets)) is False
 
 
 def test_reject_divergent_branch_structure():
@@ -350,29 +321,26 @@ def test_reject_divergent_branch_structure():
         "je 0x1",
         "ret",
     ]
-    recorder = AnalysisRecorder(
-        orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
-        recomp_addrs=[0x2000, 0x2002, 0x2003, 0x2005],
-    )
-    unanchored = AnalysisRecorder(recorder.orig_addrs, recorder.recomp_addrs)
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         orig,
         recomp,
         [None, 3, None, None],
         [None, None, 3, None],
-        recorder=recorder,
-        unanchored=unanchored,
+        orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
+        recomp_addrs=[0x2000, 0x2002, 0x2003, 0x2005],
     )
+    assert not result.proved
+    recorder = result.recorder
+    unanchored = result.unanchored
+    assert unanchored is not None
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "non_isomorphic_cfg"
+    assert analysis.inconclusive_reason == InconclusiveReason.NON_ISOMORPHIC_CFG
     location = require_inconclusive_location(analysis)
     assert location.address == 0x1004
-    assert location.facts["failure"] == "edge_roles"
-    assert location.facts["orig_block_count"] == 3
-    assert location.facts["recomp_block_count"] == 2
+    assert location.detail is StopDetail.EDGE_ROLES
     # What the product found says where to look, without being the verdict.
-    lead = unanchored.attempt("unanchored_product").difference
-    assert lead is not None and lead.kind == "branch_condition"
+    lead = unanchored.attempt(Strategy.UNANCHORED_PRODUCT).difference
+    assert lead is not None and lead.kind == DifferenceKind.BRANCH_CONDITION
     assert lead.orig.address == 0x1002
     assert lead.recomp.address == 0x2003
 
@@ -390,24 +358,21 @@ def test_a_branch_against_none_cannot_pair():
         "inc ebx",
         "ret",
     ]
-    recorder = AnalysisRecorder(
-        orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
-        recomp_addrs=[0x2000, 0x2002, 0x2003],
-    )
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         orig,
         recomp,
         [None, 3, None, None],
         [None, None, None],
-        recorder=recorder,
+        orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
+        recomp_addrs=[0x2000, 0x2002, 0x2003],
     )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "non_isomorphic_cfg"
+    assert analysis.inconclusive_reason == InconclusiveReason.NON_ISOMORPHIC_CFG
     location = require_inconclusive_location(analysis)
     assert location.address == 0x1000
-    assert location.facts["failure"] == "edge_roles"
-    assert location.facts["orig_block_count"] == 3
-    assert location.facts["recomp_block_count"] == 1
+    assert location.detail is StopDetail.EDGE_ROLES
 
 
 def test_a_branch_inverted_with_its_successors_swapped():
@@ -430,7 +395,7 @@ def test_a_branch_inverted_with_its_successors_swapped():
         "xor eax, eax",
         "ret",
     ]
-    assert verify_isomorphic_cfg_effective_match(
+    assert prove_product(
         orig,
         recomp,
         [None, 4, None, None, None, None],
@@ -457,7 +422,7 @@ def test_an_inverted_branch_must_test_the_complement():
         "xor eax, eax",
         "ret",
     ]
-    assert not verify_isomorphic_cfg_effective_match(
+    assert not prove_product(
         orig,
         recomp,
         [None, 4, None, None, None, None],
@@ -487,7 +452,7 @@ def test_a_shared_tail_against_its_copies():
         "lea eax, [ecx + edx]",
         "ret",
     ]
-    assert verify_isomorphic_cfg_effective_match(
+    assert prove_product(
         orig,
         recomp,
         [None, 4, None, 5, None, None, None],
@@ -516,7 +481,7 @@ def test_a_shared_tail_must_match_each_copy():
         "lea eax, [ecx + ebx]",
         "ret",
     ]
-    assert not verify_isomorphic_cfg_effective_match(
+    assert not prove_product(
         orig,
         recomp,
         [None, 4, None, 5, None, None, None],
@@ -527,72 +492,63 @@ def test_a_shared_tail_must_match_each_copy():
 def test_unresolved_switch_reports_dispatch_location():
     orig = ["jmp dword ptr [eax*4]"]
     recomp = ["jmp dword ptr [ecx*4]"]
-    recorder = AnalysisRecorder(
-        orig_addrs=[0x1000],
-        recomp_addrs=[0x2000],
+    result = run_product(
+        orig, recomp, [None], [None], orig_addrs=[0x1000], recomp_addrs=[0x2000]
     )
-    assert not verify_isomorphic_cfg_effective_match(
-        orig,
-        recomp,
-        [None],
-        [None],
-        recorder=recorder,
-    )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "jump_table_data"
+    assert analysis.inconclusive_reason == InconclusiveReason.JUMP_TABLE_DATA
     location = require_inconclusive_location(analysis)
     assert location.address == 0x1000
-    assert location.facts == {
-        "side": "orig",
-        "failure": "unresolved_switch_table",
-    }
+    assert location.image is ImageId.ORIG
+    assert location.detail is StopDetail.UNRESOLVED_SWITCH_TABLE
 
 
 def test_empty_control_flow_identifies_the_empty_side():
-    recorder = AnalysisRecorder(orig_addrs=[], recomp_addrs=[0x2000])
-    assert not verify_isomorphic_cfg_effective_match(
-        [], ["ret"], [], [None], recorder=recorder
-    )
+    result = run_product([], ["ret"], [], [None], orig_addrs=[], recomp_addrs=[0x2000])
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "empty_control_flow"
+    assert analysis.inconclusive_reason == InconclusiveReason.EMPTY_CONTROL_FLOW
     location = require_inconclusive_location(analysis)
     assert location.instruction_index is None
-    assert location.facts == {
-        "side": "orig",
-        "instruction_count": 0,
-    }
+    assert location.image is ImageId.ORIG
 
 
 def test_indirect_jump_is_located():
-    recorder = AnalysisRecorder(orig_addrs=[0x1000], recomp_addrs=[0x2000])
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         ["jmp dword ptr [eax]"],
         ["jmp dword ptr [eax]"],
         [None],
         [None],
-        recorder=recorder,
+        orig_addrs=[0x1000],
+        recomp_addrs=[0x2000],
     )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "indirect_jump"
+    assert analysis.inconclusive_reason == InconclusiveReason.INDIRECT_JUMP
     assert require_inconclusive_location(analysis).address == 0x1000
 
 
 def test_external_edge_with_divergent_state_is_located():
-    recorder = AnalysisRecorder(
-        orig_addrs=[0x1000, 0x1005], recomp_addrs=[0x2000, 0x2005]
-    )
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         ["mov eax, 1", "jmp 0x10"],
         ["mov eax, 2", "jmp 0x10"],
         [None, None],
         [None, None],
-        recorder=recorder,
+        orig_addrs=[0x1000, 0x1005],
+        recomp_addrs=[0x2000, 0x2005],
     )
-    assert recorder.inconclusive_reason == "external_control_flow_state"
+    assert not result.proved
+    recorder = result.recorder
+    assert (
+        recorder.inconclusive_reason == InconclusiveReason.EXTERNAL_CONTROL_FLOW_STATE
+    )
     location = recorder.inconclusive_location
     assert location is not None
     assert location.address == 0x1005
-    assert location.facts["edge_kind"] == FlowKind.JUMP.value
 
 
 def test_external_conditional_edge_checks_physical_state():
@@ -612,18 +568,24 @@ def test_external_conditional_edge_checks_physical_state():
         "ret",
     ]
     targets = [None] * len(orig)
-    assert not verify_isomorphic_cfg_effective_match(
+    assert not prove_product(
         orig, recomp, targets, targets, FunctionMetadata(return_kind="void")
     )
 
 
 def test_function_fallthrough_is_located():
-    recorder = AnalysisRecorder(orig_addrs=[0x1000], recomp_addrs=[0x2000])
-    assert not verify_isomorphic_cfg_effective_match(
-        ["mov eax, ecx"], ["mov eax, ecx"], [None], [None], recorder=recorder
+    result = run_product(
+        ["mov eax, ecx"],
+        ["mov eax, ecx"],
+        [None],
+        [None],
+        orig_addrs=[0x1000],
+        recomp_addrs=[0x2000],
     )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "function_fallthrough"
+    assert analysis.inconclusive_reason == InconclusiveReason.FUNCTION_FALLTHROUGH
     assert require_inconclusive_location(analysis).address == 0x1000
 
 
@@ -637,19 +599,20 @@ def test_incompatible_x87_paths_report_state_join_shape():
         "ret",
     ]
     targets = [None, 4, None, 5, None, None]
-    recorder = AnalysisRecorder(
+    result = run_product(
+        asm,
+        list(asm),
+        targets,
+        list(targets),
         orig_addrs=[0x1000, 0x1002, 0x1004, 0x1006, 0x1008, 0x1009],
         recomp_addrs=[0x2000, 0x2002, 0x2004, 0x2006, 0x2008, 0x2009],
     )
-    assert not verify_isomorphic_cfg_effective_match(
-        asm, list(asm), targets, list(targets), recorder=recorder
-    )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
-    assert analysis.inconclusive_reason == "state_join_failure"
+    assert analysis.inconclusive_reason == InconclusiveReason.STATE_JOIN_FAILURE
     location = require_inconclusive_location(analysis)
     assert location.address == 0x1009
-    facts = location.facts
-    assert facts["entry_orig_x87_depth"] != facts["incoming_orig_x87_depth"]
 
 
 def test_reject_mirrored_condition_with_live_difference():
@@ -674,10 +637,7 @@ def test_reject_mirrored_condition_with_live_difference():
         "ret",
     ]
     targets = [None, None, None, 5, None, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(orig, recomp, targets, list(targets))
-        is False
-    )
+    assert prove_product(orig, recomp, targets, list(targets)) is False
 
 
 def test_reject_folded_load_across_intervening_store():
@@ -697,10 +657,7 @@ def test_reject_folded_load_across_intervening_store():
         "ret",
     ]
     targets: list[int | None] = [None] * 4
-    assert (
-        verify_isomorphic_cfg_effective_match(orig, recomp, targets, list(targets))
-        is False
-    )
+    assert prove_product(orig, recomp, targets, list(targets)) is False
 
 
 def test_reject_renamed_callee_saved_across_join():
@@ -723,10 +680,7 @@ def test_reject_renamed_callee_saved_across_join():
         "ret",
     ]
     targets = [None, None, 4, None, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(orig, recomp, targets, list(targets))
-        is False
-    )
+    assert prove_product(orig, recomp, targets, list(targets)) is False
 
 
 # --- Flag canonicalization (lockstep-level) ---------------------------------
@@ -752,10 +706,7 @@ def test_test_self_equals_cmp_zero():
     metadata = FunctionMetadata(return_kind="void")
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
     targets = [None, None, 4, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
-        is True
-    )
+    assert prove_product(orig, recomp, targets, targets, metadata) is True
 
 
 def test_test_self_equals_cmp_zeroed_register():
@@ -873,7 +824,7 @@ def test_load_scheduled_across_push():
     # positional pairing misaligns; the CFG pairing proves it:
     t_o: list[int | None] = [None] * 8
     t_r: list[int | None] = [None] * 8
-    assert verify_isomorphic_cfg_effective_match(orig, recomp, t_o, t_r) is True
+    assert prove_product(orig, recomp, t_o, t_r) is True
 
 
 def test_unknown_pointer_load_across_push():
@@ -896,7 +847,7 @@ def test_unknown_pointer_load_across_push():
         "ret",
     ]
     t: list[int | None] = [None] * 6
-    assert verify_isomorphic_cfg_effective_match(orig, recomp, t, list(t)) is True
+    assert prove_product(orig, recomp, t, list(t)) is True
 
 
 def test_pushed_then_popped_values_stay_distinct():
@@ -930,7 +881,7 @@ def test_pushed_then_popped_values_stay_distinct():
         "ret",
     ]
     t: list[int | None] = [None] * 6
-    assert verify_isomorphic_cfg_effective_match(orig, bad, t, list(t)) is False
+    assert prove_product(orig, bad, t, list(t)) is False
 
 
 # --- One-sided scratch spills -------------------------------------------------
@@ -957,7 +908,7 @@ def test_one_sided_register_spill():
     ]
     t_o: list[int | None] = [None] * 4
     t_r: list[int | None] = [None] * 7
-    assert verify_isomorphic_cfg_effective_match(orig, recomp, t_o, t_r) is True
+    assert prove_product(orig, recomp, t_o, t_r) is True
 
 
 def test_one_sided_push_live_at_call_rejected():
@@ -975,7 +926,7 @@ def test_one_sided_push_live_at_call_rejected():
     ]
     t_o: list[int | None] = [None] * 2
     t_r: list[int | None] = [None] * 4
-    assert verify_isomorphic_cfg_effective_match(orig, recomp, t_o, t_r) is False
+    assert prove_product(orig, recomp, t_o, t_r) is False
 
 
 # --- Recognized switch jump tables -----------------------------------------
@@ -1017,7 +968,7 @@ def test_recognized_switch_table_iso_cfg_match_under_register_rename():
     recomp, recomp_addrs, _, recomp_table = _switch_fixture("ecx", "edx", start=0x2000)
     metadata = FunctionMetadata(return_kind="void")
     assert (
-        verify_isomorphic_cfg_effective_match(
+        prove_product(
             orig,
             recomp,
             targets,
@@ -1041,42 +992,44 @@ def test_recognized_switch_wrong_case_order_is_non_isomorphic():
         recomp_table,
         entries=((first_entry, second_target), (second_entry, first_target)),
     )
-    recorder = AnalysisRecorder(orig_addrs=orig_addrs, recomp_addrs=recomp_addrs)
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         orig,
         recomp,
         targets,
         list(targets),
         metadata=FunctionMetadata(return_kind="void"),
-        recorder=recorder,
         orig_addrs=orig_addrs,
         recomp_addrs=recomp_addrs,
         orig_tables=(orig_table,),
         recomp_tables=(recomp_table,),
     )
+    assert not result.proved
+    recorder = result.recorder
     analysis = recorder.failure_analysis()
     assert analysis.status != ComparisonStatus.EFFECTIVE
     assert (
-        analysis.inconclusive_reason == "non_isomorphic_cfg"
+        analysis.inconclusive_reason == InconclusiveReason.NON_ISOMORPHIC_CFG
         or analysis.difference is not None
     )
 
 
 def test_unresolved_switch_without_addrs_stays_jump_table_data():
     orig, _addrs, targets, _table = _switch_fixture()
-    recorder = AnalysisRecorder(
-        orig_addrs=[0x1000] * len(orig),
-        recomp_addrs=[0x2000] * len(orig),
-    )
-    assert not verify_isomorphic_cfg_effective_match(
+    result = run_product(
         orig,
         list(orig),
         targets,
         list(targets),
-        recorder=recorder,
         # No table facts → cannot resolve an indexed dispatch.
+        orig_addrs=[0x1000] * len(orig),
+        recomp_addrs=[0x2000] * len(orig),
     )
-    assert recorder.failure_analysis().inconclusive_reason == "jump_table_data"
+    assert not result.proved
+    recorder = result.recorder
+    assert (
+        recorder.failure_analysis().inconclusive_reason
+        == InconclusiveReason.JUMP_TABLE_DATA
+    )
 
 
 # --- CFG canonicalization ----------------------------------------------------
@@ -1103,12 +1056,7 @@ def test_empty_jump_only_block_canonicalizes_to_direct_edge():
         "ret",
     ]
     recomp_targets: list[int | None] = [None, 2, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is True
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is True
 
 
 def test_empty_jump_only_block_both_sides_still_match():
@@ -1121,10 +1069,7 @@ def test_empty_jump_only_block_both_sides_still_match():
         "ret",
     ]
     targets: list[int | None] = [None, 2, 3, None, None]
-    assert (
-        verify_isomorphic_cfg_effective_match(side, list(side), targets, list(targets))
-        is True
-    )
+    assert prove_product(side, list(side), targets, list(targets)) is True
 
 
 def test_ret_and_ret_imm_are_not_collapsed_together():
@@ -1149,12 +1094,7 @@ def test_ret_and_ret_imm_are_not_collapsed_together():
     # least no false EFFECTIVE via identical structure after bad collapse.
     # With text-aware collapse, each side keeps two distinct ret blocks →
     # edge roles still match (both have two ret exits), but bodies differ.
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig, recomp, orig_targets, recomp_targets
-        )
-        is False
-    )
+    assert prove_product(orig, recomp, orig_targets, recomp_targets) is False
 
 
 def test_branch_swapped_load_is_not_trap_equivalent():
@@ -1181,21 +1121,16 @@ def test_branch_swapped_load_is_not_trap_equivalent():
         "mov edx, 1",
         "ret",
     ]
-    recorder = AnalysisRecorder(
+    result = run_product(
+        orig,
+        recomp,
+        [None, 5, None, None, 6, None, None],
+        [None, 4, None, 6, None, None, None],
         orig_addrs=list(range(0x1000, 0x1007)),
         recomp_addrs=list(range(0x2000, 0x2007)),
     )
-    assert (
-        verify_isomorphic_cfg_effective_match(
-            orig,
-            recomp,
-            [None, 5, None, None, 6, None, None],
-            [None, 4, None, 6, None, None, None],
-            recorder=recorder,
-        )
-        is False
-    )
-    analysis = recorder.failure_analysis()
+    assert not result.proved
+    analysis = result.recorder.failure_analysis()
     assert analysis.status != ComparisonStatus.EFFECTIVE
 
 
@@ -1221,14 +1156,10 @@ def test_block_pairing_conflict_is_a_branch_target_difference():
     recomp = image_from_bytes(
         bytes.fromhex("85c07408eb00b801000000c3b802000000c3"), 0x2000
     )
-    recorder = AnalysisRecorder(
-        [row.address for row in orig.instructions],
-        [row.address for row in recomp.instructions],
-    )
-    assert not verify_isomorphic_cfg_effective_match_images(
-        orig, recomp, recorder=recorder
-    )
+    result = verify_product_images(orig, recomp)
+    assert not result.proved
+    recorder = result.recorder
     assert recorder.difference is not None
-    assert recorder.difference.kind == "branch_target"
-    assert recorder.difference.orig.facts["target_instruction_index"] == 3
-    assert recorder.difference.recomp.facts["target_instruction_index"] == 5
+    assert recorder.difference.kind == DifferenceKind.BRANCH_TARGET
+    assert recorder.difference.orig.observed.target_index == 3
+    assert recorder.difference.recomp.observed.target_index == 5

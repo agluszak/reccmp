@@ -14,7 +14,12 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
     DiagnosticNormalization,
+    DifferenceKind,
     DifferenceSide,
+    EffectiveReason,
+    InconclusiveReason,
+    Observed,
+    StopLocation,
     derive_diagnostic_normalizations,
 )
 from reccmp.compare.functions import FunctionComparator, _longest_increasing_by_recomp
@@ -26,6 +31,7 @@ from reccmp.compare.inlines import (
     strip_helper_epilog,
 )
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
+from reccmp.types import ImageId
 from reccmp.compare.stack_layout import (
     StackPair,
     StackRegisterOffset,
@@ -104,24 +110,24 @@ def test_rewrite_stack_displacements():
 def test_derive_diagnostic_normalizations():
     assert not derive_diagnostic_normalizations(ComparisonAnalysis.exact())
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.effective({"register_allocation"})
+        ComparisonAnalysis.effective({EffectiveReason.REGISTER_ALLOCATION})
     ) == (DiagnosticNormalization.REGISTER_ALLOCATION,)
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.effective({"frame_slot_layout"})
+        ComparisonAnalysis.effective({EffectiveReason.FRAME_SLOT_LAYOUT})
     ) == (DiagnosticNormalization.STACK_LAYOUT,)
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.effective({"folded_symbol_alias"})
+        ComparisonAnalysis.effective({EffectiveReason.FOLDED_SYMBOL_ALIAS})
     ) == (DiagnosticNormalization.FOLDED_SYMBOL_ALIAS,)
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.inconclusive("analysis_limit"),
+        ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT),
         accuracy_modulo_stack=1.0,
     ) == (DiagnosticNormalization.STACK_LAYOUT,)
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.inconclusive("analysis_limit"),
+        ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT),
         accuracy_modulo_inline=1.0,
     ) == (DiagnosticNormalization.KNOWN_INLINE,)
     assert derive_diagnostic_normalizations(
-        ComparisonAnalysis.inconclusive("analysis_limit"),
+        ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT),
         accuracy_modulo_stack=1.0,
         accuracy_modulo_inline=1.0,
     ) == (
@@ -129,7 +135,7 @@ def test_derive_diagnostic_normalizations():
         DiagnosticNormalization.KNOWN_INLINE,
     )
     assert not derive_diagnostic_normalizations(
-        ComparisonAnalysis.inconclusive("analysis_limit")
+        ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
     )
     # Non-proof tags must not use the word "equivalent" in their values.
     for tag in DiagnosticNormalization:
@@ -264,9 +270,9 @@ def test_enrich_mismatch_side_preserves_kind():
     )
     analysis = ComparisonAnalysis.mismatch(
         ComparisonDifference(
-            "call_target",
-            DifferenceSide(0, 0x401000, {}),
-            DifferenceSide(1, 0x501000, {"target": "bar"}),
+            DifferenceKind.CALL_TARGET,
+            DifferenceSide(ImageId.ORIG, 0, 0x401000, Observed()),
+            DifferenceSide(ImageId.RECOMP, 1, 0x501000, Observed(value="bar")),
         )
     )
     enriched = (
@@ -275,9 +281,10 @@ def test_enrich_mismatch_side_preserves_kind():
         )
     )
     assert enriched.difference is not None
-    assert enriched.difference.recomp.facts["source_path"] == "foo.cpp"
-    assert enriched.difference.recomp.facts["source_line"] == 183
-    assert enriched.difference.recomp.facts["target"] == "bar"
+    assert enriched.difference.recomp.source is not None
+    assert enriched.difference.recomp.source.path == "foo.cpp"
+    assert enriched.difference.recomp.source.line == 183
+    assert enriched.difference.recomp.observed.value == "bar"
 
 
 def test_enrich_inconclusive_orig_location_uses_recomp_counterpart():
@@ -296,21 +303,23 @@ def test_enrich_inconclusive_orig_location_uses_recomp_counterpart():
 
     unpaired = enrich(
         ComparisonAnalysis.inconclusive(
-            "non_isomorphic_cfg", DifferenceSide(3, 0x401000, {}, "orig")
+            InconclusiveReason.NON_ISOMORPHIC_CFG,
+            StopLocation(ImageId.ORIG, 3, 0x401000),
         )
     )
     assert unpaired.inconclusive_location is not None
-    assert "source_path" not in unpaired.inconclusive_location.facts
+    assert unpaired.inconclusive_location.source is None
     lines_db.find_line_of_recomp_address.assert_not_called()
 
     paired = enrich(
         ComparisonAnalysis.inconclusive(
-            "non_isomorphic_cfg",
-            DifferenceSide(3, 0x401000, {"recomp_address": 0x501010}, "orig"),
+            InconclusiveReason.NON_ISOMORPHIC_CFG,
+            StopLocation(ImageId.ORIG, 3, 0x401000, 0x501010),
         )
     )
     assert paired.inconclusive_location is not None
-    assert paired.inconclusive_location.facts["source_line"] == 7
+    assert paired.inconclusive_location.source is not None
+    assert paired.inconclusive_location.source.line == 7
     lines_db.find_line_of_recomp_address.assert_called_once_with(0x501010)
 
 

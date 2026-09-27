@@ -4,6 +4,7 @@ with block-local alignment."""
 from __future__ import annotations
 
 import dataclasses
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from collections.abc import Sequence
@@ -41,7 +42,6 @@ from reccmp.compare.asm.verifier.dataflow import (
     capture_cfg_state,
     clone_cfg_state,
     converged,
-    join_failure_facts,
     join_states,
     seed_context_from_cfg,
     states_equal,
@@ -68,48 +68,58 @@ from reccmp.compare.asm.verifier.state import (
     commit_memory,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import (
+    AnalysisRecorder,
+    EffectiveReason,
+    InconclusiveReason,
+    StopDetail,
+)
+from reccmp.types import ImageId
 
 if TYPE_CHECKING:
     from reccmp.compare.callee_cleanup import CallStackEffect
+
+
+@dataclass
+class ProductResult:
+    """What the product of the two graphs found."""
+
+    proved: bool
+    # Why and where it failed, or the categories of its proof.
+    recorder: AnalysisRecorder
+    # When the blocks do not pair one to one and the product failed: where
+    # it stopped under its guessed pairing, a lead rather than a verdict.
+    unanchored: AnalysisRecorder | None = None
 
 
 def verify_isomorphic_cfg_effective_match(
     orig: FunctionImage,
     recomp: FunctionImage,
     metadata: FunctionMetadata | None = None,
-    recorder: AnalysisRecorder | None = None,
-    unanchored: AnalysisRecorder | None = None,
-) -> bool:
+) -> ProductResult:
     """CFG verification that tolerates different instruction counts:
     per-side block graphs matched structurally, block contents aligned
     locally, one-sided unobservable instructions allowed. This proves
     register-allocation wobble in its full generality — renames composed
     with folded loads, elided copies and shifted branch displacements.
 
-    Recognized switch jump tables become ``caseN`` edges so isomorphic
-    pairing compares entry count and case→block topology.
-
-    When the blocks do not pair one to one, ``recorder`` gets why, and
-    ``unanchored`` where the product stopped under its guessed pairing.
-    """
+    Recognized switch jump tables become case edges, so pairing compares
+    entry count and case→block topology."""
+    recorder = AnalysisRecorder(orig, recomp)
+    if unsupported_control_flow(
+        orig, recorder, ImageId.ORIG
+    ) or unsupported_control_flow(recomp, recorder, ImageId.RECOMP):
+        return ProductResult(False, recorder)
     orig_rows, recomp_rows = orig.instructions, recomp.instructions
-    if unsupported_control_flow(orig, recorder, "orig") or unsupported_control_flow(
-        recomp, recorder, "recomp"
-    ):
-        return False
     cfg_o, cfg_r = Blocks(orig), Blocks(recomp)
-    addrs = ([row.address for row in orig_rows], [row.address for row in recomp_rows])
     # Without a one-to-one pairing of the blocks, which blocks the product
     # pairs where the graphs differ is a guess: enough to prove the two
     # equal, but a difference found under it may be the guess's own (a
     # redundant test on one side paired with the other's next branch). Such
     # a failure reports why the blocks do not pair one to one, and the
-    # difference goes to ``unanchored``: a lead, not a verdict.
-    anchored = pair_heads(cfg_o, cfg_r) is not None
-    product_recorder = recorder
-    if recorder is not None and not anchored:
-        product_recorder = unanchored or AnalysisRecorder(*addrs)
+    # difference is only a lead.
+    anchored = pair_heads(cfg_o, cfg_r)
+    product_recorder = recorder if anchored else AnalysisRecorder(orig, recomp)
     proved = _verify_product(
         cfg_o, cfg_r, orig_rows, recomp_rows, metadata, product_recorder
     )
@@ -118,20 +128,25 @@ def verify_isomorphic_cfg_effective_match(
         # on the other: try again with each side's frame its own (see
         # verifier.frame). Only a proof counts; the first attempt says why
         # the pair failed.
-        promoted = AnalysisRecorder(*addrs)
+        promoted = AnalysisRecorder(orig, recomp)
         if _verify_product(
             cfg_o, cfg_r, orig_rows, recomp_rows, metadata, promoted, promote=True
         ):
-            if recorder is not None:
-                recorder.reasons |= promoted.reasons | {"frame_slot_promotion"}
-            return True
-    if recorder is not None and product_recorder is not recorder:
-        assert product_recorder is not None
-        if proved:
-            recorder.reasons |= product_recorder.reasons
-        else:
-            pair_heads(cfg_o, cfg_r, recorder, (orig_rows, recomp_rows))
-    return proved
+            recorder.reasons |= promoted.reasons | {
+                EffectiveReason.FRAME_SLOT_PROMOTION
+            }
+            return ProductResult(True, recorder)
+    if anchored:
+        return ProductResult(proved, recorder)
+    if proved:
+        recorder.reasons |= product_recorder.reasons
+        return ProductResult(True, recorder)
+    pair_heads(cfg_o, cfg_r, recorder)
+    stopped = (
+        product_recorder.best_difference is not None
+        or product_recorder.inconclusive_reason is not None
+    )
+    return ProductResult(False, recorder, product_recorder if stopped else None)
 
 
 def _verify_product(
@@ -140,7 +155,7 @@ def _verify_product(
     orig_rows: Sequence[DecodedInstruction],
     recomp_rows: Sequence[DecodedInstruction],
     metadata: FunctionMetadata | None,
-    recorder: AnalysisRecorder | None,
+    recorder: AnalysisRecorder,
     *,
     promote: bool = False,
 ) -> bool:
@@ -187,19 +202,12 @@ def _verify_product(
         if best is not None and best[0] != indices_r:
             any_shifted = True
         if best is None:
-            if recorder is not None:
-                recorder.mark_inconclusive(
-                    "alignment_failure",
-                    start_o,
-                    start_r,
-                    {
-                        "stage": "block_alignment",
-                        "orig_block_length": len(indices_o),
-                        "recomp_block_length": len(indices_r),
-                        "orig_block_count": len(cfg_o.heads),
-                        "recomp_block_count": len(cfg_r.heads),
-                    },
-                )
+            recorder.mark_inconclusive(
+                InconclusiveReason.ALIGNMENT_FAILURE,
+                start_o,
+                start_r,
+                StopDetail.BLOCK_ALIGNMENT,
+            )
             return None
         indices_r, (aligned, _cost) = best
         # The block terminators (control lines) must pair with each other:
@@ -216,17 +224,12 @@ def _verify_product(
                 else FlowKind.NORMAL
             )
             if kind_o != kind_r or (local_o is None and kind_r is not FlowKind.NORMAL):
-                if recorder is not None:
-                    recorder.mark_inconclusive(
-                        "alignment_failure",
-                        indices_o[local_o] if local_o is not None else None,
-                        indices_r[local_r] if local_r is not None else None,
-                        {
-                            "stage": "block_terminator_alignment",
-                            "orig_kind": kind_o.value,
-                            "recomp_kind": kind_r.value,
-                        },
-                    )
+                recorder.mark_inconclusive(
+                    InconclusiveReason.ALIGNMENT_FAILURE,
+                    indices_o[local_o] if local_o is not None else None,
+                    indices_r[local_r] if local_r is not None else None,
+                    StopDetail.BLOCK_TERMINATOR_ALIGNMENT,
+                )
                 return None
         if any(local_o is None or local_r is None for local_o, local_r in aligned):
             any_shifted = True
@@ -250,25 +253,19 @@ def _verify_product(
             _exits_correspond(exits_o, exits_r, swapped=False)
             or _exits_correspond(exits_o, exits_r, swapped=True)
         ):
-            if recorder is not None:
-                recorder.mark_inconclusive(
-                    "non_isomorphic_cfg",
-                    orig_index=cfg_o.start(node[0][-1]),
-                    recomp_index=cfg_r.start(node[1][-1]),
-                    facts={
-                        "failure": (
-                            "edge_roles"
-                            if set(exits_o) != set(exits_r)
-                            else "external_edge"
-                        ),
-                        "orig_block_count": len(cfg_o.heads),
-                        "recomp_block_count": len(cfg_r.heads),
-                    },
-                )
+            recorder.mark_inconclusive(
+                InconclusiveReason.NON_ISOMORPHIC_CFG,
+                cfg_o.start(node[0][-1]),
+                cfg_r.start(node[1][-1]),
+                (
+                    StopDetail.EDGE_ROLES
+                    if set(exits_o) != set(exits_r)
+                    else StopDetail.EXTERNAL_EDGE
+                ),
+            )
             return None
         if len(nodes) >= node_limit:
-            if recorder is not None:
-                recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
             return None
         aligned = align(node)
         if aligned is None:
@@ -283,8 +280,7 @@ def _verify_product(
             return False
         if not bitvector.values_equal(value_o, value_r):
             return False
-        if recorder is not None:
-            recorder.reasons.add("algebraic_identity")
+        recorder.reasons.add(EffectiveReason.ALGEBRAIC_IDENTITY)
         return True
 
     first = node_at(cfg_o.entry, cfg_r.entry)
@@ -323,13 +319,12 @@ def _verify_product(
                 # A one-sided instruction can never store (any observable
                 # rejects it), so the memory generation is unaffected.
                 if not one_sided_ok(side, other_side, ctx, position, row):
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "alignment_failure",
-                            index_o,
-                            index_r,
-                            {"stage": "one_sided_instruction"},
-                        )
+                    recorder.mark_inconclusive(
+                        InconclusiveReason.ALIGNMENT_FAILURE,
+                        index_o,
+                        index_r,
+                        StopDetail.ONE_SIDED_INSTRUCTION,
+                    )
                     return False
                 continue
             last_o, last_r = index_o, index_r
@@ -346,19 +341,17 @@ def _verify_product(
                 execute(recomp_state, ctx, index_o, ins_r, obs_r)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
                 if instruction_semantic_key(ins_o) != instruction_semantic_key(ins_r):
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "unsupported_instruction", index_o, index_r
-                        )
+                    recorder.mark_inconclusive(
+                        InconclusiveReason.UNSUPPORTED_INSTRUCTION, index_o, index_r
+                    )
                     return False
                 if admit_unsupported_identical(
                     orig_state, recomp_state, ctx, index_o, ins_o, ins_r
                 ):
                     continue
-                if recorder is not None:
-                    recorder.mark_inconclusive(
-                        "unsupported_instruction", index_o, index_r
-                    )
+                recorder.mark_inconclusive(
+                    InconclusiveReason.UNSUPPORTED_INSTRUCTION, index_o, index_r
+                )
                 return False
 
             guard_state_size(orig_state, ctx)
@@ -430,8 +423,9 @@ def _verify_product(
             if any(obs_entry[0] == "jmpind" for obs_entry in obs_o):
                 # Recognized switch tables already expanded to caseN edges.
                 if not switch:
-                    if recorder is not None:
-                        recorder.mark_inconclusive("indirect_jump", index_o, index_r)
+                    recorder.mark_inconclusive(
+                        InconclusiveReason.INDIRECT_JUMP, index_o, index_r
+                    )
                     return False
 
             # A direct edge outside the excerpt exposes the complete machine
@@ -443,13 +437,9 @@ def _verify_product(
                 and edges_o[leaving] is None
             ):
                 if not converged(orig_state, recomp_state):
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "external_control_flow_state",
-                            index_o,
-                            index_r,
-                            {"edge_kind": kind.value},
-                        )
+                    recorder.mark_inconclusive(
+                        InconclusiveReason.EXTERNAL_CONTROL_FLOW_STATE, index_o, index_r
+                    )
                     return False
             commit_memory(ctx, obs_o, index_o)
             if ctx.stack_escaped and (orig_state.frame or recomp_state.frame):
@@ -460,13 +450,12 @@ def _verify_product(
         ):
             # The branch's two sides pair their successors one way on one
             # visit and another way (or neither) on this one.
-            if recorder is not None:
-                recorder.mark_inconclusive(
-                    "non_isomorphic_cfg",
-                    last_o,
-                    last_r,
-                    {"failure": "branch_orientation"},
-                )
+            recorder.mark_inconclusive(
+                InconclusiveReason.NON_ISOMORPHIC_CFG,
+                last_o,
+                last_r,
+                StopDetail.BRANCH_ORIENTATION,
+            )
             return False
         if last_o is not None and orig_rows[last_o].is_ret:
             if not discharge_run_obligations(
@@ -480,17 +469,15 @@ def _verify_product(
                 return False
         if cfg_o.falls_out(node[0][-1]):
             # Falling out of the disassembled function is not a modeled exit.
-            if recorder is not None:
-                recorder.mark_inconclusive(
-                    "function_fallthrough",
-                    last_o,
-                    last_r,
-                )
+            recorder.mark_inconclusive(
+                InconclusiveReason.FUNCTION_FALLTHROUGH,
+                last_o,
+                last_r,
+            )
             return False
 
         outgoing = capture_cfg_state(orig_state, recomp_state, ctx)
-        if recorder is not None:
-            recorder.reasons.update(ctx.categories)
+        recorder.reasons.update(ctx.categories)
         for role, to_o in edges_o.items():
             to_r = edges_r[SWAPPED[role] if swapped else role]
             if to_o is None or to_r is None:
@@ -506,13 +493,11 @@ def _verify_product(
                     entry[successor], outgoing, nodes[successor], equal
                 )
                 if joined is None:
-                    if recorder is not None:
-                        recorder.mark_inconclusive(
-                            "state_join_failure",
-                            cfg_o.start(to_o),
-                            cfg_r.start(to_r),
-                            join_failure_facts(entry[successor], outgoing),
-                        )
+                    recorder.mark_inconclusive(
+                        InconclusiveReason.STATE_JOIN_FAILURE,
+                        cfg_o.start(to_o),
+                        cfg_r.start(to_r),
+                    )
                     return False
                 if not states_equal(joined, entry[successor]):
                     entry[successor] = joined
@@ -524,17 +509,15 @@ def _verify_product(
             node = pending.pop()
             visits += 1
             if visits > 8 * blocks + 64:
-                if recorder is not None:
-                    recorder.mark_inconclusive("analysis_limit")
+                recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
                 return False
             if not run_node(node):
                 return False
     except (Reject, RecursionError):
-        if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+        recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
-    if any_shifted and recorder is not None:
-        recorder.reasons.add("instruction_reorder")
+    if any_shifted:
+        recorder.reasons.add(EffectiveReason.INSTRUCTION_REORDER)
     return True
 
 

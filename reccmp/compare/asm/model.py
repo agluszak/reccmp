@@ -60,6 +60,11 @@ REGISTERS: dict[str, tuple[str, str]] = {
     "sp": ("sp", "r16"),
 }
 
+# Register family -> its 32-bit register.
+FAMILY_REGISTER = {
+    family: name for name, (family, part) in REGISTERS.items() if part == "r32"
+}
+
 
 def format_imm(value: int) -> str:
     """Capstone Intel-syntax immediates: decimal for |n| < 10, else hex."""

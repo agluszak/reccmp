@@ -5,6 +5,7 @@ from functools import cache, partial
 import struct
 from collections.abc import Hashable
 from typing import Callable
+from reccmp.compare.diagnosis import EffectiveReason
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
@@ -340,14 +341,14 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             # The island is a modeled thunk to a grouped body; its guessed
             # byte window is not the function extent this proof depends on.
             alias = admit_effective(
-                ("folded_symbol_alias",),
+                (EffectiveReason.FOLDED_SYMBOL_ALIAS,),
                 coverage_incomplete=(
                     orig_image.coverage_incomplete or recomp_image.coverage_incomplete
                 ),
                 extent_closed=True,
             )
             if alias is not None:
-                return dataclasses.replace(result, analysis=alias.analysis)
+                return dataclasses.replace(result, analysis=alias)
 
         analysis = admit_proof(
             result.analysis,

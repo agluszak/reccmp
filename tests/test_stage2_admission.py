@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.diagnosis import ComparisonStatus, EffectiveReason
 from reccmp.compare.verification import admit_effective, admit_exact_analysis
 
 
@@ -68,16 +68,20 @@ def test_admit_exact_does_not_default_keys_equal():
 def test_admit_effective_requires_closed_extent():
     with pytest.raises(TypeError):
         admit_effective(  # type: ignore[call-arg]  # pylint: disable=missing-kwoa
-            {"register_allocation"}
+            {EffectiveReason.REGISTER_ALLOCATION}
         )
     minted = admit_effective(
-        {"register_allocation"}, coverage_incomplete=False, extent_closed=True
+        {EffectiveReason.REGISTER_ALLOCATION},
+        coverage_incomplete=False,
+        extent_closed=True,
     )
     assert minted is not None
-    assert minted.proof_kind == ComparisonStatus.EFFECTIVE
+    assert minted.status == ComparisonStatus.EFFECTIVE
     assert (
         admit_effective(
-            {"register_allocation"}, coverage_incomplete=True, extent_closed=True
+            {EffectiveReason.REGISTER_ALLOCATION},
+            coverage_incomplete=True,
+            extent_closed=True,
         )
         is None
     )

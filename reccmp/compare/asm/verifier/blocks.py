@@ -25,15 +25,16 @@ from reccmp.compare.asm.graph import (
     FunctionGraph,
     GraphBlock,
 )
-from reccmp.compare.asm.ir import (
-    DecodedInstruction,
-    FlowKind,
-    FunctionImage,
-    instruction_semantic_key,
-)
+from reccmp.compare.asm.ir import FlowKind, FunctionImage, instruction_semantic_key
 from reccmp.compare.asm.operand import Mem
-from reccmp.compare.asm.verifier.evidence import target_facts
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.asm.verifier.evidence import transfer
+from reccmp.compare.diagnosis import (
+    AnalysisRecorder,
+    DifferenceKind,
+    InconclusiveReason,
+    StopDetail,
+)
+from reccmp.types import ImageId
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,22 +255,16 @@ class Blocks:
 
 
 def unsupported_control_flow(
-    image: FunctionImage, recorder: AnalysisRecorder | None, side: str
+    image: FunctionImage, recorder: AnalysisRecorder | None, which: ImageId
 ) -> bool:
     """Whether the product cannot walk this side: it has no instructions, or
     a jump whose destinations are unknown. Records why."""
     rows = image.instructions
-
-    def mark(reason: str, index: int | None, facts: dict) -> None:
-        if recorder is None:
-            return
-        if side == "orig":
-            recorder.mark_inconclusive(reason, orig_index=index, facts=facts)
-        else:
-            recorder.mark_inconclusive(reason, recomp_index=index, facts=facts)
-
     if not rows:
-        mark("empty_control_flow", None, {"side": side, "instruction_count": 0})
+        if recorder is not None:
+            recorder.mark_inconclusive(
+                InconclusiveReason.EMPTY_CONTROL_FLOW, image=which
+            )
         return True
     for index, successors in enumerate(image.control_graph().edges):
         if rows[index].flow is not FlowKind.JUMP or not any(
@@ -280,106 +275,101 @@ def unsupported_control_flow(
             isinstance(op, Mem) and any(term.scale == 4 for term in op.terms)
             for op in rows[index].operands
         )
-        mark(
-            "jump_table_data" if switch_candidate else "indirect_jump",
-            index,
-            {
-                "side": side,
-                "failure": (
-                    "unresolved_switch_table" if switch_candidate else "indirect_target"
+        if recorder is not None:
+            recorder.mark_inconclusive(
+                (
+                    InconclusiveReason.JUMP_TABLE_DATA
+                    if switch_candidate
+                    else InconclusiveReason.INDIRECT_JUMP
                 ),
-            },
-        )
+                index if which is ImageId.ORIG else None,
+                index if which is ImageId.RECOMP else None,
+                (
+                    StopDetail.UNRESOLVED_SWITCH_TABLE
+                    if switch_candidate
+                    else StopDetail.INDIRECT_TARGET
+                ),
+            )
         return True
     return False
 
 
+@dataclass(frozen=True, slots=True)
+class _Reached:
+    """A pair of heads to match, and the paired heads whose same-role exit
+    reached them (None for the entries)."""
+
+    orig: int
+    recomp: int
+    source_orig: int | None = None
+    source_recomp: int | None = None
+    exit: Exit | None = None
+
+
 def pair_heads(
-    orig: Blocks,
-    recomp: Blocks,
-    recorder: AnalysisRecorder | None = None,
-    rows: (
-        tuple[tuple[DecodedInstruction, ...], tuple[DecodedInstruction, ...]] | None
-    ) = None,
-) -> list[tuple[int, int]] | None:
-    """Match the two sides' reachable heads into a structural bijection,
-    starting from the entries and following same-role exits. Returns the
-    matched pairs in discovery order, or None if the reachable graphs are
-    not isomorphic. With ``rows``, a branch whose same-role exits reach
-    heads paired elsewhere is recorded as a branch-target difference."""
-    # pylint: disable=too-many-locals
-    map_o: dict[int, int] = {}
-    map_r: dict[int, int] = {}
-    order: list[tuple[int, int]] = []
-    counts = {
-        "orig_block_count": len(orig.heads),
-        "recomp_block_count": len(recomp.heads),
-    }
-    # (orig head, recomp head, the paired heads and exit that reach them)
-    queue: list[tuple[int, int, tuple[int, int, Exit] | None]] = [
-        (orig.entry, recomp.entry, None)
-    ]
-    while queue:
-        head_o, head_r, edge = queue.pop()
-        if head_o in map_o or head_r in map_r:
-            if map_o.get(head_o) != head_r or map_r.get(head_r) != head_o:
-                if recorder is None:
-                    return None
-                if edge is not None and edge[2] != FALL and rows is not None:
-                    branch_o, branch_r = orig.last(edge[0]), recomp.last(edge[1])
-                    recorder.record_difference(
-                        "branch_target",
-                        branch_o,
-                        branch_r,
-                        target_facts(rows[0][branch_o], orig.start(head_o)),
-                        target_facts(rows[1][branch_r], recomp.start(head_r)),
-                    )
-                    return None
-                recorder.mark_inconclusive(
-                    "non_isomorphic_cfg",
-                    orig_index=orig.start(head_o),
-                    recomp_index=recomp.start(head_r),
-                    facts={
-                        "failure": "block_mapping_conflict",
-                        **counts,
-                        "orig_block": head_o,
-                        "recomp_block": head_r,
-                    },
+    orig: Blocks, recomp: Blocks, recorder: AnalysisRecorder | None = None
+) -> bool:
+    """Whether the two sides' reachable heads match one to one, starting
+    from the entries and following same-role edges. When they do not,
+    ``recorder`` gets where: a branch whose same-role edges reach heads
+    paired elsewhere is a branch-target difference."""
+    paired_o: dict[int, int] = {}
+    paired_r: dict[int, int] = {}
+    pending = [_Reached(orig.entry, recomp.entry)]
+    while pending:
+        reached = pending.pop()
+        head_o, head_r = reached.orig, reached.recomp
+        if head_o in paired_o or head_r in paired_r:
+            if paired_o.get(head_o) == head_r and paired_r.get(head_r) == head_o:
+                continue
+            if recorder is None:
+                return False
+            if (
+                reached.source_orig is not None
+                and reached.source_recomp is not None
+                and reached.exit != FALL
+            ):
+                branch_o = orig.last(reached.source_orig)
+                branch_r = recomp.last(reached.source_recomp)
+                recorder.record_difference(
+                    DifferenceKind.BRANCH_TARGET,
+                    branch_o,
+                    branch_r,
+                    transfer(orig.rows[branch_o], orig.start(head_o)),
+                    transfer(recomp.rows[branch_r], recomp.start(head_r)),
                 )
-                return None
-            continue
-        map_o[head_o] = head_r
-        map_r[head_r] = head_o
-        order.append((head_o, head_r))
-        exits_o, exits_r = orig.edges(head_o), recomp.edges(head_r)
-        if set(exits_o) != set(exits_r):
+            else:
+                recorder.mark_inconclusive(
+                    InconclusiveReason.NON_ISOMORPHIC_CFG,
+                    orig.start(head_o),
+                    recomp.start(head_r),
+                    StopDetail.BLOCK_MAPPING_CONFLICT,
+                )
+            return False
+        paired_o[head_o] = head_r
+        paired_r[head_r] = head_o
+        edges_o, edges_r = orig.edges(head_o), recomp.edges(head_r)
+        if set(edges_o) != set(edges_r):
             if recorder is not None:
                 recorder.mark_inconclusive(
-                    "non_isomorphic_cfg",
-                    orig_index=orig.start(head_o),
-                    recomp_index=recomp.start(head_r),
-                    facts={
-                        "failure": "edge_roles",
-                        **counts,
-                    },
+                    InconclusiveReason.NON_ISOMORPHIC_CFG,
+                    orig.start(head_o),
+                    recomp.start(head_r),
+                    StopDetail.EDGE_ROLES,
                 )
-            return None
-        for role, to_o in exits_o.items():
-            to_r = exits_r[role]
-            if (to_o is None) != (to_r is None):
+            return False
+        for role, to_o in edges_o.items():
+            to_r = edges_r[role]
+            if to_o is None and to_r is None:
+                continue
+            if to_o is None or to_r is None:
                 if recorder is not None:
                     recorder.mark_inconclusive(
-                        "non_isomorphic_cfg",
-                        orig_index=orig.start(head_o),
-                        recomp_index=recomp.start(head_r),
-                        facts={
-                            "failure": "external_edge",
-                            "orig_external": to_o is None,
-                            "recomp_external": to_r is None,
-                            **counts,
-                        },
+                        InconclusiveReason.NON_ISOMORPHIC_CFG,
+                        orig.start(head_o),
+                        recomp.start(head_r),
+                        StopDetail.EXTERNAL_EDGE,
                     )
-                return None
-            if to_o is not None and to_r is not None:
-                queue.append((to_o, to_r, (head_o, head_r, role)))
-    return order
+                return False
+            pending.append(_Reached(to_o, to_r, head_o, head_r, role))
+    return True

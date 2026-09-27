@@ -18,7 +18,6 @@ from reccmp.compare.asm.verifier.state import (
     clone_state,
     is_scratch,
 )
-from reccmp.compare.diagnosis import FactValue
 
 # ---------------------------------------------------------------------------
 # CFG-aware verification
@@ -363,26 +362,6 @@ def join_states(
             out_r,
         ),
     )
-
-
-def join_failure_facts(entry: CfgState, incoming: CfgState) -> dict[str, FactValue]:
-    """Compact state-shape evidence for a failed CFG join."""
-    return {
-        "entry_orig_x87_depth": len(entry.orig.x87.known),
-        "entry_recomp_x87_depth": len(entry.recomp.x87.known),
-        "incoming_orig_x87_depth": len(incoming.orig.x87.known),
-        "incoming_recomp_x87_depth": len(incoming.recomp.x87.known),
-        "entry_x87_deep_pops_equal": (
-            entry.orig.x87.deep_pops == entry.recomp.x87.deep_pops
-        ),
-        "incoming_x87_deep_pops_equal": (
-            incoming.orig.x87.deep_pops == incoming.recomp.x87.deep_pops
-        ),
-        "entry_x87_epochs_equal": entry.orig.x87.epoch == entry.recomp.x87.epoch,
-        "incoming_x87_epochs_equal": (
-            incoming.orig.x87.epoch == incoming.recomp.x87.epoch
-        ),
-    }
 
 
 def states_equal(a: CfgState, b: CfgState) -> bool:

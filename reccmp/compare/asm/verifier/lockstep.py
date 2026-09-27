@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from reccmp.compare.asm.ir import DecodedInstruction, instruction_semantic_key
+from reccmp.compare.asm.ir import (
+    DecodedInstruction,
+    instruction_ids,
+    instruction_semantic_key,
+)
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.evidence import (
     record_observable_difference,
@@ -20,7 +24,6 @@ from reccmp.compare.asm.verifier.obligations import (
     observations_agree,
     one_sided_ok,
     record_pair_categories,
-    rewrite_control_observables,
 )
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
@@ -32,7 +35,7 @@ from reccmp.compare.asm.verifier.state import (
     commit_memory,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import AnalysisRecorder, InconclusiveReason, StopDetail
 
 
 def verify_effective_match(
@@ -54,12 +57,8 @@ def verify_effective_match(
     if aligned is None:
         if recorder is not None:
             recorder.mark_inconclusive(
-                "alignment_failure",
-                facts={
-                    "stage": "stream_alignment",
-                    "orig_instruction_count": len(orig_rows),
-                    "recomp_instruction_count": len(recomp_rows),
-                },
+                InconclusiveReason.ALIGNMENT_FAILURE,
+                detail=StopDetail.STREAM_ALIGNMENT,
             )
         return False
 
@@ -68,8 +67,7 @@ def verify_effective_match(
     ctx = Context(metadata=metadata, recorder=recorder)
     last_index_o: int | None = None
     last_index_r: int | None = None
-    orig_cf_addrs = [row.address for row in orig_rows]
-    recomp_cf_addrs = [row.address for row in recomp_rows]
+    orig_ids, recomp_ids = instruction_ids(orig_rows), instruction_ids(recomp_rows)
 
     try:
         for idx, (index_o, index_r) in enumerate(aligned):
@@ -81,10 +79,10 @@ def verify_effective_match(
                 if not one_sided_ok(side, other_side, ctx, idx, row):
                     if recorder is not None:
                         recorder.mark_inconclusive(
-                            "alignment_failure",
+                            InconclusiveReason.ALIGNMENT_FAILURE,
                             index_o,
                             index_r,
-                            {"stage": "one_sided_instruction"},
+                            StopDetail.ONE_SIDED_INSTRUCTION,
                         )
                     return False
                 continue
@@ -111,22 +109,22 @@ def verify_effective_match(
                 if not same:
                     if recorder is not None:
                         recorder.mark_inconclusive(
-                            "unsupported_instruction", index_o, index_r
+                            InconclusiveReason.UNSUPPORTED_INSTRUCTION, index_o, index_r
                         )
                     return False
                 if admit_unsupported_identical(orig, recomp, ctx, idx, ins_o, ins_r):
                     continue
                 if recorder is not None:
                     recorder.mark_inconclusive(
-                        "unsupported_instruction", index_o, index_r
+                        InconclusiveReason.UNSUPPORTED_INSTRUCTION, index_o, index_r
                     )
                 return False
 
             guard_state_size(orig, ctx)
             guard_state_size(recomp, ctx)
 
-            rewrite_control_observables(obs_o, ins_o, orig_cf_addrs)
-            rewrite_control_observables(obs_r, ins_r, recomp_cf_addrs)
+            _rewrite_control_observables(obs_o, ins_o, orig_ids)
+            _rewrite_control_observables(obs_r, ins_r, recomp_ids)
 
             if callee_save_swap(ctx, ins_o, ins_r, obs_o, obs_r, orig, recomp):
                 # The pushed values differ (that is the point of the swap),
@@ -194,9 +192,30 @@ def verify_effective_match(
             return False
     except (Reject, RecursionError):
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
 
     if recorder is not None:
         recorder.reasons.update(ctx.categories)
     return True
+
+
+def _rewrite_control_observables(
+    obs: list, row: DecodedInstruction, ids: dict[int, int]
+) -> None:
+    """A branch observation's destination as a row index or an identity,
+    never a relative displacement."""
+    local = ids.get(row.branch_target) if row.branch_target is not None else None
+    for index, entry in enumerate(obs):
+        if not entry or entry[0] not in CONTROL_TAGS - {"jmpind"}:
+            continue
+        destination: object
+        if local is not None:
+            destination = ("L", local)
+        elif row.control_target is not None:
+            destination = ("ext", row.control_target)
+        elif row.branch_target is not None:
+            destination = ("ext", ("unresolved", None, row.branch_target))
+        else:
+            destination = entry[-1]
+        obs[index] = (*entry[:-1], destination)

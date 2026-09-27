@@ -15,7 +15,11 @@ from reccmp.compare.report import (
     report_function_alignment,
     report_function_accuracy,
 )
-from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    EffectiveReason,
+    InconclusiveReason,
+)
 from reccmp.types import EntityType, ImageId
 from reccmp.cvdump import CvdumpAnalysis
 from .raw_image import RawImage
@@ -713,12 +717,14 @@ def test_report_function_accuracy():
                 type=entity_type,
                 is_stub=stub,
                 analysis=(
-                    ComparisonAnalysis.effective({"register_allocation"})
+                    ComparisonAnalysis.effective({EffectiveReason.REGISTER_ALLOCATION})
                     if effective
                     else (
                         ComparisonAnalysis.exact()
                         if accuracy == 1.0
-                        else ComparisonAnalysis.inconclusive("analysis_limit")
+                        else ComparisonAnalysis.inconclusive(
+                            InconclusiveReason.ANALYSIS_LIMIT
+                        )
                     )
                 ),
             ),

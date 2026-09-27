@@ -27,9 +27,12 @@ from reccmp.compare.comparison_json import analysis_json, parse_analysis
 from reccmp.compare.extent import EntityExtent
 from reccmp.compare.diagnosis import (
     AnalysisRecorder,
-    RefutationWitness,
     ComparisonAnalysis,
     ComparisonStatus,
+    DifferenceKind,
+    InconclusiveReason,
+    SolverResult,
+    WitnessKind,
 )
 from reccmp.compare.refutation import _hint_fate, _solver_hints
 from reccmp.formats.image import ImageSection, ImageSectionFlags
@@ -58,7 +61,7 @@ from reccmp.compare.witness.machine import (
 )
 from reccmp.compare.witness.hints import Rejection, input_from_assignment
 from reccmp.compare.witness.search import HINT_SEED, UNRESOLVED, _excerpt_constants
-from tests.asm_rows import verify_effective_match
+from reccmp.compare.asm.verifier import verify_effective_match
 
 CODE = 0x401000
 DATA = 0x402000
@@ -110,6 +113,16 @@ def _function_image(start: int, code: bytes) -> FunctionImage:
         extent_kind=ExtentKind.KNOWN,
         instructions=tuple(disasm_detail(code, start)),
     )
+
+
+def _verifier_recorder(orig: bytes, recomp: bytes) -> AnalysisRecorder:
+    orig_image = _function_image(ORIG_FUNC, orig)
+    recomp_image = _function_image(RECOMP_FUNC, recomp)
+    recorder = AnalysisRecorder(orig_image, recomp_image)
+    verify_effective_match(
+        orig_image.instructions, recomp_image.instructions, recorder=recorder
+    )
+    return recorder
 
 
 def _translator(
@@ -207,7 +220,7 @@ def test_different_constant_is_refuted():
         LOAD_ARG + bytes.fromhex("83c002") + RET,  # add eax, 2
     )
     assert result.witness is not None
-    assert result.witness.kind == "return_value"
+    assert result.witness.kind == WitnessKind.RETURN_VALUE
 
 
 def test_equivalent_arithmetic_is_not_refuted():
@@ -233,7 +246,7 @@ def test_different_stored_value_is_refuted():
     store = bytes.fromhex("8b4c2404c74108")
     result = _search(store + _abs32(5) + RET, store + _abs32(6) + RET)
     assert result.witness is not None
-    assert result.witness.kind == "memory_value"
+    assert result.witness.kind == WitnessKind.MEMORY_VALUE
 
 
 def test_same_table_entry_at_different_addresses_agrees():
@@ -279,13 +292,13 @@ def test_witness_turns_inconclusive_into_refuted_mismatch():
         LOAD_ARG + bytes.fromhex("83c002") + RET,
     )
     assert result.witness is not None
-    refuted = ComparisonAnalysis.inconclusive("non_isomorphic_cfg").with_witness(
-        result.witness
-    )
+    refuted = ComparisonAnalysis.inconclusive(
+        InconclusiveReason.NON_ISOMORPHIC_CFG
+    ).with_witness(result.witness)
     assert refuted.status == ComparisonStatus.MISMATCH
     assert refuted.is_refuted
     assert refuted.difference is not None
-    assert refuted.difference.kind == "return_value"
+    assert refuted.difference.kind == DifferenceKind.RETURN_VALUE
     with pytest.raises(ValueError):
         ComparisonAnalysis.exact().with_witness(result.witness)
 
@@ -420,7 +433,7 @@ def test_nothing_after_a_guessed_call_cleanup_is_a_witness():
         callee_body=bytes.fromhex("c20400"),  # ret 4
     )
     assert result.witness is not None
-    assert result.witness.kind == "memory_value"
+    assert result.witness.kind == WitnessKind.MEMORY_VALUE
 
 
 def _ecx_then_call(value: int, func: int, callee: int, tail: bytes = RET) -> bytes:
@@ -439,7 +452,7 @@ def test_register_arguments_are_compared_when_the_callee_reads_them():
         orig, recomp, return_kind="void", call_facts=lambda _identity: thiscall
     )
     assert result.witness is not None
-    assert result.witness.kind == "call_argument"
+    assert result.witness.kind == WitnessKind.CALL_ARGUMENT
     assert result.witness.location.endswith("ecx")
 
 
@@ -682,21 +695,16 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
     tail = bytes.fromhex("06") + bytes.fromhex("b801000000c3") + bytes.fromhex("31c0c3")
     orig, recomp = head + b"\x72" + tail, head + b"\x76" + tail
 
-    recorder = AnalysisRecorder()
-    assert not verify_effective_match(
-        list(disasm_detail(orig, ORIG_FUNC)),
-        list(disasm_detail(recomp, RECOMP_FUNC)),
-        recorder=recorder,
-    )
+    recorder = _verifier_recorder(orig, recomp)
     difference = recorder.difference or recorder.candidate_difference
-    assert difference is not None and difference.kind == "branch_condition"
+    assert difference is not None and difference.kind == DifferenceKind.BRANCH_CONDITION
     hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
     assert [hint.stack_args[0] for hint in hints] == [0x122F]
 
     assert _search(orig, recomp).witness is None  # the seeds miss it
     witness = _search(orig, recomp, hints=hints).witness
     assert witness is not None
-    assert (witness.seed, witness.kind) == (HINT_SEED, "return_value")
+    assert (witness.seed, witness.kind) == (HINT_SEED, WitnessKind.RETURN_VALUE)
 
 
 def _field(offset: int, size: str = "word", register: str = "c") -> tuple:
@@ -767,12 +775,7 @@ def test_a_solver_input_can_set_this_fields():
     """`this->count + 5 < 0x1234` against `<=`: differs only when the field
     holds 0x122f, which the input sets in modelled memory."""
     orig, recomp = FIELD_BELOW, FIELD_BELOW_OR_EQUAL
-    recorder = AnalysisRecorder()
-    verify_effective_match(
-        list(disasm_detail(orig, ORIG_FUNC)),
-        list(disasm_detail(recomp, RECOMP_FUNC)),
-        recorder=recorder,
-    )
+    recorder = _verifier_recorder(orig, recomp)
     difference = recorder.difference or recorder.candidate_difference
     assert difference is not None
     hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
@@ -785,7 +788,7 @@ def test_a_solver_input_can_set_this_fields():
 _REPLAY_IN_A_FRESH_PROCESS = """
 import json, sys
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.diagnosis import RefutationWitness
+from reccmp.compare.comparison_json import parse_analysis
 from reccmp.compare.witness import replay
 from tests.test_witness import FIELD_BELOW, FIELD_BELOW_OR_EQUAL, _translator
 
@@ -793,7 +796,8 @@ def no_solver(*_args, **_kwargs):
     raise AssertionError("replay ran the solver")
 
 bitvector._query = no_solver
-witness = RefutationWitness.from_json(json.loads(sys.stdin.read()))
+witness = parse_analysis(json.loads(sys.stdin.read())).witness
+assert witness is not None
 result = replay(_translator(FIELD_BELOW, FIELD_BELOW_OR_EQUAL), witness)
 print(json.dumps([result.reproduced, list(result.problems)]))
 """
@@ -802,23 +806,16 @@ print(json.dumps([result.reproduced, list(result.problems)]))
 def test_a_solver_witness_replays_in_a_fresh_process():
     """The record is the whole witness: another process reproduces the
     divergence from it, with no solver and no search."""
-    recorder = AnalysisRecorder()
-    verify_effective_match(
-        list(disasm_detail(FIELD_BELOW, ORIG_FUNC)),
-        list(disasm_detail(FIELD_BELOW_OR_EQUAL, RECOMP_FUNC)),
-        recorder=recorder,
-    )
+    recorder = _verifier_recorder(FIELD_BELOW, FIELD_BELOW_OR_EQUAL)
     difference = recorder.difference or recorder.candidate_difference
     assert difference is not None
     hints, _ = _solver_hints(ComparisonAnalysis.mismatch(difference))
     witness = _search(FIELD_BELOW, FIELD_BELOW_OR_EQUAL, hints=hints).witness
     assert witness is not None and witness.replay is not None
     assert witness.seed == HINT_SEED and witness.replay.input.memory
-    serialized = json.dumps(dataclasses.asdict(witness))
-    assert RefutationWitness.from_json(json.loads(serialized)) == witness
     refuted = ComparisonAnalysis.mismatch(difference).with_witness(witness)
-    in_report = json.loads(json.dumps(analysis_json(refuted)))
-    assert parse_analysis(in_report).witness == witness
+    serialized = json.dumps(analysis_json(refuted))
+    assert parse_analysis(json.loads(serialized)).witness == witness
     process = subprocess.run(
         [sys.executable, "-c", _REPLAY_IN_A_FRESH_PROCESS],
         input=serialized,
@@ -849,12 +846,7 @@ def test_a_replay_says_why_it_does_not_reproduce():
 
 
 def _difference(orig: bytes, recomp: bytes):
-    recorder = AnalysisRecorder()
-    verify_effective_match(
-        list(disasm_detail(orig, ORIG_FUNC)),
-        list(disasm_detail(recomp, RECOMP_FUNC)),
-        recorder=recorder,
-    )
+    recorder = _verifier_recorder(orig, recomp)
     difference = recorder.difference or recorder.candidate_difference
     assert difference is not None
     return difference
@@ -863,8 +855,8 @@ def _difference(orig: bytes, recomp: bytes):
 def test_a_value_difference_says_what_the_solver_found():
     difference = _difference(FIELD_BELOW, FIELD_BELOW_OR_EQUAL)
     assert difference.solver is not None
-    assert difference.solver["result"] == "differs"
-    assert isinstance(difference.solver["rlimit"], int)
+    assert difference.solver.result is SolverResult.DIFFERS
+    assert isinstance(difference.solver.rlimit, int)
     in_report = json.loads(
         json.dumps(analysis_json(ComparisonAnalysis.mismatch(difference)))
     )
@@ -971,7 +963,10 @@ def test_a_difference_through_an_estimated_extent_is_not_a_witness():
     )
     assert result.witness is None
     assert result.skipped["estimated_extent"] == result.runs
-    assert result.skipped_details["estimated_extent"]["kind"] == "memory_value"
+    assert (
+        result.skipped_details["estimated_extent"]["kind"]
+        == DifferenceKind.MEMORY_VALUE
+    )
     # With the size recorded, the same difference refutes.
     result = _search(
         _store_to_table(4, 5, ORIG_TABLE), _store_to_table(4, 6, RECOMP_TABLE)
@@ -1046,7 +1041,7 @@ def test_unpaired_read_only_constants_are_read_as_what_they_hold():
     other = _search(
         _load_table(4, ORIG_TABLE), _load_table(8, RECOMP_TABLE), pair_table=False
     )
-    assert other.witness is not None and other.witness.kind == "return_value"
+    assert other.witness is not None and other.witness.kind == WitnessKind.RETURN_VALUE
     # Relocated bytes are pointers, whose values depend on the layout.
     relocated = _search(
         _load_table(4, ORIG_TABLE),

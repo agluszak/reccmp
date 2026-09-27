@@ -225,77 +225,73 @@ def image_from_bytes(code: bytes, start: int = START) -> FunctionImage:
     return decode_function(code, start)
 
 
+def _jump_to(
+    row: DecodedInstruction, index: int, addresses: Sequence[int]
+) -> int | None:
+    """The row a relative jump at ``index`` reaches, from its displacement."""
+    match row.operands:
+        case (Imm(displacement),) if row.is_jump:
+            following = (
+                addresses[index + 1]
+                if index + 1 < len(addresses)
+                else addresses[index] + row.size
+            )
+            destination = following + displacement
+            return addresses.index(destination) if destination in addresses else None
+    return None
+
+
 def as_rows(
     value,
     *,
     targets: Sequence[int | None] | None = None,
     addresses: Sequence[int] | None = None,
-    meta: Sequence[object | None] | None = None,
+    meta: Sequence[DecodedInstruction | None] | None = None,
     start: int = START,
 ) -> tuple[DecodedInstruction, ...]:
-    """Decode literal assembly at the test boundary, then attach test facts."""
-    result = (
-        tuple(value)
+    """Decode literal assembly at the test boundary. ``addresses`` places
+    the rows (relative jumps then reach the row at their destination),
+    ``targets`` names the row each jump reaches, and a ``meta`` row stands
+    for its line with the decode facts a test gives it."""
+    result = list(
+        value
         if value and isinstance(value[0], DecodedInstruction)
         else rows(value, targets, start=start)
     )
-    updated = []
     for index, row in enumerate(result):
-        changes: dict[str, object] = {}
+        if meta is not None and meta[index] is not None:
+            row = meta[index]
         if addresses is not None:
-            changes["address"] = addresses[index]
-            if (
-                targets is None
-                and row.is_jump
-                and row.operands
-                and isinstance(row.operands[0], Imm)
-            ):
-                next_addr = (
-                    addresses[index + 1]
-                    if index + 1 < len(addresses)
-                    else addresses[index] + row.size
+            row = replace(row, address=addresses[index])
+            reached = _jump_to(row, index, addresses) if targets is None else None
+            if reached is not None:
+                row = replace(
+                    row,
+                    branch_target=addresses[reached],
+                    control_target=("local_insn", reached),
                 )
-                destination = next_addr + row.operands[0].value
-                if destination in addresses:
-                    target_index = addresses.index(destination)
-                    changes["branch_target"] = destination
-                    changes["control_target"] = ("local_insn", target_index)
         target = targets[index] if targets is not None else None
         if target is not None:
-            changes["branch_target"] = (
-                addresses[target]
-                if addresses is not None and 0 <= target < len(addresses)
-                else start + target
+            row = replace(
+                row,
+                branch_target=(
+                    addresses[target]
+                    if addresses is not None and 0 <= target < len(addresses)
+                    else start + target
+                ),
+                control_target=("local_insn", target),
             )
-            changes["control_target"] = ("local_insn", target)
-        if meta is not None and meta[index] is not None:
-            facts = meta[index]
-            for name in (
-                "regs_read",
-                "regs_written",
-                "reads_flags",
-                "writes_flags",
-                "accesses_memory",
-                "flow",
-                "register_access_known",
-                "operand_model_complete",
-                "control_flow_known",
-                "control_target",
-                "branch_target",
-            ):
-                if hasattr(facts, name):
-                    changes[name] = getattr(facts, name)
-        updated.append(replace(row, **changes) if changes else row)
+        result[index] = row
     if addresses is not None:
-        for index, row in enumerate(updated[:-1]):
-            following = updated[index + 1]
+        for index, row in enumerate(result[:-1]):
+            following = result[index + 1]
             if (
                 row.address is not None
                 and following.address is not None
                 and following.address > row.address
             ):
-                updated[index] = replace(row, size=following.address - row.address)
-    return tuple(updated)
+                result[index] = replace(row, size=following.address - row.address)
+    return tuple(result)
 
 
 def verify_effective_match(
@@ -303,14 +299,13 @@ def verify_effective_match(
     recomp,
     codes=None,
     metadata=None,
-    recorder=None,
     *,
     orig_addrs=None,
     recomp_addrs=None,
     orig_meta=None,
     recomp_meta=None,
 ):
-    """Call the production verifier with fixture rows."""
+    """Call the production lockstep verifier with fixture rows."""
     from reccmp.compare.asm.verifier import verify_effective_match as verify
 
     return verify(
@@ -318,61 +313,52 @@ def verify_effective_match(
         as_rows(recomp, addresses=recomp_addrs, meta=recomp_meta, start=0x2000),
         codes,
         metadata,
-        recorder,
     )
 
 
-def verify_isomorphic_cfg_effective_match(
+def _fixture_image(lines, targets, addresses, start, tables) -> FunctionImage:
+    fixture_rows = as_rows(
+        lines, targets=targets or None, addresses=addresses, start=start
+    )
+    extent = max(
+        (
+            row.address + row.size - start
+            for row in fixture_rows
+            if row.address is not None
+        ),
+        default=0,
+    )
+    extent = max(
+        [extent] + [entry + 4 - start for table in tables for entry, _ in table.entries]
+    )
+    return FunctionImage(start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables))
+
+
+def run_product(
     orig,
     recomp,
     orig_targets=(),
     recomp_targets=(),
     metadata=None,
-    recorder=None,
     *,
     orig_addrs=None,
     recomp_addrs=None,
     orig_tables=(),
     recomp_tables=(),
-    unanchored=None,
 ):
-    from reccmp.compare.asm.verifier import (
-        verify_isomorphic_cfg_effective_match as verify,
-    )
+    """The product verifier's result on fixture lines."""
+    from reccmp.compare.asm.verifier import verify_isomorphic_cfg_effective_match
 
-    if recorder is not None:
-        orig_addrs = orig_addrs if orig_addrs is not None else recorder.orig_addrs
-        recomp_addrs = (
-            recomp_addrs if recomp_addrs is not None else recorder.recomp_addrs
-        )
-
-    def fixture_image(lines, targets, addresses, start, tables):
-        fixture_rows = as_rows(
-            lines, targets=targets or None, addresses=addresses, start=start
-        )
-        extent = max(
-            (
-                row.address + row.size - start
-                for row in fixture_rows
-                if row.address is not None
-            ),
-            default=0,
-        )
-        extent = max(
-            [extent]
-            + [entry + 4 - start for table in tables for entry, _ in table.entries]
-        )
-        return FunctionImage(
-            start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables)
-        )
-
-    return verify(
-        fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
-        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
+    return verify_isomorphic_cfg_effective_match(
+        _fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
+        _fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
         metadata,
-        recorder,
-        unanchored,
     )
+
+
+def prove_product(*args, **kwargs) -> bool:
+    """Whether the product verifier proves fixture lines equivalent."""
+    return run_product(*args, **kwargs).proved
 
 
 def analyze_effective_match(

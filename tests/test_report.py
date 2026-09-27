@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from reccmp.compare.asm.operand import Mem, ScaledReg
 from reccmp.compare.report import (
     ReccmpStatusReport,
     ReccmpComparedEntity,
@@ -17,10 +18,17 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonDifference,
     ComparisonStatus,
+    DifferenceKind,
     DifferenceSide,
+    EffectiveReason,
+    InconclusiveReason,
+    Observed,
+    StopDetail,
+    StopLocation,
+    Strategy,
     StrategyAttempt,
 )
-from reccmp.types import EntityType
+from reccmp.types import EntityType, ImageId
 
 
 def create_report(
@@ -33,7 +41,7 @@ def create_report(
             analysis = (
                 ComparisonAnalysis.exact()
                 if accuracy == 1.0
-                else ComparisonAnalysis.inconclusive("analysis_limit")
+                else ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
             )
             report.entities[addr] = ReccmpComparedEntity(
                 addr, "test", accuracy, analysis=analysis
@@ -106,7 +114,9 @@ def test_aggregate_100_over_effective():
     """Prefer 100% match over effective."""
     x = create_report([(100, 0.9)])
     y = create_report([(100, 1.0)])
-    x.entities[100].analysis = ComparisonAnalysis.effective({"register_allocation"})
+    x.entities[100].analysis = ComparisonAnalysis.effective(
+        {EffectiveReason.REGISTER_ALLOCATION}
+    )
 
     combined = combine_reports([x, y])
     assert combined.entities[100].is_effective_match is False
@@ -116,7 +126,9 @@ def test_aggregate_effective_over_any():
     """Prefer effective match over any accuracy."""
     x = create_report([(100, 0.5)])
     y = create_report([(100, 0.6)])
-    x.entities[100].analysis = ComparisonAnalysis.effective({"register_allocation"})
+    x.entities[100].analysis = ComparisonAnalysis.effective(
+        {EffectiveReason.REGISTER_ALLOCATION}
+    )
     # Y has higher accuracy score, but we could not confirm an effective match.
 
     combined = combine_reports([x, y])
@@ -175,54 +187,50 @@ def test_structured_comparison_schema_round_trip():
     report = ReccmpStatusReport(filename="test.exe")
     analyses = [
         ComparisonAnalysis.exact(),
-        ComparisonAnalysis.effective({"padding", "register_allocation"}),
+        ComparisonAnalysis.effective(
+            {EffectiveReason.PADDING, EffectiveReason.REGISTER_ALLOCATION}
+        ),
         ComparisonAnalysis.mismatch(
             ComparisonDifference(
-                "memory_address",
+                DifferenceKind.MEMORY_ADDRESS,
                 DifferenceSide(
+                    ImageId.ORIG,
                     12,
                     0x401234,
-                    {
-                        "base_register": "esi",
-                        "index_register": None,
-                        "scale": 1,
-                        "displacement": 0x98,
-                        "symbol": None,
-                    },
+                    Observed(
+                        operand=Mem("dword", "", (ScaledReg("esi", 1),), 0x98, ())
+                    ),
                 ),
                 DifferenceSide(
+                    ImageId.RECOMP,
                     13,
                     0x501234,
-                    {
-                        "base_register": "esi",
-                        "index_register": None,
-                        "scale": 1,
-                        "displacement": 0x9C,
-                        "symbol": None,
-                    },
+                    Observed(
+                        operand=Mem("dword", "", (ScaledReg("esi", 1),), 0x9C, ())
+                    ),
                 ),
             ),
         ),
         dataclasses.replace(
             ComparisonAnalysis.inconclusive(
-                "non_isomorphic_cfg",
-                DifferenceSide(
+                InconclusiveReason.NON_ISOMORPHIC_CFG,
+                StopLocation(
+                    ImageId.ORIG,
                     7,
                     0x400123,
-                    {
-                        "failure": "edge_roles",
-                        "orig_block_count": 8,
-                        "recomp_block_count": 9,
-                    },
+                    detail=StopDetail.EDGE_ROLES,
                 ),
             ),
             attempts=(
                 StrategyAttempt(
-                    "lockstep",
-                    blocker="unsupported_instruction",
-                    location=DifferenceSide(3, 0x400110, {}),
+                    Strategy.LOCKSTEP,
+                    blocker=InconclusiveReason.UNSUPPORTED_INSTRUCTION,
+                    location=StopLocation(ImageId.ORIG, 3, 0x400110),
                 ),
-                StrategyAttempt("isomorphic_cfg", blocker="non_isomorphic_cfg"),
+                StrategyAttempt(
+                    Strategy.ISOMORPHIC_CFG,
+                    blocker=InconclusiveReason.NON_ISOMORPHIC_CFG,
+                ),
             ),
         ),
     ]
@@ -259,10 +267,23 @@ def test_structured_comparison_schema_round_trip():
     assert value["data"][3]["comparison"]["attempts"] == [
         {
             "strategy": "lockstep",
+            "difference": None,
             "blocker": "unsupported_instruction",
-            "location": {"instruction_index": 3, "address": 0x400110, "facts": {}},
+            "location": {
+                "image": "orig",
+                "instruction_index": 3,
+                "address": 0x400110,
+                "counterpart_address": None,
+                "detail": None,
+                "source": None,
+            },
         },
-        {"strategy": "isomorphic_cfg", "blocker": "non_isomorphic_cfg"},
+        {
+            "strategy": "isomorphic_cfg",
+            "difference": None,
+            "blocker": "non_isomorphic_cfg",
+            "location": None,
+        },
     ]
     assert {
         key: item
@@ -272,13 +293,12 @@ def test_structured_comparison_schema_round_trip():
         "status": "inconclusive",
         "inconclusive_reason": "non_isomorphic_cfg",
         "inconclusive_location": {
+            "image": "orig",
             "instruction_index": 7,
             "address": 0x400123,
-            "facts": {
-                "failure": "edge_roles",
-                "orig_block_count": 8,
-                "recomp_block_count": 9,
-            },
+            "counterpart_address": None,
+            "detail": "edge_roles",
+            "source": None,
         },
     }
 

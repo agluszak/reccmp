@@ -7,6 +7,7 @@ from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     DiagnosticNormalization,
+    InconclusiveReason,
     StackPermutationEntry,
     derive_diagnostic_normalizations,
 )
@@ -33,7 +34,9 @@ class EntityCompareResult:
     match_ratio: float = 0.0
     display_similarity: float | None = None
     analysis: ComparisonAnalysis = dataclasses.field(
-        default_factory=lambda: ComparisonAnalysis.inconclusive("analysis_limit")
+        default_factory=lambda: ComparisonAnalysis.inconclusive(
+            InconclusiveReason.ANALYSIS_LIMIT
+        )
     )
     stack_permutation: tuple[StackPermutationEntry, ...] = ()
     accuracy_modulo_stack: float | None = None

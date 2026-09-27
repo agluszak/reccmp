@@ -19,6 +19,9 @@ from reccmp.compare.diagnosis import (
     AnalysisRecorder,
     ComparisonAnalysis,
     ComparisonStatus,
+    EffectiveReason,
+    InconclusiveReason,
+    Strategy,
 )
 from reccmp.compare.pinned_sequences import DiffOpcode
 from reccmp.compare.verification import admit_effective, admit_exact_analysis
@@ -97,21 +100,16 @@ def analyze_effective_match(
     # Embedded bytes can be read through indexed operands without appearing
     # as instruction effects. Until those reads are modeled against regions,
     # a change to the data cannot be admitted by a code-only proof.
-    orig_data = tuple(
-        (region.address - orig.start_addr, region.data) for region in orig.data_regions
-    )
-    recomp_data = tuple(
-        (region.address - recomp.start_addr, region.data)
-        for region in recomp.data_regions
-    )
-    embedded_data_differs = orig_data != recomp_data
+    embedded_data_differs = orig.data_shape[0] != recomp.data_shape[0]
 
     def finish_effective(reasons) -> ComparisonAnalysis:
         if embedded_data_differs:
-            return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
+            return ComparisonAnalysis.inconclusive(
+                InconclusiveReason.EMBEDDED_DATA_MISMATCH
+            )
         reason_set = set(reasons)
         if not reason_set:
-            reason_set.add("instruction_reorder")
+            reason_set.add(EffectiveReason.INSTRUCTION_REORDER)
         admitted = admit_effective(
             reason_set,
             coverage_incomplete=coverage_incomplete,
@@ -119,14 +117,11 @@ def analyze_effective_match(
         )
         if admitted is None:
             return ComparisonAnalysis.inconclusive(
-                "incomplete_coverage" if coverage_incomplete else "open_extent"
+                InconclusiveReason.INCOMPLETE_COVERAGE
+                if coverage_incomplete
+                else InconclusiveReason.OPEN_EXTENT
             )
-        return admitted.analysis
-
-    addrs = ([row.address for row in orig_rows], [row.address for row in recomp_rows])
-
-    def new_recorder() -> AnalysisRecorder:
-        return AnalysisRecorder(*addrs)
+        return admitted
 
     # Plain lockstep pairing first (with trailing alignment padding
     # trimmed): for equal-length sequences the diff's insert/delete blocks
@@ -137,54 +132,56 @@ def analyze_effective_match(
         recomp_rows
     )
     relocated = undo_relocations(codes, orig_rows, recomp_rows)
-    lockstep = new_recorder()
+    lockstep = AnalysisRecorder(orig, recomp)
     if verify_effective_match(
         trimmed_orig, trimmed_recomp, metadata=metadata, recorder=lockstep
     ):
         logger.debug("effective match: lockstep")
-        extra_reasons = {"padding"} if padding else set()
+        extra_reasons = {EffectiveReason.PADDING} if padding else set()
         if relocated is not None:
-            extra_reasons.add("instruction_reorder")
+            extra_reasons.add(EffectiveReason.INSTRUCTION_REORDER)
         return finish_effective(lockstep.effective_reasons(extra_reasons))
 
     # Diff-aligned pairing: handles length differences (one-sided entries
     # for whitelisted unobservable instructions, e.g. a redundant
     # register copy) and transposed independent lines.
-    diff_aligned = new_recorder()
+    diff_aligned = AnalysisRecorder(orig, recomp)
     if verify_effective_match(
         orig_rows, recomp_rows, codes, metadata=metadata, recorder=diff_aligned
     ):
         logger.debug("effective match: diff-aligned")
         return finish_effective(diff_aligned.effective_reasons())
 
-    relocation = new_recorder()
+    # Its instruction positions are those of the reordered sequence.
+    relocation = AnalysisRecorder(
+        orig, recomp.with_instructions(relocated) if relocated is not None else recomp
+    )
     if relocated is not None and verify_effective_match(
         orig_rows, relocated, metadata=metadata, recorder=relocation
     ):
         logger.debug("effective match: instruction relocation")
-        return finish_effective(relocation.effective_reasons({"instruction_reorder"}))
+        return finish_effective(
+            relocation.effective_reasons({EffectiveReason.INSTRUCTION_REORDER})
+        )
 
     # Isomorphic-CFG verification: per-side block graphs matched by
     # structure. Tolerates different instruction counts (folded loads,
     # elided copies) and the shifted branch displacements they cause.
-    iso = new_recorder()
-    unanchored = new_recorder()
-    if verify_isomorphic_cfg_effective_match(
-        orig,
-        recomp,
-        metadata=metadata,
-        recorder=iso,
-        unanchored=unanchored,
-    ):
+    product = verify_isomorphic_cfg_effective_match(orig, recomp, metadata)
+    iso = product.recorder
+    if product.proved:
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
 
-    attempts = [lockstep.attempt("lockstep"), diff_aligned.attempt("diff_aligned")]
+    attempts = [
+        lockstep.attempt(Strategy.LOCKSTEP),
+        diff_aligned.attempt(Strategy.DIFF_ALIGNED),
+    ]
     if relocated is not None:
-        attempts.append(relocation.attempt("relocation"))
-    attempts.append(iso.attempt("isomorphic_cfg"))
-    if unanchored.best_difference is not None or unanchored.inconclusive_reason:
-        attempts.append(unanchored.attempt("unanchored_product"))
+        attempts.append(relocation.attempt(Strategy.RELOCATION))
+    attempts.append(iso.attempt(Strategy.ISOMORPHIC_CFG))
+    if product.unanchored is not None:
+        attempts.append(product.unanchored.attempt(Strategy.UNANCHORED_PRODUCT))
 
     def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
         return dataclasses.replace(

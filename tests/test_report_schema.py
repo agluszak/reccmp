@@ -4,7 +4,11 @@ import json
 
 import pytest
 
-from reccmp.compare.diagnosis import ComparisonAnalysis
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    EffectiveReason,
+    InconclusiveReason,
+)
 from reccmp.compare.report import (
     ReccmpComparedEntity,
     ReccmpReportDeserializeError,
@@ -24,7 +28,9 @@ def test_current_report_round_trip_keeps_type_and_varying_address():
             0.75,
             type=EntityType.FUNCTION,
             recomp_addr_varies=True,
-            analysis=ComparisonAnalysis.effective({"register_allocation"}),
+            analysis=ComparisonAnalysis.effective(
+                {EffectiveReason.REGISTER_ALLOCATION}
+            ),
         )
     )
     encoded = json.loads(serialize_reccmp_report(report))
@@ -55,7 +61,7 @@ def test_old_or_ambiguous_report_facts_are_rejected(change):
             "function",
             0.5,
             recomp_addr=0x200,
-            analysis=ComparisonAnalysis.inconclusive("analysis_limit"),
+            analysis=ComparisonAnalysis.inconclusive(InconclusiveReason.ANALYSIS_LIMIT),
         )
     )
     encoded = json.loads(serialize_reccmp_report(report))

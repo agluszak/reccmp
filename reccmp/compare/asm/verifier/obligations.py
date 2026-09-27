@@ -5,7 +5,7 @@ swaps, frame slots and the end-of-run admission checklist."""
 from __future__ import annotations
 
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.model import FAMILY_REGISTER, REGISTERS, Reject
 from reccmp.compare.asm.operand import Mem, Reg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
@@ -14,9 +14,9 @@ from reccmp.compare.asm.verifier.addresses import (
     unwind_spadd,
 )
 from reccmp.compare.asm.verifier.evidence import (
-    diagnostic_summaries,
     record_observable_difference,
 )
+from reccmp.compare.asm.verifier.render import render
 from reccmp.compare.asm.verifier.semantics import (
     esp_add,
     execute,
@@ -29,7 +29,6 @@ from reccmp.compare.asm.verifier.state import (
     is_scratch,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
-    CONTROL_TAGS,
     FAMILIES,
     WIDTHS,
     Context,
@@ -41,7 +40,13 @@ from reccmp.compare.asm.verifier.state import (
     memory_load_tag,
     vsort,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder
+from reccmp.compare.diagnosis import (
+    AnalysisRecorder,
+    DifferenceKind,
+    EffectiveReason,
+    InconclusiveReason,
+    Observed,
+)
 
 # ---------------------------------------------------------------------------
 # Lockstep driver
@@ -203,33 +208,6 @@ def divergences_justified(ctx: Context, orig: SideState, recomp: SideState) -> b
         if slot_o != slot_r and not (is_scratch(slot_o) and is_scratch(slot_r)):
             return False
     return True
-
-
-def _control_destination(
-    raw_operand: object,
-    row: DecodedInstruction,
-    addrs: list[int | None],
-) -> object:
-    """Prefer local instruction-id; never a relative displacement."""
-    if row.branch_target is not None:
-        try:
-            return ("L", addrs.index(row.branch_target))
-        except ValueError:
-            pass
-    if row.control_target is not None:
-        return ("ext", row.control_target)
-    if row.branch_target is not None:
-        return ("ext", ("unresolved", None, row.branch_target))
-    return raw_operand
-
-
-def rewrite_control_observables(
-    obs: list, row: DecodedInstruction, addrs: list[int | None]
-) -> None:
-    """A branch observation's destination as a row index or an identity."""
-    for index, entry in enumerate(obs):
-        if entry and entry[0] in CONTROL_TAGS - {"jmpind"}:
-            obs[index] = (*entry[:-1], _control_destination(entry[-1], row, addrs))
 
 
 CALLEE_SAVED = ("b", "si", "di")
@@ -397,7 +375,7 @@ def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     ctx.gen = tag
     ctx.scratch_pushes.append([state, offset, value, tag])
     invalidate_save_slots(ctx, obs)
-    ctx.categories.add("callee_save_substitution")
+    ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
     return True
 
 
@@ -425,7 +403,7 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
             break
     state.write_reg(register, value)
     state.write_reg("esp", esp_add(esp, 4))
-    ctx.categories.add("callee_save_substitution")
+    ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
     return True
 
 
@@ -448,7 +426,7 @@ def one_sided_ok(
     if not may_be_one_sided(ins):
         return False
     if ins.mnemonic == "nop":
-        ctx.categories.add("dead_operation")
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
         return True
     try:
         # With the frame promoted, a push or pop is a slot like any other.
@@ -471,9 +449,9 @@ def one_sided_ok(
     if len(state.load_log) > reads_before:
         for entry in state.load_log - log_snapshot:
             ctx.load_obligations.append((other, *entry))
-        ctx.categories.add("load_folding")
+        ctx.categories.add(EffectiveReason.LOAD_FOLDING)
     else:
-        ctx.categories.add("dead_operation")
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
     return True
 
 
@@ -517,13 +495,12 @@ def discharge_run_obligations(
             continue
         if family not in CALLER_SAVED:
             if recorder is not None:
-                summary_o, summary_r = diagnostic_summaries(value_o, value_r)
                 recorder.record_difference(
-                    "preserved_state",
+                    DifferenceKind.PRESERVED_STATE,
                     last_index_o,
                     last_index_r,
-                    {"register": family, "value": summary_o},
-                    {"register": family, "value": summary_r},
+                    Observed(value=render(value_o), register=FAMILY_REGISTER[family]),
+                    Observed(value=render(value_r), register=FAMILY_REGISTER[family]),
                 )
             return False
         if (
@@ -541,26 +518,29 @@ def discharge_run_obligations(
                 continue
             if not (_contained(value, ctx) or _assembled(value, ctx)):
                 if recorder is not None:
-                    recorder.mark_inconclusive("analysis_limit")
+                    recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
                 return False
             dead_register_difference = True
-    if dead_register_difference and "register_allocation" not in ctx.categories:
-        ctx.categories.add("dead_operation")
+    if (
+        dead_register_difference
+        and EffectiveReason.REGISTER_ALLOCATION not in ctx.categories
+    ):
+        ctx.categories.add(EffectiveReason.DEAD_OPERATION)
 
     if ctx.save_stack:
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
     if not _load_obligations_met(ctx):
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
     if not _slots_consistent(orig, recomp):
         if recorder is not None:
-            recorder.mark_inconclusive("analysis_limit")
+            recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)
         return False
     if _uses_frame_slot_layout(orig, recomp):
-        ctx.categories.add("frame_slot_layout")
+        ctx.categories.add(EffectiveReason.FRAME_SLOT_LAYOUT)
 
     if orig.x87.state_key()[1:] != recomp.x87.state_key()[1:]:
         return False
@@ -619,7 +599,7 @@ def callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> 
         and obs_o[0][3] != obs_r[0][3]
     ):
         ctx.save_stack.append([obs_o[0][3][1], obs_r[0][3][1], obs_o[0][1], True])
-        ctx.categories.add("callee_save_substitution")
+        ctx.categories.add(EffectiveReason.CALLEE_SAVE_SUBSTITUTION)
         return True
     match ins_o.operands, ins_r.operands:
         case (Reg(name_o),), (Reg(name_r),) if (
@@ -839,15 +819,15 @@ def record_pair_categories(
         for family_r, value_r in after_r.regs.items()
         if value_r is not before_r.regs[family_r]
     ):
-        ctx.categories.add("register_allocation")
+        ctx.categories.add(EffectiveReason.REGISTER_ALLOCATION)
     if _commutative_order_used(before_o, before_r, ctx, ins_o, ins_r):
-        ctx.categories.add("commutative_order")
+        ctx.categories.add(EffectiveReason.COMMUTATIVE_ORDER)
     if (
         any(entry[0] == "branch" for entry in obs_o)
         and obs_o == obs_r
         and (ins_o.mnemonic != ins_r.mnemonic or before_o.flags != before_r.flags)
     ):
-        ctx.categories.add("condition_inversion")
+        ctx.categories.add(EffectiveReason.CONDITION_INVERSION)
 
 
 def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
@@ -861,7 +841,7 @@ def observations_agree(ctx: Context, obs_o: list, obs_r: list) -> bool:
         return False
     if not bitvector.observations_equal(obs_o, obs_r):
         return False
-    ctx.categories.add("algebraic_identity")
+    ctx.categories.add(EffectiveReason.ALGEBRAIC_IDENTITY)
     for entry in obs_r:
         ctx.add_matched(entry)
     return True

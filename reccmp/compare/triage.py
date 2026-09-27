@@ -7,228 +7,299 @@ every input tried. Many such cases share one shape (a comparison spelled two
 ways, a call through an import thunk, the same value at two widths), and one
 verifier change fixes the whole cluster.
 
-Input is the JSON report of ``reccmp-reccmp --json`` (with ``--witness`` for
-the execution buckets); instruction shapes need the two binaries.
+Input is a deserialized ``reccmp-reccmp --json`` report (with ``--witness``
+for the execution buckets); instruction shapes need the two binaries.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping
+from enum import Enum
 
-from reccmp.compare.asm.decode import decode_one
-
-# Buckets, most useful first.
-AGREED_THROUGH_DIFFERENCE = "candidate: witness agreed through the difference"
-AGREED_THROUGH_BLOCKER = "inconclusive: witness agreed through the blocker"
-NEVER_REACHED = "candidate: witness never reached the difference"
-NOT_EXECUTED = "candidate: not executed"
-REFUTED = "refuted"
-INCONCLUSIVE = "inconclusive"
-BUCKET_ORDER = (
-    AGREED_THROUGH_DIFFERENCE,
-    AGREED_THROUGH_BLOCKER,
-    NEVER_REACHED,
-    NOT_EXECUTED,
-    REFUTED,
-    INCONCLUSIVE,
+from reccmp.compare.asm.decode import disasm_detail
+from reccmp.compare.asm.operand import Mem, Operand, SignedSymbol, Sym
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    DifferenceKind,
+    DifferenceSide,
+    InconclusiveReason,
+    StopDetail,
+    StopLocation,
+    Strategy,
+    StrategyAttempt,
 )
+from reccmp.compare.report import ReccmpComparedEntity
+from reccmp.types import ImageId
 
-Shape = Callable[[str, int], str | None]  # (image, address) -> shape
+
+class Bucket(Enum):
+    """What differential execution said about a verdict, most useful first."""
+
+    AGREED_THROUGH_DIFFERENCE = "candidate: witness agreed through the difference"
+    AGREED_THROUGH_BLOCKER = "inconclusive: witness agreed through the blocker"
+    NEVER_REACHED = "candidate: witness never reached the difference"
+    NOT_EXECUTED = "candidate: not executed"
+    REFUTED = "refuted"
+    INCONCLUSIVE = "inconclusive"
+
+
+@dataclass(frozen=True)
+class InstructionShape:
+    """`cmp reg, imm`: a mnemonic and the kinds of its operands."""
+
+    mnemonic: str
+    operands: tuple[type[Operand], ...]
+
+
+# (image, address) -> the shape of the instruction there
+Shape = Callable[[ImageId, int], InstructionShape | None]
+
+
+@dataclass(frozen=True)
+class SideShape:
+    """What one side of a cluster has in common."""
+
+    instruction: InstructionShape | None = None
+    register: str | None = None
+    callee_type: str | None = None
+    indirect: bool = False
+
+
+@dataclass(frozen=True)
+class ProductStop:
+    """Where the product under a guessed block pairing stopped."""
+
+    difference: DifferenceKind | None = None
+    blocker: InconclusiveReason | None = None
+    detail: StopDetail | None = None
+
+
+@dataclass(frozen=True)
+class _SourceShape:
+    field: bool = False
+    comparisons: bool = False
 
 
 @dataclass(frozen=True)
 class TriageKey:
     """What one cluster has in common."""
 
-    bucket: str
-    kind: str  # difference kind or inconclusive reason
-    strategy: str  # the verifier strategy that reported it
-    orig: str  # instruction shape, or the summary shape of a fact
-    recomp: str
-    detail: str = ""  # callee class, source facts, ...
+    bucket: Bucket
+    verdict: DifferenceKind | InconclusiveReason
+    strategy: Strategy | None  # the verifier strategy that reported it
+    orig: SideShape | None
+    recomp: SideShape | None
+    source: _SourceShape = _SourceShape()
+    product: ProductStop | None = None
 
 
 @dataclass
 class TriageCluster:
     key: TriageKey
-    samples: list[tuple[str, str]] = field(default_factory=list)  # (address, name)
+    samples: list[ReccmpComparedEntity] = field(default_factory=list)
 
     @property
     def count(self) -> int:
         return len(self.samples)
 
 
-def bucket_of(comparison: Mapping[str, Any]) -> str | None:
-    status = comparison.get("status")
-    execution = comparison.get("execution") or {}
-    reached = execution.get("reached_location") or 0
-    if status == "mismatch":
-        if comparison.get("witness"):
-            return REFUTED
-        if not execution:
-            return NOT_EXECUTED
-        return AGREED_THROUGH_DIFFERENCE if reached else NEVER_REACHED
-    if status == "inconclusive":
-        return AGREED_THROUGH_BLOCKER if reached else INCONCLUSIVE
+def bucket_of(analysis: ComparisonAnalysis) -> Bucket | None:
+    execution = analysis.execution
+    reached = bool(execution is not None and execution.reached_location)
+    match analysis.status:
+        case ComparisonStatus.MISMATCH if analysis.witness is not None:
+            return Bucket.REFUTED
+        case ComparisonStatus.MISMATCH if execution is None:
+            return Bucket.NOT_EXECUTED
+        case ComparisonStatus.MISMATCH:
+            return Bucket.AGREED_THROUGH_DIFFERENCE if reached else Bucket.NEVER_REACHED
+        case ComparisonStatus.INCONCLUSIVE:
+            return Bucket.AGREED_THROUGH_BLOCKER if reached else Bucket.INCONCLUSIVE
     return None
 
 
-_OPERAND_KIND = {1: "reg", 2: "imm", 3: "mem"}  # capstone x86 operand types
-
-
-def instruction_shape(code: bytes, address: int) -> str | None:
-    """`cmp reg, imm`, `jbe imm`, `mov mem, reg`: a mnemonic and the kinds of
-    its operands."""
-    insn = decode_one(code, address)
-    if insn is None:
+def instruction_shape(code: bytes, address: int) -> InstructionShape | None:
+    """The shape of the instruction at the start of ``code``."""
+    rows = disasm_detail(code[:16], address)
+    if not rows:
         return None
-    kinds = [_OPERAND_KIND.get(op.type, "?") for op in insn.operands]
-    return f"{insn.mnemonic} {', '.join(kinds)}".strip()
+    return InstructionShape(
+        rows[0].mnemonic, tuple(type(operand) for operand in rows[0].operands)
+    )
 
 
-def _fact_shape(facts: Mapping[str, Any]) -> str:
-    """The leading tags of a side's facts: `lt_u` for a predicate, `load`
-    for a value, `IMPORT_THUNK` for a callee."""
-    parts = []
-    for name in ("predicate", "value"):
-        tag = facts.get(f"{name}_tag")
-        if isinstance(tag, str):
-            parts.append(f"{name}={tag}")
-    register = facts.get("register")
-    if isinstance(register, str):
-        parts.append(f"register={register}")
-    callee = facts.get("target_entity_type")
-    if isinstance(callee, str):
-        parts.append(f"callee={callee}")
-    if facts.get("target_indirect") is True:
-        parts.append("indirect")
-    return " ".join(parts)
+def _callee_type(operand: Operand | None) -> str | None:
+    match operand:
+        case Sym(ref) | Mem(symbols=(SignedSymbol(1, ref),)):
+            return ref.entity_type
+    return None
 
 
-def _side(side: Mapping[str, Any] | None, image: str, shape: Shape | None) -> str:
-    if not side:
-        return "-"
-    address = side.get("address")
-    decoded = (
-        shape(image, address)
-        if shape is not None and isinstance(address, int)
+def _side_shape(side: DifferenceSide | StopLocation, shape: Shape | None) -> SideShape:
+    instruction = (
+        shape(side.image, side.address)
+        if shape is not None and side.address is not None
         else None
     )
-    facts = _fact_shape(side.get("facts") or {})
-    return " | ".join(part for part in (decoded, facts) if part) or "-"
+    if isinstance(side, StopLocation):
+        return SideShape(instruction)
+    operand = side.observed.operand
+    return SideShape(
+        instruction,
+        side.observed.register,
+        _callee_type(operand),
+        isinstance(operand, Mem),
+    )
 
 
-def _strategy(comparison: Mapping[str, Any]) -> str:
+def _reporting_strategy(analysis: ComparisonAnalysis) -> Strategy | None:
     """The strategy whose attempt reported the final difference or blocker."""
-    final = comparison.get("difference") or comparison.get("inconclusive_location")
-    for attempt in comparison.get("attempts") or ():
-        reported = attempt.get("difference") or attempt.get("location")
-        if reported == final:
-            return str(attempt.get("strategy"))
-    return "-"
+    for attempt in analysis.attempts:
+        if (
+            attempt.difference is not None and attempt.difference == analysis.difference
+        ) or (
+            attempt.location is not None
+            and attempt.location == analysis.inconclusive_location
+        ):
+            return attempt.strategy
+    return None
 
 
-def _detail(comparison: Mapping[str, Any]) -> str:
-    difference = comparison.get("difference") or {}
-    recomp = (difference.get("recomp") or {}).get("facts") or {}
-    details = []
-    if "field_name" in recomp or "field_name" in (
-        (difference.get("orig") or {}).get("facts") or {}
-    ):
-        details.append("field facts")
-    if "source_comparisons" in recomp:
-        details.append("source comparisons")
-    for attempt in comparison.get("attempts") or ():
-        if attempt.get("strategy") == "unanchored_product":
-            details.append(f"product: {_stop(attempt)}")
-    return ", ".join(details)
-
-
-def _stop(attempt: Mapping[str, Any]) -> str:
-    """Where an attempt stopped: its difference's kind, or its blocker and
-    the blocker's stage."""
-    if attempt.get("difference"):
-        return str(attempt["difference"].get("kind"))
-    facts = (attempt.get("location") or {}).get("facts") or {}
-    stage = facts.get("stage") or facts.get("failure")
-    blocker = attempt.get("blocker")
-    return f"{blocker}/{stage}" if stage else str(blocker)
+def _product_stop(attempts: Iterable[StrategyAttempt]) -> ProductStop | None:
+    for attempt in attempts:
+        if attempt.strategy is not Strategy.UNANCHORED_PRODUCT:
+            continue
+        if attempt.difference is not None:
+            return ProductStop(difference=attempt.difference.kind)
+        return ProductStop(
+            blocker=attempt.blocker,
+            detail=attempt.location.detail if attempt.location is not None else None,
+        )
+    return None
 
 
 def triage_key(
-    comparison: Mapping[str, Any], shape: Shape | None = None
+    analysis: ComparisonAnalysis, shape: Shape | None = None
 ) -> TriageKey | None:
-    bucket = bucket_of(comparison)
+    bucket = bucket_of(analysis)
     if bucket is None:
         return None
-    difference = comparison.get("difference")
+    strategy = _reporting_strategy(analysis)
+    product = _product_stop(analysis.attempts)
+    difference = analysis.difference
     if difference is not None:
-        kind = str(difference.get("kind"))
-        orig = _side(difference.get("orig"), "orig", shape)
-        recomp = _side(difference.get("recomp"), "recomp", shape)
-    else:
-        kind = str(comparison.get("inconclusive_reason"))
-        location = comparison.get("inconclusive_location")
-        image = (location or {}).get("image") or "orig"
-        orig = _side(location, image, shape) if image == "orig" else "-"
-        recomp = _side(location, image, shape) if image == "recomp" else "-"
+        return TriageKey(
+            bucket,
+            difference.kind,
+            strategy,
+            _side_shape(difference.orig, shape),
+            _side_shape(difference.recomp, shape),
+            source=_SourceShape(
+                field=difference.orig.field is not None
+                or difference.recomp.field is not None,
+                comparisons=bool(difference.recomp.source_comparisons),
+            ),
+            product=product,
+        )
+    assert analysis.inconclusive_reason is not None
+    location = analysis.inconclusive_location
+    located = _side_shape(location, shape) if location is not None else None
+    on_recomp = location is not None and location.image is ImageId.RECOMP
     return TriageKey(
-        bucket, kind, _strategy(comparison), orig, recomp, _detail(comparison)
+        bucket,
+        analysis.inconclusive_reason,
+        strategy,
+        None if on_recomp else located,
+        located if on_recomp else None,
+        product=product,
     )
 
 
 def triage(
-    entities: Iterable[Mapping[str, Any]], shape: Shape | None = None
+    entities: Iterable[ReccmpComparedEntity], shape: Shape | None = None
 ) -> list[TriageCluster]:
     """Clusters, by bucket (most useful first), then by size."""
     clusters: dict[TriageKey, TriageCluster] = {}
     for entity in entities:
-        comparison = entity.get("comparison") or {}
-        key = triage_key(comparison, shape)
+        key = triage_key(entity.analysis, shape)
         if key is None:
             continue
-        cluster = clusters.setdefault(key, TriageCluster(key))
-        cluster.samples.append((str(entity.get("address")), str(entity.get("name"))))
+        clusters.setdefault(key, TriageCluster(key)).samples.append(entity)
+    order = list(Bucket)
     return sorted(
         clusters.values(),
-        key=lambda item: (
-            BUCKET_ORDER.index(item.key.bucket),
-            -item.count,
-            repr(item.key),
-        ),
+        key=lambda item: (order.index(item.key.bucket), -item.count, repr(item.key)),
     )
 
 
-def bucket_counts(clusters: Iterable[TriageCluster]) -> dict[str, int]:
-    counts: dict[str, int] = defaultdict(int)
+def bucket_counts(clusters: Iterable[TriageCluster]) -> dict[Bucket, int]:
+    counts: dict[Bucket, int] = defaultdict(int)
     for cluster in clusters:
         counts[cluster.key.bucket] += cluster.count
-    return {bucket: counts[bucket] for bucket in BUCKET_ORDER if counts[bucket]}
+    return {bucket: counts[bucket] for bucket in Bucket if counts[bucket]}
+
+
+def _instruction_text(instruction: InstructionShape | None) -> str:
+    if instruction is None:
+        return "-"
+    kinds = ", ".join(kind.__name__.lower() for kind in instruction.operands)
+    return f"{instruction.mnemonic} {kinds}".strip()
+
+
+def side_text(side: SideShape | None) -> str:
+    if side is None:
+        return "-"
+    parts = [_instruction_text(side.instruction)]
+    if side.register is not None:
+        parts.append(f"register={side.register}")
+    if side.callee_type is not None:
+        parts.append(f"callee={side.callee_type}")
+    if side.indirect:
+        parts.append("indirect")
+    return " | ".join(parts)
+
+
+def details_text(key: TriageKey) -> str:
+    details = []
+    if key.source.field:
+        details.append("field facts")
+    if key.source.comparisons:
+        details.append("source comparisons")
+    match key.product:
+        case ProductStop(difference=DifferenceKind() as kind):
+            details.append(f"product: {kind.value}")
+        case ProductStop(blocker=InconclusiveReason() as blocker, detail=detail):
+            stage = f" at {detail.value}" if detail is not None else ""
+            details.append(f"product: {blocker.value}{stage}")
+    return ", ".join(details)
 
 
 def triage_text(
     clusters: list[TriageCluster], *, limit: int = 20, samples: int = 3
 ) -> str:
-    lines = []
-    for bucket, count in bucket_counts(clusters).items():
-        lines.append(f"{bucket}: {count}")
+    lines = [
+        f"{bucket.value}: {count}" for bucket, count in bucket_counts(clusters).items()
+    ]
     current = None
     shown = 0
     for cluster in clusters:
         key = cluster.key
-        if key.bucket != current:
+        if key.bucket is not current:
             current, shown = key.bucket, 0
-            lines.append(f"\n== {key.bucket}")
+            lines.append(f"\n== {key.bucket.value}")
         if shown >= limit:
             continue
         shown += 1
-        lines.append(f"{cluster.count:5}  {key.kind} [{key.strategy}]")
-        lines.append(f"         orig:   {key.orig}")
-        lines.append(f"         recomp: {key.recomp}")
-        if key.detail:
-            lines.append(f"         {key.detail}")
-        for address, name in cluster.samples[:samples]:
-            lines.append(f"         e.g. {address} {name}")
+        strategy = key.strategy.value if key.strategy is not None else "-"
+        lines.append(f"{cluster.count:5}  {key.verdict.value} [{strategy}]")
+        lines.append(f"         orig:   {side_text(key.orig)}")
+        lines.append(f"         recomp: {side_text(key.recomp)}")
+        details = details_text(key)
+        if details:
+            lines.append(f"         {details}")
+        for entity in cluster.samples[:samples]:
+            lines.append(f"         e.g. {entity.orig_addr:#x} {entity.name}")
     return "\n".join(lines)

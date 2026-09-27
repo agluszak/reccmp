@@ -28,6 +28,7 @@ from typing import Any
 import z3  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.verifier.state import WIDTHS
+from reccmp.compare.diagnosis import SolverOutcome, SolverResult
 
 # Resource units per query (see SolverOutcome.rlimit), and a wall-clock
 # backstop far above what the resource limit allows.
@@ -41,28 +42,6 @@ _PREDICATES = {"eq", "ne", "lt_u", "le_u", "lt_s", "le_s"}
 
 class _Unsupported(Exception):
     """A term this module cannot lower; the message says which."""
-
-
-@dataclass(frozen=True)
-class SolverOutcome:
-    """What one equivalence query found.
-
-    ``result``: ``proved`` (equal for every input), ``differs`` (Z3 found
-    leaf values under which they differ: in this abstraction, where
-    unlowered terms and loads are independent leaves, so not a refutation),
-    ``unsupported`` (a term could not be lowered) or ``unknown`` (the
-    budget ran out). ``reason`` says which term, or why Z3 gave up.
-    ``rlimit`` is the resource units the query used, a deterministic
-    measure of its cost."""
-
-    result: str
-    reason: str | None = None
-    rlimit: int | None = None
-    # For ``differs``: (leaf term, value) for each leaf Z3 constrained.
-    assignment: tuple[tuple[Hashable, int], ...] = ()
-
-    def summary(self) -> dict[str, str | int | None]:
-        return {"result": self.result, "reason": self.reason, "rlimit": self.rlimit}
 
 
 # Proof identities that end in a byte offset into their entity (see
@@ -337,12 +316,12 @@ def _query(lowering: _Lowering, differ) -> SolverOutcome:
     if total is not None:
         _counted["rlimit"] = total
     if answer == z3.unsat:
-        return SolverOutcome("proved", rlimit=used)
+        return SolverOutcome(SolverResult.PROVED, rlimit=used)
     if answer != z3.sat:
-        return SolverOutcome("unknown", solver.reason_unknown(), used)
+        return SolverOutcome(SolverResult.UNKNOWN, solver.reason_unknown(), used)
     model = solver.model()
     return SolverOutcome(
-        "differs", rlimit=used, assignment=_assignment(lowering, model)
+        SolverResult.DIFFERS, rlimit=used, assignment=_assignment(lowering, model)
     )
 
 
@@ -377,7 +356,7 @@ def compare(values: tuple) -> SolverOutcome:
     predicates."""
     value_o, value_r, bits, kind = values
     if value_o == value_r:
-        return SolverOutcome("proved")
+        return SolverOutcome(SolverResult.PROVED)
     lowering = _Lowering()
     try:
         if kind == "predicate":
@@ -388,19 +367,19 @@ def compare(values: tuple) -> SolverOutcome:
         else:
             differ = lowering.sized(value_o, bits) != lowering.sized(value_r, bits)
     except _Unsupported as unsupported:
-        return SolverOutcome("unsupported", str(unsupported))
+        return SolverOutcome(SolverResult.UNSUPPORTED, str(unsupported))
     return _query(lowering, differ)
 
 
 def values_equal(a: Any, b: Any, bits: int | None = None) -> bool:
     """Whether two symbolic values are equal for every input (at ``bits``,
     their natural width when None). False unless proven."""
-    return compare((a, b, bits, "value")).result == "proved"
+    return compare((a, b, bits, "value")).result is SolverResult.PROVED
 
 
 def predicates_equal(a: Any, b: Any) -> bool:
     """Whether two branch predicates decide the same way for every input."""
-    return compare((a, b, None, "predicate")).result == "proved"
+    return compare((a, b, None, "predicate")).result is SolverResult.PROVED
 
 
 def entries_equal(entry_o: Any, entry_r: Any) -> bool:

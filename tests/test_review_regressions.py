@@ -248,13 +248,15 @@ def test_a5b_sahf_preserves_overflow_flag_difference():
 # --- A6: unsupported path requires compatible meta on both sides ------------
 
 
-def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstruction:
+def _bswap_meta(register: str) -> DecodedInstruction:
+    """``bswap register``, with Capstone's facts: it reads and writes the
+    register, and nothing else."""
     return replace(
-        rows(["bswap ecx"])[0],
+        rows([f"bswap {register}"])[0],
         address=4,
         size=2,
-        regs_read=reads,
-        regs_written=writes,
+        regs_read=(register,),
+        regs_written=(register,),
         register_access_known=True,
         reads_flags=False,
         writes_flags=False,
@@ -280,7 +282,7 @@ _BSWAP_RECOMP = [
 def test_a6_one_sided_meta_cannot_step_divergent_unsupported_instruction():
     """``meta_o or meta_r`` must not invent agreement when only one side has meta."""
     orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
-    one_sided = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
+    one_sided = [None, None, _bswap_meta("ecx"), None]
     assert verify_effective_match(orig, recomp, orig_meta=one_sided) is False
     assert verify_effective_match(orig, recomp, recomp_meta=one_sided) is False
 
@@ -292,12 +294,12 @@ def test_meta_step_over_unmodeled_instruction():
     orig, recomp = _BSWAP_ORIG, _BSWAP_RECOMP
     # Without metadata: bswap requires full sync, but eax/edx diverge.
     assert verify_effective_match(orig, recomp) is False
-    both = [None, None, _bswap_meta(("ecx",), ("ecx",)), None]
+    both = [None, None, _bswap_meta("ecx"), None]
     assert (
         verify_effective_match(orig, recomp, orig_meta=both, recomp_meta=both) is True
     )
     # If the bswap reads a diverged register, it must still reject.
-    bad = [None, None, _bswap_meta(("eax",), ("eax",)), None]
+    bad = [None, None, _bswap_meta("eax"), None]
     orig2 = [orig[0], orig[1], "bswap eax", "mov dword ptr [ebx], ecx"]
     recomp2 = [recomp[0], recomp[1], "bswap eax", "mov dword ptr [ebx], ecx"]
     assert (

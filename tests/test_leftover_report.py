@@ -30,7 +30,11 @@ from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.replacement import create_resolver
 from reccmp.compare.db import EntityDb, FrozenEntityDbError, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult
-from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
+from reccmp.compare.diagnosis import (
+    ComparisonAnalysis,
+    ComparisonStatus,
+    EffectiveReason,
+)
 from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
@@ -327,7 +331,7 @@ def test_array_field_resolves_later_elements():
 
 def test_entity_compare_result_derives_normalizations_at_construction():
     result = EntityCompareResult(
-        analysis=ComparisonAnalysis.effective(("register_allocation",))
+        analysis=ComparisonAnalysis.effective((EffectiveReason.REGISTER_ALLOCATION,))
     )
     assert result.analysis.status == ComparisonStatus.EFFECTIVE
     assert result.diagnostic_normalizations
@@ -385,17 +389,15 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
 
 def test_gate_mints_verification_result_not_strategy():
     minted = admit_effective(
-        {"register_allocation"},
+        {EffectiveReason.REGISTER_ALLOCATION},
         coverage_incomplete=False,
         extent_closed=True,
     )
     assert minted is not None
-    assert minted.proof_kind == ComparisonStatus.EFFECTIVE
-    assert minted.analysis.status == ComparisonStatus.EFFECTIVE
-    assert "extent_closed" in minted.assumptions
+    assert minted.status == ComparisonStatus.EFFECTIVE
     assert (
         admit_effective(
-            {"register_allocation"},
+            {EffectiveReason.REGISTER_ALLOCATION},
             coverage_incomplete=False,
             extent_closed=False,
         )
