@@ -335,7 +335,7 @@ def match_vtables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
 def match_static_variables(
     db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
 ):
-    """Match local statics by their matched function and local name.
+    """Match local static variables by their matched function and local name.
 
     Both ownership links come from input records: Clang's marker anchor on
     the original side and S_LDATA32 inside S_GPROC32 on the PDB side.

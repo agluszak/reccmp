@@ -6,6 +6,9 @@ assembly lines build their rows here. Each line becomes a
 the row each jump reaches (None for none, or outside the rows).
 """
 
+# Fixture wrappers preserve concise assembly tests while production APIs stay typed.
+# pylint: disable=import-outside-toplevel,too-many-arguments,too-many-positional-arguments
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -173,7 +176,7 @@ def as_rows(
     )
     updated = []
     for index, row in enumerate(result):
-        changes = {}
+        changes: dict[str, object] = {}
         if addresses is not None:
             changes["address"] = addresses[index]
             if (
@@ -181,6 +184,7 @@ def as_rows(
                 and row.is_jump
                 and row.operands
                 and row.operands[0][0] == "imm"
+                and isinstance(row.operands[0][1], int)
             ):
                 next_addr = (
                     addresses[index + 1]
@@ -192,8 +196,8 @@ def as_rows(
                     target_index = addresses.index(destination)
                     changes["branch_target"] = destination
                     changes["control_target"] = ("local_insn", target_index)
-        if targets is not None and targets[index] is not None:
-            target = targets[index]
+        target = targets[index] if targets is not None else None
+        if target is not None:
             changes["branch_target"] = (
                 addresses[target]
                 if addresses is not None and 0 <= target < len(addresses)

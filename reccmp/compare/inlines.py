@@ -122,6 +122,7 @@ class InlineLayoutResult:
 
 
 @dataclass(frozen=True)
+# pylint: disable-next=too-many-instance-attributes
 class HelperCatalogEntry:
     """Cached fingerprint for a paired helper usable as an inline needle."""
 
@@ -169,7 +170,9 @@ def summarize_helper_effects(
 
     for row in fingerprint:
         for operand in row.operands:
-            inputs.update(name for name in _registers(operand) if name in ("ecx", "edx"))
+            inputs.update(
+                name for name in _registers(operand) if name in ("ecx", "edx")
+            )
         match row.mnemonic, row.operands:
             case mnemonic, (("reg", "eax"), _) if mnemonic.startswith("mov"):
                 return_kind = "register"
@@ -491,7 +494,7 @@ def _evidence_confidence(
 def find_inline_expansions(
     helper_fingerprint: Fingerprint,
     hosts: Sequence[tuple[int, str, int]],
-    fingerprint_of: FingerprintFn,
+    host_fingerprint: FingerprintFn,
     *,
     min_helper_ops: int = 3,
 ) -> list[InlineHit]:
@@ -503,7 +506,7 @@ def find_inline_expansions(
     hits: list[InlineHit] = []
     helper_len = len(needle)
     for addr, name, size in hosts:
-        host_fp = fingerprint_of(addr, size)
+        host_fp = host_fingerprint(addr, size)
         if host_fp is None or len(host_fp) <= helper_len:
             continue
         for offset in find_fingerprint_spans(host_fp, needle):

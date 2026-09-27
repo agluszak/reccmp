@@ -1553,7 +1553,12 @@ class SourceIndex:
             return None
         if field_is_indirection(source_field):
             return None
-        nested = self._classes_by_semantic_id.get(source_field.record_semantic_id)
+        semantic_id = source_field.record_semantic_id
+        nested = (
+            self._classes_by_semantic_id.get(semantic_id)
+            if semantic_id is not None
+            else None
+        )
         return nested.qualified_name if nested is not None else None
 
     def field_at(self, qualified_name: str, offset: int) -> SourceField | None:
@@ -1680,10 +1685,10 @@ class SourceIndex:
         for base in source_class.base_offsets:
             if offset < base.offset:
                 continue
-            nested = self._classes_by_semantic_id.get(base.semantic_id)
-            if nested is None:
+            base_class = self._classes_by_semantic_id.get(base.semantic_id)
+            if base_class is None:
                 continue
-            nested_name = nested.qualified_name
+            nested_name = base_class.qualified_name
             base_label = nested_name.rsplit("::", 1)[-1]
             found = self._resolve_field(
                 nested_name,

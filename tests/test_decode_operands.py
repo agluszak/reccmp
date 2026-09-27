@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from dataclasses import replace
 
-from capstone import x86_const
+from capstone import x86_const  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.decode import capstone_operand, disasm_detail
 from reccmp.compare.asm.ir import (

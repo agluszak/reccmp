@@ -44,9 +44,7 @@ def _independent(moved: LineEffects, crossed: LineEffects) -> bool:
 
 
 def _same_instruction(a: DpLine, b: DpLine) -> bool:
-    return a.key == b.key or (
-        a.skeleton is not None and a.skeleton == b.skeleton
-    )
+    return a.key == b.key or (a.skeleton is not None and a.skeleton == b.skeleton)
 
 
 def schedule_like(

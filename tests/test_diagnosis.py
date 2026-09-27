@@ -5,21 +5,15 @@ from dataclasses import replace
 
 import pytest
 
-from reccmp.compare.asm.verifier import (
-    CallFacts,
-    FunctionMetadata,
-)
-from reccmp.compare.asm.verifier.evidence import (
-    diagnostic_summaries,
-)
 from reccmp.compare.asm.ir import DecodedInstruction
-from tests.asm_rows import rows
+from reccmp.compare.asm.verifier import CallFacts, FunctionMetadata
+from reccmp.compare.asm.verifier.evidence import diagnostic_summaries
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
     ComparisonStatus,
     StrategyAttempt,
 )
-from tests.asm_rows import analyze_effective_match
+from tests.asm_rows import analyze_effective_match, rows
 
 
 def analyze(orig, recomp, **kwargs):
@@ -166,7 +160,9 @@ def test_call_target_difference():
 def test_thiscall_argument_difference():
     metadata = FunctionMetadata(
         return_kind="void",
-        call_facts={"TView::Refresh": CallFacts(True, False)}.get,
+        call_facts=lambda key: (
+            CallFacts(True, False) if key == "TView::Refresh" else None
+        ),
     )
     result = analyze(
         [
@@ -253,7 +249,8 @@ def test_branch_condition_difference():
 
 
 def _jump_meta(address: int, target: int) -> DecodedInstruction:
-    return replace(rows(["je 0x2"])[0],
+    return replace(
+        rows(["je 0x2"])[0],
         address=address,
         size=2,
         regs_read=("eflags",),

@@ -1,5 +1,7 @@
 """Tests MSVC-specific match strategies"""
 
+# pylint: disable=too-many-lines
+
 from unittest.mock import Mock, ANY, patch
 import pytest
 from reccmp.types import EntityType, ImageId
@@ -504,8 +506,14 @@ def test_match_static_var(db):
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
         batch.match(200, 300)
-        batch.set(ImageId.RECOMP, 500, name="g_startupDelay", parent_function=300,
-                  static_var=True, type=EntityType.DATA)
+        batch.set(
+            ImageId.RECOMP,
+            500,
+            name="g_startupDelay",
+            parent_function=300,
+            static_var=True,
+            type=EntityType.DATA,
+        )
         # Orig entity with variable name and link to orig function addr
         batch.set(
             ImageId.ORIG,
@@ -526,10 +534,22 @@ def test_match_static_var_rejects_same_name_in_other_function(db):
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
         batch.match(200, 300)
-        batch.set(ImageId.RECOMP, 500, name="value", parent_function=301,
-                  static_var=True, type=EntityType.DATA)
-        batch.set(ImageId.ORIG, 600, name="value", parent_function=200,
-                  static_var=True, type=EntityType.DATA)
+        batch.set(
+            ImageId.RECOMP,
+            500,
+            name="value",
+            parent_function=301,
+            static_var=True,
+            type=EntityType.DATA,
+        )
+        batch.set(
+            ImageId.ORIG,
+            600,
+            name="value",
+            parent_function=200,
+            static_var=True,
+            type=EntityType.DATA,
+        )
 
     match_static_variables(db)
     assert db.get(ImageId.ORIG, 600).recomp_addr is None
@@ -541,10 +561,22 @@ def test_match_static_var_rejects_ambiguous_candidates(db):
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
         batch.match(200, 300)
         for address in (500, 504):
-            batch.set(ImageId.RECOMP, address, name="value", parent_function=300,
-                      static_var=True, type=EntityType.DATA)
-        batch.set(ImageId.ORIG, 600, name="value", parent_function=200,
-                  static_var=True, type=EntityType.DATA)
+            batch.set(
+                ImageId.RECOMP,
+                address,
+                name="value",
+                parent_function=300,
+                static_var=True,
+                type=EntityType.DATA,
+            )
+        batch.set(
+            ImageId.ORIG,
+            600,
+            name="value",
+            parent_function=200,
+            static_var=True,
+            type=EntityType.DATA,
+        )
 
     match_static_variables(db)
     assert db.get(ImageId.ORIG, 600).recomp_addr is None

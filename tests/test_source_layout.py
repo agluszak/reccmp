@@ -837,8 +837,10 @@ def test_enrich_memory_address_with_layout_facts():
             DifferenceSide(1, 0x501010, {"displacement": 12, "base_register": "ecx"}),
         )
     )
-    enriched = comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
-        analysis, match=match
+    enriched = (
+        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
+            analysis, match=match
+        )
     )
     assert enriched.difference is not None
     assert enriched.difference.orig.facts["class_name"] == "Foo"
@@ -919,8 +921,10 @@ def test_branch_condition_shows_the_source_comparisons_on_its_line():
         )
     )
 
-    enriched = comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
-        analysis, match=match
+    enriched = (
+        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
+            analysis, match=match
+        )
     )
 
     assert enriched.difference is not None

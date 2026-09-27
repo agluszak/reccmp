@@ -1001,7 +1001,8 @@ def test_cdecl_call_ignores_dead_ecx():
     assert verify_effective_match(orig, recomp) is False
     cdecl = CallFacts(uses_ecx=False, uses_edx=False)
     metadata = FunctionMetadata(
-        return_kind="i32", call_facts={"Helper (FUNCTION)": cdecl}.get
+        return_kind="i32",
+        call_facts=lambda key: cdecl if key == "Helper (FUNCTION)" else None,
     )
     # eax at ret is the callee's identical result, so the return kind
     # does not matter here; the dead ecx at the call does.
@@ -1024,7 +1025,9 @@ def test_thiscall_receiver_still_compared_with_metadata():
     thiscall = CallFacts(uses_ecx=True, uses_edx=False)
     metadata = FunctionMetadata(
         return_kind="void",
-        call_facts={"TView::RefreshControl (FUNCTION)": thiscall}.get,
+        call_facts=lambda key: (
+            thiscall if key == "TView::RefreshControl (FUNCTION)" else None
+        ),
     )
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
 
@@ -1033,7 +1036,8 @@ def test_unknown_register_access_meta_cannot_step_divergent_state():
     """Incomplete Capstone regs_access() must not look like an empty access set."""
 
     def meta(mnemonic, reads, writes, address, *, known=True):
-        return replace(rows([f"{mnemonic} ecx"])[0],
+        return replace(
+            rows([f"{mnemonic} ecx"])[0],
             address=address,
             size=2,
             regs_read=reads,

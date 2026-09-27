@@ -664,7 +664,9 @@ def execute(
         raise Reject
 
 
-def execute_x87(state: SideState, ctx: Context, ins: DecodedInstruction, obs: list) -> None:
+def execute_x87(
+    state: SideState, ctx: Context, ins: DecodedInstruction, obs: list
+) -> None:
     # pylint: disable=too-many-branches,too-many-statements
     mnemonic = ins.mnemonic
     ops = ins.operands

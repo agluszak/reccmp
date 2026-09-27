@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 def __getattr__(name: str):
     if name == "Compare":
+        # pylint: disable-next=import-outside-toplevel
         from .core import Compare
 
         return Compare

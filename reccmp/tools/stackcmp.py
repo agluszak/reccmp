@@ -38,6 +38,7 @@ SWAP_ICON = f"{reccmp.color.Fore.YELLOW}⇄{reccmp.color.Style.RESET_ALL}"
 ERROR_ICON = f"{reccmp.color.Fore.RED}✗{reccmp.color.Style.RESET_ALL}"
 UNCLEAR_ICON = f"{reccmp.color.Fore.BLUE}?{reccmp.color.Style.RESET_ALL}"
 
+
 def print_bijective_match(left: str, right: str, exact: bool):
     icon = CHECK_ICON if exact else SWAP_ICON
     print(f"{icon}{reccmp.color.Style.RESET_ALL}  {left}: {right}")

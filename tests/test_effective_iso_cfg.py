@@ -51,12 +51,16 @@ def _sample_relocations(rows, raw, base):
             assert raw[offset : offset + 5] == b"\xe8\x00\x00\x00\x00"
             identity = ("sample_relocation", ordinal)
             ordinal += 1
-            result.append(replace(
-                row,
-                operands=(("sym", Reference(row.operands[0][1].display, identity)),),
-                control_target=identity,
-                branch_target=None,
-            ))
+            result.append(
+                replace(
+                    row,
+                    operands=(
+                        ("sym", Reference(row.operands[0][1].display, identity)),
+                    ),
+                    control_target=identity,
+                    branch_target=None,
+                )
+            )
         else:
             result.append(row)
     assert ordinal == 6
@@ -89,20 +93,40 @@ def fixture_wobble_analysis():
     codes = SequenceMatcherWithPins(orig_asm, recomp_asm, []).get_opcodes()
     return analyze_images(
         codes,
-        FunctionImage(base, len(orig_raw), ExtentKind.KNOWN,
-                      _sample_relocations(
-                          rebind_local_identities(orig, start_addr=base,
-                                                  extent=len(orig_raw),
-                                                  jump_tables=orig_parser.jump_tables),
-                          orig_raw, base),
-                      tuple(orig_parser.jump_tables), raw=orig_raw),
-        FunctionImage(base, len(recomp_raw), ExtentKind.KNOWN,
-                      _sample_relocations(
-                          rebind_local_identities(recomp, start_addr=base,
-                                                  extent=len(recomp_raw),
-                                                  jump_tables=recomp_parser.jump_tables),
-                          recomp_raw, base),
-                      tuple(recomp_parser.jump_tables), raw=recomp_raw),
+        FunctionImage(
+            base,
+            len(orig_raw),
+            ExtentKind.KNOWN,
+            _sample_relocations(
+                rebind_local_identities(
+                    orig,
+                    start_addr=base,
+                    extent=len(orig_raw),
+                    jump_tables=orig_parser.jump_tables,
+                ),
+                orig_raw,
+                base,
+            ),
+            tuple(orig_parser.jump_tables),
+            raw=orig_raw,
+        ),
+        FunctionImage(
+            base,
+            len(recomp_raw),
+            ExtentKind.KNOWN,
+            _sample_relocations(
+                rebind_local_identities(
+                    recomp,
+                    start_addr=base,
+                    extent=len(recomp_raw),
+                    jump_tables=recomp_parser.jump_tables,
+                ),
+                recomp_raw,
+                base,
+            ),
+            tuple(recomp_parser.jump_tables),
+            raw=recomp_raw,
+        ),
     )
 
 

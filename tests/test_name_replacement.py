@@ -311,6 +311,7 @@ def test_decorated_symbol_defines_duplicate_body_callee_identity(db: EntityDb):
     orig = create_resolve(db)(100)
     recomp = create_resolve(db, is_orig=False)(500)
     assert orig is not None and recomp is not None
+    assert isinstance(orig.identity, tuple)
     assert orig.identity[0] == "symbol"
     assert orig == recomp
 

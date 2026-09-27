@@ -249,7 +249,8 @@ def test_a5b_sahf_preserves_overflow_flag_difference():
 
 
 def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstruction:
-    return replace(rows(["bswap ecx"])[0],
+    return replace(
+        rows(["bswap ecx"])[0],
         address=4,
         size=2,
         regs_read=reads,

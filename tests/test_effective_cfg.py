@@ -8,7 +8,11 @@ from reccmp.compare.asm.verifier import (
 )
 from reccmp.compare.asm.ir import DecodedInstruction
 from tests.asm_rows import rows
-from tests.asm_rows import verify_effective_match, analyze_effective_match, verify_cfg_effective_match
+from tests.asm_rows import (
+    verify_effective_match,
+    analyze_effective_match,
+    verify_cfg_effective_match,
+)
 
 
 def test_cfg_rename_live_across_branch():
@@ -184,7 +188,8 @@ def test_analysis_uses_structured_branch_targets():
     recomp_addrs = [0x2000, 0x2002, 0x2004, 0x2005]
 
     def jump_meta(address: int, target: int) -> DecodedInstruction:
-        return replace(rows(["je 0x2"])[0],
+        return replace(
+            rows(["je 0x2"])[0],
             address=address,
             size=2,
             regs_read=("eflags",),

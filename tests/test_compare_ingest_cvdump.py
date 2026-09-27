@@ -560,7 +560,7 @@ def test_gproc_with_static_var(binfile: PEImage):
 
     assert entity.get("symbol") is None
     assert entity.get("static_var") is True
-    assert entity.get("parent_function") == 0x1009CA20
+    assert entity.get("parent_function") == binfile.get_abs_addr(1, 0x9CA20)
 
 
 def test_float_symbols_with_size(binfile: PEImage):

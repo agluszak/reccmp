@@ -27,7 +27,9 @@ from reccmp.types import EntityType, ImageId
 _ISLAND_PADDING = (0x90, 0xCC)  # nop / int3
 
 
-def _code_rows(raw: bytes, addr: int, is_32bit: bool) -> list[DecodedInstruction] | None:
+def _code_rows(
+    raw: bytes, addr: int, is_32bit: bool
+) -> list[DecodedInstruction] | None:
     """The body's decoded instructions, or None when the body carries
     non-code sections (jump-table data)."""
     rows: list[DecodedInstruction] = []
@@ -230,7 +232,8 @@ class BodyEquivalenceMixin(ComparatorState):
             # Local branches must reach the same instruction id: equal
             # displacements do not imply that when encodings differ.
             if (
-                instruction_semantic_key(orig_row) == instruction_semantic_key(recomp_row)
+                instruction_semantic_key(orig_row)
+                == instruction_semantic_key(recomp_row)
                 and orig_topology[index] == recomp_topology[index]
             ):
                 continue
@@ -478,9 +481,7 @@ class BodyEquivalenceMixin(ComparatorState):
     ) -> bool:
         """Classify one image's remaining bodies against canonical pairs."""
         added = False
-        canonical_groups: dict[
-            tuple[int, tuple[tuple[str, str], ...]], list[ReccmpMatch]
-        ] = {}
+        canonical_groups: dict[tuple[int, Fingerprint], list[ReccmpMatch]] = {}
         # Every duplicate is proven against the pair's recompiled body, whose
         # extent the PDB states: an original duplicate across the images, a
         # recompiled one within the recompiled image (retail ICF folded
@@ -516,8 +517,8 @@ class BodyEquivalenceMixin(ComparatorState):
 
     def _unpaired_function_candidates(
         self, image_id: ImageId
-    ) -> dict[tuple[int, tuple[tuple[str, str], ...]], list[int]]:
-        groups: dict[tuple[int, tuple[tuple[str, str], ...]], list[int]] = {}
+    ) -> dict[tuple[int, Fingerprint], list[int]]:
+        groups: dict[tuple[int, Fingerprint], list[int]] = {}
         for entity in self.db.unexplained(image_id):
             if entity.entity_type != EntityType.FUNCTION:
                 continue

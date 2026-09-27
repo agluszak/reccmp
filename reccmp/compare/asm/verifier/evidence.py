@@ -128,8 +128,7 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
     symbol = None
     if symbols:
         symbol = " + ".join(
-            ("-" if sign < 0 else "") + str(name)
-            for sign, name in symbols
+            ("-" if sign < 0 else "") + str(name) for sign, name in symbols
         )
     facts: dict[str, str | int | bool | None] = {
         "base_register": base,

@@ -131,9 +131,14 @@ class ParseAsm:
                     0,
                     ((1, self.reference(disp, indirect=indirect)),),
                 )
-            case ("mem", size, "", reg_terms, int() as disp, ()) if (
-                disp and self.is_addr(abs(disp))
-            ):
+            case (
+                "mem",
+                size,
+                "",
+                reg_terms,
+                int() as disp,
+                (),
+            ) if disp and self.is_addr(abs(disp)):
                 sign = 1 if disp >= 0 else -1
                 return (
                     "mem",

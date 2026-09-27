@@ -374,9 +374,14 @@ def _remapped_key(
     operands = []
     for op in row.operands:
         match op:
-            case ("mem", size, seg, [(("ebp" | "esp") as register, 1)], int() as disp, ()) if (
-                (register, disp) in mapping
-            ):
+            case (
+                "mem",
+                size,
+                seg,
+                [(("ebp" | "esp") as register, 1)],
+                int() as disp,
+                (),
+            ) if (register, disp) in mapping:
                 new_register, new_disp = mapping[(register, disp)]
                 operands.append(("mem", size, seg, [(new_register, 1)], new_disp, ()))
             case _:

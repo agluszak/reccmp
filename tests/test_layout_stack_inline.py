@@ -38,11 +38,13 @@ def test_canonical_stack_ref_pdb_multi_slot():
 
 
 def test_summarize_helper_effects_detects_this_stores():
-    helper = fingerprint([
-        "mov dword ptr [ecx + 0x4], eax",
-        "mov dword ptr [ecx + 0x8], edx",
-        "ret",
-    ])
+    helper = fingerprint(
+        [
+            "mov dword ptr [ecx + 0x4], eax",
+            "mov dword ptr [ecx + 0x8], edx",
+            "ret",
+        ]
+    )
     summary = summarize_helper_effects(helper)
     assert summary is not None
     assert summary.inputs == ("ecx", "edx")
@@ -93,11 +95,13 @@ def test_literal_inline_match_is_not_marked_semantic():
 
 def test_register_normalized_inline_match_is_semantic():
     """Differing registers that share shape match via normalized fingerprint."""
-    helper_fp = fingerprint([
-        "mov eax, dword ptr [ecx]",
-        "mov dword ptr [ecx + 0x4], eax",
-        "xor edx, edx",
-    ])
+    helper_fp = fingerprint(
+        [
+            "mov eax, dword ptr [ecx]",
+            "mov dword ptr [ecx + 0x4], eax",
+            "xor edx, edx",
+        ]
+    )
     # Host uses ebx instead of eax for the temporary — literal miss, register hit.
     orig = [
         "push esi",
@@ -122,11 +126,13 @@ def test_register_normalized_inline_match_is_semantic():
         effect_summary=summarize_helper_effects(helper_fp),
     )
     assert register_normalized(helper_fp) == register_normalized(
-        fingerprint([
-            "mov ebx, dword ptr [ecx]",
-            "mov dword ptr [ecx + 0x4], ebx",
-            "xor edx, edx",
-        ])
+        fingerprint(
+            [
+                "mov ebx, dword ptr [ecx]",
+                "mov dword ptr [ecx + 0x4], ebx",
+                "xor edx, edx",
+            ]
+        )
     )
     result = analyze_inline_layout(rows(orig), rows(recomp), [helper])
     assert len(result.expansions) == 1
@@ -134,7 +140,7 @@ def test_register_normalized_inline_match_is_semantic():
 
 
 def test_asm_fingerprint_from_ir_uses_structured_operands():
-    rows = [
+    instructions = [
         DecodedInstruction(
             address=0x1000,
             size=3,
@@ -154,5 +160,5 @@ def test_asm_fingerprint_from_ir_uses_structured_operands():
             role=AsmRole.JUMP_TABLE_HEADER,
         ),
     ]
-    fp = fingerprint_of(rows)
+    fp = fingerprint_of(instructions)
     assert fp == fingerprint(["mov eax, dword ptr [ecx + 4]"])

@@ -407,7 +407,11 @@ def _forward_jcc_within(
     if row.address is None or row.branch_target <= row.address:
         return False
     target = next(
-        (index for index, other in enumerate(orig) if other.address == row.branch_target),
+        (
+            index
+            for index, other in enumerate(orig)
+            if other.address == row.branch_target
+        ),
         None,
     )
     return target is not None and k < target <= reloc_end

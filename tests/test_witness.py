@@ -12,6 +12,7 @@ import json
 import subprocess
 import sys
 from collections import deque
+from collections.abc import Hashable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,9 +150,10 @@ def _translator(
     def sizes(image_id: ImageId):
         def size(address: int) -> EntityExtent | None:
             entity = db.get(image_id, address)
-            if entity is None or entity.size(image_id) is None:
+            if entity is None:
                 return None
-            return EntityExtent(entity.size(image_id))
+            count = entity.size(image_id)
+            return EntityExtent(count) if count is not None else None
 
         return size
 
@@ -637,12 +639,15 @@ def test_an_uncertain_cleanup_needs_the_paired_callees_to_agree():
             machine._pristine = bytes(
                 machine.uc.mem_read(machine.image_range.start, len(machine.image_range))
             )
-            machine.function_window = (
-                (lambda _a: None)
-                if side == ImageId.ORIG
-                else (lambda _a, n=len(body): EntityExtent(n))
-            )
-            machine.insn_at.cache_clear()
+            extent = None if side == ImageId.ORIG else EntityExtent(len(body))
+
+            def window(
+                _address: int, *, bound: EntityExtent | None = extent
+            ) -> EntityExtent | None:
+                return bound
+
+            machine.function_window = window
+            machine.insn_at.cache_clear()  # type: ignore[attr-defined]
             machine.callee_pop_bytes.cache_clear()
         return translator
 
@@ -721,7 +726,7 @@ def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
 
 def test_overlapping_solver_loads_must_agree_on_every_byte():
     base = RunInput.from_seed(1)
-    this = {("init", "c"): 0x20000000}
+    this: dict[Hashable, int] = {("init", "c"): 0x20000000}
     # a dword at +4 and a word at +5 share bytes 5 and 6
     agree = input_from_assignment(
         {**this, _field(4, "dword"): 0x11223344, _field(5): 0x2233}, base
@@ -928,7 +933,7 @@ def test_a_paired_object_borrows_only_an_exactly_fitting_extent():
     """Without an original size, the recompiled size is used only when it is
     exactly the gap to the next known original entity."""
 
-    def extent(orig_gap: int, *, matched: bool = True) -> int | None:
+    def extent(orig_gap: int, *, matched: bool = True) -> EntityExtent | None:
         entity = ReccmpEntity(
             DATA,
             DATA + 0x100 if matched else None,

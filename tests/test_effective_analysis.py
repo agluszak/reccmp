@@ -753,9 +753,13 @@ def test_relocate_across_forward_jcc_with_addresses():
     assert is_effective_match(codes, orig_asm, recomp_asm) is False
     assert (
         is_effective_match(
-            codes, orig_asm, recomp_asm,
-            orig_addrs=orig_addrs, recomp_addrs=recomp_addrs,
-        ) is True
+            codes,
+            orig_asm,
+            recomp_asm,
+            orig_addrs=orig_addrs,
+            recomp_addrs=recomp_addrs,
+        )
+        is True
     )
 
 

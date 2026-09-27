@@ -103,12 +103,12 @@ def test_accuracy_after_stack_map_reaches_one():
 def test_rewrite_stack_displacements():
     orig = rows(["mov eax, dword ptr [ebp - 0x24]"])
     recomp = rows(["mov eax, dword ptr [ebp - 0x18]"])
-    assert accuracy_after_stack_map(
-        orig, recomp, {("ebp", -0x24): ("ebp", -0x18)}
-    ) == 1.0
-    assert extract_stack_offset_from_operands(recomp[0].operands) == StackRegisterOffset(
-        "ebp", -0x18
+    assert (
+        accuracy_after_stack_map(orig, recomp, {("ebp", -0x24): ("ebp", -0x18)}) == 1.0
     )
+    assert extract_stack_offset_from_operands(
+        recomp[0].operands
+    ) == StackRegisterOffset("ebp", -0x18)
 
 
 def test_derive_diagnostic_normalizations():
@@ -154,7 +154,9 @@ def test_strip_helper_epilog_drops_trailing_ret():
 
 def test_find_inline_expansions_detects_subsequence():
     helper = fingerprint(["mov eax, ecx", "add eax, 1", "imul eax, 2", "ret"])
-    host = fingerprint(["push ebp", "mov eax, ecx", "add eax, 1", "imul eax, 2", "pop ebp"])
+    host = fingerprint(
+        ["push ebp", "mov eax, ecx", "add eax, 1", "imul eax, 2", "pop ebp"]
+    )
 
     def fingerprint_of(addr: int, _size: int):
         assert addr == 0x200

@@ -52,7 +52,11 @@ def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
         _mismatch(
             "0x4",
             "call_target",
-            {"target_name": "arbitrary text", "target_entity_type": "IMPORT", "target_indirect": True},
+            {
+                "target_name": "arbitrary text",
+                "target_entity_type": "IMPORT",
+                "target_indirect": True,
+            },
             {"target_name": "arbitrary text", "target_entity_type": "IMPORT_THUNK"},
             AGREED,
         ),
