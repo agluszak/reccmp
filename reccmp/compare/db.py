@@ -272,9 +272,6 @@ class EntityBatch:
     def match(self, orig: int, recomp: int):
         self._matches.append((orig, recomp))
 
-    def set_recomp_addr(self, orig: int, recomp: int):
-        self.match(orig, recomp)
-
     def _finalized_matches(self) -> Iterator[tuple[int, int]]:
         """Reduce the list of matches so that each orig and recomp addr appears once.
         If an address is repeated, retain the first pair where it is used and ignore any others.

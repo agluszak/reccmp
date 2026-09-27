@@ -140,18 +140,3 @@ def admit_effective(
         ),
         reasons=normalized,
     )
-
-
-def admit_effective_analysis(
-    reasons,
-    *,
-    coverage_incomplete: bool = False,
-    extent_closed: bool,
-) -> ComparisonAnalysis | None:
-    """Shared EFFECTIVE admission; same coverage/extent obligations as exact."""
-    minted = admit_effective(
-        reasons,
-        coverage_incomplete=coverage_incomplete,
-        extent_closed=extent_closed,
-    )
-    return None if minted is None else minted.analysis

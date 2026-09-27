@@ -692,14 +692,6 @@ class Compare:
     def get_functions(self) -> Iterator[ReccmpMatch]:
         return self._db.get_functions()
 
-    def get_unmatched(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
-        """Raw unmatched inventory, including proven duplicate bodies."""
-        return self._db.unmatched(image_id)
-
-    def get_unexplained(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
-        """Unmatched inventory excluding proven duplicate bodies."""
-        return self._db.unexplained(image_id)
-
     def get_aliases(
         self, image_id: ImageId
     ) -> Iterator[tuple[ReccmpEntity, ReccmpMatch]]:

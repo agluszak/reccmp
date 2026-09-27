@@ -792,7 +792,6 @@ from tests.test_witness import FIELD_BELOW, FIELD_BELOW_OR_EQUAL, _translator
 def no_solver(*_args, **_kwargs):
     raise AssertionError("replay ran the solver")
 
-bitvector.distinguishing_assignment = no_solver
 bitvector._query = no_solver
 witness = RefutationWitness.from_json(json.loads(sys.stdin.read()))
 result = replay(_translator(FIELD_BELOW, FIELD_BELOW_OR_EQUAL), witness)

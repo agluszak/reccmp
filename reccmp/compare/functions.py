@@ -3,9 +3,8 @@ import dataclasses
 from dataclasses import dataclass, field
 from functools import cache, partial
 import struct
-from itertools import pairwise
 from collections.abc import Hashable
-from typing import Callable, Iterator
+from typing import Callable
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
@@ -580,28 +579,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
                 )
 
         return line_annotations_monotonous
-
-    def _split_code_on_line_annotations(
-        self,
-        orig_combined: list[DecodedInstruction],
-        recomp_combined: list[DecodedInstruction],
-        line_annotations: list[ReccmpMatch],
-    ) -> Iterator[tuple[list[DecodedInstruction], list[DecodedInstruction]]]:
-        """
-        For each given `// LINE:` annotation, splits the code into the part before,
-        the annotated line, and the part after it.
-        """
-        split_points = self._compute_split_points(
-            orig_combined, recomp_combined, line_annotations
-        )
-
-        for (orig_start, recomp_start), (orig_end, recomp_end) in pairwise(
-            split_points
-        ):
-            yield (
-                orig_combined[orig_start:orig_end],
-                recomp_combined[recomp_start:recomp_end],
-            )
 
     def _compute_split_points(
         self,

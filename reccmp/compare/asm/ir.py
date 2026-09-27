@@ -18,8 +18,6 @@ from .model import Reference
 if TYPE_CHECKING:
     from .graph import FunctionGraph
 
-_STACK_SLOT = ("stack_slot",)
-
 
 class ExtentKind(Enum):
     """How the compared byte window was chosen."""
@@ -154,14 +152,6 @@ class FunctionImage:
     def __post_init__(self) -> None:
         if any(row.size <= 0 or not row.mnemonic for row in self.instructions):
             raise ValueError("FunctionImage.instructions must contain instructions")
-
-    @property
-    def instruction_ids(self) -> tuple[int, ...]:
-        """Stable program-point ids owned by this image."""
-        return tuple(
-            row.instruction_id if row.instruction_id is not None else index
-            for index, row in enumerate(self.instructions)
-        )
 
     def with_instructions(
         self, instructions: Sequence[DecodedInstruction]
@@ -436,41 +426,6 @@ def local_destination_keys(
             return None
         keys.append(item)
     return tuple(keys)
-
-
-def compute_extent_closed(
-    excerpt: Sequence[DecodedInstruction],
-    *,
-    start_addr: int,
-    extent: int,
-    coverage_incomplete: bool = False,
-    jump_tables: Sequence[JumpTable] = (),
-    extent_kind: ExtentKind = ExtentKind.KNOWN,
-) -> bool:
-    # pylint: disable=import-outside-toplevel
-    """Extent closure from the same control-flow graph used by comparison."""
-    from .graph import build_function_graph
-
-    return build_function_graph(
-        excerpt, jump_tables, start_addr=start_addr, extent=extent
-    ).extent_closed(extent_kind=extent_kind, coverage_incomplete=coverage_incomplete)
-
-
-def _normalize_operand_stack(operand) -> Hashable:
-    """An operand with a stack slot's displacement erased."""
-    match operand:
-        case ("mem", size, seg, reg_terms, _, ()) if {
-            name for name, _scale in reg_terms
-        } & {"ebp", "esp"}:
-            return ("mem", size, seg, _freeze(reg_terms), _STACK_SLOT, ())
-        case _:
-            return _freeze(operand)
-
-
-def stack_normalized_key(row: DecodedInstruction) -> Hashable:
-    """The match key of a row with its stack slots' displacements erased."""
-    operands = tuple(_normalize_operand_stack(op) for op in row.operands)
-    return ("ins", row.mnemonic, row.prefix, operands)
 
 
 def local_branch_targets(rows: Sequence[DecodedInstruction]) -> list[int | None]:

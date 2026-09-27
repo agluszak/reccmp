@@ -84,24 +84,3 @@ def require_source_index(
             f"ms_abi={None if abi is None else abi.ms_abi}): {path}"
         )
     return scoped
-
-
-def load_source_index_for_target(
-    target: RecCmpTarget, *, explicit: Path | None = None
-) -> SourceIndex | None:
-    """Load a target-scoped source index, or ``None`` when unavailable.
-
-    Reports absence via debug log; parse/schema/ABI failures are logged as
-    warnings and treated as absent capability.
-    """
-    if resolve_source_index_path(target, explicit=explicit) is None:
-        logger.debug(
-            "source index unavailable for target %s (set RECCMP_SOURCE_INDEX)",
-            target.target_id,
-        )
-        return None
-    try:
-        return require_source_index(target, explicit=explicit)
-    except SourceIndexError as exc:
-        logger.warning("%s", exc)
-        return None

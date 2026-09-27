@@ -436,15 +436,6 @@ def observations_equal(obs_o: Sequence[Any], obs_r: Sequence[Any]) -> bool:
     )
 
 
-def distinguishing_assignment(values: tuple) -> dict[Hashable, int] | None:
-    """For a verifier value difference ``(value_orig, value_recomp, bits,
-    kind)`` (see ComparisonDifference.values): values of the leaf terms
-    under which the two differ, when Z3 finds one. Leaves Z3 leaves free
-    are absent. None when they cannot differ, or the solver cannot tell."""
-    outcome = compare(values)
-    return dict(outcome.assignment) if outcome.result == "differs" else None
-
-
 @dataclass(frozen=True)
 class Counterexample:
     """Leaf values under which two symbolic values differ, in the verifier's

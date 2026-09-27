@@ -229,11 +229,6 @@ def find_fingerprint_spans(haystack: Fingerprint, needle: Fingerprint) -> list[i
     return starts
 
 
-def _subsequence_index(haystack: Fingerprint, needle: Fingerprint) -> int | None:
-    starts = find_fingerprint_spans(haystack, needle)
-    return starts[0] if starts else None
-
-
 def select_nonoverlapping(spans: Sequence[_Span]) -> list[_Span]:
     """Weighted interval selection: prefer call-backed, unique, longer spans.
 

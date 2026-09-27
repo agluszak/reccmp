@@ -26,6 +26,3 @@ JUMP_MNEMONICS = {
     "loope",
     "loopne",
 }
-
-# Guaranteed to be a single operand.
-SINGLE_OPERAND_INSTS = {"push", "call", *JUMP_MNEMONICS}

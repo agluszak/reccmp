@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from unittest.mock import Mock
 
-from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
+from reccmp.compare.asm.ir import ExtentKind
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diagnosis import ComparisonStatus
@@ -177,26 +177,10 @@ def test_external_jcc_displacement_is_not_proof_identity():
 
 def test_estimated_extent_jmp_past_window_is_open():
     blob = bytes.fromhex("EB05")  # jmp +5, destination is start+7
-    excerpt = decode_function(blob, 0x1000).instructions
-    assert excerpt[0].branch_target == 0x1007
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.ESTIMATED,
-        )
-        is False
-    )
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is True
-    )
+    estimated = decode_function(blob, 0x1000, extent_kind=ExtentKind.ESTIMATED)
+    assert estimated.instructions[0].branch_target == 0x1007
+    assert estimated.extent_closed is False
+    assert decode_function(blob, 0x1000).extent_closed is True
 
 
 def test_unmatched_data_display_names_are_not_proof_identity():

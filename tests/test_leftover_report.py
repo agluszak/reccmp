@@ -20,9 +20,7 @@ from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     ExtentKind,
-    FunctionImage,
     JumpTable,
-    compute_extent_closed,
     rebind_local_identities,
 )
 from reccmp.compare.asm.model import Reference
@@ -40,7 +38,8 @@ from reccmp.compare.report import (
     serialize_reccmp_report,
 )
 from reccmp.compare.source_capability import (
-    load_source_index_for_target,
+    SourceIndexError,
+    require_source_index,
     resolve_source_index_path,
     source_index_abi_compatible,
 )
@@ -64,64 +63,19 @@ from reccmp.types import EntityType, ImageId
 from tests.raw_image import RawImage
 
 
-def test_instruction_ids_survive_slice_and_reorder():
-    blob = bytes.fromhex("B80100000083C001C3")  # mov eax,1; add eax,1; ret
-    rows = decode_function(blob, 0x1000).instructions
-    stamped = tuple(replace(row, instruction_id=100 + i) for i, row in enumerate(rows))
-    image = FunctionImage(0x1000, len(blob), ExtentKind.KNOWN, stamped)
-    assert image.instruction_ids == (100, 101, 102)
-    sliced = image.with_instructions(image.instructions[:2])
-    assert sliced.instruction_ids == (100, 101)
-    reordered = image.with_instructions([image.instructions[i] for i in (2, 0, 1)])
-    assert reordered.instruction_ids == (102, 100, 101)
-    assert reordered.instructions[0].display == image.instructions[2].display
+def _extent_closed(hex_code: str, kind: ExtentKind) -> bool:
+    return decode_function(
+        bytes.fromhex(hex_code), 0x1000, extent_kind=kind
+    ).extent_closed
 
 
-def test_estimated_extent_without_terminal_is_open():
-    blob = bytes.fromhex("B801000000B802000000")  # mov eax,1; mov eax,2
-    excerpt = decode_function(blob, 0x1000).instructions
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.ESTIMATED,
-        )
-        is False
-    )
-
-
-def test_known_extent_with_plain_fallthrough_is_open():
-    blob = bytes.fromhex("B801000000B901000000")  # mov eax,1; mov ecx,1
-    excerpt = decode_function(blob, 0x1000).instructions
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is False
-    )
-
-
-def test_known_extent_ending_in_ret_is_closed():
-    blob = bytes.fromhex("B801000000C3")  # mov eax,1; ret
-    excerpt = decode_function(blob, 0x1000).instructions
-    image = FunctionImage(
-        start_addr=0x1000,
-        extent=len(blob),
-        extent_kind=ExtentKind.KNOWN,
-        instructions=excerpt,
-        extent_closed=compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=len(blob),
-            extent_kind=ExtentKind.KNOWN,
-        ),
-        raw=blob,
-    )
-    assert image.extent_closed is True
+def test_extent_closure_needs_every_path_to_end():
+    # mov eax,1; mov eax,2
+    assert not _extent_closed("B801000000B802000000", ExtentKind.ESTIMATED)
+    # mov eax,1; mov ecx,1
+    assert not _extent_closed("B801000000B901000000", ExtentKind.KNOWN)
+    # mov eax,1; ret
+    assert _extent_closed("B801000000C3", ExtentKind.KNOWN)
 
 
 def _ret_at(addr: int, iid: int) -> DecodedInstruction:
@@ -151,40 +105,19 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         index_register="eax",
     )
     excerpt = (dispatch, case0, case1)
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=0x21,
-            jump_tables=(table,),
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is True
-    )
+
+    def closed(*tables: JumpTable) -> bool:
+        graph = build_function_graph(excerpt, tables, start_addr=0x1000, extent=0x21)
+        return graph.extent_closed(extent_kind=ExtentKind.KNOWN)
+
+    assert closed(table)
     other_table = JumpTable(
         address=0x2000,
         entries=((0x2000, 0x1010),),
         dispatch_address=0x9999,
     )
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=0x21,
-            jump_tables=(other_table,),
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is False
-    )
-    assert (
-        compute_extent_closed(
-            excerpt,
-            start_addr=0x1000,
-            extent=0x21,
-            extent_kind=ExtentKind.KNOWN,
-        )
-        is False
-    )
+    assert not closed(other_table)
+    assert not closed()
 
 
 def test_admit_proof_refuses_open_extent_and_incomplete_coverage():
@@ -255,7 +188,8 @@ def test_source_index_is_not_auto_discovered(tmp_path: Path):
     target.source_paths = ()
     target.source_index = None
     assert resolve_source_index_path(target) is None
-    assert load_source_index_for_target(target) is None
+    with pytest.raises(SourceIndexError, match="no source index"):
+        require_source_index(target)
 
 
 def test_source_index_rejects_incompatible_abi(tmp_path: Path):
@@ -280,7 +214,8 @@ def test_source_index_rejects_incompatible_abi(tmp_path: Path):
         source_index_abi_compatible(SourceAbi("x86_64-pc-windows-msvc", 8, True))
         is False
     )
-    assert load_source_index_for_target(target, explicit=path) is None
+    with pytest.raises(SourceIndexError, match="ABI is incompatible"):
+        require_source_index(target, explicit=path)
 
 
 def test_source_index_scopes_variable_only_targets(tmp_path: Path):
@@ -316,7 +251,8 @@ def test_source_index_scopes_variable_only_targets(tmp_path: Path):
     target.recompiled_path = tmp_path / "game.exe"
     target.source_paths = ()
     target.source_index = None
-    assert load_source_index_for_target(target, explicit=path) is None
+    with pytest.raises(SourceIndexError, match="no records for target GAME"):
+        require_source_index(target, explicit=path)
 
 
 def test_array_field_resolves_later_elements():

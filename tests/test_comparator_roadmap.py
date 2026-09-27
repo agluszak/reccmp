@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 from reccmp.compare.asm.ir import (
     instruction_match_key,
-    stack_normalized_key,
 )
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
@@ -42,15 +41,6 @@ def test_instruction_match_key_ignores_display_whitespace_equivalence():
     b = instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0])
     assert a == b
     assert a != instruction_match_key(rows(["mov ecx, dword ptr [ebp - 0x18]"])[0])
-
-
-def test_stack_normalized_key_collapses_frame_displacements():
-    a = stack_normalized_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0])
-    b = stack_normalized_key(rows(["mov eax, dword ptr [ebp - 0x24]"])[0])
-    assert a == b
-    assert instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x18]"])[0]) != (
-        instruction_match_key(rows(["mov eax, dword ptr [ebp - 0x24]"])[0])
-    )
 
 
 def test_ir_keyed_sequence_matcher_matches_string_ratio_for_identical_streams():
