@@ -11,7 +11,6 @@ from reccmp.compare.asm.model import REGISTERS, Reject
 from reccmp.compare.asm.verifier.addresses import mem_disjoint
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
-    CC_CANON,
     FAMILIES,
     JCC_MNEMONICS,
     Context,
@@ -47,125 +46,46 @@ class LineEffects:
 
 BARRIER = LineEffects(barrier=True)
 
-_RMW_BINOPS = frozenset(
-    {"add", "sub", "and", "or", "xor", "shl", "shr", "sar", "rol", "ror", "adc", "sbb"}
-)
-_X87_MEM_WRITERS = frozenset({"fst", "fstp", "fist", "fistp", "fnstcw", "fbstp"})
+_X87_REGISTERS = frozenset({"fpsw", "fpcw", "fptag", "fpip", "fpdp"})
 
 
 def _line_base_effects(ins: DecodedInstruction) -> LineEffects:
-    """Effect summary for one instruction: register families, flags, x87
-    use and barriers. Memory accesses are filled in by sequence_effects.
-    Anything not modeled (calls, jumps, string ops) is a scheduling
-    barrier."""
-    # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
-    if ins.prefix:
-        return BARRIER
-
-    mnemonic = ins.mnemonic
-    ops = ins.operands
-
-    regs_read: set = set()
-    regs_written: set = set()
-    x87 = mnemonic.startswith("f")
-    reads_flags = False
-    writes_flags = False
-
-    def use(op, write: bool = False) -> None:
-        kind = op[0]
-        if kind == "reg":
-            (regs_written if write else regs_read).add(REGISTERS[op[1]][0])
-        elif kind == "mem":
-            for reg, _ in op[3]:
-                regs_read.add(REGISTERS[reg][0])
-        elif kind not in ("imm", "sym", "st"):
-            raise Reject
-
-    try:
-        if mnemonic in ("mov", "movsx", "movzx") and len(ops) == 2:
-            use(ops[1])
-            use(ops[0], write=True)
-        elif mnemonic == "lea" and len(ops) == 2 and ops[1][0] == "mem":
-            for reg, _ in ops[1][3]:
-                regs_read.add(REGISTERS[reg][0])
-            use(ops[0], write=True)
-        elif mnemonic in _RMW_BINOPS and len(ops) == 2:
-            use(ops[0])
-            use(ops[0], write=True)
-            use(ops[1])
-            writes_flags = True
-            reads_flags = mnemonic in ("adc", "sbb")
-        elif mnemonic == "imul" and len(ops) == 3:
-            use(ops[0], write=True)
-            use(ops[1])
-            use(ops[2])
-            writes_flags = True
-        elif mnemonic == "imul" and len(ops) == 2:
-            use(ops[0])
-            use(ops[0], write=True)
-            use(ops[1])
-            writes_flags = True
-        elif mnemonic in ("inc", "dec", "neg", "not") and len(ops) == 1:
-            use(ops[0])
-            use(ops[0], write=True)
-            writes_flags = mnemonic != "not"
-        elif mnemonic in ("cmp", "test") and len(ops) == 2:
-            use(ops[0])
-            use(ops[1])
-            writes_flags = True
-        elif mnemonic in ("mul", "imul", "div", "idiv") and len(ops) == 1:
-            use(ops[0])
-            regs_read.update(("a", "d"))
-            regs_written.update(("a", "d"))
-            writes_flags = True
-        elif mnemonic == "cdq":
-            regs_read.add("a")
-            regs_written.add("d")
-        elif mnemonic == "cwde":
-            regs_read.add("a")
-            regs_written.add("a")
-        elif mnemonic == "sahf":
-            regs_read.add("a")
-            writes_flags = True
-        elif mnemonic == "lahf":
-            regs_written.add("a")
-            reads_flags = True
-        elif mnemonic == "push" and len(ops) == 1:
-            use(ops[0])
-            regs_read.add("sp")
-            regs_written.add("sp")
-        elif mnemonic == "pop" and len(ops) == 1:
-            use(ops[0], write=True)
-            regs_read.add("sp")
-            regs_written.add("sp")
-        elif mnemonic.startswith("set") and mnemonic[3:] in CC_CANON and len(ops) == 1:
-            use(ops[0], write=True)
-            reads_flags = True
-        elif mnemonic in ("nop", "int3"):
-            pass
-        elif mnemonic in JCC_MNEMONICS or mnemonic in ("loop", "loope", "loopne"):
-            return LineEffects(reads_flags=True, barrier=True)
-        elif mnemonic in ("call", "ret"):
-            # Calls clobber the flags; at ret they are dead.
-            return LineEffects(writes_flags=True, barrier=True)
-        elif x87:
-            for op in ops:
-                if op[0] == "mem":
-                    use(op, write=mnemonic in _X87_MEM_WRITERS)
-            if mnemonic == "fnstsw":
-                regs_written.add("a")
-        else:
-            return BARRIER
-    except (Reject, IndexError, KeyError):
-        return BARRIER
-
+    """Effect summary for one instruction from Capstone's register and flag
+    access: register families, flags, x87 use and barriers. Memory
+    accesses are filled in by sequence_effects. Control transfers, prefixed
+    instructions and registers outside the model are scheduling barriers;
+    a barrier keeps its flag effects (a jcc reads the flags, a call
+    clobbers them)."""
+    reads_flags = ins.reads_flags or "eflags" in ins.regs_read
+    writes_flags = ins.writes_flags or "eflags" in ins.regs_written
+    if (
+        ins.prefix
+        or ins.is_jump
+        or ins.is_call
+        or ins.is_ret
+        or not ins.register_access_known
+    ):
+        return LineEffects(
+            reads_flags=reads_flags,
+            writes_flags=writes_flags or ins.is_call or ins.is_ret,
+            barrier=True,
+        )
+    x87 = ins.mnemonic.startswith("f")
+    families: list[set[str]] = [set(), set()]
+    for names, found in ((ins.regs_read, families[0]), (ins.regs_written, families[1])):
+        for name in names:
+            if name in REGISTERS:
+                found.add(REGISTERS[name][0])
+            elif name == "eflags" or (x87 and name in _X87_REGISTERS):
+                continue
+            else:
+                return BARRIER
     return LineEffects(
-        regs_read=frozenset(regs_read),
-        regs_written=frozenset(regs_written),
+        regs_read=frozenset(families[0]),
+        regs_written=frozenset(families[1]),
         reads_flags=reads_flags,
         writes_flags=writes_flags,
         x87=x87,
-        barrier=False,
     )
 
 
