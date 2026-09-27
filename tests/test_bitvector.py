@@ -1,18 +1,26 @@
 """Bit-vector equivalence of the verifier's symbolic values (z3)."""
 
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.asm.verifier.addresses import CallResult, Init
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    CallResult,
+    Constant,
+    Init,
+    Load,
+    MemoryAddress,
+    SymbolValue,
+)
 from reccmp.compare.asm.verifier.state import Call, FunctionMetadata, Store
 from tests.asm_rows import verify_effective_match
 
 EAX = Init("a")
 ECX = Init("c")
-LOAD = ("load", ("mem", "", ((ECX, 1),), 4, ()), "dword", 0)
-BYTE = ("load", ("mem", "", ((ECX, 1),), 8, ()), "byte", 0)
+LOAD = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "dword", 0)
+BYTE = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 8, ()), "byte", 0)
 
 
 def imm(value: int):
-    return ("imm", value)
+    return Constant(value)
 
 
 def test_the_same_low_byte_computed_at_different_widths():
@@ -72,7 +80,7 @@ def test_predicates():
 
 
 def test_terms_it_cannot_lower_are_not_proven():
-    qword = ("load", ("mem", "", ((ECX, 1),), 4, ()), "qword", 0)
+    qword = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "qword", 0)
     assert not bitvector.values_equal(qword, ("add", qword, imm(0)))
     # an opaque term is an unconstrained value: equal only to itself
     call = CallResult(3, "eax")
@@ -81,20 +89,20 @@ def test_terms_it_cannot_lower_are_not_proven():
 
 
 def test_observations():
-    address = ("mem", "", ((ECX, 1),), 4, ())
+    address = MemoryAddress("", (AddressTerm(ECX, 1),), 4, ())
     assert bitvector.entries_equal(
         Store(address, "byte", ("and", imm(1), ("l8", LOAD))),
         Store(address, "byte", ("l8", ("and", imm(1), LOAD))),
     )
     # the address and width must be the same, not merely equivalent
-    other = ("mem", "", ((ECX, 1),), 8, ())
+    other = MemoryAddress("", (AddressTerm(ECX, 1),), 8, ())
     assert not bitvector.entries_equal(
         Store(address, "byte", ("l8", LOAD)),
         Store(other, "byte", ("l8", LOAD)),
     )
     assert not bitvector.entries_equal(
-        Call(("sym", "f"), (EAX,)),
-        Call(("sym", "f"), (("add", EAX, imm(0)),)),
+        Call(SymbolValue("f"), (EAX,)),
+        Call(SymbolValue("f"), (("add", EAX, imm(0)),)),
     )
 
 
@@ -114,7 +122,11 @@ def test_the_verifier_accepts_an_algebraic_identity():
 
 
 def _at(displacement: int, size: str, generation=0):
-    return ("load", ("mem", "", ((ECX, 1),), displacement, ()), size, generation)
+    return Load(
+        MemoryAddress("", (AddressTerm(ECX, 1),), displacement, ()),
+        size,
+        generation,
+    )
 
 
 def test_a_narrower_load_is_the_bytes_of_a_wider_one():

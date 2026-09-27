@@ -8,8 +8,15 @@ from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import REGISTERS, Reject
 from reccmp.compare.asm.operand import Imm, Mem, Operand, Reg, ScaledReg, St, Sym
 from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    AddressValue,
     CallResult,
+    Constant,
+    Load,
+    MemoryAddress,
+    StackOffset,
     StringResult,
+    SymbolValue,
     Value,
     flatten_mem,
     stack_rooted,
@@ -79,26 +86,27 @@ def mem_address(
             # The slot's address escapes (lea) or the access is indexed
             # (a local array): renaming frame slots is no longer safe.
             state.slots_escaped = True
-    pairs = [(state.read_reg(term.register), term.scale) for term in op.terms]
+    pairs = [
+        AddressTerm(state.read_reg(term.register), term.scale) for term in op.terms
+    ]
     if isinstance(disp_key, int):
         # Fold constant stack-pointer adjustments into the displacement so
         # that e.g. [esp + 8] before a push and [esp + 0xc] after it denote
         # the same address. Skipped for alpha-renamed frame slots, whose
         # key is the slot id rather than an offset.
         folded = []
-        for value, scale in pairs:
-            base, offset = unwind_spadd(value)
+        for term in pairs:
+            base, offset = unwind_spadd(term.value)
             if offset:
-                disp_key += scale * offset
-                value = base
-            folded.append((value, scale))
+                disp_key += term.scale * offset
+            folded.append(AddressTerm(base, term.scale))
         pairs = folded
     terms = tuple(sorted(pairs, key=repr))
-    if escape and any(stack_rooted(value) for value, _ in terms):
+    if escape and any(stack_rooted(term.value) for term in terms):
         # A stack address escapes into a register: pointers derived from it
         # could reach frame slots or saved registers on the stack.
         state.slots_escaped = True
-    return ("mem", op.segment, terms, disp_key, op.symbols)
+    return MemoryAddress(op.segment, terms, disp_key, op.symbols)
 
 
 def read_operand(state: SideState, ctx: Context, op: Operand) -> Value:
@@ -109,11 +117,11 @@ def read_operand(state: SideState, ctx: Context, op: Operand) -> Value:
         case Reg(name):
             # A register outside the model (a segment register) reads as a
             # fixed symbol of the function.
-            return ("sym", name)
+            return SymbolValue(name)
         case Imm(value):
-            return ("imm", value)
+            return Constant(value)
         case Sym(ref):
-            return ("sym", ref.identity)
+            return SymbolValue(ref.identity)
         case St(index):
             return state.x87.read(index)
         case Mem(size=size):
@@ -127,7 +135,7 @@ def read_operand(state: SideState, ctx: Context, op: Operand) -> Value:
                 ctx.trace.append(("r", address, width, False))
             tag = memory_load_tag(ctx, address, width, False)
             state.load_log.add((address, tag))
-            return ("load", address, size, tag)
+            return Load(address, size, tag)
     raise Reject
 
 
@@ -141,15 +149,14 @@ def _canonical_address_value(address: Value) -> Value:
     by ADD itself.
     """
     mem = flatten_mem(address)
-    _, seg, terms, disp, syms = mem
-    if seg or syms or not isinstance(disp, int):
-        return ("addr", mem)
-    if any(scale != 1 or stack_rooted(value) for value, scale in terms):
-        return ("addr", mem)
+    if mem.segment or mem.symbols or not isinstance(mem.displacement, int):
+        return AddressValue(mem)
+    if any(term.scale != 1 or stack_rooted(term.value) for term in mem.terms):
+        return AddressValue(mem)
 
-    values = [value for value, _ in terms]
-    if disp or not values:
-        values.append(("imm", disp))
+    values = [term.value for term in mem.terms]
+    if mem.displacement or not values:
+        values.append(Constant(mem.displacement))
     if len(values) == 1:
         return values[0]
 
@@ -162,19 +169,14 @@ def _canonical_address_value(address: Value) -> Value:
 def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
     """Canonical receiver identity independent of reload generation tags."""
     seen: set[int] = set()
-    while (
-        isinstance(receiver, tuple)
-        and len(receiver) == 4
-        and receiver[0] == "load"
-        and id(receiver) not in seen
-    ):
+    while isinstance(receiver, Load) and id(receiver) not in seen:
         seen.add(id(receiver))
-        address, size = receiver[1], WIDTHS.get(receiver[2])
+        address, size = receiver.address, WIDTHS.get(receiver.width)
         forwarded = ctx.receiver_values.get((address, size))
         if forwarded is None:
-            return ("receiver_load", address, receiver[2])
+            return ("receiver_load", address, receiver.width)
         store_tag, stored_value = forwarded
-        load_tag = receiver[3]
+        load_tag = receiver.generation
         event_tags = [tag for tag, _ in ctx.mem_events]
         if store_tag == load_tag:
             receiver = stored_value
@@ -182,9 +184,9 @@ def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
             if event_tags.index(store_tag) < event_tags.index(load_tag):
                 receiver = stored_value
             else:
-                return ("receiver_load", address, receiver[2])
+                return ("receiver_load", address, receiver.width)
         else:
-            return ("receiver_load", address, receiver[2])
+            return ("receiver_load", address, receiver.width)
     return receiver
 
 
@@ -196,31 +198,32 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     register allocation, moved equivalent loads, and equivalent phi inputs
     transparent while retaining the receiver and slot as the call identity.
     """
-    if not (isinstance(target, tuple) and len(target) == 4 and target[0] == "load"):
+    if not isinstance(target, Load):
         return None
 
-    call_mem = flatten_mem(target[1])
-    _, call_seg, call_terms, slot, call_syms = call_mem
-    if call_seg or call_syms or not isinstance(slot, int) or len(call_terms) != 1:
-        return None
-    vtable, scale = call_terms[0]
-    if scale != 1 or not (
-        isinstance(vtable, tuple) and len(vtable) == 4 and vtable[0] == "load"
-    ):
-        return None
-
-    receiver_mem = flatten_mem(vtable[1])
-    _, receiver_seg, receiver_terms, receiver_disp, receiver_syms = receiver_mem
+    call_mem = flatten_mem(target.address)
     if (
-        receiver_seg
-        or receiver_syms
-        or receiver_disp != 0
-        or len(receiver_terms) != 1
-        or receiver_terms[0][1] != 1
+        call_mem.segment
+        or call_mem.symbols
+        or not isinstance(call_mem.displacement, int)
+        or len(call_mem.terms) != 1
     ):
         return None
-    receiver = receiver_equivalence_class(receiver_terms[0][0], ctx)
-    return ("vcall", receiver, slot)
+    vtable = call_mem.terms[0]
+    if vtable.scale != 1 or not isinstance(vtable.value, Load):
+        return None
+
+    receiver_mem = flatten_mem(vtable.value.address)
+    if (
+        receiver_mem.segment
+        or receiver_mem.symbols
+        or receiver_mem.displacement != 0
+        or len(receiver_mem.terms) != 1
+        or receiver_mem.terms[0].scale != 1
+    ):
+        return None
+    receiver = receiver_equivalence_class(receiver_mem.terms[0].value, ctx)
+    return ("vcall", receiver, call_mem.displacement)
 
 
 def write_operand(
@@ -279,10 +282,10 @@ def _st_index(op: Operand) -> int:
 
 
 def esp_add(value: Value, delta: int) -> Value:
-    if isinstance(value, tuple) and value[0] == "spadd":
-        base, offset = value[1], value[2] + delta
-        return base if offset == 0 else ("spadd", base, offset)
-    return ("spadd", value, delta)
+    if isinstance(value, StackOffset):
+        offset = value.offset + delta
+        return value.base if offset == 0 else StackOffset(value.base, offset)
+    return StackOffset(value, delta)
 
 
 # Condition codes whose outcome depends on the carry flag.
@@ -295,13 +298,11 @@ def _import_call(target: Value) -> Value:
     at the same point; both run X with the same return address. Only the
     call target is unified: the thunk's address and the slot's content are
     different pointer values."""
-    if not isinstance(target, tuple) or len(target) < 2:
-        return target
-    if target[0] == "sym" and isinstance(target[1], tuple):
-        if target[1][:1] == ("jmp_through",):
-            return ("call_through", target[1][1])
-    if target[0] == "load" and len(target) >= 3 and target[2] == "dword":
-        slot = _absolute_symbol(target[1])
+    if isinstance(target, SymbolValue) and isinstance(target.identity, tuple):
+        if target.identity[:1] == ("jmp_through",):
+            return ("call_through", target.identity[1])
+    if isinstance(target, Load) and target.width == "dword":
+        slot = _absolute_symbol(target.address)
         if slot is not None:
             return ("call_through", slot)
     return target
@@ -310,16 +311,18 @@ def _import_call(target: Value) -> Value:
 def _absolute_symbol(address: Value) -> Hashable | None:
     """The identity of `[symbol]`: an address with no registers, no
     displacement and one symbol."""
-    if not isinstance(address, tuple) or not address:
+    if isinstance(address, SymbolValue):
+        return address.identity
+    if not isinstance(address, MemoryAddress):
         return None
-    if address[0] == "sym" and len(address) == 2:
-        return address[1]
-    if address[0] != "mem" or len(address) != 5:
+    if (
+        address.terms
+        or address.displacement != 0
+        or len(address.symbols) != 1
+        or address.symbols[0].sign != 1
+    ):
         return None
-    _, _, registers, displacement, symbols = address
-    if registers or displacement != 0 or len(symbols) != 1 or symbols[0].sign != 1:
-        return None
-    return symbols[0].ref.identity
+    return address.symbols[0].ref.identity
 
 
 def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
@@ -342,16 +345,16 @@ def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
     low, high = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, mask)
     strict = pred.startswith("lt_")
     kind = "le_s" if signed else "le_u"
-    if isinstance(b, tuple) and b[:1] == ("imm",) and isinstance(b[1], int):
-        constant = value(b[1])
+    if isinstance(b, Constant):
+        constant = value(b.value)
         if strict and constant > low:
-            return (kind, a, ("imm", constant - 1))
-        return (pred, a, ("imm", constant))
-    if isinstance(a, tuple) and a[:1] == ("imm",) and isinstance(a[1], int):
-        constant = value(a[1])
+            return (kind, a, Constant(constant - 1))
+        return (pred, a, Constant(constant))
+    if isinstance(a, Constant):
+        constant = value(a.value)
         if strict and constant < high:
-            return (kind, ("imm", constant + 1), b)
-        return (pred, ("imm", constant), b)
+            return (kind, Constant(constant + 1), b)
+        return (pred, Constant(constant), b)
     return (pred, a, b)
 
 
@@ -441,7 +444,7 @@ def execute(
         b = read_operand(state, ctx, ops[1])
         pair = vsort(a, b)
         if mnemonic == "xor" and a == b:
-            value = ("imm", 0)
+            value = Constant(0)
         elif mnemonic in ("and", "or") and a == b:
             # and/or of a value with itself leaves it unchanged.
             value = a
@@ -455,7 +458,7 @@ def execute(
             # SF/ZF/PF reflect the value; CF and OF are cleared: exactly
             # the flag state of `cmp value, 0`.
             width = _compare_width(ops[0], ops[0])
-            state.flags = ("cmp", a, ("imm", 0), width)
+            state.flags = ("cmp", a, Constant(0), width)
         else:
             state.flags = ("flags", mnemonic, *pair)
         # and/or/xor clear CF; add/imul produce a carry-out.
@@ -475,7 +478,7 @@ def execute(
     elif mnemonic in ORDERED_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
-        value = ("imm", 0) if (mnemonic == "sub" and a == b) else (mnemonic, a, b)
+        value = Constant(0) if (mnemonic == "sub" and a == b) else (mnemonic, a, b)
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic == "sub" and a == b:
             # Zero idiom: same flag state as xor r, r.
@@ -511,7 +514,7 @@ def execute(
         else:
             state.flags = ("cmp", a, b, width)
         # `x < x` and `x < 0` (unsigned) are always false.
-        if b in (a, ("imm", 0)):
+        if b in (a, Constant(0)):
             state.carry = ("cf0",)
         else:
             state.carry = ("lt_u", a, b, width)
@@ -522,7 +525,7 @@ def execute(
         if a == b:
             # `test r, r` sets SF/ZF/PF from the value and clears CF/OF:
             # exactly the flag state of `cmp r, 0`.
-            state.flags = ("cmp", a, ("imm", 0), width)
+            state.flags = ("cmp", a, Constant(0), width)
         else:
             state.flags = ("test", *vsort(a, b), width)
         state.carry = ("cf0",)
@@ -568,7 +571,7 @@ def execute(
         else:
             if ctx.trace is not None:
                 ctx.trace.append(("r", esp, 4, "pop"))
-            popped = ("load", esp, "stack", memory_load_tag(ctx, esp, 4, "pop"))
+            popped = Load(esp, "stack", memory_load_tag(ctx, esp, 4, "pop"))
         write_operand(state, ctx, ops[0], popped, obs)
         state.write_reg("esp", esp_add(esp, 4))
     elif mnemonic == "leave":
@@ -580,7 +583,7 @@ def execute(
             if ctx.trace is not None:
                 ctx.trace.append(("r", ebp, 4, "pop"))
             state.write_reg(
-                "ebp", ("load", ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
+                "ebp", Load(ebp, "stack", memory_load_tag(ctx, ebp, 4, "pop"))
             )
         state.write_reg("esp", esp_add(ebp, 4))
     elif mnemonic == "call" and len(ops) == 1:
@@ -777,7 +780,7 @@ def execute_x87(
         x87.pop()
         x87.pop()
     elif mnemonic == "ftst":
-        state.fpu_flags = ("fcom", x87.read(0), ("imm", 0))
+        state.fpu_flags = ("fcom", x87.read(0), Constant(0))
     elif mnemonic == "fnstsw" and ops == (Reg("ax"),):
         state.write_reg("ax", ("fsw", state.fpu_flags))
     elif mnemonic == "fnstcw" and len(ops) == 1:

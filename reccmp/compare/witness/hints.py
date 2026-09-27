@@ -19,7 +19,13 @@ from dataclasses import dataclass
 from collections.abc import Hashable, Mapping
 from typing import Any
 
-from reccmp.compare.asm.verifier.addresses import Init
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    Init,
+    Load,
+    MemoryAddress,
+    SymbolValue,
+)
 from reccmp.compare.witness.machine import STACK_ARG_DWORDS, RunInput, lazily_mapped
 
 _REGISTERS = {
@@ -37,20 +43,17 @@ _ENTRY_MEMORY = (0, ("cfg_mem_init",))  # load tags of memory untouched since en
 def _stack_argument(term: Any) -> int | None:
     """The index of a dword stack argument read as it was at entry:
     `[esp + 4 * (index + 1)]`, the return address being `[esp]`."""
-    if not (isinstance(term, tuple) and len(term) == 4 and term[0] == "load"):
-        return None
-    _, address, size, tag = term
-    if size != "dword" or tag not in _ENTRY_MEMORY:
-        return None
-    if not (isinstance(address, tuple) and len(address) == 5 and address[0] == "mem"):
-        return None
-    _, segment, terms, displacement, symbols = address
-    if segment or symbols or terms != ((Init("sp"), 1),):
-        return None
-    if not isinstance(displacement, int) or displacement % 4:
-        return None
-    index = displacement // 4 - 1
-    return index if 0 <= index < STACK_ARG_DWORDS else None
+    match term:
+        case Load(
+            MemoryAddress("", (AddressTerm(Init("sp"), 1),), int() as displacement, ()),
+            "dword",
+            tag,
+        ) if (
+            tag in _ENTRY_MEMORY and displacement % 4 == 0
+        ):
+            index = displacement // 4 - 1
+            return index if 0 <= index < STACK_ARG_DWORDS else None
+    return None
 
 
 _LOAD_SIZES = {"byte": 1, "word": 2, "dword": 4}
@@ -59,23 +62,18 @@ _LOAD_SIZES = {"byte": 1, "word": 2, "dword": 4}
 def _entry_load(term: Any) -> tuple[str, int, int] | None:
     """(register, displacement, size) of `[register + displacement]` read
     as it was at entry, through a register other than esp."""
-    # pylint: disable=too-many-return-statements
-    if not (isinstance(term, tuple) and len(term) == 4 and term[0] == "load"):
-        return None
-    _, address, size, tag = term
-    if size not in _LOAD_SIZES or tag not in _ENTRY_MEMORY:
-        return None
-    if not (isinstance(address, tuple) and len(address) == 5 and address[0] == "mem"):
-        return None
-    _, segment, terms, displacement, symbols = address
-    if segment or symbols or len(terms) != 1 or not isinstance(displacement, int):
-        return None
-    ((base, scale),) = terms
-    if scale != 1 or not isinstance(base, Init):
-        return None
-    if base.family not in _REGISTERS:
-        return None
-    return _REGISTERS[base.family], displacement, _LOAD_SIZES[size]
+    match term:
+        case Load(
+            MemoryAddress(
+                "", (AddressTerm(Init(family), 1),), int() as displacement, ()
+            ),
+            size,
+            tag,
+        ) if (
+            family in _REGISTERS and size in _LOAD_SIZES and tag in _ENTRY_MEMORY
+        ):
+            return _REGISTERS[family], displacement, _LOAD_SIZES[size]
+    return None
 
 
 @dataclass(frozen=True)
@@ -101,13 +99,14 @@ def input_from_assignment(
     arguments = list(base.stack_args)
     loads: list[tuple[Hashable, str, int, int, int]] = []
     for term, value in assignment.items():
-        if isinstance(term, tuple) and term[:1] == ("sym",):
-            # Each image fixes its symbols' addresses; the solver's choice is
-            # not an input. The run decides whether the rest reproduces.
-            continue
-        if isinstance(term, Init) and term.family in _REGISTERS:
-            registers[_REGISTERS[term.family]] = value & 0xFFFFFFFF
-            continue
+        match term:
+            case SymbolValue():
+                # Each image fixes its symbols' addresses; the solver's choice is
+                # not an input. The run decides whether the rest reproduces.
+                continue
+            case Init(family) if family in _REGISTERS:
+                registers[_REGISTERS[family]] = value & 0xFFFFFFFF
+                continue
         index = _stack_argument(term)
         if index is not None:
             arguments[index] = value & 0xFFFFFFFF

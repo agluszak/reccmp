@@ -26,7 +26,16 @@ from reccmp.compare.asm.operand import (
     format_operand,
 )
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.asm.verifier.addresses import Init, Phi
+from reccmp.compare.asm.verifier.addresses import (
+    AddressValue,
+    Constant,
+    Init,
+    Load,
+    MemoryAddress,
+    Phi,
+    StackOffset,
+    SymbolValue,
+)
 from reccmp.compare.asm.verifier.render import render, render_number
 from reccmp.source.records import SourceComparison, SourceComparisonOperand
 from reccmp.compare.diagnosis import (
@@ -204,8 +213,17 @@ def _identity_kinds(value: Any) -> set[str]:
                 ref=Reference(identity=(kind, *_))
             ):
                 kinds.add(str(kind))
-            case ("sym", (kind, *_)):
+            case SymbolValue((kind, *_)):
                 kinds.add(str(kind))
+            case Load(address, _, generation):
+                stack.extend((address, generation))
+            case AddressValue(address):
+                stack.append(address)
+            case MemoryAddress(terms=terms, displacement=displacement):
+                stack.extend(term.value for term in terms)
+                stack.append(displacement)
+            case StackOffset(base):
+                stack.append(base)
             case tuple() if id(node) not in seen:
                 seen.add(id(node))
                 stack.extend(node)
@@ -227,12 +245,34 @@ def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
     """The smallest subterms where two values differ, with the node that
     holds them: ``(parent, orig part, recomp part)``. None when the two
     differ in shape (another operation) above any single part."""
+    result: tuple[Any, Any, Any] | None = None
     match orig, recomp:
         case _ if orig == recomp:
-            return None
-        case ("sym", _), ("sym", _):
-            # A reference is compared whole, not by its identity's parts.
-            return (None, orig, recomp)
+            pass
+        case (SymbolValue(), SymbolValue()) | (Constant(), Constant()):
+            result = (None, orig, recomp)
+        case AddressValue(address_o), AddressValue(address_r):
+            result = first_difference(address_o, address_r)
+        case Load(address_o, width_o, generation_o), Load(
+            address_r, width_r, generation_r
+        ) if (width_o, generation_o) == (width_r, generation_r):
+            result = first_difference(address_o, address_r)
+        case StackOffset(base_o, offset_o), StackOffset(base_r, offset_r) if (
+            offset_o == offset_r
+        ):
+            result = first_difference(base_o, base_r)
+        case MemoryAddress(
+            segment_o, terms_o, displacement_o, symbols_o
+        ), MemoryAddress(segment_r, terms_r, displacement_r, symbols_r) if (
+            segment_o,
+            terms_o,
+            symbols_o,
+        ) == (
+            segment_r,
+            terms_r,
+            symbols_r,
+        ):
+            result = (orig, displacement_o, displacement_r)
         case (tag_o, *items_o), (tag_r, *items_r) if tag_o == tag_r and len(
             items_o
         ) == len(items_r):
@@ -243,15 +283,13 @@ def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
             ]
             if len(differing) == 1:
                 inner = first_difference(*differing[0])
-                return inner if inner is not None else (orig, *differing[0])
-            return None
-        case _:
-            return None
+                result = inner if inner is not None else (orig, *differing[0])
+    return result
 
 
 def _identity(part: Any) -> Any:
     match part:
-        case Reference(identity=identity) | ("sym", identity):
+        case Reference(identity=identity) | SymbolValue(identity):
             return identity
         case _:
             return None
@@ -261,7 +299,7 @@ def _part_cause(parent: Any, part_o: Any, part_r: Any) -> Cause | None:
     """What the one differing part of two otherwise equal values means."""
     # pylint: disable=too-many-return-statements
     match parent, part_o, part_r:
-        case ("mem", *_), int(), int():
+        case MemoryAddress(), int(), int():
             return Cause(
                 CauseCode.FIELD_OFFSET,
                 Group.LOGIC,
@@ -269,7 +307,7 @@ def _part_cause(parent: Any, part_o: Any, part_r: Any) -> Cause | None:
                 f"{render_number(part_r)}: the wrong field or element, or a layout "
                 "that places it elsewhere",
             )
-        case _, ("imm", int() as value_o), ("imm", int() as value_r):
+        case _, Constant(value_o), Constant(value_r):
             return Cause(
                 CauseCode.CONSTANT,
                 Group.LOGIC,

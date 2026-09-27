@@ -57,75 +57,188 @@ class Phi:
         return self.settled
 
 
-Value: TypeAlias = tuple | Init | CallResult | StringResult | Resync | Phi
+@dataclass(frozen=True, slots=True)
+class Constant:
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolValue:
+    identity: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class AddressTerm:
+    value: Value
+    scale: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryAddress:
+    segment: str
+    terms: tuple[AddressTerm, ...]
+    displacement: int | Value
+    symbols: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class AddressValue:
+    address: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Load:
+    address: Value
+    width: str
+    generation: int | Value
+
+
+@dataclass(frozen=True, slots=True)
+class StackOffset:
+    base: Value
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class Slot:
+    index: int
+
+
+Value: TypeAlias = (
+    tuple
+    | Init
+    | CallResult
+    | StringResult
+    | Resync
+    | Phi
+    | Constant
+    | SymbolValue
+    | MemoryAddress
+    | AddressValue
+    | Load
+    | StackOffset
+    | Slot
+)
+
+_VALUE_TYPES = (
+    Init,
+    CallResult,
+    StringResult,
+    Resync,
+    Phi,
+    Constant,
+    SymbolValue,
+    MemoryAddress,
+    AddressValue,
+    Load,
+    StackOffset,
+    Slot,
+)
+
+
+def is_value(value: object) -> bool:
+    return isinstance(value, (tuple, *_VALUE_TYPES))
+
+
+def value_children(value: Value) -> tuple[Value, ...]:
+    match value:
+        case MemoryAddress(terms=terms, displacement=displacement):
+            children = tuple(term.value for term in terms)
+            return (
+                children if isinstance(displacement, int) else (*children, displacement)
+            )
+        case AddressValue(address):
+            return (address,)
+        case Load(address, _, generation):
+            return (address,) if isinstance(generation, int) else (address, generation)
+        case StackOffset(base):
+            return (base,)
+        case tuple():
+            return tuple(child for child in value if is_value(child))
+    return ()
 
 
 def _foldable_address_value(value: Value, scale: int, segment: str) -> bool:
-    if scale != 1 or not isinstance(value, tuple):
+    if scale != 1:
         return False
-    if value and value[0] == "add":
-        return True
-    return len(value) == 2 and value[0] == "addr" and value[1][1] in ("", segment)
+    if isinstance(value, AddressValue) and isinstance(value.address, MemoryAddress):
+        return value.address.segment in ("", segment)
+    return isinstance(value, tuple) and bool(value) and value[0] == "add"
 
 
-def flatten_mem(addr: Value) -> tuple:
+def flatten_mem(addr: Value) -> MemoryAddress:
     """Fold scale-1 base registers that hold a computed address (from lea)
     into the memory expression itself, so `[esi]` with esi = &[ebx + 0x1c6]
     compares as `[ebx + 0x1c6]`."""
-    if not isinstance(addr, tuple):
-        return ("mem", "", ((addr, 1),), 0, ())
-    _, seg, terms, disp, syms = addr
+    mem = (
+        addr
+        if isinstance(addr, MemoryAddress)
+        else MemoryAddress("", (AddressTerm(addr, 1),), 0, ())
+    )
+    seg, terms, disp, syms = (
+        mem.segment,
+        mem.terms,
+        mem.displacement,
+        mem.symbols,
+    )
     for _ in range(8):
-        folded = None
-        for term in terms:
-            value, scale = term
-            if _foldable_address_value(value, scale, seg):
-                folded = term
-                break
+        folded = next(
+            (
+                term
+                for term in terms
+                if _foldable_address_value(term.value, term.scale, seg)
+            ),
+            None,
+        )
         if folded is None:
             break
-        value = folded[0]
-        terms = tuple(t for t in terms if t is not folded)
-        if value[0] == "addr":
-            inner = value[1]
-            terms += inner[2]
-            disp += inner[3]
-            syms = tuple(sorted(set(syms) | set(inner[4]), key=repr))
-            seg = seg or inner[1]
+        value = folded.value
+        terms = tuple(term for term in terms if term is not folded)
+        if isinstance(value, AddressValue):
+            assert isinstance(value.address, MemoryAddress)
+            inner = value.address
+            terms += inner.terms
+            if isinstance(disp, int) and isinstance(inner.displacement, int):
+                disp += inner.displacement
+            else:
+                break
+            syms = tuple(sorted(set(syms) | set(inner.symbols), key=repr))
+            seg = seg or inner.segment
         else:
+            assert isinstance(value, tuple) and value[0] == "add"
             for leaf in value[1:]:
-                if isinstance(leaf, tuple) and leaf[0] == "imm":
-                    disp += leaf[1]
+                if isinstance(leaf, Constant):
+                    assert isinstance(disp, int)
+                    disp += leaf.value
                 else:
-                    terms += ((leaf, 1),)
-    return ("mem", seg, tuple(sorted(terms, key=repr)), disp, syms)
+                    terms += (AddressTerm(leaf, 1),)
+    return MemoryAddress(seg, tuple(sorted(terms, key=repr)), disp, syms)
 
 
 def stack_rooted(value: Value) -> bool:
     """Is the value derived from the stack pointer or frame pointer?"""
     if isinstance(value, Init):
         return value.family in ("sp", "bp")
+    if isinstance(value, StackOffset):
+        return stack_rooted(value.base)
+    if isinstance(value, AddressValue):
+        if isinstance(value.address, MemoryAddress):
+            return any(stack_rooted(term.value) for term in value.address.terms)
+        return stack_rooted(value.address)
     if not isinstance(value, tuple) or not value:
         return False
-    tag = value[0]
-    children: tuple[Value, ...] = ()
-    if tag == "spadd":
-        children = (value[1],)
-    elif tag == "addr":
-        children = tuple(child for child, _ in value[1][2])
-    elif tag in ("add", "ins_r16"):
-        children = value[1:]
+    children: tuple[Value, ...] = value[1:] if value[0] in ("add", "ins_r16") else ()
     return any(stack_rooted(child) for child in children)
 
 
-def _is_pure_global(mem: tuple) -> bool:
-    return not mem[2] and bool(mem[4])
+def _is_pure_global(mem: MemoryAddress) -> bool:
+    return not mem.terms and bool(mem.symbols)
 
 
 def unwind_spadd(value: Value, offset: int = 0) -> tuple[Value, int]:
-    while isinstance(value, tuple) and value and value[0] == "spadd":
-        offset += value[2]
-        value = value[1]
+    while isinstance(value, StackOffset):
+        offset += value.offset
+        value = value.base
     return (value, offset)
 
 
@@ -138,25 +251,27 @@ def constant_offset(value: Value) -> tuple[Value, int]:
     """(root, offset) of a value that is a root plus a constant, whether
     built by push/pop (``spadd``) or by ``add``/``sub`` of an immediate."""
     offset = 0
-    while isinstance(value, tuple) and value:
-        if value[0] == "spadd":
-            offset += value[2]
-            value = value[1]
+    while True:
+        if isinstance(value, StackOffset):
+            offset += value.offset
+            value = value.base
         elif (
-            value[0] == "sub"
+            isinstance(value, tuple)
             and len(value) == 3
-            and isinstance(value[2], tuple)
-            and value[2][:1] == ("imm",)
+            and value[0] == "sub"
+            and isinstance(value[2], Constant)
         ):
-            offset -= _signed32(value[2][1])
+            offset -= _signed32(value[2].value)
             value = value[1]
-        elif value[0] == "add":
-            terms = [
-                t for t in value[1:] if not (isinstance(t, tuple) and t[:1] == ("imm",))
-            ]
+        elif isinstance(value, tuple) and value and value[0] == "add":
+            terms = [term for term in value[1:] if not isinstance(term, Constant)]
             if len(terms) != 1:
                 break
-            offset += sum(_signed32(t[1]) for t in value[1:] if t is not terms[0])
+            offset += sum(
+                _signed32(term.value)
+                for term in value[1:]
+                if isinstance(term, Constant)
+            )
             value = terms[0]
         else:
             break
@@ -170,11 +285,11 @@ def abs_stack_offset(addr: Value, is_slot) -> tuple[Value, int] | None:
     if is_slot:
         return unwind_spadd(addr)
     mem = flatten_mem(addr)
-    if len(mem[2]) == 1 and not mem[4] and isinstance(mem[3], int):
-        value, scale = mem[2][0]
-        if scale == 1:
-            root, offset = unwind_spadd(value)
-            return (root, offset + mem[3])
+    if len(mem.terms) == 1 and not mem.symbols and isinstance(mem.displacement, int):
+        term = mem.terms[0]
+        if term.scale == 1:
+            root, offset = unwind_spadd(term.value)
+            return (root, offset + mem.displacement)
     return None
 
 
@@ -187,11 +302,7 @@ def _ranges_disjoint(a_disp, a_width, b_disp, b_width) -> bool:
         return False
     # Alpha-renamed frame slots: distinct slot ids are distinct locals
     # (their non-overlap is validated by _slots_consistent).
-    return (
-        isinstance(a_disp, tuple)
-        and isinstance(b_disp, tuple)
-        and a_disp[0] == b_disp[0] == "slot"
-    )
+    return isinstance(a_disp, Slot) and isinstance(b_disp, Slot)
 
 
 def mem_disjoint(a: tuple, b: tuple) -> bool:
@@ -224,25 +335,27 @@ def mem_disjoint(a: tuple, b: tuple) -> bool:
     a_mem = flatten_mem(a_addr)
     b_mem = flatten_mem(b_addr)
 
-    if a_mem[1] != b_mem[1]:
+    if a_mem.segment != b_mem.segment:
         # Different segment prefixes: assume they can alias.
         return False
 
     # Same base values (symbolically identical registers/symbols): the two
     # accesses differ only by constant displacement.
-    if a_mem[2] == b_mem[2] and a_mem[4] == b_mem[4]:
-        return _ranges_disjoint(a_mem[3], a_width, b_mem[3], b_width)
+    if a_mem.terms == b_mem.terms and a_mem.symbols == b_mem.symbols:
+        return _ranges_disjoint(
+            a_mem.displacement, a_width, b_mem.displacement, b_width
+        )
 
     global_a = _is_pure_global(a_mem)
     global_b = _is_pure_global(b_mem)
 
-    if global_a and global_b and a_mem[4] != b_mem[4]:
+    if global_a and global_b and a_mem.symbols != b_mem.symbols:
         # Two different named globals do not overlap.
         return True
 
     # Stack/frame memory never overlaps a named global.
-    stack_a = any(stack_rooted(v) for v, _ in a_mem[2])
-    stack_b = any(stack_rooted(v) for v, _ in b_mem[2])
+    stack_a = any(stack_rooted(term.value) for term in a_mem.terms)
+    stack_b = any(stack_rooted(term.value) for term in b_mem.terms)
     if (global_a and stack_b) or (global_b and stack_a):
         return True
 

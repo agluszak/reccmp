@@ -28,11 +28,17 @@ from typing import Any
 import z3  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.verifier.addresses import (
+    AddressValue,
     CallResult,
+    Constant,
     Init,
+    Load,
+    MemoryAddress,
     Phi,
     Resync,
+    StackOffset,
     StringResult,
+    SymbolValue,
 )
 from reccmp.compare.asm.verifier.state import (
     Branch,
@@ -101,20 +107,22 @@ class _Lowering:
     # whose width its context decides.
     def value(self, value: Any):
         # pylint: disable=too-many-return-statements,too-many-branches
+        if isinstance(value, Constant):
+            return value.value
+        if isinstance(value, Load):
+            return self.load(value)
+        if isinstance(value, AddressValue):
+            return self.address(value.address)
+        if isinstance(value, SymbolValue):
+            base, offset = _symbol_base(value.identity)
+            return self.opaque(base) + offset
+        if isinstance(value, StackOffset):
+            return self.sized(value.base, 32) + value.offset
         if isinstance(value, (Init, CallResult, StringResult, Resync, Phi)):
             return self.opaque(value)
         if not isinstance(value, tuple) or not value:
             raise _Unsupported(f"value {value!r:.40}")
         tag = value[0]
-        if tag == "imm" and isinstance(value[1], int):
-            return value[1]
-        if tag == "load":
-            return self.load(value)
-        if tag == "addr" and len(value) == 2:
-            return self.address(value[1])
-        if tag == "sym" and len(value) == 2:
-            base, offset = _symbol_base(value[1])
-            return self.opaque(base) + offset
         if tag in _PART_BITS and len(value) == 2:
             whole = self.sized(value[1], 32)
             low = 8 if tag == "h8" else 0
@@ -164,31 +172,24 @@ class _Lowering:
         return self.opaque(value)
 
     def address(self, mem: Any):
-        """The 32-bit value of an address: a ``("mem", ...)`` operand's
-        registers, displacement and symbol bases, or a plain value."""
-        match mem:
-            case ("mem", _, terms, int() as displacement, symbols):
-                total = z3.BitVecVal(displacement, 32)
-                for term, scale in terms:
-                    total = total + self.sized(term, 32) * scale
-                for symbol in symbols:
-                    base, offset = _symbol_base(symbol.ref.identity)
-                    total = total + symbol.sign * (self.opaque(base) + offset)
-                return total
-            case ("mem", *_):
-                raise _Unsupported(f"address {mem!r:.40}")
-            case _:
-                return self.sized(mem, 32)
+        """The 32-bit value of a memory address's registers, displacement
+        and symbol bases, or a plain value."""
+        if not isinstance(mem, MemoryAddress):
+            return self.sized(mem, 32)
+        if not isinstance(mem.displacement, int):
+            raise _Unsupported(f"address {mem!r:.40}")
+        total = z3.BitVecVal(mem.displacement, 32)
+        for term in mem.terms:
+            total = total + self.sized(term.value, 32) * term.scale
+        for symbol in mem.symbols:
+            base, offset = _symbol_base(symbol.ref.identity)
+            total = total + symbol.sign * (self.opaque(base) + offset)
+        return total
 
-    def load(self, value: tuple):
+    def load(self, value: Load):
         """A load: its bytes in its generation's memory, little-endian."""
-        match value:
-            case ("load", ("mem", segment, *_) as where, size, generation):
-                pass
-            case ("load", where, size, generation):
-                segment = ""
-            case _:
-                raise _Unsupported(f"load {value!r:.40}")
+        where, size, generation = value.address, value.width, value.generation
+        segment = where.segment if isinstance(where, MemoryAddress) else ""
         bits = 32 if size == "stack" else _LOAD_BITS.get(size)
         if bits is None:
             raise _Unsupported(f"load width {size}")

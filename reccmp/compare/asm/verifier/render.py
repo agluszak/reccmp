@@ -6,11 +6,18 @@ from typing import Any
 
 from reccmp.compare.asm.model import FAMILY_REGISTER
 from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    AddressValue,
     CallResult,
+    Constant,
     Init,
+    Load,
+    MemoryAddress,
     Phi,
     Resync,
+    StackOffset,
     StringResult,
+    SymbolValue,
 )
 
 _BINARY = {
@@ -41,7 +48,7 @@ def render_number(value: int) -> str:
     return str(value) if -10 < value < 10 else hex(value)
 
 
-_ENTRY_SP = (Init("sp"), 1)
+_ENTRY_SP = AddressTerm(Init("sp"), 1)
 
 
 def render(value: Any, depth: int = 0) -> str:
@@ -54,23 +61,23 @@ def render(value: Any, depth: int = 0) -> str:
         return render(item, depth + 1)
 
     match value:
-        case ("imm", int() as constant):
+        case Constant(constant):
             return render_number(constant)
         case Init(family):
             return f"{FAMILY_REGISTER.get(family, family)}@entry"
-        case ("load", ("mem", "", (entry,), int() as displacement, ()), "dword", _) if (
-            entry == _ENTRY_SP and displacement > 0 and displacement % 4 == 0
-        ):
+        case Load(
+            MemoryAddress("", (entry,), int() as displacement, ()), "dword", _
+        ) if (entry == _ENTRY_SP and displacement > 0 and displacement % 4 == 0):
             return f"arg{displacement // 4}"
-        case ("load", address, size, *_):
+        case Load(address, size, _):
             return f"{size}[{_address(address, depth + 1)}]"
-        case ("mem", *_):
+        case MemoryAddress():
             return _address(value, depth)
-        case ("addr", address):
+        case AddressValue(address):
             return f"&[{_address(address, depth + 1)}]"
-        case ("sym", identity):
+        case SymbolValue(identity):
             return _symbol(identity)
-        case ("spadd", base, int() as offset):
+        case StackOffset(base, offset):
             return f"{inner(base)} {'+' if offset >= 0 else '-'} {render_number(abs(offset))}"
         case (tag, whole) if tag in _PART:
             return f"{_PART[tag]}({inner(whole)})"
@@ -133,13 +140,17 @@ def _symbol(identity: Any) -> str:
 
 def _address(mem: Any, depth: int) -> str:
     match mem:
-        case ("mem", segment, terms, displacement, symbols):
+        case MemoryAddress(segment, terms, displacement, symbols):
             pass
         case _:
             return render(mem, depth)
     parts = [
-        render(term, depth + 1) if scale == 1 else f"{render(term, depth + 1)}*{scale}"
-        for term, scale in terms
+        (
+            render(term.value, depth + 1)
+            if term.scale == 1
+            else f"{render(term.value, depth + 1)}*{term.scale}"
+        )
+        for term in terms
     ]
     parts += [term.ref.display for term in symbols]
     match displacement:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.operand import Imm, Mem, Reg, Sym
+from reccmp.compare.asm.verifier.addresses import AddressValue
 from reccmp.compare.asm.verifier.semantics import mem_address
 from reccmp.compare.asm.verifier.state import (
     Branch,
@@ -90,8 +91,8 @@ def _operand_addresses(
     try:
         # mem_address records frame-slot uses; work on copies.
         return (
-            ("addr", mem_address(clone_state(states[0]), op_o)),
-            ("addr", mem_address(clone_state(states[1]), op_r)),
+            AddressValue(mem_address(clone_state(states[0]), op_o)),
+            AddressValue(mem_address(clone_state(states[1]), op_r)),
             32,
             "value",
         )
@@ -243,7 +244,12 @@ def record_observable_difference(
                 Observed(operand=ins_o.operands[0] if ins_o.operands else None),
                 Observed(operand=ins_r.operands[0] if ins_r.operands else None),
                 **_solved(
-                    (("addr", first_o.address), ("addr", first_r.address), 32, "value")
+                    (
+                        AddressValue(first_o.address),
+                        AddressValue(first_r.address),
+                        32,
+                        "value",
+                    )
                 ),
             )
             return

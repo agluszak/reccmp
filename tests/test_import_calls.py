@@ -3,7 +3,13 @@
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.operand import SignedSymbol
 from reccmp.compare.asm.replacement import entity_proof_identity
-from reccmp.compare.asm.verifier.addresses import Init
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    Init,
+    Load,
+    MemoryAddress,
+    SymbolValue,
+)
 from reccmp.compare.asm.verifier.semantics import _import_call
 from reccmp.compare.db import EntityDb
 from reccmp.types import EntityType, ImageId
@@ -39,23 +45,24 @@ def test_an_import_thunk_is_identified_by_the_slot_it_jumps_through():
 def test_calls_through_the_thunk_and_the_slot_have_one_callee():
     slot = ("entity", 0x7000, 0)
     reference = Reference(display=IMPORT, identity=slot)
-    through_slot = (
-        "load",
-        ("mem", "", (), 0, (SignedSymbol(1, reference),)),
-        "dword",
-        0,
+    through_slot = Load(
+        MemoryAddress("", (), 0, (SignedSymbol(1, reference),)), "dword", 0
     )
-    through_thunk = ("sym", ("jmp_through", slot))
+    through_thunk = SymbolValue(("jmp_through", slot))
     assert _import_call(through_slot) == _import_call(through_thunk)
     assert _import_call(through_thunk) == ("call_through", slot)
     # [slot + 4], [reg + slot], a word load and other symbols keep their identity
-    offset = ("load", ("mem", "", (), 4, (SignedSymbol(1, reference),)), "dword", 0)
-    indexed = (
-        "load",
-        ("mem", "", (((Init("a"), 4)),), 0, (SignedSymbol(1, reference),)),
+    offset = Load(MemoryAddress("", (), 4, (SignedSymbol(1, reference),)), "dword", 0)
+    indexed = Load(
+        MemoryAddress(
+            "",
+            (AddressTerm(Init("a"), 4),),
+            0,
+            (SignedSymbol(1, reference),),
+        ),
         "dword",
         0,
     )
-    word = ("load", ("mem", "", (), 0, (SignedSymbol(1, reference),)), "word", 0)
-    for value in (offset, indexed, word, ("sym", ("entity", 0x1000, 0))):
+    word = Load(MemoryAddress("", (), 0, (SignedSymbol(1, reference),)), "word", 0)
+    for value in (offset, indexed, word, SymbolValue(("entity", 0x1000, 0))):
         assert _import_call(value) == value

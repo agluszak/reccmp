@@ -16,15 +16,21 @@ from reccmp.compare.asm.model import (
 from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
     CallResult,
+    Constant,
     Init,
     Phi,
+    AddressValue,
     Resync,
+    Slot,
+    StackOffset,
     StringResult,
     Value,
     abs_stack_offset,
     constant_offset,
     flatten_mem,
+    is_value,
     mem_disjoint,
+    value_children,
     stack_rooted,
     unwind_spadd,
 )
@@ -68,7 +74,7 @@ CC_CANON = {
 
 # Canonical flag state of every zero idiom (`xor r, r`, `sub r, r`,
 # `cmp r, r`): the result is zero, CF and OF are cleared.
-ZERO_FLAGS = ("cmp", ("imm", 0), ("imm", 0))
+ZERO_FLAGS = ("cmp", Constant(0), Constant(0))
 
 X87_CONSTANTS = {"fld1", "fldz", "fldpi", "fldl2e", "fldl2t", "fldlg2", "fldln2"}
 X87_UNARY = {"fchs", "fabs", "fsqrt", "frndint", "fcos", "fsin", "ftan", "f2xm1"}
@@ -183,7 +189,7 @@ class SideState:
             else:
                 self.slot_map[disp] = None
         slot = self.slot_map[disp]
-        return disp if slot is None else ("slot", slot)
+        return disp if slot is None else Slot(slot)
 
     def read_reg(self, name: str) -> Value:
         family, part = REGISTERS[name]
@@ -203,7 +209,7 @@ class SideState:
                 # pointer: keep stack pointers in one form.
                 root, offset = constant_offset(value)
                 if root == Init("sp"):
-                    value = ("spadd", root, offset) if offset else root
+                    value = StackOffset(root, offset) if offset else root
             self.regs[family] = value
             return
         old = self.regs[family]
@@ -481,10 +487,7 @@ class Context:
         stack = [value]
         while stack:
             node = stack.pop()
-            if isinstance(node, (Init, CallResult, StringResult, Resync, Phi)):
-                self.matched_nodes.add(node)
-                continue
-            if not isinstance(node, tuple):
+            if not is_value(node):
                 continue
             key = id(node)
             if key in self.matched_ids:
@@ -492,7 +495,7 @@ class Context:
             self.matched_ids.add(key)
             self.keepalive.append(node)
             self.matched_nodes.add(node)
-            stack.extend(node)
+            stack.extend(value_children(node))
 
 
 # A load only needs the newest may-aliasing store. Scanning the whole event
@@ -523,17 +526,17 @@ def frame_pointer_value(value: Value) -> bool:
     """Does this value hold a pointer into the current function's own
     frame (strictly below the entry stack pointer)? Such a value reaching
     memory or a callee makes the frame externally reachable."""
-    if not isinstance(value, tuple) or not value:
-        return False
-    if value[0] == "addr":
-        resolved = abs_stack_offset(value[1], False)
+    if isinstance(value, AddressValue):
+        resolved = abs_stack_offset(value.address, False)
         if resolved is None:
             # An escaping address we cannot resolve: assume the worst
             # when it is stack-rooted at all.
-            return any(stack_rooted(term) for term, _ in value[1][2])
+            return any(
+                stack_rooted(term.value) for term in flatten_mem(value.address).terms
+            )
         root, offset = resolved
         return root == Init("sp") and offset < 0
-    if value[0] == "spadd":
+    if isinstance(value, StackOffset):
         root, offset = unwind_spadd(value)
         return root == Init("sp") and offset < 0
     return False
@@ -556,7 +559,7 @@ def _store_may_alias_load(store: tuple, load: tuple, stack_escaped: bool) -> boo
                 and not other[2]
             ):
                 other_mem = flatten_mem(other[0])
-                if not any(stack_rooted(term) for term, _ in other_mem[2]):
+                if not any(stack_rooted(term.value) for term in other_mem.terms):
                     return False
     return True
 
@@ -606,13 +609,13 @@ VALUE_SIZE_LIMIT = 50_000
 
 
 def _tree_size(value, ctx: Context) -> int:
-    if not isinstance(value, tuple):
+    if not is_value(value):
         return 1
     key = id(value)
     cached = ctx.size_cache.get(key)
     if cached is not None:
         return cached
-    size = 1 + sum(_tree_size(child, ctx) for child in value)
+    size = 1 + sum(_tree_size(child, ctx) for child in value_children(value))
     ctx.size_cache[key] = size
     ctx.keepalive.append(value)
     return size

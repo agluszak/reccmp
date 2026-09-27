@@ -25,9 +25,12 @@ from __future__ import annotations
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.addresses import (
     Init,
+    Load,
     Value,
     constant_offset,
     flatten_mem,
+    is_value,
+    value_children,
 )
 from reccmp.compare.asm.verifier.state import Context, SideState
 
@@ -43,18 +46,17 @@ def maybe_frame_pointer(value: Value) -> bool:
     stack = [value]
     while stack:
         node = stack.pop()
-        if isinstance(node, Init):
-            if node.family in ("sp", "bp"):
+        match node:
+            case Init("sp" | "bp"):
                 return True
-            continue
-        if not isinstance(node, tuple) or not node or id(node) in seen:
+            case Load():
+                continue
+            case ("callesp", *_):
+                return True
+        if not is_value(node) or id(node) in seen:
             continue
         seen.add(id(node))
-        if node[0] == "callesp":
-            return True
-        if node[0] == "load":
-            continue
-        stack.extend(node)
+        stack.extend(value_children(node))
     return False
 
 
@@ -81,7 +83,7 @@ def frame_offset(
         if offset + width <= 0:
             return offset
         raise Reject  # straddles the entry stack pointer
-    terms = [address] if slot else [term for term, _ in flatten_mem(address)[2]]
+    terms = [address] if slot else [term.value for term in flatten_mem(address).terms]
     if state.frame and any(maybe_frame_pointer(term) for term in terms):
         raise Reject
     return None
@@ -92,11 +94,11 @@ def _entry_offset(address: Value, slot: bool) -> tuple[Value, int] | None:
     if slot:
         return constant_offset(address)
     mem = flatten_mem(address)
-    if len(mem[2]) == 1 and not mem[4] and isinstance(mem[3], int):
-        value, scale = mem[2][0]
-        if scale == 1:
-            root, offset = constant_offset(value)
-            return (root, offset + mem[3])
+    if len(mem.terms) == 1 and not mem.symbols and isinstance(mem.displacement, int):
+        term = mem.terms[0]
+        if term.scale == 1:
+            root, offset = constant_offset(term.value)
+            return (root, offset + mem.displacement)
     return None
 
 

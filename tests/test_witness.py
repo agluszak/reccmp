@@ -20,7 +20,14 @@ import pytest
 
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
-from reccmp.compare.asm.verifier.addresses import Init
+from reccmp.compare.asm.verifier.addresses import (
+    AddressTerm,
+    Constant,
+    Init,
+    Load,
+    MemoryAddress,
+    SymbolValue,
+)
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.refutation import RefutationMixin
@@ -710,12 +717,14 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
 
 def _field(offset: int, size: str = "word", register: str = "c") -> tuple:
     """A load of `[register + offset]` as memory was at entry."""
-    return ("load", ("mem", "", ((Init(register), 1),), offset, ()), size, 0)
+    return Load(
+        MemoryAddress("", (AddressTerm(Init(register), 1),), offset, ()), size, 0
+    )
 
 
 def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     base = RunInput.from_seed(1)
-    argument = ("load", ("mem", "", ((Init("sp"), 1),), 8, ()), "dword", 0)
+    argument = Load(MemoryAddress("", (AddressTerm(Init("sp"), 1),), 8, ()), "dword", 0)
     hint = input_from_assignment({Init("c"): 7, argument: 9}, base)
     assert isinstance(hint, RunInput)
     assert hint.registers["ecx"] == 7 and hint.stack_args[1] == 9
@@ -725,11 +734,11 @@ def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     assert isinstance(hint, RunInput)
     assert hint.memory == ((0x20000004, 0xEF), (0x20000005, 0xBE))
     # an argument after a store cannot be set; a symbol's address is ignored
-    stored = ("load", argument[1], "dword", 3)
+    stored = Load(argument.address, "dword", 3)
     assert input_from_assignment({stored: 1}, base) == Rejection(
         "uncontrollable_leaf", repr(stored)
     )
-    symbol = input_from_assignment({("sym", ("entity", 0x5000, 0)): 1}, base)
+    symbol = input_from_assignment({SymbolValue(("entity", 0x5000, 0)): 1}, base)
     assert isinstance(symbol, RunInput) and symbol.registers == base.registers
 
 
@@ -872,14 +881,16 @@ def test_the_fate_of_a_solver_hint_is_recorded():
     analysis = ComparisonAnalysis.mismatch(difference)
     hints, failure = _solver_hints(analysis)
     assert hints and failure is None
-    stored = ("load", ("mem", "", (((Init("c")), 1),), 8, ()), "dword", 3)
-    rejected = dataclasses.replace(difference, values=(stored, ("imm", 1), 32, "value"))
+    stored = Load(MemoryAddress("", (AddressTerm(Init("c"), 1),), 8, ()), "dword", 3)
+    rejected = dataclasses.replace(
+        difference, values=(stored, Constant(1), 32, "value")
+    )
     assert _solver_hints(ComparisonAnalysis.mismatch(rejected)) == (
         [],
         "rejected: uncontrollable_leaf",
     )
     unsupported = dataclasses.replace(
-        difference, values=(("imm", 1), ("imm", 2), None, "value")
+        difference, values=(Constant(1), Constant(2), None, "value")
     )
     assert _solver_hints(ComparisonAnalysis.mismatch(unsupported)) == (
         [],

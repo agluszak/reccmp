@@ -11,7 +11,9 @@ from reccmp.compare.asm.model import FAMILY_REGISTER, REGISTERS, Reject
 from reccmp.compare.asm.operand import Mem, Reg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
+    Constant,
     Init,
+    Load,
     Resync,
     Value,
     mem_disjoint,
@@ -125,9 +127,7 @@ def _assembled(value: Value, ctx: Context) -> bool:
     ):
         return False
     old = value[1]
-    old_ok = (isinstance(old, tuple) and old[:1] == ("imm",)) or _dead_or_contained(
-        old, ctx
-    )
+    old_ok = isinstance(old, Constant) or _dead_or_contained(old, ctx)
     return old_ok and _dead_or_contained(value[2], ctx)
 
 
@@ -175,7 +175,7 @@ def _inserted_over(value: Value, base: Value, ctx: Context) -> bool:
 
 
 def _old_bits_ok(value: Value, ctx: Context) -> bool:
-    is_constant = isinstance(value, tuple) and value[:1] == ("imm",)
+    is_constant = isinstance(value, Constant)
     return is_constant or _dead_or_contained(value, ctx)
 
 
@@ -410,7 +410,7 @@ def _one_sided_pop_ok(side: ImageId, state: SideState, ctx: Context, ins) -> boo
     if root != Init("sp") or offset >= 0 or ctx.stack_escaped:
         return False
     tag = memory_load_tag(ctx, esp, 4, "pop")
-    value: Value = ("load", esp, "stack", tag)
+    value: Value = Load(esp, "stack", tag)
     for k, record in enumerate(ctx.scratch_pushes):
         if record.side is side and record.offset == offset:
             if record.tag == tag:
@@ -662,14 +662,10 @@ def _restores_swapped_save(
         # slot through a pointer we cannot see.
         and not orig.slots_escaped
         and not recomp.slots_escaped
-        and isinstance(popped_o, tuple)
-        and popped_o
-        and popped_o[0] == "load"
-        and popped_o[1] == substitution.address
-        and isinstance(popped_r, tuple)
-        and popped_r
-        and popped_r[0] == "load"
-        and popped_r[1] == substitution.address
+        and isinstance(popped_o, Load)
+        and popped_o.address == substitution.address
+        and isinstance(popped_r, Load)
+        and popped_r.address == substitution.address
     ):
         return False
     ctx.save_stack.pop()
