@@ -1,6 +1,6 @@
 """Converts x86 machine code into canonical ``DecodedInstruction`` rows.
 
-Capstone detail-mode decode happens once in ``InstructGen``. This module
+Capstone detail-mode decode and section discovery are local to this module. It
 sanitizes addresses into references (a name or placeholder to show, and
 the identity proofs compare) on the structured operands, and renders each
 row's display from them. Nothing here reads a display back.
@@ -8,23 +8,316 @@ row's display from them. Nothing here reads a display back.
 
 from __future__ import annotations
 
+import bisect
+import struct
 from dataclasses import replace
+from enum import Enum, auto
+from typing import Literal, NamedTuple
 from collections.abc import Hashable
 from typing_extensions import Buffer
 
 from reccmp.types import ImageId
 
-from .instgen import InstructGen, SectionType
+from .const import JUMP_MNEMONICS
+from .decode import disasm_detail
 from .graph import build_function_graph
 from .ir import (
     DataRegion,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
+    JumpTable,
     rebind_local_identities,
 )
 from .model import Reference, ResolvedAddress, format_instruction
 from .replacement import AddrTestProtocol, ReferenceResolver
+
+
+class _SectionType(Enum):
+    CODE = auto()
+    DATA_TAB = auto()
+    ADDR_TAB = auto()
+
+
+class _CodeSection(NamedTuple):
+    type: Literal[_SectionType.CODE]
+    contents: list[DecodedInstruction]
+
+
+_TabSectionType = Literal[_SectionType.DATA_TAB] | Literal[_SectionType.ADDR_TAB]
+
+
+class _TabSection(NamedTuple):
+    type: _TabSectionType
+    contents: list[tuple[int, int]]
+
+
+_FuncSection = _CodeSection | _TabSection
+
+
+def _table_displacement(insn: DecodedInstruction) -> int | None:
+    """The displacement of an indexed memory operand, ``[reg*4 + table]``:
+    where a jump or a load reads a table of addresses or bytes."""
+    for operand in insn.operands:
+        match operand:
+            case ("mem", _, _, reg_terms, int() as displacement, _) if (
+                reg_terms and displacement > 0
+            ):
+                return displacement
+    return None
+
+
+class _SectionDiscovery:
+    # pylint: disable=too-many-instance-attributes
+    def __init__(self, blob: bytes, start: int, is_32bit: bool = True) -> None:
+        self.is_32bit = is_32bit
+        self.blob = blob
+        self.start = start
+        self.end = len(blob) + start
+        self.section_end: int = self.end
+        self.code_tracks: list[list[DecodedInstruction]] = []
+        # Canonical IR from the same Capstone detail pass as code_tracks.
+        self.decoded_by_addr: dict[int, DecodedInstruction] = {}
+
+        self.cur_addr: int = 0
+        self.cur_section_type: _SectionType = _SectionType.CODE
+        self.section_start = start
+
+        self.sections: list[_FuncSection] = []
+
+        self.confirmed_addrs: dict[int, _SectionType] = {}
+        self.jump_tables: list[JumpTable] = []
+        self.coverage_incomplete: bool = False
+        self.analysis()
+
+    def _finish_code_section(self, contents: list[DecodedInstruction]):
+        self.sections.append(_CodeSection(_SectionType.CODE, contents))
+
+    def _finish_tab_section(self, type_: _TabSectionType, stuff: list[tuple[int, int]]):
+        self.sections.append(_TabSection(type_, stuff))
+        if type_ == _SectionType.ADDR_TAB and stuff:
+            table_addr = stuff[0][0]
+            dispatch, index_reg = self._dispatch_for_table(table_addr)
+            self.jump_tables.append(
+                JumpTable(
+                    address=table_addr,
+                    entries=tuple(stuff),
+                    dispatch_address=dispatch,
+                    scale=4,
+                    entry_width=4,
+                    index_register=index_reg,
+                )
+            )
+
+    def _dispatch_for_table(self, table_addr: int) -> tuple[int | None, str | None]:
+        """Find a scale-4 ``jmp dword ptr [idx*4 + table]`` at ``table_addr``."""
+        for addr, insn in self.decoded_by_addr.items():
+            if not insn.is_jump or insn.mnemonic != "jmp":
+                continue
+            for op in insn.operands:
+                if not isinstance(op, tuple) or op[0] != "mem":
+                    continue
+                _size, _seg, reg_terms, disp, _syms = (
+                    op[1],
+                    op[2],
+                    op[3],
+                    op[4],
+                    op[5],
+                )
+                index_reg = next((reg for reg, scale in reg_terms if scale == 4), None)
+                if index_reg is None or disp != table_addr:
+                    continue
+                return addr, index_reg
+        return None, None
+
+    def _insert_confirmed_addr(self, addr: int, type_: _SectionType):
+        # Ignore address outside the bounds of the function
+        if not self.start <= addr < self.end:
+            return
+
+        self.confirmed_addrs[addr] = type_
+
+        # This newly inserted address might signal the end of this section.
+        # For example, a jump table at the end of the function means we should
+        # stop reading instructions once we hit that address.
+        # However, if there is a jump table in between code sections, we might
+        # read a jump to an address back to the beginning of the function
+        # (e.g. a loop that spans the entire function)
+        # so ignore this address because we have already passed it.
+        if type_ != self.cur_section_type and addr > self.cur_addr:
+            self.section_end = min(self.section_end, addr)
+
+    def _next_section(self, addr: int) -> _SectionType | None:
+        """We have reached the start of a new section. Tell what kind of
+        data we are looking at (code or other) and how much we should read."""
+
+        # Assume the start of every function is code.
+        if addr == self.start:
+            self.section_end = self.end
+            return _SectionType.CODE
+
+        # The start of a new section must be an address that we've seen.
+        new_type = self.confirmed_addrs.get(addr)
+        if new_type is None:
+            return None
+
+        self.cur_section_type = new_type
+
+        # The confirmed addrs dict is sorted by insertion order
+        # i.e. the order in which we read the addresses
+        # So we have to sort and then find the next item
+        # to see where this section should end.
+
+        # If we are in a CODE section, ignore contiguous CODE addresses.
+        # These are not the start of a new section.
+        # However: if we are not in CODE, any upcoming address is a new section.
+        # Do this so we can detect contiguous non-CODE sections.
+        confirmed = [
+            conf_addr
+            for (conf_addr, conf_type) in sorted(self.confirmed_addrs.items())
+            if self.cur_section_type != _SectionType.CODE
+            or conf_type != self.cur_section_type
+        ]
+
+        index = bisect.bisect_right(confirmed, addr)
+        if index < len(confirmed):
+            self.section_end = confirmed[index]
+        else:
+            self.section_end = self.end
+
+        return new_type
+
+    def _get_code_for(self, addr: int) -> list[DecodedInstruction]:
+        """Start disassembling at the given address (single Capstone detail pass)."""
+        # If we are reading a code block beyond the first, see if we already
+        # have disassembled instructions beginning at the specified address.
+        for track in self.code_tracks:
+            for i, inst in enumerate(track):
+                if inst.address == addr:
+                    return track[i:]
+
+        blob_cropped = self.blob[addr - self.start :]
+        decoded = disasm_detail(blob_cropped, addr, self.is_32bit)
+        for insn in decoded:
+            assert insn.address is not None
+            self.decoded_by_addr[insn.address] = insn
+        self.code_tracks.append(decoded)
+        return decoded
+
+    def _handle_jump(self, insn: DecodedInstruction):
+        # A direct jump inside the function's bytes starts code there.
+        if insn.branch_target is not None:
+            self._insert_confirmed_addr(insn.branch_target, _SectionType.CODE)
+        # An indexed jump reads a table of addresses there.
+        elif (table := _table_displacement(insn)) is not None:
+            self._insert_confirmed_addr(table, _SectionType.ADDR_TAB)
+
+    def analysis(self):
+        self.cur_addr = self.start
+        self.coverage_incomplete = False
+        visited_code: set[int] = set()
+
+        while True:
+            sect_type = self._next_section(self.cur_addr)
+            if sect_type is None:
+                # Drain pending confirmed addresses beyond the current cursor.
+                # A forward jmp can end a CODE section at its target while
+                # leaving the cursor on skipped padding (e.g. int3); the
+                # target must still be visited.
+                pending = sorted(
+                    addr
+                    for addr, kind in self.confirmed_addrs.items()
+                    if addr >= self.cur_addr
+                    and kind == _SectionType.CODE
+                    and addr not in visited_code
+                )
+                if not pending:
+                    pending = sorted(
+                        addr
+                        for addr in self.confirmed_addrs
+                        if addr >= self.cur_addr and addr not in visited_code
+                    )
+                if not pending:
+                    break
+                self.cur_addr = pending[0]
+                continue
+
+            self.section_start = self.cur_addr
+
+            if sect_type == _SectionType.CODE:
+                visited_code.add(self.cur_addr)
+                instructions = self._get_code_for(self.cur_addr)
+
+                # If we didn't get any instructions back, something is wrong.
+                # i.e. We can only read part of the full instruction that is up next.
+                if len(instructions) == 0:
+                    self.coverage_incomplete = True
+                    # Nudge the current addr so we will eventually move on to the
+                    # next section.
+                    self.cur_addr += 1
+                    continue
+
+                for insn in instructions:
+                    # section_end is updated as we read instructions.
+                    # If we are into a jump/data table and would read
+                    # a junk instruction, stop here.
+                    if self.cur_addr >= self.section_end:
+                        break
+
+                    if insn.mnemonic in JUMP_MNEMONICS:
+                        self._handle_jump(insn)
+                    elif insn.mnemonic in ("mov", "movzx"):
+                        # An indexed load reads a table of bytes there.
+                        if (table := _table_displacement(insn)) is not None:
+                            self._insert_confirmed_addr(table, _SectionType.DATA_TAB)
+
+                    self.cur_addr += insn.size
+
+                instruction_slice = [
+                    inst
+                    for inst in instructions
+                    if inst.address is not None and inst.address < self.section_end
+                ]
+                self._finish_code_section(instruction_slice)
+
+            elif sect_type == _SectionType.ADDR_TAB:
+                # Clamp to multiple of 4 (dwords)
+                read_size = ((self.section_end - self.cur_addr) // 4) * 4
+                offsets = range(self.section_start, self.section_start + read_size, 4)
+                dwords = self.blob[
+                    self.cur_addr - self.start : self.cur_addr - self.start + read_size
+                ]
+                addrs: list[int] = [addr for addr, in struct.iter_unpack("<L", dwords)]
+                for addr in addrs:
+                    self._insert_confirmed_addr(addr, _SectionType.CODE)
+
+                jump_table = list(zip(offsets, addrs))
+                self._finish_tab_section(_SectionType.ADDR_TAB, jump_table)
+                self.cur_addr = self.section_end
+
+            else:
+                read_size = self.section_end - self.cur_addr
+                offsets = range(self.section_start, self.section_start + read_size)
+                bytes_ = self.blob[
+                    self.cur_addr - self.start : self.cur_addr - self.start + read_size
+                ]
+                data = [b for b, in struct.iter_unpack("<B", bytes_)]
+
+                data_table = list(zip(offsets, data))
+                self._finish_tab_section(_SectionType.DATA_TAB, data_table)
+                self.cur_addr = self.section_end
+
+        # Any confirmed CODE address never visited means incomplete coverage.
+        for addr, kind in self.confirmed_addrs.items():
+            if kind == _SectionType.CODE and addr not in visited_code:
+                # Visited if any finished CODE section contains this address.
+                if not any(
+                    section.type == _SectionType.CODE
+                    and any(inst.address == addr for inst in section.contents)
+                    for section in self.sections
+                ):
+                    self.coverage_incomplete = True
+                    break
 
 
 class AddressSanitizer:
@@ -236,13 +529,13 @@ def decode_function(
     sanitizer = AddressSanitizer(
         addr_test, resolver, is_32bit, image_id, (start_addr, start_addr + len(blob))
     )
-    sections = InstructGen(blob, start_addr, is_32bit)
+    sections = _SectionDiscovery(blob, start_addr, is_32bit)
     instructions: list[DecodedInstruction] = []
     data_regions: list[DataRegion] = []
     for section in sections.sections:
-        if section.type == SectionType.CODE:
+        if section.type == _SectionType.CODE:
             instructions.extend(sanitizer.sanitize_row(row) for row in section.contents)
-        elif section.type == SectionType.DATA_TAB and section.contents:
+        elif section.type == _SectionType.DATA_TAB and section.contents:
             data_regions.append(
                 DataRegion(
                     section.contents[0][0],

@@ -40,7 +40,7 @@ class ExtentKind(Enum):
 
 @dataclass(frozen=True)
 class JumpTable:
-    """One switch address table discovered by ``InstructGen``.
+    """One switch address table discovered during function decoding.
 
     ``entries`` are ``(entry_address, target_address)`` pairs. Optional
     ``dispatch_address`` is the ``jmp`` that indexes the table when known.
