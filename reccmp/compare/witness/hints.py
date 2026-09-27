@@ -21,6 +21,7 @@ from typing import Any
 
 from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
+    CfgMemoryInit,
     Init,
     Load,
     MemoryAddress,
@@ -37,7 +38,7 @@ _REGISTERS = {
     "di": "edi",
     "bp": "ebp",
 }
-_ENTRY_MEMORY = (0, ("cfg_mem_init",))  # load tags of memory untouched since entry
+_ENTRY_MEMORY = (CfgMemoryInit(),)  # load tags of memory untouched since entry
 
 
 def _stack_argument(term: Any) -> int | None:

@@ -15,22 +15,29 @@ from reccmp.compare.asm.model import (
 )
 from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
+    AddressValue,
     CallResult,
+    CfgMemoryInit,
+    CompareFlags,
     CompareKind,
     Constant,
+    DeepFloat,
     Extract,
     Init,
     Insert,
+    MemoryClobber,
+    MemoryGeneration,
+    MemoryStore,
     Operation,
     OperationKind,
     Phi,
-    AddressValue,
     Resync,
     RegisterPart,
     Slot,
     StackOffset,
     StringResult,
     Value,
+    X87EpochJoin,
     abs_stack_offset,
     constant_offset,
     flatten_mem,
@@ -80,7 +87,7 @@ CC_CANON = {
 
 # Canonical flag state of every zero idiom (`xor r, r`, `sub r, r`,
 # `cmp r, r`): the result is zero, CF and OF are cleared.
-ZERO_FLAGS = ("cmp", Constant(0), Constant(0))
+ZERO_FLAGS = CompareFlags(Constant(0), Constant(0))
 
 X87_CONSTANTS = {"fld1", "fldz", "fldpi", "fldl2e", "fldl2t", "fldlg2", "fldln2"}
 X87_UNARY = {"fchs", "fabs", "fsqrt", "frndint", "fcos", "fsin", "ftan", "f2xm1"}
@@ -120,12 +127,12 @@ class X87Stack:
     # (or to a callee's float return) and are addressed by (epoch, index).
     known: list[Value] = field(default_factory=list)
     deep_pops: int = 0
-    epoch: int = 0
+    epoch: int | X87EpochJoin = 0
 
     def read(self, i: int) -> Value:
         if i < len(self.known):
             return self.known[i]
-        return ("fdeep", self.epoch, self.deep_pops + i - len(self.known))
+        return DeepFloat(self.epoch, self.deep_pops + i - len(self.known))
 
     def push(self, value: Value) -> None:
         # The physical x87 stack has 8 slots; deeper is an overflow.
@@ -287,20 +294,43 @@ class Call:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalDestination:
+    key: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalDestination:
+    identity: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedDestination:
+    address: int
+
+
+Destination: TypeAlias = LocalDestination | ExternalDestination | UnresolvedDestination
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchTarget:
+    """Canonical target of an indirect jump through a recognized switch table."""
+
+
+@dataclass(frozen=True, slots=True)
 class Branch:
     predicate: Value
-    destination: Hashable | None
+    destination: Destination | None
 
 
 @dataclass(frozen=True, slots=True)
 class IndirectJump:
-    target: Value
-    selector: tuple = ()
+    target: Value | SwitchTarget
+    selector: tuple[Value, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class Jump:
-    destination: Hashable | None
+    destination: Destination | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,7 +338,7 @@ class Loop:
     kind: LoopKind
     counter: Value
     flags: Value
-    destination: Hashable | None
+    destination: Destination | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,20 +413,14 @@ def observation_values(observation: Observation) -> tuple[Value, ...]:
             values = (address, value)
         case Call(target, arguments):
             values = (target, *arguments)
-        case Branch(predicate, destination):
-            values = (
-                (predicate, destination)
-                if isinstance(destination, tuple)
-                else (predicate,)
-            )
+        case Branch(predicate):
+            values = (predicate,)
         case IndirectJump(target, selector):
-            values = (target, *selector)
-        case Jump(destination) if isinstance(destination, tuple):
-            values = (destination,)
-        case Loop(_, counter, flags, destination):
+            values = (
+                selector if isinstance(target, SwitchTarget) else (target, *selector)
+            )
+        case Loop(_, counter, flags):
             values = (counter, flags)
-            if isinstance(destination, tuple):
-                values = (*values, destination)
         case ReturnValue(found) | ReturnSaved(found):
             values = found
         case ReturnFpu(value) | LoadControlWord(value):
@@ -420,7 +444,7 @@ class CalleeSaveSubstitution:
 class LoadObligation:
     side: ImageId
     address: Value
-    generation: int | Value
+    generation: MemoryGeneration
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,7 +452,7 @@ class ScratchPush:
     side: ImageId
     offset: int
     value: Value
-    tag: Value
+    tag: MemoryGeneration
 
 
 @dataclass
@@ -438,7 +462,7 @@ class Context:
     # store/clobber event, or the scope's initial value. Used as a block's
     # outgoing memory state and as the base tag for loads that no recorded
     # store can alias.
-    gen: int | Value = 0
+    gen: MemoryGeneration = field(default_factory=CfgMemoryInit)
     # Committed memory events, newest last: (tag, access) for a store with
     # a known (address value, width, stack kind), or (tag, None) for a
     # clobber-all (call, string write, resync). A load is tagged by the
@@ -450,8 +474,8 @@ class Context:
     # receiver reloaded from its stable slot is equivalent to the saved value.
     # Unknown calls do not erase the identity of that slot; an explicit later
     # store to the same address replaces it.
-    receiver_values: dict[tuple[Value, int | None], tuple[Value, Value]] = field(
-        default_factory=dict
+    receiver_values: dict[tuple[Value, int | None], tuple[MemoryGeneration, Value]] = (
+        field(default_factory=dict)
     )
     # Whether a pointer into this function's own frame may have escaped
     # (stored to memory or passed to a callee). Until then, memory below
@@ -513,7 +537,7 @@ class Context:
 _ALIAS_SCAN_LIMIT = 128
 
 
-def memory_load_tag(ctx: Context, address: Value, width, stack) -> int | Value:
+def memory_load_tag(ctx: Context, address: Value, width, stack) -> MemoryGeneration:
     """Tag identifying which memory state a load reads: the tag of the
     newest committed store that may alias it (or of any clobber), else the
     scope's initial memory tag. Two loads of the same address with the same
@@ -573,9 +597,8 @@ def _store_may_alias_load(store: tuple, load: tuple, stack_escaped: bool) -> boo
     return True
 
 
-def commit_clobber(ctx: Context, marker) -> None:
+def commit_clobber(ctx: Context, tag: MemoryClobber) -> None:
     """Record a write to unknown locations: every later load re-reads."""
-    tag = ("mem", marker, "clobber")
     ctx.mem_events.append((tag, None))
     ctx.gen = tag
 
@@ -589,7 +612,7 @@ def commit_memory(ctx: Context, obs: list[Observation], marker) -> None:
             case Store(address, size, value):
                 width = 4 if size == "stack" else WIDTHS.get(size)
                 stack = "push" if size == "stack" else False
-                tag = ("mem", marker, k)
+                tag = MemoryStore(marker, k)
                 ctx.mem_events.append((tag, (address, width, stack)))
                 ctx.receiver_values[(address, width)] = (tag, value)
                 ctx.gen = tag
@@ -603,11 +626,11 @@ def commit_memory(ctx: Context, obs: list[Observation], marker) -> None:
                 for argument in arguments:
                     if frame_pointer_value(argument):
                         ctx.stack_escaped = True
-                commit_clobber(ctx, (marker, k))
+                commit_clobber(ctx, MemoryClobber(marker, k))
             case StringOperation(writes_memory=True):
                 # Writers clobber; the data they copy was already committed
                 # by its original store.
-                commit_clobber(ctx, (marker, k))
+                commit_clobber(ctx, MemoryClobber(marker, k))
 
 
 # Symbolic values are DAGs (a register value can feed several later values),

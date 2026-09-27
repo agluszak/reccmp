@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 
 from reccmp.compare.asm.ir import (
@@ -30,11 +30,15 @@ from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     Branch,
     Context,
+    Destination,
+    ExternalDestination,
     FunctionMetadata,
     Jump,
+    LocalDestination,
     Loop,
     Observation,
     SideState,
+    UnresolvedDestination,
     clone_state,
     commit_memory,
     guard_state_size,
@@ -215,13 +219,13 @@ def _rewrite_control_observables(
     for index, entry in enumerate(obs):
         if not isinstance(entry, (Branch, Jump, Loop)):
             continue
-        destination: Hashable | None
+        destination: Destination | None
         if local is not None:
-            destination = ("L", local)
+            destination = LocalDestination(local)
         elif row.control_target is not None:
-            destination = ("ext", row.control_target)
+            destination = ExternalDestination(row.control_target)
         elif row.branch_target is not None:
-            destination = ("ext", ("unresolved", None, row.branch_target))
+            destination = UnresolvedDestination(row.branch_target)
         else:
             destination = entry.destination
         obs[index] = replace(entry, destination=destination)

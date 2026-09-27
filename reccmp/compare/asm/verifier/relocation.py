@@ -8,7 +8,11 @@ from typing import Sequence
 
 from reccmp.compare.asm.ir import DecodedInstruction, instruction_semantic_key
 from reccmp.compare.asm.model import REGISTERS, Reject
-from reccmp.compare.asm.verifier.addresses import mem_disjoint
+from reccmp.compare.asm.verifier.addresses import (
+    OpaqueKind,
+    OpaqueValue,
+    mem_disjoint,
+)
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
     FAMILIES,
@@ -93,10 +97,10 @@ def _havoc(state: SideState, idx: int) -> None:
     """Discard everything we know about the state after an instruction
     outside the model."""
     for family in FAMILIES:
-        state.regs[family] = ("havoc", idx, family)
-    state.flags = ("havoc_flags", idx)
-    state.carry = ("havoc_cf", idx)
-    state.fpu_flags = ("havoc_fpuflags", idx)
+        state.regs[family] = OpaqueValue(OpaqueKind.HAVOC_REGISTER, idx, family)
+    state.flags = OpaqueValue(OpaqueKind.HAVOC_FLAGS, idx)
+    state.carry = OpaqueValue(OpaqueKind.HAVOC_CARRY, idx)
+    state.fpu_flags = OpaqueValue(OpaqueKind.HAVOC_FPU_FLAGS, idx)
     state.x87 = X87Stack(epoch=-idx - 1)
 
 

@@ -8,31 +8,51 @@ from reccmp.compare.asm.model import FAMILY_REGISTER
 from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     AddressValue,
+    CallArgument,
     CallResult,
+    CallStack,
+    CallThrough,
+    CarryCleared,
+    CarryResult,
     Compare,
+    CompareFlags,
     CompareKind,
     ConditionCode,
     Constant,
+    DeepFloat,
     DivideResult,
     Extend,
     ExtendKind,
     Extract,
+    FlagsResult,
+    FloatCompare,
+    FloatConstant,
+    FloatControlWord,
+    FloatOperation,
+    FloatStatusWord,
     Init,
     Insert,
     Load,
     MemoryAddress,
     MultiplyResult,
+    OpaqueValue,
     Operation,
     OperationKind,
     Phi,
+    ReceiverLoad,
     RegisterPart,
     Resync,
+    SahfCarry,
+    SahfFlags,
     Select,
     SetCondition,
     StackOffset,
     StringResult,
     SymbolValue,
+    TestFlags,
     UnaryOperation,
+    VirtualCall,
+    X87Slot,
 )
 
 _BINARY = {
@@ -133,6 +153,8 @@ def render(value: Any, depth: int = 0) -> str:
             return f"{FAMILY_REGISTER.get(family, family)} after call@{call}"
         case StringResult(site, family):
             return f"{FAMILY_REGISTER.get(family, family)} after string@{site}"
+        case Resync(site, X87Slot(index)):
+            return f"st({index}) after resync@{site}"
         case Resync(site, location):
             return f"{location} after resync@{site}"
         case Phi(block, class_id):
@@ -157,8 +179,46 @@ def render(value: Any, depth: int = 0) -> str:
                 f"{mnemonic}.{part.value}(({inner(high)}, {inner(low)}), "
                 f"{inner(divisor)})"
             )
-        case (tag, *operands):
-            return f"{tag}(" + ", ".join(inner(item) for item in operands[:2]) + ")"
+        case FlagsResult(operation) | CarryResult(operation):
+            prefix = "flags" if isinstance(value, FlagsResult) else "carry"
+            return f"{prefix}({inner(operation)})"
+        case CompareFlags(left, right, width):
+            bits = f" ({8 * width}-bit)" if isinstance(width, int) else ""
+            return f"flags(cmp {inner(left)}, {inner(right)}{bits})"
+        case TestFlags(left, right, width):
+            bits = f" ({8 * width}-bit)" if isinstance(width, int) else ""
+            return f"flags(test {inner(left)}, {inner(right)}{bits})"
+        case CarryCleared():
+            return "carry=0"
+        case SahfFlags(source, previous):
+            return f"sahf({inner(source)}; prior {inner(previous)})"
+        case SahfCarry(source):
+            return f"sahf-carry({inner(source)})"
+        case OpaqueValue(kind, site, location):
+            suffix = f".{location}" if location is not None else ""
+            return f"{kind.value}{suffix}@{site}"
+        case FloatConstant(kind):
+            return kind.value
+        case FloatOperation(kind, operands):
+            return f"{kind.value}(" + ", ".join(inner(item) for item in operands) + ")"
+        case DeepFloat(epoch, index):
+            return f"st({index})@epoch{epoch}"
+        case FloatCompare(left, right):
+            return f"fcom({inner(left)}, {inner(right)})"
+        case FloatStatusWord(flags):
+            return f"fsw({inner(flags)})"
+        case FloatControlWord():
+            return "fcw"
+        case CallStack(site, incoming):
+            return f"esp after call@{site}({inner(incoming)})"
+        case ReceiverLoad(address, width):
+            return f"receiver {width}[{_address(address, depth + 1)}]"
+        case VirtualCall(receiver, displacement):
+            return f"virtual {inner(receiver)}+{render_number(displacement)}"
+        case CallThrough(slot):
+            return f"call through {_symbol(slot)}"
+        case CallArgument(site, offset, width):
+            return f"callarg{width}@{site}[{render_number(offset)}]"
         case _:
             return repr(value)
 

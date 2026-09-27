@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier.addresses import (
+    CallStack,
     Init,
     Load,
     Value,
@@ -51,7 +52,7 @@ def maybe_frame_pointer(value: Value) -> bool:
                 return True
             case Load():
                 continue
-            case ("callesp", *_):
+            case CallStack():
                 return True
         if not is_value(node) or id(node) in seen:
             continue

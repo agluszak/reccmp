@@ -11,26 +11,46 @@ from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     AddressValue,
     CallResult,
+    CallStack,
+    CallThrough,
+    CarryCleared,
+    CarryResult,
     Compare,
+    CompareFlags,
     CompareKind,
     ConditionCode,
     Constant,
     DivideResult,
     Extend,
     ExtendKind,
+    FlagsResult,
+    FloatCompare,
+    FloatConstant,
+    FloatConstantKind,
+    FloatControlWord,
+    FloatOperation,
+    FloatOperationKind,
+    FloatStatusWord,
     Load,
     MemoryAddress,
     MultiplyResult,
+    OpaqueKind,
+    OpaqueValue,
     Operation,
     OperationKind,
     ProductPart,
+    ReceiverLoad,
     Select,
     SetCondition,
+    SahfCarry,
+    SahfFlags,
     StackOffset,
     StringResult,
     SymbolValue,
+    TestFlags,
     UnaryOperation,
     Value,
+    VirtualCall,
     flatten_mem,
     stack_rooted,
     unwind_spadd,
@@ -67,6 +87,7 @@ from reccmp.compare.asm.verifier.state import (
     X87_UNARY,
     ZERO_FLAGS,
     Context,
+    ExternalDestination,
     SideState,
     register_arguments,
     X87Stack,
@@ -187,7 +208,7 @@ def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
         address, size = receiver.address, WIDTHS.get(receiver.width)
         forwarded = ctx.receiver_values.get((address, size))
         if forwarded is None:
-            return ("receiver_load", address, receiver.width)
+            return ReceiverLoad(address, receiver.width)
         store_tag, stored_value = forwarded
         load_tag = receiver.generation
         event_tags = [tag for tag, _ in ctx.mem_events]
@@ -197,9 +218,9 @@ def receiver_equivalence_class(receiver: Value, ctx: Context) -> Value:
             if event_tags.index(store_tag) < event_tags.index(load_tag):
                 receiver = stored_value
             else:
-                return ("receiver_load", address, receiver.width)
+                return ReceiverLoad(address, receiver.width)
         else:
-            return ("receiver_load", address, receiver.width)
+            return ReceiverLoad(address, receiver.width)
     return receiver
 
 
@@ -236,7 +257,7 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     ):
         return None
     receiver = receiver_equivalence_class(receiver_mem.terms[0].value, ctx)
-    return ("vcall", receiver, call_mem.displacement)
+    return VirtualCall(receiver, call_mem.displacement)
 
 
 def write_operand(
@@ -311,13 +332,13 @@ def _import_call(target: Value) -> Value:
     at the same point; both run X with the same return address. Only the
     call target is unified: the thunk's address and the slot's content are
     different pointer values."""
-    if isinstance(target, SymbolValue) and isinstance(target.identity, tuple):
-        if target.identity[:1] == ("jmp_through",):
-            return ("call_through", target.identity[1])
-    if isinstance(target, Load) and target.width == "dword":
-        slot = _absolute_symbol(target.address)
-        if slot is not None:
-            return ("call_through", slot)
+    match target:
+        case SymbolValue(("jmp_through", slot)):
+            return CallThrough(slot)
+        case Load(address, "dword"):
+            slot = _absolute_symbol(address)
+            if slot is not None:
+                return CallThrough(slot)
     return target
 
 
@@ -376,29 +397,18 @@ def canon_condition(cc: str, state: SideState) -> Value:
     that `cmp a, b` + jg equals `cmp b, a` + jl."""
     flags = state.flags
     entry = CC_CANON.get(cc)
-    if (
-        entry is not None
-        and isinstance(flags, tuple)
-        and flags[:1] == ("cmp",)
-        and len(flags) >= 3
-    ):
-        pred, swap = entry
-        a, b = flags[1], flags[2]
-        width = flags[3] if len(flags) > 3 else None
-        if pred in (CompareKind.EQ, CompareKind.NE):
-            left, right = vsort(a, b)
-            return Compare(pred, left, right, width)
-        if swap:
-            return _constant_order(pred=pred, a=b, b=a, width=width)
-        return _constant_order(pred=pred, a=a, b=b, width=width)
-    if (
-        cc in ("o", "no")
-        and isinstance(flags, tuple)
-        and flags[0] == "sahf"
-        and len(flags) > 2
-    ):
-        # OF is preserved across SAHF; observe the prior flag producer.
-        return ConditionCode(cc, flags[2])
+    match flags:
+        case CompareFlags(a, b, width) if entry is not None:
+            pred, swap = entry
+            if pred in (CompareKind.EQ, CompareKind.NE):
+                left, right = vsort(a, b)
+                return Compare(pred, left, right, width)
+            if swap:
+                return _constant_order(pred=pred, a=b, b=a, width=width)
+            return _constant_order(pred=pred, a=a, b=b, width=width)
+        case SahfFlags(previous=previous) if cc in ("o", "no"):
+            # OF is preserved across SAHF; observe the prior flag producer.
+            return ConditionCode(cc, previous)
     if cc in CF_CONDITIONS:
         # The carry flag may have a different (older) producer than the
         # rest of the flags.
@@ -425,9 +435,11 @@ def _compare_width(op_a: Operand, op_b: Operand) -> int | str:
     return "unk"
 
 
-def _branch_obs_dest(ins: DecodedInstruction) -> Hashable | None:
+def _branch_obs_dest(ins: DecodedInstruction) -> ExternalDestination | None:
     """Proof identity of a direct transfer; never a relative displacement."""
-    return ins.control_target
+    return (
+        None if ins.control_target is None else ExternalDestination(ins.control_target)
+    )
 
 
 def execute(
@@ -478,22 +490,23 @@ def execute(
             # SF/ZF/PF reflect the value; CF and OF are cleared: exactly
             # the flag state of `cmp value, 0`.
             width = _compare_width(ops[0], ops[0])
-            state.flags = ("cmp", a, Constant(0), width)
+            state.flags = CompareFlags(a, Constant(0), width)
         else:
-            state.flags = ("flags", mnemonic, *pair)
+            operation = Operation(OperationKind(mnemonic), pair)
+            state.flags = FlagsResult(operation)
         # and/or/xor clear CF; add/imul produce a carry-out.
         if mnemonic in ("and", "or", "xor"):
-            state.carry = ("cf0",)
+            state.carry = CarryCleared()
         else:
-            state.carry = ("carry", mnemonic, *pair)
+            state.carry = CarryResult(operation)
     elif mnemonic == "imul" and len(ops) == 3:
         value = Operation(
             OperationKind.IMUL3,
             (read_operand(state, ctx, ops[1]), read_operand(state, ctx, ops[2])),
         )
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", value.kind.value, *value.operands)
-        state.carry = ("carry", value.kind.value, *value.operands)
+        state.flags = FlagsResult(value)
+        state.carry = CarryResult(value)
     elif mnemonic in ORDERED_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -506,22 +519,22 @@ def execute(
         if mnemonic == "sub" and a == b:
             # Zero idiom: same flag state as xor r, r.
             state.flags = ZERO_FLAGS
-            state.carry = ("cf0",)
+            state.carry = CarryCleared()
         else:
-            state.flags = ("flags", mnemonic, a, b)
+            state.flags = FlagsResult(value)
             # The borrow out of sub is the unsigned comparison of its operands.
             state.carry = (
                 Compare(CompareKind.LT_U, a, b)
                 if mnemonic == "sub"
-                else ("carry", mnemonic, a, b)
+                else CarryResult(value)
             )
     elif mnemonic in CARRY_BINOPS and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
         value = Operation(OperationKind(mnemonic), (a, b, state.carry))
         write_operand(state, ctx, ops[0], value, obs)
-        state.flags = ("flags", value.kind.value, *value.operands)
-        state.carry = ("carry", value.kind.value, *value.operands)
+        state.flags = FlagsResult(value)
+        state.carry = CarryResult(value)
     elif mnemonic in ("inc", "dec", "neg", "not") and len(ops) == 1:
         value = UnaryOperation(
             OperationKind(mnemonic), read_operand(state, ctx, ops[0])
@@ -529,9 +542,9 @@ def execute(
         write_operand(state, ctx, ops[0], value, obs)
         # inc/dec rewrite the flags but preserve CF; not touches nothing.
         if mnemonic != "not":
-            state.flags = ("flags", value.kind.value, value.operand)
+            state.flags = FlagsResult(value)
         if mnemonic == "neg":
-            state.carry = ("carry", value.kind.value, value.operand)
+            state.carry = CarryResult(value)
     elif mnemonic == "cmp" and len(ops) == 2:
         a = read_operand(state, ctx, ops[0])
         b = read_operand(state, ctx, ops[1])
@@ -539,10 +552,10 @@ def execute(
         if a == b:
             state.flags = ZERO_FLAGS
         else:
-            state.flags = ("cmp", a, b, width)
+            state.flags = CompareFlags(a, b, width)
         # `x < x` and `x < 0` (unsigned) are always false.
         if b in (a, Constant(0)):
-            state.carry = ("cf0",)
+            state.carry = CarryCleared()
         else:
             state.carry = Compare(CompareKind.LT_U, a, b, width)
     elif mnemonic == "test" and len(ops) == 2:
@@ -552,18 +565,19 @@ def execute(
         if a == b:
             # `test r, r` sets SF/ZF/PF from the value and clears CF/OF:
             # exactly the flag state of `cmp r, 0`.
-            state.flags = ("cmp", a, Constant(0), width)
+            state.flags = CompareFlags(a, Constant(0), width)
         else:
-            state.flags = ("test", *vsort(a, b), width)
-        state.carry = ("cf0",)
+            state.flags = TestFlags(*vsort(a, b), width)
+        state.carry = CarryCleared()
     elif mnemonic in ("mul", "imul") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         pair = vsort(state.read_reg(acc), read_operand(state, ctx, ops[0]))
         signed = mnemonic == "imul"
         state.write_reg(acc, MultiplyResult(signed, ProductPart.LOW, pair))
         state.write_reg(hi, MultiplyResult(signed, ProductPart.HIGH, pair))
-        state.flags = ("flags", mnemonic, *pair)
-        state.carry = ("carry", mnemonic, *pair)
+        operation = Operation(OperationKind(mnemonic), pair)
+        state.flags = FlagsResult(operation)
+        state.carry = CarryResult(operation)
     elif mnemonic in ("div", "idiv") and len(ops) == 1:
         acc, hi = _mul_registers(ops[0])
         divisor = read_operand(state, ctx, ops[0])
@@ -588,16 +602,16 @@ def execute(
                 divisor,
             ),
         )
-        state.flags = ("undef_flags", idx)
-        state.carry = ("undef_cf", idx)
+        state.flags = OpaqueValue(OpaqueKind.DIVISION_FLAGS, idx)
+        state.carry = OpaqueValue(OpaqueKind.DIVISION_CARRY, idx)
     elif mnemonic == "cdq":
         state.write_reg("edx", UnaryOperation(OperationKind.CDQ, state.read_reg("eax")))
     elif mnemonic == "cwde":
         state.write_reg("eax", UnaryOperation(OperationKind.CWDE, state.read_reg("ax")))
     elif mnemonic == "sahf":
         # SAHF loads SF/ZF/AF/PF/CF from AH; OF is preserved.
-        state.flags = ("sahf", state.read_reg("ah"), state.flags)
-        state.carry = ("sahf_cf", state.read_reg("ah"))
+        state.flags = SahfFlags(state.read_reg("ah"), state.flags)
+        state.carry = SahfCarry(state.read_reg("ah"))
     elif mnemonic == "push" and len(ops) == 1:
         value = read_operand(state, ctx, ops[0])
         new_esp = esp_add(state.read_reg("esp"), -4)
@@ -664,9 +678,9 @@ def execute(
             state.write_reg(reg, CallResult(idx, reg))
         # Preserve dependence on incoming SP; unknown cleanup must not
         # erase a pre-call stack discrepancy.
-        state.write_reg("esp", ("callesp", idx, incoming_esp))
-        state.flags = ("callflags", idx)
-        state.carry = ("callcf", idx)
+        state.write_reg("esp", CallStack(idx, incoming_esp))
+        state.flags = OpaqueValue(OpaqueKind.CALL_FLAGS, idx)
+        state.carry = OpaqueValue(OpaqueKind.CALL_CARRY, idx)
         state.x87 = X87Stack(epoch=idx + 1)
     elif mnemonic == "ret":
         obs.append(ReturnStack(ins.operands, state.x87.state_key()[1:]))
@@ -743,8 +757,8 @@ def execute(
         if ins.prefix:
             state.regs["c"] = StringResult(idx, "c")
         if mnemonic.startswith(("scas", "cmps")):
-            state.flags = ("strflags", idx)
-            state.carry = ("strcf", idx)
+            state.flags = OpaqueValue(OpaqueKind.STRING_FLAGS, idx)
+            state.carry = OpaqueValue(OpaqueKind.STRING_CARRY, idx)
 
     elif mnemonic in ("nop", "int3"):
         pass
@@ -768,51 +782,62 @@ def execute_x87(
     if mnemonic in ("fld", "fild") and len(ops) == 1:
         x87.push(read_operand(state, ctx, ops[0]))
     elif mnemonic in X87_CONSTANTS and not ops:
-        x87.push(("fconst", mnemonic))
+        x87.push(FloatConstant(FloatConstantKind(mnemonic)))
     elif mnemonic in ("fst", "fstp", "fist", "fistp") and len(ops) == 1:
         value = x87.read(0)
         if mnemonic.startswith("fist"):
-            value = ("fist", value)
+            value = FloatOperation(FloatOperationKind.TO_INTEGER, (value,))
         write_operand(state, ctx, ops[0], value, obs)
         if mnemonic.endswith("p"):
             x87.pop()
     elif mnemonic in ("fadd", "fmul", "faddp", "fmulp", "fiadd", "fimul"):
-        op = "f" + ("add" if "add" in mnemonic else "mul")
+        op = FloatOperationKind("f" + ("add" if "add" in mnemonic else "mul"))
         if mnemonic in ("faddp", "fmulp"):
             dest = _st_index(ops[0]) if ops else 1
-            value = (op, *vsort(x87.read(dest), x87.read(0)))
+            value = FloatOperation(op, vsort(x87.read(dest), x87.read(0)))
             x87.write(dest, value)
             x87.pop()
         elif len(ops) == 2 and ops[0] == St(0):
-            x87.write(0, (op, *vsort(x87.read(0), x87.read(_st_index(ops[1])))))
+            x87.write(
+                0,
+                FloatOperation(op, vsort(x87.read(0), x87.read(_st_index(ops[1])))),
+            )
         elif len(ops) == 2 and ops[1] == St(0):
             dest = _st_index(ops[0])
-            x87.write(dest, (op, *vsort(x87.read(dest), x87.read(0))))
+            x87.write(dest, FloatOperation(op, vsort(x87.read(dest), x87.read(0))))
         elif len(ops) == 1:
-            x87.write(0, (op, *vsort(x87.read(0), read_operand(state, ctx, ops[0]))))
+            x87.write(
+                0,
+                FloatOperation(
+                    op, vsort(x87.read(0), read_operand(state, ctx, ops[0]))
+                ),
+            )
         else:
             raise Reject
     elif (
         mnemonic in ("fsub", "fsubr", "fdiv", "fdivr", "fisub", "fidiv")
         and len(ops) == 1
     ):
-        op = "fsub" if "sub" in mnemonic else "fdiv"
+        op = FloatOperationKind("fsub" if "sub" in mnemonic else "fdiv")
         other = read_operand(state, ctx, ops[0])
         if mnemonic.endswith("r"):
-            x87.write(0, (op, other, x87.read(0)))
+            x87.write(0, FloatOperation(op, (other, x87.read(0))))
         else:
-            x87.write(0, (op, x87.read(0), other))
+            x87.write(0, FloatOperation(op, (x87.read(0), other)))
     elif mnemonic in ("fsubp", "fsubrp", "fdivp", "fdivrp"):
-        op = "fsub" if "sub" in mnemonic else "fdiv"
+        op = FloatOperationKind("fsub" if "sub" in mnemonic else "fdiv")
         dest = _st_index(ops[0]) if ops else 1
         if "r" in mnemonic[4:]:
-            value = (op, x87.read(0), x87.read(dest))
+            value = FloatOperation(op, (x87.read(0), x87.read(dest)))
         else:
-            value = (op, x87.read(dest), x87.read(0))
+            value = FloatOperation(op, (x87.read(dest), x87.read(0)))
         x87.write(dest, value)
         x87.pop()
     elif mnemonic in X87_UNARY and not ops:
-        x87.write(0, (mnemonic, x87.read(0)))
+        x87.write(
+            0,
+            FloatOperation(FloatOperationKind(mnemonic), (x87.read(0),)),
+        )
     elif mnemonic == "fxch":
         i = _st_index(ops[0]) if ops else 1
         a, b = x87.read(0), x87.read(i)
@@ -820,27 +845,30 @@ def execute_x87(
         x87.write(i, a)
     elif mnemonic in ("fcom", "fcomp", "fucom", "fucomp", "ficom", "ficomp"):
         other = read_operand(state, ctx, ops[0]) if ops else x87.read(1)
-        state.fpu_flags = ("fcom", x87.read(0), other)
+        state.fpu_flags = FloatCompare(x87.read(0), other)
         if mnemonic.endswith("p"):
             x87.pop()
     elif mnemonic in ("fcompp", "fucompp"):
-        state.fpu_flags = ("fcom", x87.read(0), x87.read(1))
+        state.fpu_flags = FloatCompare(x87.read(0), x87.read(1))
         x87.pop()
         x87.pop()
     elif mnemonic == "ftst":
-        state.fpu_flags = ("fcom", x87.read(0), Constant(0))
+        state.fpu_flags = FloatCompare(x87.read(0), Constant(0))
     elif mnemonic == "fnstsw" and ops == (Reg("ax"),):
-        state.write_reg("ax", ("fsw", state.fpu_flags))
+        state.write_reg("ax", FloatStatusWord(state.fpu_flags))
     elif mnemonic == "fnstcw" and len(ops) == 1:
-        write_operand(state, ctx, ops[0], ("fcw",), obs)
+        write_operand(state, ctx, ops[0], FloatControlWord(), obs)
     elif mnemonic == "fldcw" and len(ops) == 1:
         # Loading the control word affects rounding of subsequent operations;
         # the loaded value flows in via a checked channel only if it differs.
         obs.append(LoadControlWord(read_operand(state, ctx, ops[0])))
     elif mnemonic in ("fprem", "fscale"):
-        x87.write(0, (mnemonic, x87.read(0), x87.read(1)))
+        x87.write(
+            0,
+            FloatOperation(FloatOperationKind(mnemonic), (x87.read(0), x87.read(1))),
+        )
     elif mnemonic in ("fpatan", "fyl2x"):
-        value = (mnemonic, x87.read(0), x87.read(1))
+        value = FloatOperation(FloatOperationKind(mnemonic), (x87.read(0), x87.read(1)))
         x87.pop()
         x87.write(0, value)
     else:

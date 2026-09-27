@@ -4,6 +4,7 @@ from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     CallResult,
+    CfgMemoryInit,
     Compare,
     CompareKind,
     ConditionCode,
@@ -11,10 +12,12 @@ from reccmp.compare.asm.verifier.addresses import (
     Extend,
     ExtendKind,
     Extract,
+    FlagsResult,
     Init,
     Insert,
     Load,
     MemoryAddress,
+    MemoryStore,
     Operation,
     OperationKind,
     RegisterPart,
@@ -26,8 +29,9 @@ from tests.asm_rows import verify_effective_match
 
 EAX = Init("a")
 ECX = Init("c")
-LOAD = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "dword", 0)
-BYTE = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 8, ()), "byte", 0)
+ENTRY_MEMORY = CfgMemoryInit()
+LOAD = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "dword", ENTRY_MEMORY)
+BYTE = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 8, ()), "byte", ENTRY_MEMORY)
 
 
 def imm(value: int):
@@ -114,14 +118,16 @@ def test_predicates():
         pred("eq", op("and", imm(0xFF), LOAD), imm(0), 4),
     )
     # flag states it cannot lower stay distinct unless identical
-    flags = ("flags", "add", LOAD, imm(1))
+    flags = FlagsResult(op("add", LOAD, imm(1)))
     opaque = ConditionCode("o", flags)
     assert bitvector.predicates_equal(opaque, opaque)
     assert not bitvector.predicates_equal(opaque, ConditionCode("no", flags))
 
 
 def test_terms_it_cannot_lower_are_not_proven():
-    qword = Load(MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "qword", 0)
+    qword = Load(
+        MemoryAddress("", (AddressTerm(ECX, 1),), 4, ()), "qword", ENTRY_MEMORY
+    )
     assert not bitvector.values_equal(qword, op("add", qword, imm(0)))
     # an opaque term is an unconstrained value: equal only to itself
     call = CallResult(3, "eax")
@@ -162,7 +168,7 @@ def test_the_verifier_accepts_an_algebraic_identity():
     )
 
 
-def _at(displacement: int, size: str, generation=0):
+def _at(displacement: int, size: str, generation=ENTRY_MEMORY):
     return Load(
         MemoryAddress("", (AddressTerm(ECX, 1),), displacement, ()),
         size,
@@ -192,5 +198,5 @@ def test_bytes_outside_the_wider_load_stay_unknown():
     assert not bitvector.values_equal(extract("h8", dword), _at(8, "byte"))
     # Another memory generation is another read.
     assert not bitvector.values_equal(
-        extract("l8", dword), _at(4, "byte", generation=1)
+        extract("l8", dword), _at(4, "byte", generation=MemoryStore(1, 0))
     )

@@ -17,7 +17,13 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.asm.verifier.addresses import Init, Value, unwind_spadd
+from reccmp.compare.asm.verifier.addresses import (
+    CallArgument,
+    CfgMemoryInit,
+    Init,
+    Value,
+    unwind_spadd,
+)
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.block_align import AlignedPair, align_block_lines
 from reccmp.compare.asm.verifier.blocks import (
@@ -58,11 +64,13 @@ from reccmp.compare.asm.verifier.state import (
     IndirectJump,
     JCC_MNEMONICS,
     Jump,
+    LocalDestination,
     Loop,
     Observation,
     Context,
     FunctionMetadata,
     SideState,
+    SwitchTarget,
     clone_state,
     commit_memory,
     guard_state_size,
@@ -293,7 +301,7 @@ def _verify_product(
         first: CfgState(
             SideState(rename_slots=False, frame={} if promote else None),
             SideState(rename_slots=False, frame={} if promote else None),
-            ("cfg_mem_init",),
+            CfgMemoryInit(),
         )
     }
     pending: list[_Node] = [first]
@@ -405,14 +413,16 @@ def _verify_product(
                 for entries in (obs_o, obs_r):
                     for k, obs_entry in enumerate(entries):
                         if isinstance(obs_entry, (Branch, Jump, Loop)):
-                            entries[k] = replace(obs_entry, destination=("L", "jcc"))
+                            entries[k] = replace(
+                                obs_entry, destination=LocalDestination("paired")
+                            )
             if kind is FlowKind.JUMP and switch:
                 idx_o = switch_index_observation(state_before_o, ins_o)
                 idx_r = switch_index_observation(state_before_r, ins_r)
                 for entries, idx in ((obs_o, idx_o), (obs_r, idx_r)):
                     for k, obs_entry in enumerate(entries):
                         if isinstance(obs_entry, IndirectJump):
-                            entries[k] = IndirectJump(("L", "switch"), idx)
+                            entries[k] = IndirectJump(SwitchTarget(), idx)
 
             if not accept_agreeing_pair(
                 ctx,
@@ -699,7 +709,7 @@ def _pass_frame(
             # callee could reach the promoted slots through it.
             raise Reject
         passed.append((offset - top, width, value))
-        state.frame[offset] = (width, ("callarg", index, offset - top, width))
+        state.frame[offset] = (width, CallArgument(index, offset - top, width))
     if effect is not None and effect.callee_pops is not None:
         state.write_reg("esp", esp_add(esp, effect.callee_pops))
     return FrameArguments(tuple(passed))

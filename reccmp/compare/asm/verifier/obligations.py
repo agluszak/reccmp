@@ -15,9 +15,14 @@ from reccmp.compare.asm.verifier.addresses import (
     Init,
     Insert,
     Load,
+    MemoryClobber,
+    OpaqueKind,
+    OpaqueValue,
     RegisterPart,
     Resync,
+    ScratchStore,
     Value,
+    X87Slot,
     mem_disjoint,
     unwind_spadd,
 )
@@ -104,9 +109,9 @@ def resync(states: tuple[SideState, SideState], idx: int, ctx: Context) -> None:
         state.carry = Resync(idx, "carry")
         state.fpu_flags = Resync(idx, "fpuflags")
         state.x87.known = [
-            Resync(idx, ("st", index)) for index in range(len(state.x87.known))
+            Resync(idx, X87Slot(index)) for index in range(len(state.x87.known))
         ]
-    commit_clobber(ctx, Resync(idx, "memory"))
+    commit_clobber(ctx, MemoryClobber(Resync(idx, "memory")))
 
 
 def _contained(value: Value, ctx: Context) -> bool:
@@ -329,12 +334,12 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
         return False
 
     for family in written_families:
-        value = ("metastep", idx, family)
+        value = OpaqueValue(OpaqueKind.META_RESULT, idx, family)
         orig.regs[family] = value
         recomp.regs[family] = value
     if meta.writes_flags:
-        orig.flags = recomp.flags = ("metastep_flags", idx)
-        orig.carry = recomp.carry = ("metastep_cf", idx)
+        orig.flags = recomp.flags = OpaqueValue(OpaqueKind.META_FLAGS, idx)
+        orig.carry = recomp.carry = OpaqueValue(OpaqueKind.META_CARRY, idx)
 
     return True
 
@@ -377,7 +382,7 @@ def _one_sided_push_ok(
         return False
     obs: list[Observation] = [Store(new_esp, "stack", value)]
     state.write_reg("esp", new_esp)
-    tag = ("mem", ("scratch", idx), 0)
+    tag = ScratchStore(idx)
     ctx.mem_events.append((tag, (new_esp, 4, "push")))
     ctx.gen = tag
     ctx.scratch_pushes.append(ScratchPush(side, offset, value, tag))

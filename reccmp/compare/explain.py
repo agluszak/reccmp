@@ -29,7 +29,10 @@ from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
     AddressValue,
+    CallStack,
+    CarryResult,
     Compare,
+    CompareFlags,
     CompareKind,
     ConditionCode,
     Constant,
@@ -37,6 +40,10 @@ from reccmp.compare.asm.verifier.addresses import (
     Extend,
     ExtendKind,
     Extract,
+    FlagsResult,
+    FloatCompare,
+    FloatOperation,
+    FloatStatusWord,
     Init,
     Insert,
     Load,
@@ -45,11 +52,16 @@ from reccmp.compare.asm.verifier.addresses import (
     Operation,
     OperationKind,
     Phi,
+    ReceiverLoad,
+    SahfCarry,
+    SahfFlags,
     Select,
     SetCondition,
     StackOffset,
     SymbolValue,
+    TestFlags,
     UnaryOperation,
+    VirtualCall,
     is_value,
     value_children,
 )
@@ -275,8 +287,8 @@ def _identity_kinds(value: Any) -> set[str]:
                 kinds.add(str(kind))
             case SymbolValue((kind, *_)):
                 kinds.add(str(kind))
-            case Load(address, _, generation):
-                stack.extend((address, generation))
+            case Load(address):
+                stack.append(address)
             case AddressValue(address):
                 stack.append(address)
             case MemoryAddress(terms=terms, displacement=displacement):
@@ -300,15 +312,7 @@ def _without_joins(value: Any) -> Any:
         case Phi():
             return Phi(0, 0)
         case Load(address, width, generation):
-            return Load(
-                _without_joins(address),
-                width,
-                (
-                    generation
-                    if isinstance(generation, int)
-                    else _without_joins(generation)
-                ),
-            )
+            return Load(_without_joins(address), width, generation)
         case AddressValue(address):
             return AddressValue(_without_joins(address))
         case MemoryAddress(segment, terms, displacement, symbols):
@@ -365,6 +369,26 @@ def _without_joins(value: Any) -> Any:
                 _without_joins(low),
                 _without_joins(divisor),
             )
+        case FlagsResult(operation) | CarryResult(operation):
+            return type(value)(_without_joins(operation))
+        case CompareFlags(left, right, width) | TestFlags(left, right, width):
+            return type(value)(_without_joins(left), _without_joins(right), width)
+        case SahfFlags(source, previous):
+            return SahfFlags(_without_joins(source), _without_joins(previous))
+        case SahfCarry(source) | FloatStatusWord(source):
+            return type(value)(_without_joins(source))
+        case FloatOperation(kind, operands):
+            return FloatOperation(
+                kind, tuple(_without_joins(item) for item in operands)
+            )
+        case FloatCompare(left, right):
+            return FloatCompare(_without_joins(left), _without_joins(right))
+        case CallStack(site, incoming):
+            return CallStack(site, _without_joins(incoming))
+        case ReceiverLoad(address, width):
+            return ReceiverLoad(_without_joins(address), width)
+        case VirtualCall(receiver, displacement):
+            return VirtualCall(_without_joins(receiver), displacement)
         case (*items,):
             return tuple(_without_joins(item) for item in items)
         case _:
@@ -467,6 +491,45 @@ def first_difference(orig: Any, recomp: Any) -> tuple[Any, Any, Any] | None:
                 (high_o, low_o, divisor_o),
                 (high_r, low_r, divisor_r),
             )
+        case (FlagsResult(operation_o) | CarryResult(operation_o)), (
+            FlagsResult(operation_r) | CarryResult(operation_r)
+        ) if type(orig) is type(recomp):
+            result = _difference_in_children(orig, (operation_o,), (operation_r,))
+        case (
+            CompareFlags(left_o, right_o, width_o) | TestFlags(left_o, right_o, width_o)
+        ), (
+            CompareFlags(left_r, right_r, width_r) | TestFlags(left_r, right_r, width_r)
+        ) if (
+            type(orig) is type(recomp) and width_o == width_r
+        ):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case SahfFlags(source_o, previous_o), SahfFlags(source_r, previous_r):
+            result = _difference_in_children(
+                orig, (source_o, previous_o), (source_r, previous_r)
+            )
+        case (SahfCarry(source_o) | FloatStatusWord(source_o)), (
+            SahfCarry(source_r) | FloatStatusWord(source_r)
+        ) if type(orig) is type(recomp):
+            result = _difference_in_children(orig, (source_o,), (source_r,))
+        case FloatOperation(kind_o, operands_o), FloatOperation(
+            kind_r, operands_r
+        ) if kind_o == kind_r and len(operands_o) == len(operands_r):
+            result = _difference_in_children(orig, operands_o, operands_r)
+        case FloatCompare(left_o, right_o), FloatCompare(left_r, right_r):
+            result = _difference_in_children(orig, (left_o, right_o), (left_r, right_r))
+        case CallStack(site_o, incoming_o), CallStack(site_r, incoming_r) if (
+            site_o == site_r
+        ):
+            result = _difference_in_children(orig, (incoming_o,), (incoming_r,))
+        case ReceiverLoad(address_o, width_o), ReceiverLoad(address_r, width_r) if (
+            width_o == width_r
+        ):
+            result = _difference_in_children(orig, (address_o,), (address_r,))
+        case VirtualCall(receiver_o, displacement_o), VirtualCall(
+            receiver_r, displacement_r
+        ):
+            if displacement_o == displacement_r:
+                result = _difference_in_children(orig, (receiver_o,), (receiver_r,))
         case (tag_o, *items_o), (tag_r, *items_r) if tag_o == tag_r and len(
             items_o
         ) == len(items_r):

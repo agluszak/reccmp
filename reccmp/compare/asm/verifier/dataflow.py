@@ -6,7 +6,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from reccmp.compare.asm.verifier.addresses import Phi, Value
+from reccmp.compare.asm.verifier.addresses import (
+    CfgMemoryPhi,
+    MemoryGeneration,
+    Phi,
+    Value,
+    X87EpochJoin,
+)
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.state import (
     CalleeSaveSubstitution,
@@ -41,9 +47,9 @@ class CfgState:
 
     orig: SideState
     recomp: SideState
-    memory: int | Value
-    receiver_values: dict[tuple[Value, int | None], tuple[Value, Value]] = field(
-        default_factory=dict
+    memory: MemoryGeneration
+    receiver_values: dict[tuple[Value, int | None], tuple[MemoryGeneration, Value]] = (
+        field(default_factory=dict)
     )
     # Whether a pointer into the function's own frame may have escaped on
     # some path reaching this point (see Context.stack_escaped).
@@ -188,9 +194,9 @@ def join_states(
         # x87 epochs. Control flow is paired, so both sides always arrive
         # via corresponding paths: a joined epoch keyed by the block keeps
         # deep-stack reads cross-equal (same reasoning as the memory phi).
-        joined_epoch = ("x87_epoch_phi", block)
-        out_o.x87.epoch = joined_epoch  # type: ignore[assignment]
-        out_r.x87.epoch = joined_epoch  # type: ignore[assignment]
+        joined_epoch = X87EpochJoin(block)
+        out_o.x87.epoch = joined_epoch
+        out_r.x87.epoch = joined_epoch
 
     # (entry value, incoming value, setter on the joined state)
     nodes: list[tuple[Value, Value, Callable[[Value], None]]] = []
@@ -288,7 +294,7 @@ def join_states(
     if entry.memory == incoming.memory:
         memory = entry.memory
     else:
-        memory = ("cfg_mem_phi", block)
+        memory = CfgMemoryPhi(block)
     receiver_values = {
         key: value
         for key, value in entry.receiver_values.items()

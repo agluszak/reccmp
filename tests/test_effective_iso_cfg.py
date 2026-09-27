@@ -19,13 +19,14 @@ from pathlib import Path
 import pytest
 
 from reccmp.compare.asm.parse import decode_function
-from reccmp.compare.asm.ir import DataRegion, FlowKind, JumpTable
+from reccmp.compare.asm.ir import DataRegion, JumpTable
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.operand import Sym
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
 )
+from reccmp.compare.asm.verifier.addresses import CfgMemoryInit, SymbolValue
 from reccmp.compare.asm.verifier.dataflow import (
     CfgState,
     join_states,
@@ -1136,8 +1137,8 @@ def test_branch_swapped_load_is_not_trap_equivalent():
 
 def test_cfg_join_rejects_uncorrelated_trap_parity():
     """Opposite-arm loads must not join by unioning trap-parity histories."""
-    addr = (("reg", "si"), 4)
-    gen = ("cfg_mem_init",)
+    addr = SymbolValue("si")
+    gen = CfgMemoryInit()
     fall_o, fall_r = SideState(), SideState()
     fall_o.load_log.add((addr, gen))
     taken_o, taken_r = SideState(), SideState()

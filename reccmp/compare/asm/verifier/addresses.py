@@ -38,6 +38,11 @@ class StringResult:
 
 
 @dataclass(frozen=True, slots=True)
+class X87Slot:
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
 class Resync:
     site: int
     location: Hashable
@@ -91,7 +96,7 @@ class AddressValue:
 class Load:
     address: Value
     width: str
-    generation: int | Value
+    generation: MemoryGeneration
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +117,7 @@ class OperationKind(Enum):
     XOR = "xor"
     IMUL = "imul"
     IMUL3 = "imul3"
+    MUL = "mul"
     SUB = "sub"
     SHL = "shl"
     SHR = "shr"
@@ -231,9 +237,215 @@ class DivideResult:
     divisor: Value
 
 
+@dataclass(frozen=True, slots=True)
+class FlagsResult:
+    operation: Value
+
+
+@dataclass(frozen=True, slots=True)
+class CompareFlags:
+    left: Value
+    right: Value
+    width: int | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TestFlags:
+    left: Value
+    right: Value
+    width: int | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CarryResult:
+    operation: Value
+
+
+@dataclass(frozen=True, slots=True)
+class CarryCleared:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SahfFlags:
+    value: Value
+    previous: Value
+
+
+@dataclass(frozen=True, slots=True)
+class SahfCarry:
+    value: Value
+
+
+class OpaqueKind(Enum):
+    DIVISION_FLAGS = "undef_flags"
+    DIVISION_CARRY = "undef_cf"
+    CALL_FLAGS = "callflags"
+    CALL_CARRY = "callcf"
+    STRING_FLAGS = "strflags"
+    STRING_CARRY = "strcf"
+    META_RESULT = "metastep"
+    META_FLAGS = "metastep_flags"
+    META_CARRY = "metastep_cf"
+    HAVOC_REGISTER = "havoc"
+    HAVOC_FLAGS = "havoc_flags"
+    HAVOC_CARRY = "havoc_cf"
+    HAVOC_FPU_FLAGS = "havoc_fpuflags"
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueValue:
+    kind: OpaqueKind
+    site: int
+    location: Hashable | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CallStack:
+    """The stack pointer after a call, still rooted at its incoming value."""
+
+    site: int
+    incoming: Value
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiverLoad:
+    """The canonical identity of a receiver read whose value cannot forward."""
+
+    address: Value
+    width: str
+
+
+@dataclass(frozen=True, slots=True)
+class VirtualCall:
+    receiver: Value
+    displacement: int
+
+
+@dataclass(frozen=True, slots=True)
+class CallThrough:
+    slot: Hashable
+
+
+@dataclass(frozen=True, slots=True)
+class CallArgument:
+    """A promoted frame slot rewritten by a callee."""
+
+    site: int
+    offset: int
+    width: int
+
+
+@dataclass(frozen=True, slots=True)
+class CfgMemoryInit:
+    """The memory state at the start of a CFG verification scope."""
+
+
+@dataclass(frozen=True, slots=True)
+class CfgMemoryPhi:
+    """A joined memory state at a CFG block."""
+
+    block: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryStore:
+    """The memory generation after one committed store."""
+
+    site: Hashable
+    ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchStore:
+    """The memory generation after a private one-sided push."""
+
+    site: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryClobber:
+    """The memory generation after an opaque write."""
+
+    site: Hashable
+    ordinal: Hashable | None = None
+
+
+MemoryGeneration: TypeAlias = (
+    CfgMemoryInit | CfgMemoryPhi | MemoryStore | ScratchStore | MemoryClobber
+)
+
+
+class FloatConstantKind(Enum):
+    ONE = "fld1"
+    ZERO = "fldz"
+    PI = "fldpi"
+    LOG2E = "fldl2e"
+    LOG2T = "fldl2t"
+    LOG10_2 = "fldlg2"
+    LN2 = "fldln2"
+
+
+class FloatOperationKind(Enum):
+    ADD = "fadd"
+    MULTIPLY = "fmul"
+    SUBTRACT = "fsub"
+    DIVIDE = "fdiv"
+    TO_INTEGER = "fist"
+    CHANGE_SIGN = "fchs"
+    ABSOLUTE = "fabs"
+    SQUARE_ROOT = "fsqrt"
+    ROUND_INTEGER = "frndint"
+    COSINE = "fcos"
+    SINE = "fsin"
+    TANGENT = "ftan"
+    TWO_X_MINUS_ONE = "f2xm1"
+    PARTIAL_REMAINDER = "fprem"
+    SCALE = "fscale"
+    PARTIAL_ARCTANGENT = "fpatan"
+    Y_LOG2_X = "fyl2x"
+
+
+@dataclass(frozen=True, slots=True)
+class FloatConstant:
+    kind: FloatConstantKind
+
+
+@dataclass(frozen=True, slots=True)
+class FloatOperation:
+    kind: FloatOperationKind
+    operands: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class X87EpochJoin:
+    block: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeepFloat:
+    epoch: int | X87EpochJoin
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
+class FloatCompare:
+    left: Value
+    right: Value
+
+
+@dataclass(frozen=True, slots=True)
+class FloatStatusWord:
+    flags: Value
+
+
+@dataclass(frozen=True, slots=True)
+class FloatControlWord:
+    pass
+
+
 Value: TypeAlias = (
-    tuple
-    | Init
+    Init
     | CallResult
     | StringResult
     | Resync
@@ -256,6 +468,25 @@ Value: TypeAlias = (
     | Select
     | MultiplyResult
     | DivideResult
+    | FlagsResult
+    | CompareFlags
+    | TestFlags
+    | CarryResult
+    | CarryCleared
+    | SahfFlags
+    | SahfCarry
+    | OpaqueValue
+    | FloatConstant
+    | FloatOperation
+    | DeepFloat
+    | FloatCompare
+    | FloatStatusWord
+    | FloatControlWord
+    | CallStack
+    | ReceiverLoad
+    | VirtualCall
+    | CallThrough
+    | CallArgument
 )
 
 _VALUE_TYPES = (
@@ -282,11 +513,30 @@ _VALUE_TYPES = (
     Select,
     MultiplyResult,
     DivideResult,
+    FlagsResult,
+    CompareFlags,
+    TestFlags,
+    CarryResult,
+    CarryCleared,
+    SahfFlags,
+    SahfCarry,
+    OpaqueValue,
+    FloatConstant,
+    FloatOperation,
+    DeepFloat,
+    FloatCompare,
+    FloatStatusWord,
+    FloatControlWord,
+    CallStack,
+    ReceiverLoad,
+    VirtualCall,
+    CallThrough,
+    CallArgument,
 )
 
 
 def is_value(value: object) -> bool:
-    return isinstance(value, (tuple, *_VALUE_TYPES))
+    return isinstance(value, _VALUE_TYPES)
 
 
 def value_children(value: Value) -> tuple[Value, ...]:
@@ -299,8 +549,12 @@ def value_children(value: Value) -> tuple[Value, ...]:
             )
         case AddressValue(address):
             return (address,)
-        case Load(address, _, generation):
-            return (address,) if isinstance(generation, int) else (address, generation)
+        case Load(address):
+            return (address,)
+        case CallStack(incoming=incoming) | ReceiverLoad(address=incoming):
+            return (incoming,)
+        case VirtualCall(receiver):
+            return (receiver,)
         case (
             StackOffset(base)
             | Extract(_, base)
@@ -319,8 +573,18 @@ def value_children(value: Value) -> tuple[Value, ...]:
             return (predicate, fallthrough, taken)
         case DivideResult(high=high, low=low, divisor=divisor):
             return (high, low, divisor)
-        case tuple():
-            return tuple(child for child in value if is_value(child))
+        case FlagsResult(operation) | CarryResult(operation):
+            return (operation,)
+        case CompareFlags(left, right) | TestFlags(left, right):
+            return (left, right)
+        case SahfFlags(value, previous):
+            return (value, previous)
+        case SahfCarry(value) | FloatStatusWord(value):
+            return (value,)
+        case FloatOperation(operands=operands):
+            return operands
+        case FloatCompare(left, right):
+            return (left, right)
     return ()
 
 

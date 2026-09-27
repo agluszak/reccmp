@@ -22,10 +22,12 @@ from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import ExtentKind, FunctionImage
 from reccmp.compare.asm.verifier.addresses import (
     AddressTerm,
+    CfgMemoryInit,
     Constant,
     Init,
     Load,
     MemoryAddress,
+    MemoryStore,
     SymbolValue,
 )
 from reccmp.call_facts import CallFacts
@@ -715,16 +717,22 @@ def test_the_solver_suggests_the_input_the_seeds_miss():
     assert (witness.seed, witness.kind) == (HINT_SEED, WitnessKind.RETURN_VALUE)
 
 
-def _field(offset: int, size: str = "word", register: str = "c") -> tuple:
+def _field(offset: int, size: str = "word", register: str = "c") -> Load:
     """A load of `[register + offset]` as memory was at entry."""
     return Load(
-        MemoryAddress("", (AddressTerm(Init(register), 1),), offset, ()), size, 0
+        MemoryAddress("", (AddressTerm(Init(register), 1),), offset, ()),
+        size,
+        CfgMemoryInit(),
     )
 
 
 def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     base = RunInput.from_seed(1)
-    argument = Load(MemoryAddress("", (AddressTerm(Init("sp"), 1),), 8, ()), "dword", 0)
+    argument = Load(
+        MemoryAddress("", (AddressTerm(Init("sp"), 1),), 8, ()),
+        "dword",
+        CfgMemoryInit(),
+    )
     hint = input_from_assignment({Init("c"): 7, argument: 9}, base)
     assert isinstance(hint, RunInput)
     assert hint.registers["ecx"] == 7 and hint.stack_args[1] == 9
@@ -734,7 +742,7 @@ def test_solver_assignments_only_become_inputs_when_the_witness_sets_them():
     assert isinstance(hint, RunInput)
     assert hint.memory == ((0x20000004, 0xEF), (0x20000005, 0xBE))
     # an argument after a store cannot be set; a symbol's address is ignored
-    stored = Load(argument.address, "dword", 3)
+    stored = Load(argument.address, "dword", MemoryStore(3, 0))
     assert input_from_assignment({stored: 1}, base) == Rejection(
         "uncontrollable_leaf", repr(stored)
     )
@@ -881,7 +889,11 @@ def test_the_fate_of_a_solver_hint_is_recorded():
     analysis = ComparisonAnalysis.mismatch(difference)
     hints, failure = _solver_hints(analysis)
     assert hints and failure is None
-    stored = Load(MemoryAddress("", (AddressTerm(Init("c"), 1),), 8, ()), "dword", 3)
+    stored = Load(
+        MemoryAddress("", (AddressTerm(Init("c"), 1),), 8, ()),
+        "dword",
+        MemoryStore(3, 0),
+    )
     rejected = dataclasses.replace(
         difference, values=(stored, Constant(1), 32, "value")
     )
