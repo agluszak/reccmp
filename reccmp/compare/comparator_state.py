@@ -10,7 +10,7 @@ from collections.abc import Hashable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from reccmp.compare.asm.parse import ParseAsm
+    from reccmp.compare.asm.replacement import AddrTestProtocol, ReferenceResolver
     from reccmp.call_facts import CallFacts
     from reccmp.compare.db import EntityDb
     from reccmp.compare.inlines import HelperCatalogEntry
@@ -32,8 +32,10 @@ class ComparatorState:
     equivalence_groups: dict[int, int]
     source_index: SourceIndex | None
     is_32bit: bool
-    orig_sanitize: ParseAsm
-    recomp_sanitize: ParseAsm
+    orig_addr_test: AddrTestProtocol
+    recomp_addr_test: AddrTestProtocol
+    orig_resolver: ReferenceResolver
+    recomp_resolver: ReferenceResolver
     _call_facts_cache: dict[Hashable, CallFacts | None] | None
     _fp_cache: dict
     _helper_catalog: list[HelperCatalogEntry] | None

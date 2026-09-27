@@ -1,10 +1,20 @@
-from reccmp.compare.asm.instgen import CodeSection, InstructGen, SectionType
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.render import render_function_rows
+from reccmp.compare.asm.verifier.cfg_build import build_side_cfg
 
 
 def test_ret():
     """Make sure we can handle a function with one instruction."""
-    ig = InstructGen(b"\xc3", 0)
-    assert len(ig.sections) == 1
+    image = decode_function(b"\xc3", 0)
+    assert len(image.instructions) == 1
+
+
+def _code_gaps(image):
+    return [
+        (previous.address, following)
+        for previous, following in zip(image.instructions, image.instructions[1:])
+        if previous.address + previous.size != following.address
+    ]
 
 
 SCORE_NOTIFY = (
@@ -31,17 +41,10 @@ def test_score_notify():
     """Score::Notify function from 0x10001410 in LEGO1.
     Good representative function for jump table (at 0x100014d4)
     and switch data (at 0x100014ec)."""
-    ig = InstructGen(SCORE_NOTIFY, 0x10001410)
-
-    # Did we get everything?
-    assert len(ig.sections) == 3
-    types_only = tuple(s.type for s in ig.sections)
-    assert types_only == (SectionType.CODE, SectionType.ADDR_TAB, SectionType.DATA_TAB)
-
-    # CODE section stopped at correct place?
-    section = ig.sections[0]
-    assert section.type == SectionType.CODE
-    last_inst_address = section.contents[-1].address
+    image = decode_function(SCORE_NOTIFY, 0x10001410)
+    assert len(image.jump_tables) == 1
+    assert len(image.data_regions) == 1
+    last_inst_address = image.instructions[-1].address
 
     assert last_inst_address == 0x100014D2
     # n.b. 0x100014d2 is the dummy instruction `mov edi, edi`
@@ -50,9 +53,26 @@ def test_score_notify():
     # to include this because it is not junk data.
 
     # 6 switch addresses
-    assert len(ig.sections[1].contents) == 6
+    assert len(image.jump_tables[0].entries) == 6
 
     # TODO: The data table at the end includes all of the 0xCC padding bytes.
+
+
+def test_decoded_image_keeps_tables_out_of_instructions():
+    start = 0x10001410
+    image = decode_function(SCORE_NOTIFY, start)
+    assert all(row.mnemonic for row in image.instructions)
+    assert len(image.jump_tables) == 1
+    assert len(image.data_regions) == 1
+    region = image.data_regions[0]
+    assert region.address == 0x100014EC
+    assert region.data == SCORE_NOTIFY[region.address - start :]
+    cfg = build_side_cfg(image)
+    assert cfg is not None and cfg.table_dests
+    rendered = render_function_rows(image)
+    assert sum(row.display == "Jump table:" for row in rendered) == 1
+    assert sum(row.display == "Data table:" for row in rendered) == 1
+    assert len(rendered) > len(image.instructions)
 
 
 SMACK_CASE = (
@@ -69,15 +89,10 @@ def test_smack_case():
     """Case where we have code / jump table / code.
     Need to properly separate code sections, eliminate junk instructions
     and continue disassembling at the proper address following the data."""
-    ig = InstructGen(SMACK_CASE, 0x1000)
-    assert len(ig.sections) == 3
-    assert ig.sections[0].type == ig.sections[2].type == SectionType.CODE
-
-    # Make sure we captured the instruction immediately after
-    section = ig.sections[2]
-    assert section.type == SectionType.CODE
-    first_inst_mnemonic = section.contents[0].mnemonic
-    assert first_inst_mnemonic == "mov"
+    image = decode_function(SMACK_CASE, 0x1000)
+    assert len(image.jump_tables) == 1
+    assert len(_code_gaps(image)) == 1
+    assert _code_gaps(image)[0][1].mnemonic == "mov"
 
 
 # BETA10 0x1004c9cc
@@ -95,18 +110,13 @@ BETA_FUNC = (
 
 def test_beta_case():
     """Complete (and short) function with CODE / ADDR / CODE"""
-    ig = InstructGen(BETA_FUNC, 0x1004C9CC)
+    image = decode_function(BETA_FUNC, 0x1004C9CC)
     # The JMP into the jump table immediately precedes the jump table.
     # We have to detect this and switch sections correctly or we will only
     # get 1 section.
-    assert len(ig.sections) == 3
-    assert ig.sections[0].type == ig.sections[2].type == SectionType.CODE
-
-    # Make sure we captured the instruction immediately after
-    section = ig.sections[2]
-    assert section.type == SectionType.CODE
-    first_inst_mnemonic = section.contents[0].mnemonic
-    assert first_inst_mnemonic == "mov"
+    assert len(image.jump_tables) == 1
+    assert len(_code_gaps(image)) == 1
+    assert _code_gaps(image)[0][1].mnemonic == "mov"
 
 
 # LEGO1 0x1000fb50
@@ -128,17 +138,15 @@ THUNK_TEST = (
 def test_thunk_case():
     """Adjuster thunk incorrectly annotated.
     We are reading way more bytes than we should for this function."""
-    ig = InstructGen(THUNK_TEST, 0x1000FB50)
+    image = decode_function(THUNK_TEST, 0x1000FB50)
     # The body begins with ``sub``/``jmp`` over int3 padding into the real
     # implementation. Pending-target drainage must visit that landing site
     # (a second CODE section) without looping forever on truncated trailing
     # bytes from the next function.
-    assert len(ig.sections) == 2
-    first, second = ig.sections[0], ig.sections[1]
-    assert isinstance(first, CodeSection) and isinstance(second, CodeSection)
-    assert first.contents[0].mnemonic == "sub"
-    assert first.contents[1].mnemonic == "jmp"
-    assert second.contents[0].mnemonic == "push"
+    assert len(_code_gaps(image)) == 1
+    assert image.instructions[0].mnemonic == "sub"
+    assert image.instructions[1].mnemonic == "jmp"
+    assert _code_gaps(image)[0][1].mnemonic == "push"
 
     # TODO: We might detect the 0xCC padding bytes and cut off the function.
     # If we did that, we would correctly read only 2 instructions.
@@ -222,10 +230,11 @@ HANDLE_END_ACTION = (
 
 def test_action_case():
     """3 switches: 3 jump tables, 1 data table"""
-    ig = InstructGen(HANDLE_END_ACTION, 0x1006F080)
+    image = decode_function(HANDLE_END_ACTION, 0x1006F080)
     # Two of the jump tables (0x1006f478 with 5, 0x1006f48c with 8)
     # are contiguous.
-    assert len(ig.sections) == 5
+    assert len(image.jump_tables) == 3
+    assert len(image.data_regions) == 1
 
 
 # MFC 3.1, CDocument::ReportSaveLoadException
@@ -262,10 +271,6 @@ def test_movzx_data_table():
     00451df7 0f b6 88        MOVZX      this,byte ptr [EAX + 0x451ed5]=>PTR_caseD_7_00
              d5 1e 45 00
     """
-    ig = InstructGen(REPORT_SAVE_LOAD_EXCEPTION, 0x451D73)
-    assert len(ig.sections) == 3
-    assert [section.type for section in ig.sections] == [
-        SectionType.CODE,
-        SectionType.ADDR_TAB,
-        SectionType.DATA_TAB,
-    ]
+    image = decode_function(REPORT_SAVE_LOAD_EXCEPTION, 0x451D73)
+    assert len(image.jump_tables) == 1
+    assert len(image.data_regions) == 1

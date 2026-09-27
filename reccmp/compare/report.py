@@ -2,7 +2,7 @@ from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic_core import from_json
 
 from reccmp.types import EntityType
@@ -53,7 +53,7 @@ class ReccmpComparedEntity:
     orig_addr: int
     name: str
     accuracy: float
-    type: EntityType | None = None
+    type: EntityType = EntityType.FUNCTION
     recomp_addr: int | None = None
     """The meaning of `None` depends on `recomp_addr_varies`:
     recomp_addr_varies is False: This entity is unmatched.
@@ -64,9 +64,6 @@ class ReccmpComparedEntity:
     is_library: bool = False
     rdiff: RawDiffOutput | None = None
     report_diff: CombinedDiffOutput | None = None
-
-    # Legacy field for importing version 1 files (aggregate).
-    udiff: CombinedDiffOutput | None = None
 
     recomp_addr_varies: bool = False
     """True if this entity had no fixed recomp address across the
@@ -85,9 +82,7 @@ class ReccmpComparedEntity:
         return self.recomp_addr is not None or self.recomp_addr_varies
 
     def is_function(self) -> bool:
-        """Entities without a type (derived from older reports that did not
-        serialize this field) are considered functions to maintain compatibility."""
-        return self.type is None or self.type == EntityType.FUNCTION
+        return self.type == EntityType.FUNCTION
 
     @property
     def is_effective_match(self) -> bool:
@@ -124,9 +119,6 @@ class ReccmpStatusReport:
     entities: dict[int, ReccmpComparedEntity]
     """Using orig addr as the key."""
 
-    from_version: int | None
-    """Only set during deserialize. (Not used yet)"""
-
     source_digest: str | None = None
     """SHA-256 of the original binary, when known. Two reports with
     different digests are not aggregate-compatible even if they share a
@@ -141,11 +133,9 @@ class ReccmpStatusReport:
         self,
         filename: str,
         timestamp: datetime | None = None,
-        from_version: int | None = None,
         source_digest: str | None = None,
     ) -> None:
         self.filename = filename
-        self.from_version = from_version
         self.source_digest = source_digest
         self.function_count = 0
         if timestamp is not None:
@@ -313,21 +303,10 @@ def combine_reports(samples: list[ReccmpStatusReport]) -> ReccmpStatusReport:
     return output
 
 
-def get_udiff_for_entity(entity: ReccmpComparedEntity) -> CombinedDiffOutput | None:
-    """Create a unified diff for this entity to add to a version 1 report.
-
-    If the entity was imported from a version 1 report and we already have a unified diff, use it.
-    This can occur with `reccmp-aggregate` where we copy the entity with the highest accuracy score.
-
-    If there is no unified diff, create a new one using the entity's raw diff, if it exists.
-
-    If we return None, no diff is possible because the entity matches 100%, is a stub,
-    or was created from a deserialized report without diff data."""
+def _render_entity_diff(entity: ReccmpComparedEntity) -> CombinedDiffOutput | None:
+    """Use a stored report diff or render the raw comparison diff."""
     if entity.report_diff is not None:
         return entity.report_diff
-
-    if entity.udiff is not None:
-        return entity.udiff
 
     if entity.rdiff is None:
         # We need data to create the unified diff.
@@ -348,21 +327,19 @@ def get_udiff_for_entity(entity: ReccmpComparedEntity) -> CombinedDiffOutput | N
 #### JSON schema and conversion functions ####
 
 
-@dataclass
-class JSONEntityVersion1:
+class JSONEntity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     # pylint:disable=too-many-instance-attributes
     address: str
     name: str
     matching: float
-    comparison: dict[str, object] | None = None
-    # Optional fields
+    type: int
+    comparison: dict[str, object]
     recomp: str | None = None
-    stub: bool | None = False
-    library: bool | None = False
-    effective: bool | None = False
+    recomp_varies: bool = False
+    stub: bool = False
+    library: bool = False
     diff: CombinedDiffOutput | None = None
-    # EntityType as int. Older reports do not include this field.
-    type: int | None = None
     accuracy_modulo_stack: float | None = None
     stack_permutation: list[dict[str, object]] | None = None
     accuracy_modulo_inline: float | None = None
@@ -370,23 +347,20 @@ class JSONEntityVersion1:
     diagnostic_normalizations: list[str] | None = None
 
 
-class JSONReportVersion1(BaseModel):
+class JSONReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     file: str
-    format: Literal[1]
+    format: Literal[2]
     timestamp: float
-    data: list[JSONEntityVersion1]
-    function_count: int | None = None
+    data: list[JSONEntity]
+    function_count: int
     source_digest: str | None = None
 
 
-MAGIC_STRING_VARIOUS = "various"
-"""reccmp-aggregate uses this to indicate an entity whose recomp addr varied between the sample reports."""
-
-
-def _serialize_version_1(
+def _serialize_current(
     report: ReccmpStatusReport,
     diff_included: bool = False,
-) -> JSONReportVersion1:
+) -> JSONReport:
     """The JSON report can exclude the diff to make deserialization faster."""
     entities = []
 
@@ -396,7 +370,7 @@ def _serialize_version_1(
 
         assert addr == entity.orig_addr
         entities.append(
-            JSONEntityVersion1(
+            JSONEntity(
                 address=format_address(addr),
                 name=entity.name,
                 matching=entity.accuracy,
@@ -404,12 +378,13 @@ def _serialize_version_1(
                 recomp=(
                     format_address(entity.recomp_addr)
                     if entity.recomp_addr is not None
-                    else (MAGIC_STRING_VARIOUS if entity.recomp_addr_varies else "")
+                    else None
                 ),
+                recomp_varies=entity.recomp_addr_varies,
                 stub=entity.is_stub,
                 library=entity.is_library,
-                diff=(get_udiff_for_entity(entity) if diff_included else None),
-                type=int(entity.type) if entity.type is not None else None,
+                diff=(_render_entity_diff(entity) if diff_included else None),
+                type=int(entity.type),
                 accuracy_modulo_stack=entity.accuracy_modulo_stack,
                 stack_permutation=(
                     [
@@ -452,9 +427,9 @@ def _serialize_version_1(
         )
 
     report.update_function_count()
-    return JSONReportVersion1(
+    return JSONReport(
         file=report.filename,
-        format=1,
+        format=2,
         timestamp=report.timestamp.timestamp(),
         data=entities,
         function_count=report.function_count,
@@ -462,39 +437,21 @@ def _serialize_version_1(
     )
 
 
-def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
+def _deserialize_current(obj: JSONReport) -> ReccmpStatusReport:
     report = ReccmpStatusReport(
         filename=obj.file,
         timestamp=datetime.fromtimestamp(obj.timestamp),
-        from_version=1,
         source_digest=obj.source_digest,
     )
-    report.function_count = obj.function_count or 0
+    report.function_count = obj.function_count
 
     for e in obj.data:
-        try:
-            entity_type = EntityType(e.type) if e.type is not None else None
-        except ValueError:
-            entity_type = None
-
+        entity_type = EntityType(e.type)
         orig_addr = int(e.address, 16)
-
-        if e.recomp == MAGIC_STRING_VARIOUS:
-            recomp_addr = None
-            various = True
-        else:
-            recomp_addr = int(e.recomp, 16) if e.recomp is not None else None
-            various = False
-
-        if e.comparison is not None:
-            analysis = parse_analysis(e.comparison)
-        elif e.effective:
-            # Legacy reports only recorded a boolean; reason codes are unknown.
-            analysis = ComparisonAnalysis.effective(())
-        elif e.matching == 1.0:
-            analysis = ComparisonAnalysis.exact()
-        else:
-            analysis = ComparisonAnalysis.inconclusive("analysis_limit")
+        recomp_addr = int(e.recomp, 16) if e.recomp is not None else None
+        if e.recomp_varies and recomp_addr is not None:
+            raise ValueError("A varying recomp address cannot be fixed")
+        analysis = parse_analysis(e.comparison)
 
         report.entities[orig_addr] = ReccmpComparedEntity(
             orig_addr=orig_addr,
@@ -505,9 +462,8 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
             analysis=analysis,
             is_stub=bool(e.stub),
             is_library=bool(e.library),
-            udiff=e.diff,
             report_diff=e.diff,
-            recomp_addr_varies=various,
+            recomp_addr_varies=e.recomp_varies,
             accuracy_modulo_stack=e.accuracy_modulo_stack,
             stack_permutation=parse_stack_permutation(e.stack_permutation),
             accuracy_modulo_inline=e.accuracy_modulo_inline,
@@ -525,10 +481,10 @@ def _deserialize_version_1(obj: JSONReportVersion1) -> ReccmpStatusReport:
 
 
 def deserialize_reccmp_report(json_str: str) -> ReccmpStatusReport:
-    """Read only the current structured format-1 schema."""
+    """Read only the current structured report schema."""
     try:
-        obj = JSONReportVersion1.model_validate(from_json(json_str))
-        return _deserialize_version_1(obj)
+        obj = JSONReport.model_validate(from_json(json_str))
+        return _deserialize_current(obj)
     except (ValidationError, ValueError) as ex:
         raise ReccmpReportDeserializeError from ex
 
@@ -538,6 +494,6 @@ def serialize_reccmp_report(
     diff_included: bool = False,
 ) -> str:
     """Create a JSON string for the report so it can be written to a file."""
-    obj = _serialize_version_1(report, diff_included=diff_included)
+    obj = _serialize_current(report, diff_included=diff_included)
 
     return obj.model_dump_json(exclude_defaults=True)

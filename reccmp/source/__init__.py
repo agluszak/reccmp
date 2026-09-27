@@ -1,25 +1,22 @@
 """Compiler-backed source ownership model."""
 
-from .index import (
+from .records import (
     SourceAbi,
     SourceBaseOffset,
     SourceBaseVtable,
     DeclarationKey,
     SourceClass,
-    SourceCollector,
     SourceDeclaration,
     SourceField,
-    SourceIndex,
-    SourceIndexError,
     SourceMemberUse,
     SourceArrayIndex,
     SourceConversion,
     SourceMarker,
     ResolvedField,
-    TranslationUnitRecords,
-    keyed,
-    record_command,
 )
+from .observations import SourceIndexError, TranslationUnitRecords
+from .index import SourceCollector, SourceIndex, keyed
+from .commands import record_command
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [

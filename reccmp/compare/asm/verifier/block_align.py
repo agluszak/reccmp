@@ -90,9 +90,6 @@ def _dp_skeleton(ins: DecodedInstruction) -> tuple:
 
 def dp_line(row: DecodedInstruction) -> DpLine:
     key = instruction_match_key(row)
-    if not row.is_code:
-        # Table rows pair only with an identical row.
-        return DpLine(key, "", "opaque", None)
     head = row.prefix or row.mnemonic
     return DpLine(key, head, _dp_line_class(row), _dp_skeleton(row))
 

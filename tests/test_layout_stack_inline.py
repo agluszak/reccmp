@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from reccmp.compare.asm.ir import DecodedInstruction, AsmRole
+from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.inlines import (
     HelperCatalogEntry,
     StoreEffect,
@@ -148,16 +148,6 @@ def test_asm_fingerprint_from_ir_uses_structured_operands():
             prefix="",
             operands=(("reg", "eax"), ("mem", "dword", "", (("ecx", 1),), 4, ())),
             display="mov eax, dword ptr [ecx + 0x4]",
-            role=AsmRole.CODE,
-        ),
-        DecodedInstruction(
-            address=None,
-            size=0,
-            mnemonic="",
-            prefix="",
-            operands=(),
-            display="Jump table:",
-            role=AsmRole.JUMP_TABLE_HEADER,
         ),
     ]
     fp = fingerprint_of(instructions)

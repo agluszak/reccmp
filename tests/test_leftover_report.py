@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import pickle
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -14,11 +16,8 @@ import pytest
 from reccmp.source import keyed
 
 from reccmp.compare import Compare
-from reccmp.compare.asm.verifier.cfg_build import (
-    extract_switch_tables,
-)
+from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -27,7 +26,7 @@ from reccmp.compare.asm.ir import (
     rebind_local_identities,
 )
 from reccmp.compare.asm.model import Reference
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.replacement import create_resolver
 from reccmp.compare.db import EntityDb, FrozenEntityDbError, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult
@@ -67,20 +66,20 @@ from tests.raw_image import RawImage
 
 def test_instruction_ids_survive_slice_and_reorder():
     blob = bytes.fromhex("B80100000083C001C3")  # mov eax,1; add eax,1; ret
-    rows = ParseAsm().parse_asm(blob, 0x1000)
+    rows = decode_function(blob, 0x1000).instructions
     stamped = tuple(replace(row, instruction_id=100 + i) for i, row in enumerate(rows))
     image = FunctionImage(0x1000, len(blob), ExtentKind.KNOWN, stamped)
     assert image.instruction_ids == (100, 101, 102)
-    sliced = image.with_excerpt(image.excerpt[:2])
+    sliced = image.with_instructions(image.instructions[:2])
     assert sliced.instruction_ids == (100, 101)
-    reordered = image.with_excerpt([image.excerpt[i] for i in (2, 0, 1)])
+    reordered = image.with_instructions([image.instructions[i] for i in (2, 0, 1)])
     assert reordered.instruction_ids == (102, 100, 101)
-    assert reordered.excerpt[0].display == image.excerpt[2].display
+    assert reordered.instructions[0].display == image.instructions[2].display
 
 
 def test_estimated_extent_without_terminal_is_open():
     blob = bytes.fromhex("B801000000B802000000")  # mov eax,1; mov eax,2
-    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    excerpt = decode_function(blob, 0x1000).instructions
     assert (
         compute_extent_closed(
             excerpt,
@@ -94,7 +93,7 @@ def test_estimated_extent_without_terminal_is_open():
 
 def test_known_extent_with_plain_fallthrough_is_open():
     blob = bytes.fromhex("B801000000B901000000")  # mov eax,1; mov ecx,1
-    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    excerpt = decode_function(blob, 0x1000).instructions
     assert (
         compute_extent_closed(
             excerpt,
@@ -108,16 +107,12 @@ def test_known_extent_with_plain_fallthrough_is_open():
 
 def test_known_extent_ending_in_ret_is_closed():
     blob = bytes.fromhex("B801000000C3")  # mov eax,1; ret
-    sanitizer = ParseAsm()
-    excerpt = tuple(
-        replace(row, instruction_id=i)
-        for i, row in enumerate(sanitizer.parse_asm(blob, 0x1000))
-    )
+    excerpt = decode_function(blob, 0x1000).instructions
     image = FunctionImage(
         start_addr=0x1000,
         extent=len(blob),
         extent_kind=ExtentKind.KNOWN,
-        excerpt=excerpt,
+        instructions=excerpt,
         extent_closed=compute_extent_closed(
             excerpt,
             start_addr=0x1000,
@@ -130,21 +125,8 @@ def test_known_extent_ending_in_ret_is_closed():
 
 
 def _ret_at(addr: int, iid: int) -> DecodedInstruction:
-    row = ParseAsm().parse_asm(b"\xc3", addr)[0]
+    row = decode_function(b"\xc3", addr).instructions[0]
     return replace(row, instruction_id=iid)
-
-
-def _table_entry(addr: int, display: str, iid: int) -> DecodedInstruction:
-    return replace(
-        ParseAsm().parse_asm(b"\xc3", addr)[0],
-        address=addr,
-        size=4,
-        mnemonic="",
-        operands=(),
-        display=display,
-        role=AsmRole.JUMP_TABLE_ENTRY,
-        instruction_id=iid,
-    )
 
 
 def test_jump_table_dispatch_closes_indirect_switch_extent():
@@ -153,9 +135,8 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         size=2,
         mnemonic="jmp",
         prefix="",
-        operands=(("mem", "dword", "", (("eax", 4),), 0, ()),),
-        display="jmp dword ptr [eax*4]",
-        role=AsmRole.CODE,
+        operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
+        display="jmp dword ptr [eax*4+0x1004]",
         is_jump=True,
         branch_target=None,
         control_flow_known=False,
@@ -167,6 +148,7 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         address=0x1004,
         entries=((0x1004, 0x1010), (0x1008, 0x1020)),
         dispatch_address=0x1000,
+        index_register="eax",
     )
     excerpt = (dispatch, case0, case1)
     assert (
@@ -232,10 +214,35 @@ def test_entity_db_freeze_rejects_later_pairing():
         batch.set(ImageId.ORIG, 0x10, name="orig", size=4)
         batch.set(ImageId.RECOMP, 0x20, name="recomp", size=4)
         batch.match(0x10, 0x20)
+    before_freeze = db.get(ImageId.ORIG, 0x10)
+    assert before_freeze is not None and before_freeze.orig is not None
+    mutable_facts = before_freeze.orig.facts
     db.freeze()
+    assert isinstance(mutable_facts, dict)
+    mutable_facts["name"] = "stale reference"
     with pytest.raises(FrozenEntityDbError):
         with db.batch() as batch:
             batch.set(ImageId.ORIG, 0x30, name="later")
+    orig = db.get(ImageId.ORIG, 0x10)
+    recomp = db.get(ImageId.RECOMP, 0x20)
+    assert orig is recomp
+    assert orig is not None
+    assert recomp is not None
+    assert orig.orig is not None and orig.recomp is not None
+    with pytest.raises(TypeError):
+        cast(dict[str, object], orig.orig.facts)["name"] = "changed"
+    with pytest.raises(TypeError):
+        cast(dict[str, object], orig.recomp.facts)["name"] = "changed"
+    assert recomp.fact(ImageId.ORIG, "name") == "orig"
+    assert recomp.fact(ImageId.RECOMP, "name") == "recomp"
+
+    restored = pickle.loads(pickle.dumps(db))
+    restored_match = restored.get(ImageId.ORIG, 0x10)
+    assert restored.frozen
+    assert restored_match is restored.get(ImageId.RECOMP, 0x20)
+    assert restored_match is not None and restored_match.orig is not None
+    with pytest.raises(TypeError):
+        cast(dict[str, object], restored_match.orig.facts)["name"] = "changed"
 
 
 def test_source_index_is_not_auto_discovered(tmp_path: Path):
@@ -398,14 +405,11 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         prefix="",
         operands=(("mem", "dword", "", (("eax", 1),), 0x1004, ()),),
         display="jmp dword ptr [eax+0x1004]",
-        role=AsmRole.CODE,
         is_jump=True,
         instruction_id=0,
     )
     excerpt = (
         dispatch,
-        _table_entry(0x1004, "start + 0x10", 3),
-        _table_entry(0x1008, "start + 0x20", 4),
         _ret_at(0x1010, 1),
         _ret_at(0x1020, 2),
     )
@@ -417,14 +421,8 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    extracted = extract_switch_tables(
-        excerpt,
-        ["jmp", "data", "data", "ret", "ret"],
-        (table,),
-    )
-    assert extracted is not None
-    dests, _owned = extracted
-    assert dests == {}
+    graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
+    assert not graph.table_dests
 
 
 def test_first_class_jump_table_accepts_scale4_indexed_jmp():
@@ -435,14 +433,11 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         prefix="",
         operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
         display="jmp dword ptr [eax*4+0x1004]",
-        role=AsmRole.CODE,
         is_jump=True,
         instruction_id=0,
     )
     excerpt = (
         dispatch,
-        _table_entry(0x1004, "start + 0x10", 3),
-        _table_entry(0x1008, "start + 0x20", 4),
         _ret_at(0x1010, 1),
         _ret_at(0x1020, 2),
     )
@@ -454,15 +449,8 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         entry_width=4,
         index_register="eax",
     )
-    extracted = extract_switch_tables(
-        excerpt,
-        ["jmp", "data", "data", "ret", "ret"],
-        (table,),
-    )
-    assert extracted is not None
-    dests, owned = extracted
-    assert dests[0] == [3, 4]
-    assert owned == {1, 2}
+    graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
+    assert graph.table_dests == ((0, (1, 2)),)
 
 
 def test_gate_mints_verification_result_not_strategy():

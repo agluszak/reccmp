@@ -673,11 +673,11 @@ def _compare(
 
 def _excerpt_constants(image: FunctionImage, machine: SideMachine) -> set[int]:
     """Immediates of the canonical decode that are not addresses. Branch
-    targets and ``ret N`` are not data; table rows are not instructions."""
+    targets and ``ret N`` are not data."""
     return {
         value & 0xFFFFFFFF
-        for row in image.excerpt
-        if row.is_code and not (row.is_call or row.is_jump or row.is_ret)
+        for row in image.instructions
+        if not (row.is_call or row.is_jump or row.is_ret)
         for operand in row.operands
         if isinstance(operand, tuple)
         and len(operand) == 2

@@ -12,11 +12,13 @@ from unittest.mock import Mock
 import pytest
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.compare.core import Compare
+from reccmp.compare.asm.ir import ExtentKind, FunctionImage, JumpTable
 from reccmp.compare.db import EntityDb, ReccmpEntity
 from reccmp.compare.event import ReccmpReportProtocol
 from reccmp.compare.functions import FunctionComparator
 from reccmp.compare.lines import LinesDb
 from reccmp.types import EntityType, ImageId
+from tests.asm_rows import rows
 
 ORIG_BODY = 0x200
 RECOMP_BODY = 0x400
@@ -183,6 +185,25 @@ def test_equal_displays_with_different_branch_destinations_are_not_alias_equival
     orig = b"\x74\x06" + add3 + add3 + add6 + b"\xc3"
     recomp = b"\x74\x06" + add6 + add3 + add3 + b"\xc3"
     comparator = _comparator(db, orig, recomp)
-    assert comparator.orig_sanitize.parse_asm(
-        orig, ORIG_BODY
-    ) and not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
+    assert not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
+
+
+def test_switch_case_order_is_part_of_alias_identity(db: EntityDb) -> None:
+    """The same dispatch instruction cannot hide swapped table destinations."""
+
+    def image(start: int, swapped: bool) -> FunctionImage:
+        code = rows(["jmp dword ptr [eax*4]", "ret", "ret"], start=start)
+        targets = (start + 2, start + 1) if swapped else (start + 1, start + 2)
+        table = JumpTable(
+            start + 3,
+            ((start + 3, targets[0]), (start + 7, targets[1])),
+            start,
+            index_register="eax",
+        )
+        return FunctionImage(start, 11, ExtentKind.KNOWN, code, (table,))
+
+    comparator = _comparator(db, bytes(11), bytes(11))
+    comparator._load_function_image = Mock(  # type: ignore[method-assign]  # pylint: disable=protected-access
+        side_effect=[image(ORIG_BODY, False), image(RECOMP_BODY, True)]
+    )
+    assert not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, 11)

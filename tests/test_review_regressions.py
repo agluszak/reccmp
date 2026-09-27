@@ -12,9 +12,8 @@ from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
-from reccmp.compare.asm.instgen import InstructGen, SectionType
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb
 from reccmp.compare.diagnosis import ComparisonStatus
 from reccmp.compare.event import ReccmpReportProtocol
@@ -31,12 +30,10 @@ _A1_RECOMP = bytes.fromhex("EB01CCB802000000C3")  # jmp +1; int3; mov eax,2; ret
 
 
 def _code_mnemonics(blob: bytes, base: int = 0x1000) -> list[tuple[str, tuple]]:
-    """Collect (mnemonic, operands) from InstructGen CODE sections."""
+    """Collect (mnemonic, operands) from the decoded function."""
     return [
         (insn.mnemonic, insn.operands)
-        for section in InstructGen(blob, base).sections
-        if section.type == SectionType.CODE
-        for insn in section.contents
+        for insn in decode_function(blob, base).instructions
     ]
 
 
@@ -53,8 +50,10 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
     assert any(m == "mov" for m, _ in recomp_rows)
     assert orig_rows != recomp_rows
 
-    orig_asm = [row.display for row in ParseAsm().parse_asm(_A1_ORIG, 0x1000)]
-    recomp_asm = [row.display for row in ParseAsm().parse_asm(_A1_RECOMP, 0x1000)]
+    orig_asm = [row.display for row in decode_function(_A1_ORIG, 0x1000).instructions]
+    recomp_asm = [
+        row.display for row in decode_function(_A1_RECOMP, 0x1000).instructions
+    ]
     assert any("mov" in line and "1" in line for line in orig_asm)
     assert any("mov" in line and "2" in line for line in recomp_asm)
     assert orig_asm != recomp_asm
@@ -69,19 +68,19 @@ def test_a1_jmp_over_int3_extracts_divergent_mov_immediates():
     assert analysis.is_effective is False
 
 
-def test_a1_disasm_detail_or_instructgen_sees_mov_after_jump():
-    """Prefer detail/InstructGen coverage of the mov after the forward jmp."""
-    # Linear Capstone stop-at-int3 may still truncate; InstructGen must not.
+def test_a1_function_decoder_sees_mov_after_jump():
+    """The function decoder visits the target beyond int3 padding."""
+    # Linear Capstone stop-at-int3 may still truncate; the function decoder must not.
     for blob, imm in ((_A1_ORIG, 1), (_A1_RECOMP, 2)):
-        ig_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
-        assert ig_movs, "InstructGen must decode the mov after jmp-over-int3"
-        assert any(("imm", imm) in ops for ops in ig_movs)
+        decoded_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
+        assert decoded_movs, "function decoder must visit the mov after jmp-over-int3"
+        assert any(("imm", imm) in ops for ops in decoded_movs)
 
         detail = disasm_detail(blob, 0x1000)
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
         if not detail_movs:
-            # Accept InstructGen-only coverage until the shared detail walker
-            # also drains pending targets; still require unequal ParseAsm lists.
+            # Accept function-only coverage until the shared detail walker
+            # also drains pending targets; still require unequal decoded rows.
             continue
         assert any(("imm", imm) in insn.operands for insn in detail_movs)
 

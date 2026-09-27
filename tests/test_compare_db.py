@@ -616,8 +616,7 @@ def test_size_functions_matched_recomp_null(db: EntityDb):
 
 
 def test_independent_sets(db: EntityDb):
-    """If we modify a matched entity, the new values should be accessible
-    whether we access the entity via ORIG or RECOMP address space."""
+    """A matched entity retains both sides' facts as they change."""
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Hello")
         batch.set(ImageId.RECOMP, 200, name="Hello")
@@ -632,16 +631,36 @@ def test_independent_sets(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="asdf")
 
-    # reflected in orig
+    # The linked entity sees the recomp display name on either lookup.
     ent = db.get(ImageId.ORIG, 100)
     assert ent is not None
     assert ent.get("name") == "asdf"
+    assert ent.fact(ImageId.ORIG, "name") == "Hello"
+    assert ent.fact(ImageId.RECOMP, "name") == "asdf"
 
     # update orig side
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="test")
 
-    # reflected in recomp
+    # Updating the original never overwrites recomp-side evidence.
     ent = db.get(ImageId.RECOMP, 200)
     assert ent is not None
-    assert ent.get("name") == "test"
+    assert ent.get("name") == "asdf"
+    assert ent.fact(ImageId.ORIG, "name") == "test"
+    assert ent.fact(ImageId.RECOMP, "name") == "asdf"
+    assert db.get(ImageId.ORIG, 100) is ent
+
+
+def test_catalog_canonical_identity_combines_pairs_and_aliases(db: EntityDb):
+    db.set_equivalence_groups({0x110: 0x100})
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x100, type=EntityType.FUNCTION)
+        batch.set(ImageId.ORIG, 0x110, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x500, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x510, type=EntityType.FUNCTION)
+        batch.match(0x100, 0x500)
+    assert db.set_alias(ImageId.RECOMP, 0x510, 0x100)
+    assert db.canonical_orig(ImageId.ORIG, 0x100) == 0x100
+    assert db.canonical_orig(ImageId.ORIG, 0x110) == 0x100
+    assert db.canonical_orig(ImageId.RECOMP, 0x500) == 0x100
+    assert db.canonical_orig(ImageId.RECOMP, 0x510) == 0x100

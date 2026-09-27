@@ -108,7 +108,7 @@ def _function_image(start: int, code: bytes) -> FunctionImage:
         start_addr=start,
         extent=len(code),
         extent_kind=ExtentKind.KNOWN,
-        excerpt=tuple(disasm_detail(code, start)),
+        instructions=tuple(disasm_detail(code, start)),
     )
 
 

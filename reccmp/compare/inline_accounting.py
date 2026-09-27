@@ -3,7 +3,7 @@ expansions at call sites."""
 
 from collections.abc import Hashable
 
-from reccmp.compare.asm.parse import AsmExcerpt
+from reccmp.compare.asm.ir import DecodedInstruction, ExtentKind
 from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.body_equivalence import BodyEquivalenceMixin
 from reccmp.compare.db import ReccmpMatch
@@ -32,8 +32,8 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
     def _analyze_inline_expansions(
         self,
         match: ReccmpMatch,
-        orig_asm: AsmExcerpt,
-        recomp_asm: AsmExcerpt,
+        orig_asm: list[DecodedInstruction],
+        recomp_asm: list[DecodedInstruction],
     ) -> InlineLayoutResult | None:
         """Call-driven inline accounting: only fingerprint helpers named by CALLs."""
         helpers_by_orig: dict[int, HelperCatalogEntry] = {}
@@ -91,8 +91,10 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
             memo[entity.orig_addr] = None
             return None
-        excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-        needle = strip_helper_epilog(fingerprint_of(excerpt))
+        image = self._load_function_image(
+            ImageId.RECOMP, raw, entity.recomp_addr, ExtentKind.KNOWN
+        )
+        needle = strip_helper_epilog(fingerprint_of(image.instructions))
         if len(needle) < 3:
             memo[entity.orig_addr] = None
             return None
@@ -102,9 +104,7 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
             recomp_addr=entity.recomp_addr,
             name=name,
             fingerprint=needle,
-            identity=entity_proof_identity(
-                self.db, ImageId.RECOMP, entity, 0, self.equivalence_groups
-            ),
+            identity=entity_proof_identity(self.db, ImageId.RECOMP, entity),
             byte_size=recomp_size,
             effect_summary=summarize_helper_effects(needle),
         )

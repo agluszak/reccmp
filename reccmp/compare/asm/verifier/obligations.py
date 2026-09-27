@@ -420,8 +420,6 @@ def one_sided_ok(
     read the same address at the same memory generation somewhere in the
     same verification scope (the folded-load case). Control flow, stack
     adjustments, x87 and potentially-faulting arithmetic stay excluded."""
-    if not ins.is_code:
-        return False
     if ins.prefix or ins.mnemonic in _ONE_SIDED_BLACKLIST:
         return False
     if ins.mnemonic == "nop":

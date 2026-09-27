@@ -116,9 +116,7 @@ class FunctionMetadataMixin(ComparatorState):
             node = self.func_nodes.get(recomp_addr)
             if node is None:
                 continue
-            identity = entity_proof_identity(
-                self.db, ImageId.RECOMP, entity, 0, self.equivalence_groups
-            )
+            identity = entity_proof_identity(self.db, ImageId.RECOMP, entity)
             facts = self._call_facts_of_node(node, entity.orig_addr)
             previous = result.get(identity, facts)
             result[identity] = None if previous is None else previous.agreed(facts)

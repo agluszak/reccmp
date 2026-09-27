@@ -270,7 +270,9 @@ def load_markers(
                 batch.set(
                     ImageId.ORIG,
                     offset,
-                    folded_vtables=[(tbl.name, tbl.base_class) for tbl in candidates],
+                    folded_vtables=tuple(
+                        (tbl.name, tbl.base_class) for tbl in candidates
+                    ),
                 )
 
         for string in codebase.iter_strings():

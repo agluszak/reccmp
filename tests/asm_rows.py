@@ -16,7 +16,6 @@ from dataclasses import replace
 
 from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -25,33 +24,6 @@ from reccmp.compare.asm.ir import (
 from reccmp.compare.asm.model import parse_instruction
 
 START = 0x1000
-
-
-def _marker(line: str, address: int) -> DecodedInstruction | None:
-    """A jump/data table line, as ParseAsm renders them."""
-    role: AsmRole | None = None
-    payload: tuple = ()
-    if line == "Jump table:":
-        role = AsmRole.JUMP_TABLE_HEADER
-    elif line == "Data table:":
-        role = AsmRole.DATA_TABLE_HEADER
-    elif line.startswith("start + "):
-        role = AsmRole.JUMP_TABLE_ENTRY
-        payload = (("case", int(line[len("start + ") :], 16)),)
-    elif line.startswith("0x") and " " not in line:
-        role = AsmRole.DATA_TABLE_ENTRY
-        payload = (("byte", int(line, 16)),)
-    if role is None:
-        return None
-    return DecodedInstruction(
-        address=address,
-        size=0,
-        mnemonic="",
-        prefix="",
-        operands=payload,
-        display=line,
-        role=role,
-    )
 
 
 def rows(
@@ -64,10 +36,6 @@ def rows(
     result: list[DecodedInstruction] = []
     for index, line in enumerate(lines):
         address = start + index
-        marker = _marker(line, address)
-        if marker is not None:
-            result.append(marker)
-            continue
         prefix, mnemonic, operands = parse_instruction(line)
         target = targets[index] if targets is not None else None
         is_jump = mnemonic in JUMP_MNEMONICS
@@ -113,7 +81,7 @@ def image(
         start_addr=start,
         extent=len(lines),
         extent_kind=ExtentKind.KNOWN,
-        excerpt=rows(lines, targets, start=start),
+        instructions=rows(lines, targets, start=start),
         jump_tables=tuple(jump_tables),
         coverage_incomplete=coverage_incomplete,
         extent_closed=extent_closed,
@@ -129,35 +97,9 @@ def fingerprint(lines: Sequence[str]):
 
 def image_from_bytes(code: bytes, start: int = START) -> FunctionImage:
     """Decode a real byte fixture once, including its local target topology."""
-    from reccmp.compare.asm.parse import ParseAsm
-    from reccmp.compare.asm.ir import compute_extent_closed, rebind_local_identities
+    from reccmp.compare.asm.parse import decode_function
 
-    parser = ParseAsm()
-    excerpt = tuple(
-        replace(row, instruction_id=index)
-        for index, row in enumerate(parser.parse_asm(code, start))
-    )
-    tables = tuple(parser.jump_tables)
-    excerpt = rebind_local_identities(
-        excerpt, start_addr=start, extent=len(code), jump_tables=tables
-    )
-    return FunctionImage(
-        start,
-        len(code),
-        ExtentKind.KNOWN,
-        excerpt,
-        tables,
-        parser.coverage_incomplete,
-        compute_extent_closed(
-            excerpt,
-            start_addr=start,
-            extent=len(code),
-            coverage_incomplete=parser.coverage_incomplete,
-            jump_tables=tables,
-            extent_kind=ExtentKind.KNOWN,
-        ),
-        code,
-    )
+    return decode_function(code, start)
 
 
 def as_rows(
@@ -224,6 +166,15 @@ def as_rows(
                 if hasattr(facts, name):
                     changes[name] = getattr(facts, name)
         updated.append(replace(row, **changes) if changes else row)
+    if addresses is not None:
+        for index, row in enumerate(updated[:-1]):
+            following = updated[index + 1]
+            if (
+                row.address is not None
+                and following.address is not None
+                and following.address > row.address
+            ):
+                updated[index] = replace(row, size=following.address - row.address)
     return tuple(updated)
 
 
@@ -283,6 +234,8 @@ def verify_isomorphic_cfg_effective_match(
     *,
     orig_addrs=None,
     recomp_addrs=None,
+    orig_tables=(),
+    recomp_tables=(),
 ):
     from reccmp.compare.asm.verifier import (
         verify_isomorphic_cfg_effective_match as verify,
@@ -294,13 +247,29 @@ def verify_isomorphic_cfg_effective_match(
             recomp_addrs if recomp_addrs is not None else recorder.recomp_addrs
         )
 
+    def fixture_image(lines, targets, addresses, start, tables):
+        fixture_rows = as_rows(
+            lines, targets=targets or None, addresses=addresses, start=start
+        )
+        extent = max(
+            (
+                row.address + row.size - start
+                for row in fixture_rows
+                if row.address is not None
+            ),
+            default=0,
+        )
+        extent = max(
+            [extent]
+            + [entry + 4 - start for table in tables for entry, _ in table.entries]
+        )
+        return FunctionImage(
+            start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables)
+        )
+
     return verify(
-        as_rows(orig, targets=orig_targets or None, addresses=orig_addrs),
-        as_rows(
-            recomp, targets=recomp_targets or None, addresses=recomp_addrs, start=0x2000
-        ),
-        (),
-        (),
+        fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
+        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
         metadata,
         recorder,
     )

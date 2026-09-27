@@ -152,16 +152,7 @@ class Compare:
         self.types = CvdumpTypesParser()
 
         self.source_index = source_index
-        self.function_comparator = FunctionComparator(
-            self._db,
-            self._lines_db,
-            self.orig_bin,
-            self.recomp_bin,
-            self.report,
-            self.types,
-            equivalence_groups=self.equivalence_groups,
-            source_index=source_index,
-        )
+        self.function_comparator = self._make_function_comparator()
         self.variable_comparator = VariableComparator(
             db=self._db,
             types=self.types,
@@ -169,6 +160,31 @@ class Compare:
             recomp_bin=self.recomp_bin,
             source_index=source_index,
         )
+
+    def _make_function_comparator(
+        self, *, algebraic_identities: bool = True
+    ) -> FunctionComparator:
+        return FunctionComparator(
+            self._db,
+            self._lines_db,
+            self.orig_bin,
+            self.recomp_bin,
+            self.report,
+            self.types,
+            equivalence_groups=self.equivalence_groups,
+            source_index=self.source_index,
+            algebraic_identities=algebraic_identities,
+        )
+
+    def _seal_catalog(self) -> None:
+        """Build comparison lookups only after the final catalog mutation."""
+        if not self._db.frozen:
+            self._db.freeze()
+        algebraic = self.function_comparator.algebraic_identities
+        self.function_comparator = self._make_function_comparator(
+            algebraic_identities=algebraic
+        )
+        self._configure_function_nodes()
 
     def _configure_function_nodes(self) -> None:
         if isinstance(self.recomp_bin, PEImage):
@@ -189,16 +205,6 @@ class Compare:
         self._db = analysis.db
         self._lines_db = analysis.lines_db
         self.types = analysis.types
-        self.function_comparator = FunctionComparator(
-            self._db,
-            self._lines_db,
-            self.orig_bin,
-            self.recomp_bin,
-            self.report,
-            self.types,
-            equivalence_groups=self.equivalence_groups,
-            source_index=self.source_index,
-        )
         self.variable_comparator = VariableComparator(
             db=self._db,
             types=self.types,
@@ -206,10 +212,7 @@ class Compare:
             recomp_bin=self.recomp_bin,
             source_index=self.source_index,
         )
-        self._configure_function_nodes()
-        if not self._db.frozen:
-            self._db.freeze()
-        self.function_comparator.rebuild_lookups()
+        self._seal_catalog()
 
     def run(self):
         if not isinstance(self.orig_bin, PEImage) or not isinstance(
@@ -317,8 +320,7 @@ class Compare:
 
         match_strings(self._db, self.report)
         classify_exact_string_aliases(self._db)
-        self._db.freeze()
-        self.function_comparator.rebuild_lookups()
+        self._seal_catalog()
 
     @classmethod
     def from_target(

@@ -11,11 +11,8 @@ from reccmp.compare.diagnosis import (
     FactValue,
     StrategyAttempt,
 )
-from reccmp.source.index import (
-    SourceComparison,
-    SourceComparisonOperand,
-    SourceIndexError,
-)
+from reccmp.source.records import SourceComparison, SourceComparisonOperand
+from reccmp.source.observations import SourceIndexError
 
 
 def _describe_operand(operand: SourceComparisonOperand) -> str:

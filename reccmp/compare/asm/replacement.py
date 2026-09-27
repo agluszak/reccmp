@@ -45,38 +45,19 @@ def canonical_callee_name(
     if entity.entity_type not in _CALLABLE_TYPES:
         return entity.match_name()
 
-    canonical_entity = entity
     entity_addr = entity.addr(image_id)
-    discovered_orig = (
-        db.alias_canonical_orig(image_id, entity_addr)
+    canonical_orig = (
+        db.canonical_orig(image_id, entity_addr, equivalence_groups, entity)
         if entity_addr is not None
         else None
     )
-    canonical_orig = (
-        discovered_orig if discovered_orig is not None else entity.orig_addr
-    )
-    if discovered_orig is not None:
-        discovered_entity = db.get(ImageId.ORIG, discovered_orig, exact=True)
-        if discovered_entity is not None:
-            canonical_entity = discovered_entity
-    configured_alias = False
-    if canonical_orig is not None and equivalence_groups:
-        configured_orig = equivalence_groups.get(canonical_orig)
-        configured_alias = configured_orig is not None
-        canonical_orig = (
-            configured_orig if configured_orig is not None else canonical_orig
-        )
-        configured_entity = db.get(ImageId.ORIG, canonical_orig, exact=True)
-        if configured_entity is not None:
-            canonical_entity = configured_entity
-
+    canonical_entity = (
+        db.get(ImageId.ORIG, canonical_orig, exact=True)
+        if canonical_orig is not None
+        else None
+    ) or entity
     symbol = canonical_entity.get("symbol") or entity.get("symbol")
-    if canonical_orig is not None and (
-        configured_alias or entity.matched or canonical_entity.matched
-    ):
-        original_entity = db.get(ImageId.ORIG, canonical_orig, exact=True)
-        if original_entity is not None:
-            canonical_entity = original_entity
+    if canonical_orig is not None:
         return canonical_entity.match_name() or entity.match_name()
     if symbol:
         return f"{symbol} ({EntityTypeLookup.get(entity.entity_type or -1, 'UNK')})"
@@ -96,69 +77,28 @@ def entity_proof_identity(
     canonical original address. Unmatched data, strings, and locals stay
     side-local so identical names cannot prove correspondence.
     """
-    # pylint: disable=too-many-return-statements
     if entity.entity_type == EntityType.IMPORT_THUNK:
         # `jmp [__imp_X]`: calling it is calling through that slot.
-        ref = entity.get("ref_orig" if image_id == ImageId.ORIG else "ref_recomp")
+        ref = entity.fact(
+            image_id, "ref_orig" if image_id == ImageId.ORIG else "ref_recomp"
+        )
         slot = db.get(image_id, ref) if ref is not None else None
         if slot is not None and slot.entity_type == EntityType.IMPORT:
             return (
                 "jmp_through",
                 entity_proof_identity(db, image_id, slot, 0, equivalence_groups),
             )
-    if entity.entity_type in _CALLABLE_TYPES:
-        entity_addr = entity.addr(image_id)
-        discovered_orig = (
-            db.alias_canonical_orig(image_id, entity_addr)
-            if entity_addr is not None
-            else None
-        )
-        canonical_orig = (
-            discovered_orig if discovered_orig is not None else entity.orig_addr
-        )
-        configured_alias = False
-        if canonical_orig is not None and equivalence_groups:
-            configured_orig = equivalence_groups.get(canonical_orig)
-            configured_alias = configured_orig is not None
-            canonical_orig = (
-                configured_orig if configured_orig is not None else canonical_orig
-            )
-        symbol = entity.get("symbol")
-        # alias_canonical_orig covers real pairs and proven aliases alike.
-        if canonical_orig is not None and (
-            configured_alias or entity.matched or discovered_orig is not None
-        ):
-            return ("entity", canonical_orig, offset)
-        if entity.entity_type == EntityType.IMPORT:
-            return ("import", entity.best_name() or entity.get("symbol"))
-        if symbol:
-            return ("symbol", symbol, offset)
-        addr = entity.addr(image_id)
-        assert addr is not None
-        return ("unmatched", image_id.name.lower(), addr, offset)
-
-    entity_addr = entity.addr(image_id)
-    discovered_orig = (
-        db.alias_canonical_orig(image_id, entity_addr)
-        if entity_addr is not None
-        else None
-    )
-    canonical_orig = (
-        discovered_orig if discovered_orig is not None else entity.orig_addr
-    )
-    configured_alias = False
-    if canonical_orig is not None and equivalence_groups:
-        configured_orig = equivalence_groups.get(canonical_orig)
-        configured_alias = configured_orig is not None
-        canonical_orig = (
-            configured_orig if configured_orig is not None else canonical_orig
-        )
-    if canonical_orig is not None and (
-        configured_alias or entity.matched or discovered_orig is not None
-    ):
-        return ("entity", canonical_orig, offset)
     addr = entity.addr(image_id)
     assert addr is not None
+    canonical_orig = db.canonical_orig(image_id, addr, equivalence_groups, entity)
+    if canonical_orig is not None:
+        return ("entity", canonical_orig, offset)
+    if entity.entity_type in _CALLABLE_TYPES:
+        if entity.entity_type == EntityType.IMPORT:
+            return ("import", entity.best_name() or entity.get("symbol"))
+        symbol = entity.get("symbol")
+        if symbol:
+            return ("symbol", symbol, offset)
     return ("unmatched", image_id.name.lower(), addr, offset)
 
 

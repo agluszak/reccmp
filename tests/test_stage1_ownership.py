@@ -7,8 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from reccmp.compare.asm.ir import ExtentKind, FunctionImage
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.ir import ExtentKind
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb
 from reccmp.compare.source_capability import (
     load_source_index_for_target,
@@ -33,24 +33,17 @@ from tests.test_variable_comparator import create_matched_variable, get_match
 def test_function_image_captures_excerpt_tables_and_coverage():
     # jmp over int3 then mov/ret — coverage complete after Stage 0 drain.
     blob = bytes.fromhex("EB01CCB801000000C3")
-    sanitizer = ParseAsm()
-    image = FunctionImage(
-        start_addr=0x1000,
-        extent=len(blob),
-        extent_kind=ExtentKind.KNOWN,
-        excerpt=tuple(sanitizer.parse_asm(blob, 0x1000)),
-        jump_tables=tuple(sanitizer.jump_tables),
-        coverage_incomplete=sanitizer.coverage_incomplete,
-        raw=blob,
-    )
+    image = decode_function(blob, 0x1000)
     assert image.extent_kind is ExtentKind.KNOWN
     assert image.coverage_incomplete is False
-    assert any(row.mnemonic == "mov" for row in image.excerpt if row.is_code)
-    stamped = image.with_excerpt(
-        tuple(replace(row, instruction_id=i) for i, row in enumerate(image.excerpt))
+    assert any(row.mnemonic == "mov" for row in image.instructions)
+    stamped = image.with_instructions(
+        tuple(
+            replace(row, instruction_id=i) for i, row in enumerate(image.instructions)
+        )
     )
-    assert stamped.instruction_ids == tuple(range(len(stamped.excerpt)))
-    assert all(row.instruction_id == i for i, row in enumerate(stamped.excerpt))
+    assert stamped.instruction_ids == tuple(range(len(stamped.instructions)))
+    assert all(row.instruction_id == i for i, row in enumerate(stamped.instructions))
 
 
 def test_load_source_index_for_target_scopes_and_enriches_datacmp_path(

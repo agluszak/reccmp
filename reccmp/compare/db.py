@@ -4,7 +4,9 @@ addresses/symbols that we want to compare between the original and recompiled bi
 
 import bisect
 import logging
-from typing import Any, Iterable, Iterator
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Iterable, Iterator, Mapping
 from reccmp.types import EntityType, ImageId
 
 
@@ -24,12 +26,33 @@ class FrozenEntityDbError(RuntimeError):
     """Raised when a frozen entity catalog is mutated."""
 
 
-class ReccmpEntity:
-    """ORM object for Reccmp database entries."""
+@dataclass(frozen=True)
+class SideEntity:
+    """Facts from one binary. Matching links two records without merging them."""
 
-    _orig_addr: int | None
-    _recomp_addr: int | None
-    _kvstore: dict[str, Any]
+    address: int
+    facts: Mapping[str, Any] = field(default_factory=dict)
+
+    def freeze(self) -> None:
+        """Seal the side facts shared by all views of a matched entity."""
+        if isinstance(self.facts, dict):
+            object.__setattr__(self, "facts", MappingProxyType(dict(self.facts)))
+
+    def __getstate__(self) -> tuple[int, dict[str, Any], bool]:
+        """Keep frozen prepared analyses usable in the local pickle cache."""
+        return self.address, dict(self.facts), not isinstance(self.facts, dict)
+
+    def __setstate__(self, state: tuple[int, dict[str, Any], bool]) -> None:
+        address, facts, frozen = state
+        object.__setattr__(self, "address", address)
+        object.__setattr__(self, "facts", MappingProxyType(facts) if frozen else facts)
+
+
+class ReccmpEntity:
+    """One or two side records joined by a match."""
+
+    orig: SideEntity | None
+    recomp: SideEntity | None
 
     def __init__(
         self,
@@ -39,44 +62,65 @@ class ReccmpEntity:
     ) -> None:
         """Requires one or both of the addresses to be defined"""
         assert orig is not None or recomp is not None
-        self._orig_addr = orig
-        self._recomp_addr = recomp
-        if kvstore:
-            self._kvstore = kvstore
-        else:
-            self._kvstore = {}
+        # Direct construction is also used by fixtures. Route the few
+        # side-qualified input fields to their owner; ordinary facts stay
+        # with the original side when both addresses are present.
+        orig_facts = {
+            key: value
+            for key, value in (kvstore or {}).items()
+            if key not in {"recomp_size", "recomp_max_size", "ref_recomp"}
+        }
+        recomp_facts = {
+            key: value
+            for key, value in (kvstore or {}).items()
+            if orig is None or key in {"recomp_size", "recomp_max_size", "ref_recomp"}
+        }
+        self.orig = SideEntity(orig, orig_facts) if orig is not None else None
+        self.recomp = SideEntity(recomp, recomp_facts) if recomp is not None else None
+
+    def side(self, image_id: ImageId) -> SideEntity | None:
+        if image_id == ImageId.ORIG:
+            return self.orig
+        if image_id == ImageId.RECOMP:
+            return self.recomp
+        raise ValueError("Invalid image id")
+
+    def fact(self, image_id: ImageId, key: str, default: Any = None) -> Any:
+        """Read a fact only from the specified binary."""
+        side = self.side(image_id)
+        return side.facts.get(key, default) if side is not None else default
 
     def addr(self, image_id: ImageId) -> int | None:
         if image_id == ImageId.ORIG:
-            return self._orig_addr
+            return self.orig_addr
 
         if image_id == ImageId.RECOMP:
-            return self._recomp_addr
+            return self.recomp_addr
 
         assert False, "Invalid image id"
 
     @property
     def orig_addr(self) -> int | None:
-        return self._orig_addr
+        return self.orig.address if self.orig is not None else None
 
     @property
     def recomp_addr(self) -> int | None:
-        return self._recomp_addr
+        return self.recomp.address if self.recomp is not None else None
 
     @property
     def entity_type(self) -> int | None:
-        return self._kvstore.get("type")
+        return self.get("type")
 
     @property
     def name(self) -> str | None:
-        return self._kvstore.get("name")
+        return self.get("name")
 
     def max_size(self, image_id: ImageId) -> int | None:
         if image_id == ImageId.RECOMP:
-            return self._kvstore.get("recomp_max_size")
+            return self.fact(ImageId.RECOMP, "recomp_max_size")
 
         if image_id == ImageId.ORIG:
-            return self._kvstore.get("orig_max_size")
+            return self.fact(ImageId.ORIG, "orig_max_size")
 
         assert False, "Invalid image id"
 
@@ -86,39 +130,36 @@ class ReccmpEntity:
         With no ImageId, prefer recomp_size first, then orig_size, default to zero.
         (This matches the previous behavior.)"""
         if image_id == ImageId.RECOMP:
-            return (
-                self._kvstore.get("recomp_size") or self._kvstore.get("orig_size") or 0
-            )
+            return self.size(ImageId.RECOMP) or self.size(ImageId.ORIG) or 0
 
         if image_id == ImageId.ORIG:
-            return (
-                self._kvstore.get("orig_size") or self._kvstore.get("recomp_size") or 0
-            )
+            return self.size(ImageId.ORIG) or self.size(ImageId.RECOMP) or 0
 
         return 0
 
     def size(self, image_id: ImageId) -> int | None:
         """Return the size attribute for the provided ImageId."""
         if image_id == ImageId.ORIG:
-            return self._kvstore.get("orig_size")
+            return self.fact(ImageId.ORIG, "orig_size")
 
         if image_id == ImageId.RECOMP:
-            return self._kvstore.get("recomp_size")
+            return self.fact(ImageId.RECOMP, "recomp_size")
 
         assert False, "Invalid image id"
 
     @property
     def matched(self) -> bool:
-        return self._orig_addr is not None and self._recomp_addr is not None
+        return self.orig is not None and self.recomp is not None
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self._kvstore.get(key, default)
+        recomp = self.fact(ImageId.RECOMP, key)
+        return recomp if recomp is not None else self.fact(ImageId.ORIG, key, default)
 
     def best_name(self) -> str | None:
         """Return the first name that exists from our
         priority list of name attributes for this entity."""
         for key in ("computed_name", "name"):
-            if (value := self._kvstore.get(key)) is not None:
+            if (value := self.get(key)) is not None:
                 return str(value)
 
         return None
@@ -148,15 +189,23 @@ class ReccmpMatch(ReccmpEntity):
         assert orig is not None and recomp is not None
         super().__init__(orig, recomp, kvstore)
 
+    @classmethod
+    def link(cls, orig: SideEntity, recomp: SideEntity) -> "ReccmpMatch":
+        """Link existing side records without copying or merging their facts."""
+        match = cls.__new__(cls)
+        match.orig = orig
+        match.recomp = recomp
+        return match
+
     @property
     def orig_addr(self) -> int:
-        assert self._orig_addr is not None
-        return self._orig_addr
+        assert self.orig is not None
+        return self.orig.address
 
     @property
     def recomp_addr(self) -> int:
-        assert self._recomp_addr is not None
-        return self._recomp_addr
+        assert self.recomp is not None
+        return self.recomp.address
 
 
 logger = logging.getLogger(__name__)
@@ -291,6 +340,7 @@ class EntityDb:
         self._addr_order = {ImageId.ORIG: [], ImageId.RECOMP: []}
 
         self._sections = {ImageId.ORIG: [], ImageId.RECOMP: []}
+        self._equivalence_groups: dict[int, int] = {}
         self._frozen = False
         self._generation = 0
 
@@ -307,8 +357,55 @@ class EntityDb:
         self._generation = getattr(self, "_generation", 0) + 1
 
     def freeze(self) -> None:
-        """Seal pairing/identity after ingest. Resolver caches may follow."""
+        """Seal facts and pairing/identity after ingest. Resolver caches may follow."""
+        if self._frozen:
+            return
+        for image_id in (ImageId.ORIG, ImageId.RECOMP):
+            for entity in self._entities[image_id].values():
+                side = entity.side(image_id)
+                if side is not None:
+                    side.freeze()
         self._frozen = True
+
+    def set_equivalence_groups(self, groups: Mapping[int, int]) -> None:
+        """Install project-declared canonical original addresses during ingest."""
+        if dict(groups) == self._equivalence_groups:
+            return
+        self._require_mutable()
+        self._equivalence_groups = dict(groups)
+        self._bump_generation()
+
+    def canonical_orig(
+        self,
+        image_id: ImageId,
+        addr: int,
+        groups: Mapping[int, int] | None = None,
+        entity: ReccmpEntity | None = None,
+    ) -> int | None:
+        """Proven original identity of a paired, folded, or declared alias."""
+        canonical = self.alias_canonical_orig(image_id, addr)
+        if canonical is None and entity is not None and entity.matched:
+            canonical = entity.orig_addr
+        if (
+            canonical is None
+            and image_id == ImageId.ORIG
+            and addr in self._entities[image_id]
+        ):
+            canonical = addr
+        if canonical is None:
+            return None
+        chosen_groups = groups if groups is not None else self._equivalence_groups
+        mapped = chosen_groups.get(canonical)
+        if mapped is not None:
+            return mapped
+        if (
+            image_id == ImageId.ORIG
+            and addr not in self._matches[image_id]
+            and addr not in self._aliases[image_id]
+            and not (entity is not None and entity.matched)
+        ):
+            return None
+        return canonical
 
     def _require_mutable(self) -> None:
         if self.frozen:
@@ -337,14 +434,16 @@ class EntityDb:
         for addr, values in rows:
             new_addrs.add(addr)
 
-            # pylint: disable=protected-access
             if addr not in entities:
                 if image == ImageId.ORIG:
                     entities[addr] = ReccmpEntity(addr, None, values)
                 else:
                     entities[addr] = ReccmpEntity(None, addr, values)
             else:
-                entities[addr]._kvstore.update(values)
+                side = entities[addr].side(image)
+                assert side is not None
+                assert isinstance(side.facts, dict)
+                side.facts.update(values)
 
         self._update_addr_index(image, new_addrs)
         self._bump_generation()
@@ -372,23 +471,12 @@ class EntityDb:
             self._aliases[ImageId.ORIG].pop(x, None)
             self._aliases[ImageId.RECOMP].pop(y, None)
 
-            orig_data = {}
-            if x in orig_entities:
-                # pylint: disable=protected-access
-                orig_data = orig_entities[x]._kvstore
-
-            recomp_data = {}
-            if y in recomp_entities:
-                # Remove null values from recomp. If we don't, the merge
-                # will overwrite a value at the same key in orig.
-                # pylint: disable=protected-access
-                recomp_data = {
-                    k: v
-                    for k, v in recomp_entities[y]._kvstore.items()
-                    if v is not None
-                }
-
-            match = ReccmpMatch(x, y, orig_data | recomp_data)
+            orig_side = orig_entities[x].orig if x in orig_entities else SideEntity(x)
+            recomp_side = (
+                recomp_entities[y].recomp if y in recomp_entities else SideEntity(y)
+            )
+            assert orig_side is not None and recomp_side is not None
+            match = ReccmpMatch.link(orig_side, recomp_side)
 
             orig_entities[x] = match
             recomp_entities[y] = match

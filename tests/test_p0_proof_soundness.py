@@ -6,7 +6,7 @@ import struct
 from unittest.mock import Mock
 
 from reccmp.compare.asm.ir import ExtentKind, compute_extent_closed
-from reccmp.compare.asm.parse import ParseAsm
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diagnosis import ComparisonStatus
 from reccmp.compare.report import ReccmpComparedEntity
@@ -67,8 +67,12 @@ def _compare_bytes(orig: bytes, recomp: bytes, db: EntityDb | None = None):
 
 def test_encoding_length_shift_is_not_exact_or_effective():
     """Identical ``je +5`` text can still jump to different instructions."""
-    orig_asm = [row.display for row in ParseAsm().parse_asm(_TOPOLOGY_ORIG, 0x200)]
-    recomp_asm = [row.display for row in ParseAsm().parse_asm(_TOPOLOGY_RECOMP, 0x400)]
+    orig_asm = [
+        row.display for row in decode_function(_TOPOLOGY_ORIG, 0x200).instructions
+    ]
+    recomp_asm = [
+        row.display for row in decode_function(_TOPOLOGY_RECOMP, 0x400).instructions
+    ]
     assert [line.rstrip() for line in orig_asm] == [
         "cmp ecx, 0",
         "je 0x5",
@@ -124,8 +128,8 @@ def test_unresolved_call_offsets_are_not_exact_or_effective():
     """Same ``<OFFSET1>`` display is not semantic identity across images."""
     orig = _call_ret(0x200, 0x401000)
     recomp = _call_ret(0x400, 0x527000)
-    orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(orig, 0x200)
-    recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(recomp, 0x400)
+    orig_rows = decode_function(orig, 0x200, image_id=ImageId.ORIG).instructions
+    recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
     assert orig_rows[0].display == recomp_rows[0].display
     assert "<OFFSET" in orig_rows[0].display
     orig_id = orig_rows[0].operands[0][1].identity
@@ -142,8 +146,8 @@ def test_unresolved_call_offsets_are_not_exact_or_effective():
 def test_unresolved_data_offsets_are_not_exact_or_effective():
     orig = _mov_abs_ret(0x401000)
     recomp = _mov_abs_ret(0x527000)
-    orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(orig, 0x200)
-    recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(recomp, 0x400)
+    orig_rows = decode_function(orig, 0x200, image_id=ImageId.ORIG).instructions
+    recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
     assert orig_rows[0].display != recomp_rows[0].display
     assert "0x401000" in orig_rows[0].display
 
@@ -157,8 +161,8 @@ def test_unresolved_data_offsets_are_not_exact_or_effective():
 def test_external_jcc_displacement_is_not_proof_identity():
     """Same ``je +0x20`` text can land on unrelated absolute destinations."""
     body = bytes.fromhex("7420C3")  # je +0x20; ret
-    orig_rows = ParseAsm(image_id=ImageId.ORIG).parse_asm(body, 0x200)
-    recomp_rows = ParseAsm(image_id=ImageId.RECOMP).parse_asm(body, 0x400)
+    orig_rows = decode_function(body, 0x200, image_id=ImageId.ORIG).instructions
+    recomp_rows = decode_function(body, 0x400, image_id=ImageId.RECOMP).instructions
     assert orig_rows[0].display == recomp_rows[0].display
     assert orig_rows[0].display.startswith("je ")
     assert orig_rows[0].control_target != recomp_rows[0].control_target
@@ -172,7 +176,7 @@ def test_external_jcc_displacement_is_not_proof_identity():
 
 def test_estimated_extent_jmp_past_window_is_open():
     blob = bytes.fromhex("EB05")  # jmp +5, destination is start+7
-    excerpt = tuple(ParseAsm().parse_asm(blob, 0x1000))
+    excerpt = decode_function(blob, 0x1000).instructions
     assert excerpt[0].branch_target == 0x1007
     assert (
         compute_extent_closed(
@@ -213,16 +217,20 @@ def test_unmatched_data_display_names_are_not_proof_identity():
             name="g_state",
             size=4,
         )
-    orig_rows = ParseAsm(
+    orig_rows = decode_function(
+        orig,
+        0x200,
         image_id=ImageId.ORIG,
         resolver=db_lookup(db, ImageId.ORIG),
         addr_test=lambda addr: addr in {0x401000},
-    ).parse_asm(orig, 0x200)
-    recomp_rows = ParseAsm(
+    ).instructions
+    recomp_rows = decode_function(
+        recomp,
+        0x400,
         image_id=ImageId.RECOMP,
         resolver=db_lookup(db, ImageId.RECOMP),
         addr_test=lambda addr: addr in {0x527000},
-    ).parse_asm(recomp, 0x400)
+    ).instructions
     assert "g_state" in orig_rows[0].display
     assert orig_rows[0].display == recomp_rows[0].display
     orig_mem = orig_rows[0].operands[1]

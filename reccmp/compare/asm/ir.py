@@ -8,23 +8,17 @@ diffs and is never read back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from enum import Enum, auto
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from collections.abc import Hashable, Sequence
+from typing import TYPE_CHECKING
 
 from .model import Reference
 
+if TYPE_CHECKING:
+    from .graph import FunctionGraph
+
 _STACK_SLOT = ("stack_slot",)
-
-
-class AsmRole(Enum):
-    """What kind of row this is in a function excerpt."""
-
-    CODE = auto()
-    JUMP_TABLE_HEADER = auto()
-    JUMP_TABLE_ENTRY = auto()
-    DATA_TABLE_HEADER = auto()
-    DATA_TABLE_ENTRY = auto()
 
 
 class ExtentKind(Enum):
@@ -36,7 +30,7 @@ class ExtentKind(Enum):
 
 @dataclass(frozen=True)
 class JumpTable:
-    """One switch address table discovered by ``InstructGen``.
+    """One switch address table discovered during function decoding.
 
     ``entries`` are ``(entry_address, target_address)`` pairs. Optional
     ``dispatch_address`` is the ``jmp`` that indexes the table when known.
@@ -61,6 +55,14 @@ class JumpTable:
         )
 
 
+@dataclass(frozen=True)
+class DataRegion:
+    """Bytes embedded in a function body but not decoded as instructions."""
+
+    address: int
+    data: bytes
+
+
 def rebind_local_identities(
     excerpt: Sequence[DecodedInstruction],
     *,
@@ -78,7 +80,7 @@ def rebind_local_identities(
     insn_ids = {
         row.address: (row.instruction_id if row.instruction_id is not None else index)
         for index, row in enumerate(excerpt)
-        if row.address is not None and row.is_code
+        if row.address is not None
     }
     table_ids = {table.address: index for index, table in enumerate(jump_tables)}
     entry_ids: dict[int, tuple[int, int]] = {}
@@ -141,31 +143,70 @@ class FunctionImage:
     # pylint: disable=too-many-instance-attributes
     """Lossless view of one decoded function for comparison.
 
-    Owns the extent evidence, decoded excerpt, jump tables, and coverage
+    Owns the extent evidence, decoded instructions, jump tables, and coverage
     flag for a single side (original or recompiled). Callers should not
-    read long-lived state off a shared ``ParseAsm`` after construction.
+    read state from the decoder after construction.
     """
 
     start_addr: int
     extent: int
     extent_kind: ExtentKind
-    excerpt: tuple[DecodedInstruction, ...]
+    instructions: tuple[DecodedInstruction, ...]
     jump_tables: tuple[JumpTable, ...] = ()
     coverage_incomplete: bool = False
     extent_closed: bool = True
     raw: bytes | None = None
+    data_regions: tuple[DataRegion, ...] = ()
+    graph: FunctionGraph | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if any(row.size <= 0 or not row.mnemonic for row in self.instructions):
+            raise ValueError("FunctionImage.instructions must contain instructions")
 
     @property
     def instruction_ids(self) -> tuple[int, ...]:
         """Stable program-point ids owned by this image."""
         return tuple(
             row.instruction_id if row.instruction_id is not None else index
-            for index, row in enumerate(self.excerpt)
+            for index, row in enumerate(self.instructions)
         )
 
-    def with_excerpt(self, excerpt: Sequence[DecodedInstruction]) -> "FunctionImage":
-        """Return a copy whose excerpt (and ids) come from ``excerpt``."""
-        return replace(self, excerpt=tuple(excerpt))
+    def with_instructions(
+        self, instructions: Sequence[DecodedInstruction]
+    ) -> "FunctionImage":
+        """Return a copy with the supplied instructions and their ids."""
+        return replace(self, instructions=tuple(instructions), graph=None)
+
+    def control_graph(self) -> FunctionGraph:
+        # pylint: disable=import-outside-toplevel
+        """The graph built with this image, or derived for a synthetic fixture."""
+        if self.graph is not None:
+            return self.graph
+        from .graph import build_function_graph
+
+        return build_function_graph(
+            self.instructions,
+            self.jump_tables,
+            start_addr=self.start_addr,
+            extent=self.extent,
+        )
+
+    @property
+    def data_shape(self) -> tuple:
+        """Embedded data and table positions relative to the function start."""
+        return (
+            tuple(
+                (region.address - self.start_addr, region.data)
+                for region in self.data_regions
+            ),
+            tuple(
+                (
+                    table.address - self.start_addr,
+                    tuple(entry - self.start_addr for entry, _target in table.entries),
+                )
+                for table in self.jump_tables
+            ),
+        )
 
     @property
     def control_flow_complete(self) -> bool:
@@ -176,16 +217,14 @@ class FunctionImage:
             if table.is_recognized_switch()
         }
         return all(
-            not row.is_code
-            or row.control_flow_known
-            or (row.is_jump and row.address in switches)
-            for row in self.excerpt
+            row.control_flow_known or (row.is_jump and row.address in switches)
+            for row in self.instructions
         )
 
 
 @dataclass(frozen=True)
 class DecodedInstruction:
-    """One canonical instruction (or table marker) in a function excerpt."""
+    """One canonical instruction in a function image."""
 
     # pylint: disable=too-many-instance-attributes
 
@@ -195,13 +234,11 @@ class DecodedInstruction:
     prefix: str
     # Typed operands: ("reg", name), ("imm", value), ("st", index),
     # ("sym", Reference), ("mem", size, segment, reg_terms, displacement,
-    # symbols), ("opaque", ...). A table marker's payload: ("case", offset
-    # from the function start) or ("byte", value).
+    # symbols), ("opaque", ...).
     operands: tuple
     # Rendered once, for humans and diffs; never read back.
     display: str
-    role: AsmRole = AsmRole.CODE
-    # Capstone detail facts (empty for table markers).
+    # Capstone detail facts.
     regs_read: tuple[str, ...] = ()
     regs_written: tuple[str, ...] = ()
     reads_flags: bool = False
@@ -224,29 +261,6 @@ class DecodedInstruction:
     # Proof identity of a jump/call destination. Display may be a relative
     # displacement; this is never that displacement.
     control_target: Hashable | None = None
-
-    @property
-    def is_code(self) -> bool:
-        return self.role == AsmRole.CODE
-
-
-def marker(
-    display: str,
-    *,
-    address: int | None = None,
-    role: AsmRole,
-    payload: tuple = (),
-) -> DecodedInstruction:
-    """Build a non-code excerpt row (jump/data table header or entry)."""
-    return DecodedInstruction(
-        address=address,
-        size=0,
-        mnemonic="",
-        prefix="",
-        operands=payload,
-        display=display,
-        role=role,
-    )
 
 
 # Identities private to one image: across images such references match by
@@ -275,15 +289,11 @@ def instruction_match_key(row: DecodedInstruction) -> Hashable:
     placeholder or name it shows, so ``<OFFSET1>`` on both sides lines up.
     Proofs use ``instruction_semantic_key`` instead.
     """
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
 
 
 def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
     """Proof key: every reference compares by identity."""
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     return (
         "ins",
         row.mnemonic,
@@ -369,27 +379,6 @@ def control_flow_topology_keys(
     }
     keys: list[Hashable] = []
     for row in excerpt:
-        if row.role == AsmRole.JUMP_TABLE_ENTRY:
-            target_id = None
-            for table in jump_tables:
-                for entry_addr, target in table.entries:
-                    if entry_addr == row.address:
-                        target_id = _local_destination_id(target, addr_to_id)
-                        keys.append(
-                            ("case", target_id)
-                            if target_id is not None
-                            else ("case_ext", ("unresolved", None, target))
-                        )
-                        break
-                else:
-                    continue
-                break
-            else:
-                keys.append(("table_entry", row.operands))
-            continue
-        if not row.is_code:
-            keys.append(())
-            continue
         if row.is_call:
             keys.append(("call", _operand_identity(row)))
             continue
@@ -416,7 +405,6 @@ def control_flow_topology_keys(
 
 def local_destination_keys(
     excerpt: Sequence[DecodedInstruction],
-    jump_tables: Sequence[JumpTable] = (),
     *,
     start_addr: int,
     extent: int,
@@ -434,11 +422,6 @@ def local_destination_keys(
         for index, row in enumerate(excerpt)
         if row.address is not None
     }
-    case_targets = {
-        entry_addr: target
-        for table in jump_tables
-        for entry_addr, target in table.entries
-    }
 
     def key(target: int | None, tag: str) -> Hashable | None:
         if target is None or not start_addr <= target < start_addr + extent:
@@ -448,9 +431,7 @@ def local_destination_keys(
 
     keys: list[Hashable] = []
     for row in excerpt:
-        if row.role == AsmRole.JUMP_TABLE_ENTRY and row.address is not None:
-            item = key(case_targets.get(row.address), "case")
-        elif row.is_jump:
+        if row.is_jump:
             item = key(row.branch_target, "local")
         else:
             item = ()
@@ -458,46 +439,6 @@ def local_destination_keys(
             return None
         keys.append(item)
     return tuple(keys)
-
-
-_NO_FALLTHROUGH = frozenset({"ret", "jmp", "int3"})
-_MODELED_EXTERNAL = frozenset(
-    {"entity", "import", "jmp_through", "unmatched", "symbol"}
-)
-
-
-def _is_modeled_external_target(row: DecodedInstruction) -> bool:
-    """True when the destination is independently known as another entity."""
-    ident = row.control_target
-    if ident is None:
-        ident = _operand_identity(row)
-    if not isinstance(ident, tuple) or not ident:
-        return False
-    return ident[0] in _MODELED_EXTERNAL
-
-
-def _enqueue_or_close_target(
-    target: int,
-    *,
-    addr_to_row: dict[int, DecodedInstruction],
-    window: range,
-    extent_kind: ExtentKind,
-    row: DecodedInstruction,
-    pending: list[int],
-) -> bool:
-    """Enqueue an in-window target, accept a modeled external, or reject.
-
-    Returns False when an estimated extent jumps into unknown bytes.
-    """
-    if target in addr_to_row or target in window:
-        pending.append(target)
-        return True
-    if _is_modeled_external_target(row):
-        return True
-    if extent_kind is ExtentKind.ESTIMATED:
-        return False
-    pending.append(target)
-    return True
 
 
 def compute_extent_closed(
@@ -509,108 +450,13 @@ def compute_extent_closed(
     jump_tables: Sequence[JumpTable] = (),
     extent_kind: ExtentKind = ExtentKind.KNOWN,
 ) -> bool:
-    # pylint: disable=too-many-nested-blocks,too-many-return-statements
-    """True when every reachable path ends inside a modeled terminal.
+    # pylint: disable=import-outside-toplevel
+    """Extent closure from the same control-flow graph used by comparison."""
+    from .graph import build_function_graph
 
-    A coverage walk can only prove the supplied byte window. Implicit
-    fallthrough past the window is never a modeled terminal, even for a
-    known annotated size. Explicit ``jmp`` to a known entity, import, or
-    unmatched symbol can close a path. For estimated extents, jumping into
-    unknown bytes just past the guessed window is not a terminal.
-    """
-    if coverage_incomplete:
-        return False
-    if extent <= 0:
-        return True
-    code = [row for row in excerpt if row.is_code and row.address is not None]
-    if not code:
-        return False
-    addr_to_row = {row.address: row for row in code if row.address is not None}
-    window = range(start_addr, start_addr + extent)
-    pending = list(addr_to_row)[:1]
-    seen: set[int] = set()
-    while pending:
-        addr = pending.pop()
-        if addr in seen:
-            continue
-        seen.add(addr)
-        row = addr_to_row.get(addr)
-        if row is None:
-            if addr in window:
-                return False
-            if extent_kind is ExtentKind.ESTIMATED:
-                return False
-            continue
-        nxt = addr + row.size
-        mnemonic = row.mnemonic
-        if mnemonic in _NO_FALLTHROUGH:
-            if mnemonic == "jmp":
-                if row.branch_target is not None:
-                    if not _enqueue_or_close_target(
-                        row.branch_target,
-                        addr_to_row=addr_to_row,
-                        window=window,
-                        extent_kind=extent_kind,
-                        row=row,
-                        pending=pending,
-                    ):
-                        return False
-                else:
-                    table = _table_for_dispatch(row.address, jump_tables)
-                    if table is None:
-                        return False
-                    for _entry, target in table.entries:
-                        if not _enqueue_or_close_target(
-                            target,
-                            addr_to_row=addr_to_row,
-                            window=window,
-                            extent_kind=extent_kind,
-                            row=row,
-                            pending=pending,
-                        ):
-                            return False
-            continue
-        if row.is_jump and row.branch_target is not None:
-            if not _enqueue_or_close_target(
-                row.branch_target,
-                addr_to_row=addr_to_row,
-                window=window,
-                extent_kind=extent_kind,
-                row=row,
-                pending=pending,
-            ):
-                return False
-        elif row.is_jump and row.branch_target is None:
-            table = _table_for_dispatch(row.address, jump_tables)
-            if table is None:
-                return False
-            for _entry, target in table.entries:
-                if not _enqueue_or_close_target(
-                    target,
-                    addr_to_row=addr_to_row,
-                    window=window,
-                    extent_kind=extent_kind,
-                    row=row,
-                    pending=pending,
-                ):
-                    return False
-            if mnemonic == "jmp":
-                continue
-        if nxt not in window:
-            return False
-        pending.append(nxt)
-    return True
-
-
-def _table_for_dispatch(
-    address: int | None, jump_tables: Sequence[JumpTable]
-) -> JumpTable | None:
-    if address is None:
-        return None
-    for table in jump_tables:
-        if table.dispatch_address == address:
-            return table
-    return None
+    return build_function_graph(
+        excerpt, jump_tables, start_addr=start_addr, extent=extent
+    ).extent_closed(extent_kind=extent_kind, coverage_incomplete=coverage_incomplete)
 
 
 def _normalize_operand_stack(operand) -> Hashable:
@@ -626,8 +472,6 @@ def _normalize_operand_stack(operand) -> Hashable:
 
 def stack_normalized_key(row: DecodedInstruction) -> Hashable:
     """The match key of a row with its stack slots' displacements erased."""
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     operands = tuple(_normalize_operand_stack(op) for op in row.operands)
     return ("ins", row.mnemonic, row.prefix, operands)
 

@@ -3,19 +3,14 @@ canonicalization and structural block pairing."""
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass
 
 from collections.abc import Hashable, Sequence
 
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DecodedInstruction,
-    JumpTable,
+    FunctionImage,
     instruction_semantic_key,
-    local_branch_targets,
 )
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
@@ -37,132 +32,11 @@ _LOOPS = frozenset({"loop", "loope", "loopne", "jcxz", "jecxz"})
 
 
 def _control_kind(row: DecodedInstruction) -> str:
-    if not row.is_code:
-        return "data"
     if row.mnemonic in JCC_MNEMONICS or row.mnemonic in _LOOPS:
         return "jcc"
     if row.mnemonic in ("jmp", "ret"):
         return row.mnemonic
     return "code"
-
-
-def _scale4_mem_jmp(row: DecodedInstruction) -> bool:
-    """True for ``jmp dword ptr [idx*4 + …]`` regardless of table base."""
-    match row.mnemonic, row.operands:
-        case "jmp", (("mem", _, _, reg_terms, _, _),):
-            return any(scale == 4 for _reg, scale in reg_terms)
-    return False
-
-
-def _is_recognized_switch_jmp(row: DecodedInstruction) -> bool:
-    """True for ``jmp dword ptr [idx*4 + table]`` (scale-4 mem with a base)."""
-    match row.operands:
-        case (("mem", _, _, _, disp, syms),) if _scale4_mem_jmp(row):
-            # Require an identifiable table base (symbol and/or displacement).
-            return bool(syms) or disp != 0
-    return False
-
-
-def _case_offset(row: DecodedInstruction) -> int | None:
-    """A jump-table entry's target, as an offset from the function start."""
-    match row.role, row.operands:
-        case AsmRole.JUMP_TABLE_ENTRY, (("case", int() as offset),):
-            return offset
-    return None
-
-
-def extract_switch_tables(
-    rows: Sequence[DecodedInstruction],
-    kinds: list[str],
-    jump_tables: Sequence[JumpTable] = (),
-) -> tuple[dict[int, list[int]], set[int]] | None:
-    # pylint: disable=too-many-nested-blocks,too-many-branches
-    """Map recognized switch jmps to case destination indices.
-
-    Returns ``(jmp_index -> dest line indices, owned data line indices)``.
-    ``None`` means a candidate table could not be resolved conservatively.
-
-    A table is recognized when a switch jmp is followed by a jump-table
-    header row and then contiguous entry rows.
-    """
-    total = len(rows)
-    table_dests: dict[int, list[int]] = {}
-    owned: set[int] = set()
-    addr_index: dict[int, int] = {}
-    func_start: int | None = None
-    for i, row in enumerate(rows):
-        if row.address is None or kinds[i] == "data":
-            continue
-        if func_start is None:
-            func_start = row.address
-        addr_index.setdefault(row.address, i)
-
-    def _is_table_header(index: int) -> bool:
-        return rows[index].role == AsmRole.JUMP_TABLE_HEADER
-
-    # Prefer the JumpTables InstructGen found.
-    for table in jump_tables:
-        if table.dispatch_address is None:
-            continue
-        dispatch_i = addr_index.get(table.dispatch_address)
-        if dispatch_i is None or kinds[dispatch_i] != "jmp":
-            continue
-        # First-class tables still have to be a scale-4 indexed mem jmp.
-        # Metadata alone (a dispatch address on any jmp) is not enough.
-        if not table.is_recognized_switch() or not _scale4_mem_jmp(rows[dispatch_i]):
-            continue
-        entry_index = {row.address: i for i, row in enumerate(rows) if not row.is_code}
-        dests: list[int] = []
-        entry_indices: list[int] = []
-        for entry_addr, target_va in table.entries:
-            entry_i = entry_index.get(entry_addr)
-            dest_i = addr_index.get(target_va)
-            if entry_i is None or dest_i is None:
-                dests = []
-                break
-            entry_indices.append(entry_i)
-            dests.append(dest_i)
-        if not dests:
-            continue
-        table_dests[dispatch_i] = dests
-        owned.update(entry_indices)
-        header_i = min(entry_indices) - 1
-        if header_i >= 0 and _is_table_header(header_i):
-            owned.add(header_i)
-
-    i = 0
-    while i < total:
-        if i in table_dests:
-            i += 1
-            continue
-        if (
-            kinds[i] == "jmp"
-            and _is_recognized_switch_jmp(rows[i])
-            and i + 1 < total
-            and _is_table_header(i + 1)
-        ):
-            entries: list[int] = []
-            j = i + 2
-            while j < total and _case_offset(rows[j]) is not None:
-                entries.append(j)
-                j += 1
-            if entries:
-                if func_start is None:
-                    return None
-                dests = []
-                for entry_i in entries:
-                    offset = _case_offset(rows[entry_i])
-                    assert offset is not None
-                    dest_i = addr_index.get(func_start + offset)
-                    if dest_i is None:
-                        return None
-                    dests.append(dest_i)
-                table_dests[i] = dests
-                owned.update(range(i + 1, j))
-                i = j
-                continue
-        i += 1
-    return table_dests, owned
 
 
 @dataclass
@@ -173,11 +47,8 @@ class _SideCfg:
     # block index, or "external" for a target outside the excerpt.
     succ: list[dict[str, int | str]]
     kinds: list[str]
-    # Jump-table header/entry lines attached to recognized switches; excluded
-    # from block bodies during alignment / symbolic execution.
-    owned_data: frozenset[int] = frozenset()
     # jmp line index -> case destination line indices (recognized switches).
-    table_dests: dict[int, list[int]] = field(default_factory=dict)
+    table_dests: dict[int, list[int]]
 
 
 def _mark_side_inconclusive(
@@ -195,35 +66,20 @@ def _mark_side_inconclusive(
         recorder.mark_inconclusive(reason, recomp_index=index, facts=facts)
 
 
-def block_terminator(
-    start: int, end: int, kinds: list[str], owned_data: set[int] | frozenset[int]
-) -> int:
-    """Last non-owned instruction in ``[start, end)``, preferring a control op."""
-    last_code = start
-    for i in range(end - 1, start - 1, -1):
-        if i in owned_data:
-            continue
-        if kinds[i] in ("jcc", "jmp", "ret"):
-            return i
-        last_code = i
-        break
-    return last_code
+def block_terminator(_start: int, end: int) -> int:
+    """Last instruction in a code-only block."""
+    return end - 1
 
 
 def build_side_cfg(
-    rows: Sequence[DecodedInstruction],
-    jump_tables: Sequence[JumpTable] = (),
+    image: FunctionImage,
     *,
     recorder: AnalysisRecorder | None = None,
     side: str = "orig",
 ) -> _SideCfg | None:
-    """One side's basic-block structure, or None when the shape is outside
-    this verifier's model (unrecognized jump/data tables, invalid targets).
-
-    Recognized ``jmp [idx*4 + table]`` + jump-table rows become ``caseN``
-    CFG edges; other table/data rows still bail.
-    """
-    # pylint: disable=too-many-branches,too-many-locals,too-many-return-statements
+    """Project the function's canonical graph into verifier block indices."""
+    rows = image.instructions
+    graph = image.control_graph()
     total = len(rows)
     if total == 0:
         _mark_side_inconclusive(
@@ -234,112 +90,53 @@ def build_side_cfg(
             {"side": side, "instruction_count": 0},
         )
         return None
-    targets = local_branch_targets(rows)
     kinds = [_control_kind(row) for row in rows]
-    extracted = extract_switch_tables(rows, kinds, jump_tables)
-    if extracted is None:
-        first_data = next((i for i, k in enumerate(kinds) if k == "data"), 0)
-        _mark_side_inconclusive(
-            recorder,
-            side,
-            "jump_table_data",
-            first_data,
-            {
-                "side": side,
-                "data_line_count": kinds.count("data"),
-                "data_line": rows[first_data].display,
-                "failure": "unresolved_switch_table",
-            },
-        )
-        return None
-    table_dests, owned_data = extracted
-    unowned_data = [
-        i for i, kind in enumerate(kinds) if kind == "data" and i not in owned_data
-    ]
-    if unowned_data:
-        first_data = unowned_data[0]
-        _mark_side_inconclusive(
-            recorder,
-            side,
-            "jump_table_data",
-            first_data,
-            {
-                "side": side,
-                "data_line_count": len(unowned_data),
-                "data_line": rows[first_data].display,
-            },
-        )
-        return None
-    leaders = {0}
-    for i in range(total):
-        if i in owned_data:
-            continue
-        target = targets[i]
-        if target is not None:
-            if not 0 <= target < total:
-                _mark_side_inconclusive(
-                    recorder,
-                    side,
-                    "invalid_control_flow_target",
-                    i,
-                    {"side": side, "target_instruction_index": target},
-                )
-                return None
-            leaders.add(target)
-        if i in table_dests:
-            for dest in table_dests[i]:
-                leaders.add(dest)
-            continue
-        if kinds[i] in ("jcc", "jmp", "ret") and i + 1 < total:
-            nxt = i + 1
-            while nxt < total and nxt in owned_data:
-                nxt += 1
-            if nxt < total:
-                leaders.add(nxt)
-    order = sorted(leaders)
+    for i, successors in enumerate(graph.edges):
+        if kinds[i] == "jmp" and any(edge.kind == "unknown" for edge in successors):
+            switch_candidate = any(
+                op[0] == "mem" and any(scale == 4 for _reg, scale in op[3])
+                for op in rows[i].operands
+            )
+            _mark_side_inconclusive(
+                recorder,
+                side,
+                "jump_table_data" if switch_candidate else "indirect_jump",
+                i,
+                {
+                    "side": side,
+                    "failure": (
+                        "unresolved_switch_table"
+                        if switch_candidate
+                        else "indirect_target"
+                    ),
+                },
+            )
+            return None
+    order = [block.start for block in graph.blocks]
+    ends = [block.end for block in graph.blocks]
     index = {start: n for n, start in enumerate(order)}
-    ends = [order[n + 1] if n + 1 < len(order) else total for n in range(len(order))]
-    succ: list[dict[str, int | str]] = []
-    for n, start in enumerate(order):
-        last = block_terminator(start, ends[n], kinds, owned_data)
-        kind = kinds[last]
-        edges: dict[str, int | str] = {}
-        if kind == "jcc":
-            target = targets[last]
-            edges["taken"] = index[target] if target is not None else "external"
-            if ends[n] < total:
-                edges["fall"] = index[ends[n]]
-            else:
-                edges["fallout"] = "external"
-        elif kind == "jmp":
-            if last in table_dests:
-                for case_i, dest in enumerate(table_dests[last]):
-                    edges[f"case{case_i}"] = index[dest]
-            else:
-                target = targets[last]
-                edges["jmp"] = index[target] if target is not None else "external"
-        elif kind == "ret":
-            pass
-        else:
-            if ends[n] < total:
-                edges["fall"] = index[ends[n]]
-            else:
-                edges["fallout"] = "external"
-        succ.append(edges)
+    succ = [
+        {
+            edge.label: (
+                index[edge.target]
+                if edge.kind == "local" and edge.target is not None
+                else "external"
+            )
+            for edge in block.successors
+        }
+        for block in graph.blocks
+    ]
     return _SideCfg(
         starts=list(order),
         ends=ends,
         succ=succ,
         kinds=kinds,
-        owned_data=frozenset(owned_data),
-        table_dests=table_dests,
+        table_dests={i: list(dests) for i, dests in graph.table_dests},
     )
 
 
 def _block_code_indices(cfg: _SideCfg, block: int) -> list[int]:
-    return [
-        i for i in range(cfg.starts[block], cfg.ends[block]) if i not in cfg.owned_data
-    ]
+    return list(range(cfg.starts[block], cfg.ends[block]))
 
 
 def _rebuild_cfg_keeping(
@@ -373,7 +170,6 @@ def _rebuild_cfg_keeping(
             {role: map_target(dest) for role, dest in cfg.succ[b].items()} for b in keep
         ],
         kinds=cfg.kinds,
-        owned_data=cfg.owned_data,
         table_dests=cfg.table_dests,
     )
 
@@ -473,9 +269,7 @@ def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
             continue
         if _is_empty_jump_block(cfg, block_b):
             continue
-        last_b = block_terminator(
-            cfg.starts[block_b], cfg.ends[block_b], cfg.kinds, cfg.owned_data
-        )
+        last_b = block_terminator(cfg.starts[block_b], cfg.ends[block_b])
         if last_b in cfg.table_dests:
             continue
         absorb[block_b] = block_a
@@ -510,7 +304,6 @@ def _merge_trivial_fallthrough_splits(cfg: _SideCfg) -> tuple[_SideCfg, bool]:
             ends=[new_ends[b] for b in keep],
             succ=remapped_succ,
             kinds=cfg.kinds,
-            owned_data=cfg.owned_data,
             table_dests=cfg.table_dests,
         ),
         True,

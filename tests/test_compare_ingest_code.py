@@ -429,7 +429,7 @@ def test_load_code_vtable_folded(db: EntityDb, lines_db: LinesDb, binfile: PEIma
     assert entity.get("name") == "Pizza"
     assert entity.get("base_class") is None
 
-    assert entity.get("folded_vtables") == [("Pizza", None), ("Lunch", None)]
+    assert entity.get("folded_vtables") == (("Pizza", None), ("Lunch", None))
 
 
 def test_load_code_variable(db: EntityDb, lines_db: LinesDb, binfile: PEImage):

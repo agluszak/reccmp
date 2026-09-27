@@ -2,7 +2,7 @@
 
 The one disassembly pass: typed operands, register and flag effects and
 branch targets come from Capstone's detail here; address sanitization
-happens later in ``ParseAsm``.
+happens when the function image is built.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from capstone import (  # type: ignore
 )
 from capstone import x86_const  # type: ignore
 
-from .ir import AsmRole, DecodedInstruction
+from .ir import DecodedInstruction
 from .model import (
     REGISTERS,
     ST_RE,
@@ -197,7 +197,6 @@ def from_capstone(insn) -> DecodedInstruction:
         prefix=prefix,
         operands=operands,
         display=display,
-        role=AsmRole.CODE,
         regs_read=regs_read,
         regs_written=regs_written,
         reads_flags=bool(insn.eflags & _EFLAGS_READ_MASK),

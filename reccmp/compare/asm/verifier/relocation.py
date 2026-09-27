@@ -189,14 +189,11 @@ def sequence_effects(rows: Sequence[DecodedInstruction]) -> list[LineEffects] | 
     result = []
     try:
         for idx, row in enumerate(rows):
-            ins = row if row.is_code else None
-            base = BARRIER if ins is None else _line_base_effects(ins)
+            base = _line_base_effects(row)
             ctx.trace = []
             failed = False
             try:
-                if ins is None:
-                    raise Reject
-                execute(state, ctx, idx, ins, [])
+                execute(state, ctx, idx, row, [])
                 guard_state_size(state, ctx)
             except (Reject, IndexError, KeyError, ValueError, TypeError):
                 _havoc(state, idx)

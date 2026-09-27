@@ -11,7 +11,7 @@ from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Literal, NamedTuple, Sequence
 
-from reccmp.compare.asm.ir import AsmRole, DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
 from reccmp.compare.diagnosis import StackPermutationEntry
 from reccmp.compare.pinned_sequences import DiffOpcode, SequenceMatcherWithPins
 from reccmp.cvdump.symbols import SymbolsEntry
@@ -238,7 +238,7 @@ def pdb_stack_slots(
 
 
 def _stack_slot(row: DecodedInstruction) -> StackRegisterOffset | None:
-    return extract_stack_offset_from_operands(row.operands) if row.is_code else None
+    return extract_stack_offset_from_operands(row.operands)
 
 
 def collect_stack_pairs(
@@ -369,8 +369,6 @@ def _remapped_key(
     row: DecodedInstruction, mapping: dict[tuple[str, int], tuple[str, int]]
 ) -> Hashable:
     """A row's match key with its stack slot moved through ``mapping``."""
-    if row.role != AsmRole.CODE:
-        return instruction_match_key(row)
     operands = []
     for op in row.operands:
         match op:

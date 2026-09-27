@@ -38,7 +38,7 @@ def _trim_padding(rows: Sequence[DecodedInstruction]) -> Sequence[DecodedInstruc
     """Strip trailing nop/int3 alignment padding, but only behind an
     instruction that does not fall through into it."""
     end = len(rows)
-    while end > 0 and rows[end - 1].is_code and rows[end - 1].mnemonic in _PADDING:
+    while end > 0 and rows[end - 1].mnemonic in _PADDING:
         end -= 1
     if 0 < end < len(rows) and rows[end - 1].mnemonic in ("ret", "jmp"):
         return rows[:end]
@@ -64,15 +64,18 @@ def analyze_effective_match(
     verifier can prove."""
     coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
     extent_closed = orig.extent_closed and recomp.extent_closed
-    orig_rows, recomp_rows = orig.excerpt, recomp.excerpt
+    orig_rows, recomp_rows = orig.instructions, recomp.instructions
     exact = admit_exact_analysis(
         bytes_equal=(
             orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
         ),
         topology_equal=local_branch_targets(orig_rows)
         == local_branch_targets(recomp_rows),
-        keys_equal=[instruction_semantic_key(row) for row in orig_rows]
-        == [instruction_semantic_key(row) for row in recomp_rows],
+        keys_equal=(
+            [instruction_semantic_key(row) for row in orig_rows]
+            == [instruction_semantic_key(row) for row in recomp_rows]
+            and orig.data_shape == recomp.data_shape
+        ),
         operands_complete=all(
             row.operand_model_complete for row in (*orig_rows, *recomp_rows)
         ),
@@ -85,7 +88,21 @@ def analyze_effective_match(
     if exact is not None:
         return exact
 
+    # Embedded bytes can be read through indexed operands without appearing
+    # as instruction effects. Until those reads are modeled against regions,
+    # a change to the data cannot be admitted by a code-only proof.
+    orig_data = tuple(
+        (region.address - orig.start_addr, region.data) for region in orig.data_regions
+    )
+    recomp_data = tuple(
+        (region.address - recomp.start_addr, region.data)
+        for region in recomp.data_regions
+    )
+    embedded_data_differs = orig_data != recomp_data
+
     def finish_effective(reasons) -> ComparisonAnalysis:
+        if embedded_data_differs:
+            return ComparisonAnalysis.inconclusive("embedded_data_mismatch")
         reason_set = set(reasons)
         if not reason_set:
             reason_set.add("instruction_reorder")
@@ -154,10 +171,8 @@ def analyze_effective_match(
     # elided copies) and the shifted branch displacements they cause.
     iso = new_recorder()
     if verify_isomorphic_cfg_effective_match(
-        orig_rows,
-        recomp_rows,
-        orig.jump_tables,
-        recomp.jump_tables,
+        orig,
+        recomp,
         metadata=metadata,
         recorder=iso,
     ):

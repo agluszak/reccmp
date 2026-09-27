@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
-    JumpTable,
+    FunctionImage,
     instruction_semantic_key,
 )
 from reccmp.compare.asm.model import Reject
@@ -67,10 +67,8 @@ if TYPE_CHECKING:
 
 
 def verify_isomorphic_cfg_effective_match(
-    orig_rows: Sequence[DecodedInstruction],
-    recomp_rows: Sequence[DecodedInstruction],
-    orig_tables: Sequence[JumpTable] = (),
-    recomp_tables: Sequence[JumpTable] = (),
+    orig: FunctionImage,
+    recomp: FunctionImage,
     metadata: FunctionMetadata | None = None,
     recorder: AnalysisRecorder | None = None,
 ) -> bool:
@@ -83,9 +81,9 @@ def verify_isomorphic_cfg_effective_match(
     Recognized switch jump tables become ``caseN`` edges so isomorphic
     pairing compares entry count and case→block topology.
     """
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
-    cfg_o = build_side_cfg(orig_rows, orig_tables, recorder=recorder, side="orig")
-    cfg_r = build_side_cfg(recomp_rows, recomp_tables, recorder=recorder, side="recomp")
+    orig_rows, recomp_rows = orig.instructions, recomp.instructions
+    cfg_o = build_side_cfg(orig, recorder=recorder, side="orig")
+    cfg_r = build_side_cfg(recomp, recorder=recorder, side="recomp")
     if cfg_o is None or cfg_r is None:
         return False
     cfg_o = canonicalize_side_cfg(cfg_o, orig_rows)
@@ -583,13 +581,9 @@ def _run_indices(cfg: _SideCfg, run: tuple[int, ...]) -> list[int]:
     indices: list[int] = []
     for block in run:
         start, end = cfg.starts[block], cfg.ends[block]
-        last = block_terminator(start, end, cfg.kinds, cfg.owned_data)
+        last = block_terminator(start, end)
         internal_jump = cfg.kinds[last] == "jmp" and set(_exits(cfg, block)) == {"next"}
-        indices += [
-            i
-            for i in range(start, end)
-            if i not in cfg.owned_data and not (internal_jump and i == last)
-        ]
+        indices += [i for i in range(start, end) if not (internal_jump and i == last)]
     return indices
 
 

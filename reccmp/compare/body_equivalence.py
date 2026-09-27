@@ -4,8 +4,7 @@ COMDAT aliases, stale jmp islands and uniquely discoverable pairs."""
 from typing import Callable
 
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.decode import decode_one, from_capstone
-from reccmp.compare.asm.instgen import InstructGen, SectionType
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     ExtentKind,
@@ -13,7 +12,6 @@ from reccmp.compare.asm.ir import (
     instruction_semantic_key,
     local_destination_keys,
 )
-from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.inlines import Fingerprint, FingerprintRow
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
@@ -32,25 +30,25 @@ def _code_rows(
 ) -> list[DecodedInstruction] | None:
     """The body's decoded instructions, or None when the body carries
     non-code sections (jump-table data)."""
-    rows: list[DecodedInstruction] = []
-    for section in InstructGen(bytes(raw), addr, is_32bit).sections:
-        if section.type != SectionType.CODE:
-            return None
-        rows.extend(section.contents)
-    return rows
+    image = decode_function(raw, addr, is_32bit=is_32bit)
+    if image.jump_tables or image.data_regions:
+        return None
+    return list(image.instructions)
 
 
 def _code_shape(raw: bytes, start: int) -> tuple | None:
     """The instructions of ``raw`` at ``start``, with direct branches inside
     the body as offsets and every other operand as decoded; None when it
     does not decode exactly."""
+    image = decode_function(raw, start)
+    if image.jump_tables or image.data_regions:
+        return None
     shape: list[tuple] = []
-    offset = 0
-    while offset < len(raw):
-        insn = decode_one(raw[offset : offset + 16], start + offset)
-        if insn is None:
+    cursor = start
+    for decoded in image.instructions:
+        if decoded.address != cursor:
             return None
-        decoded = from_capstone(insn)
+        cursor += decoded.size
         target = decoded.branch_target
         head = (decoded.prefix, decoded.mnemonic)
         if target is None:
@@ -59,8 +57,7 @@ def _code_shape(raw: bytes, start: int) -> tuple | None:
             shape.append((*head, "local", target - start))
         else:
             shape.append((*head, "far", target))
-        offset += insn.size
-    return tuple(shape) if offset == len(raw) else None
+    return tuple(shape) if cursor == start + len(raw) else None
 
 
 def _frozen(value):
@@ -107,8 +104,6 @@ def _is_bare_jmp_island(raw: bytes) -> bool:
 class BodyEquivalenceMixin(ComparatorState):
     """Part of FunctionComparator; relies on its attributes."""
 
-    orig_sanitize: ParseAsm
-    recomp_sanitize: ParseAsm
     _load_function_image: Callable[..., FunctionImage]
 
     def raw_pair_alias_equivalent(
@@ -212,19 +207,31 @@ class BodyEquivalenceMixin(ComparatorState):
                 _proved=proved,
             )
         orig_image = self._load_function_image(
-            self.orig_sanitize, orig_raw, orig_addr, size, ExtentKind.KNOWN
+            ImageId.ORIG, orig_raw, orig_addr, ExtentKind.KNOWN
         )
         recomp_image = self._load_function_image(
-            self.recomp_sanitize, recomp_raw, recomp_addr, size, ExtentKind.KNOWN
+            ImageId.RECOMP, recomp_raw, recomp_addr, ExtentKind.KNOWN
         )
-        orig_rows, recomp_rows = orig_image.excerpt, recomp_image.excerpt
+        orig_rows, recomp_rows = orig_image.instructions, recomp_image.instructions
         if not orig_rows or len(orig_rows) != len(recomp_rows):
             return False
+        # Table bytes and case ordering are body semantics even though table
+        # entries are not instructions. Only recognized all-local switches
+        # have comparable instruction-id destinations here.
+        orig_cases = orig_image.control_graph().table_dests
+        recomp_cases = recomp_image.control_graph().table_dests
+        if (
+            orig_image.data_shape != recomp_image.data_shape
+            or len(orig_cases) != len(orig_image.jump_tables)
+            or len(recomp_cases) != len(recomp_image.jump_tables)
+            or orig_cases != recomp_cases
+        ):
+            return False
         orig_topology = local_destination_keys(
-            orig_rows, orig_image.jump_tables, start_addr=orig_addr, extent=size
+            orig_rows, start_addr=orig_addr, extent=size
         )
         recomp_topology = local_destination_keys(
-            recomp_rows, recomp_image.jump_tables, start_addr=recomp_addr, extent=size
+            recomp_rows, start_addr=recomp_addr, extent=size
         )
         if orig_topology is None or recomp_topology is None:
             return False
@@ -464,7 +471,14 @@ class BodyEquivalenceMixin(ComparatorState):
                 FingerprintRow(
                     row.prefix,
                     row.mnemonic,
-                    tuple(_erase_addresses(op, valid_addr) for op in row.operands),
+                    tuple(
+                        _erase_addresses(op, valid_addr)
+                        for op in (
+                            (("imm", row.branch_target),)
+                            if row.branch_target is not None
+                            else row.operands
+                        )
+                    ),
                 )
                 for row in rows
             )
