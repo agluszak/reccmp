@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import pickle
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -212,10 +213,34 @@ def test_entity_db_freeze_rejects_later_pairing():
         batch.set(ImageId.ORIG, 0x10, name="orig", size=4)
         batch.set(ImageId.RECOMP, 0x20, name="recomp", size=4)
         batch.match(0x10, 0x20)
+    before_freeze = db.get(ImageId.ORIG, 0x10)
+    assert before_freeze is not None and before_freeze.orig is not None
+    mutable_facts = before_freeze.orig.facts
     db.freeze()
+    assert isinstance(mutable_facts, dict)
+    mutable_facts["name"] = "stale reference"
     with pytest.raises(FrozenEntityDbError):
         with db.batch() as batch:
             batch.set(ImageId.ORIG, 0x30, name="later")
+    orig = db.get(ImageId.ORIG, 0x10)
+    recomp = db.get(ImageId.RECOMP, 0x20)
+    assert orig is recomp
+    assert orig is not None
+    assert orig.orig is not None and orig.recomp is not None
+    with pytest.raises(TypeError):
+        orig.orig.facts["name"] = "changed"
+    with pytest.raises(TypeError):
+        orig.recomp.facts["name"] = "changed"
+    assert recomp.fact(ImageId.ORIG, "name") == "orig"
+    assert recomp.fact(ImageId.RECOMP, "name") == "recomp"
+
+    restored = pickle.loads(pickle.dumps(db))
+    restored_match = restored.get(ImageId.ORIG, 0x10)
+    assert restored.frozen
+    assert restored_match is restored.get(ImageId.RECOMP, 0x20)
+    assert restored_match is not None and restored_match.orig is not None
+    with pytest.raises(TypeError):
+        restored_match.orig.facts["name"] = "changed"
 
 
 def test_source_index_is_not_auto_discovered(tmp_path: Path):

@@ -5,6 +5,7 @@ addresses/symbols that we want to compare between the original and recompiled bi
 import bisect
 import logging
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping
 from reccmp.types import EntityType, ImageId
 
@@ -25,12 +26,26 @@ class FrozenEntityDbError(RuntimeError):
     """Raised when a frozen entity catalog is mutated."""
 
 
-@dataclass
+@dataclass(frozen=True)
 class SideEntity:
     """Facts from one binary. Matching links two records without merging them."""
 
     address: int
-    facts: dict[str, Any] = field(default_factory=dict)
+    facts: Mapping[str, Any] = field(default_factory=dict)
+
+    def freeze(self) -> None:
+        """Seal the side facts shared by all views of a matched entity."""
+        if isinstance(self.facts, dict):
+            object.__setattr__(self, "facts", MappingProxyType(dict(self.facts)))
+
+    def __getstate__(self) -> tuple[int, dict[str, Any], bool]:
+        """Keep frozen prepared analyses usable in the local pickle cache."""
+        return self.address, dict(self.facts), not isinstance(self.facts, dict)
+
+    def __setstate__(self, state: tuple[int, dict[str, Any], bool]) -> None:
+        address, facts, frozen = state
+        object.__setattr__(self, "address", address)
+        object.__setattr__(self, "facts", MappingProxyType(facts) if frozen else facts)
 
 
 class ReccmpEntity:
@@ -342,7 +357,14 @@ class EntityDb:
         self._generation = getattr(self, "_generation", 0) + 1
 
     def freeze(self) -> None:
-        """Seal pairing/identity after ingest. Resolver caches may follow."""
+        """Seal facts and pairing/identity after ingest. Resolver caches may follow."""
+        if self._frozen:
+            return
+        for image_id in (ImageId.ORIG, ImageId.RECOMP):
+            for entity in self._entities[image_id].values():
+                side = entity.side(image_id)
+                if side is not None:
+                    side.freeze()
         self._frozen = True
 
     def set_equivalence_groups(self, groups: Mapping[int, int]) -> None:
@@ -420,6 +442,7 @@ class EntityDb:
             else:
                 side = entities[addr].side(image)
                 assert side is not None
+                assert isinstance(side.facts, dict)
                 side.facts.update(values)
 
         self._update_addr_index(image, new_addrs)

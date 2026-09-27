@@ -99,6 +99,9 @@ Commits on this branch:
 - `cb0d9a77`: comparison gets a fresh `FunctionComparator` after the catalog
   freezes, so its resolver and proof caches start from final identities.
 - `774f1d8b`: compile-command normalization moved to `source/commands.py`.
+- The entity catalog now seals side facts when it freezes. Matched entity
+  views share the sealed records, and prepared-analysis pickle caching keeps
+  them sealed after reload.
 
 Full Python suite: 1,387 passed, 221 skipped, 3 expected failures. Mypy and
 repository-wide Pylint pass. The Wizardry WIZ8
@@ -113,17 +116,21 @@ could not start because the browser executable is not installed locally.
 
 The positional CFG verifier cannot yet be removed: a product-only probe
 retained its successful proofs but lost branch-target diagnoses on 63 WIZ8
-functions when the product graph alignment failed. Lockstep, diff-aligned,
-and relocation strategies also have successful proofs the product strategy
-does not yet cover. Port those proof and diagnosis capabilities before
-deleting their implementations.
+functions when the product graph alignment failed. Of 21 effective WIZ8
+functions proved by lockstep alone, the product verifier stopped at nine
+analysis limits, six alignment failures, and two state joins. On four more it
+reported a return-value or memory-address difference despite the lockstep
+proof. Those conflicting outcomes need a soundness review before using the
+product verifier as the sole strategy. Diff-aligned and relocation paths also
+remain until their proof and diagnosis capabilities are measured and ported.
 
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
-machine and semantic instruction effects; make the entity catalog's side
-facts immutable as well as guarding mutations through its methods; finish separating source
-index marker binding, layout queries, and orchestration; finish typed
-diagnosis payloads.
+machine and semantic instruction effects; finish separating source index
+marker binding, layout queries, and orchestration; finish typed diagnosis
+payloads. The catalog's side fact maps are sealed, though entity pairing
+objects remain mutable Python objects and the catalog still uses key-value
+facts internally.
 Keep cvdump and Unicorn as separate input and
 execution engines.
 
