@@ -65,6 +65,7 @@ work separate until its corpus evidence and review are complete.
 
 The continuation is on local branch
 `refactor/function-image-graph`, based on `71a79dec`.
+It is published as draft PR #43, stacked on PR #42.
 
 Commits on this branch:
 
@@ -87,12 +88,17 @@ Commits on this branch:
   decoder instead of accessing `InstructGen` directly or decoding a body again.
 - `558be1d6`: compiler fact dataclasses live in `source/records.py` rather
   than sharing a file with index orchestration and layout queries.
+- `6c947933`: section discovery is private inside `decode_function()`;
+  `instgen.py` and direct section-shaped callers are gone.
+- `a40e5789`: delete `AsmRole` and all fake table instructions. Test switches
+  pass explicit `JumpTable` records. Alias proofs check table case destinations.
+- `bb586099`: make the report and graph tests pass CI Pylint.
 
 Full Python suite: 1,387 passed, 221 skipped, 3 expected failures. Mypy and
 Pylint pass for the latest changed production modules. The Wizardry WIZ8
 corpus retained all 2,684 exact and 284 effective proofs against the pinned
-`71a79dec` baseline. The final decoder-migration run had exactly the same
-status and reason for all 6,098 entries as the preceding local run. Against
+`71a79dec` baseline. The decoder, role-removal, and alias-guard runs had
+exactly the same status and reason for all 6,098 entries. Against
 the pinned baseline, 14 inconclusive entries became mismatch and 8 mismatches
 became inconclusive; those diagnosis changes remain under review. The web UI
 lints and builds; Playwright Chromium
@@ -105,13 +111,12 @@ and relocation strategies also have successful proofs the product strategy
 does not yet cover. Port those proof and diagnosis capabilities before
 deleting their implementations.
 
-Still open: make `InstructGen` private to function decoding and remove its
-section-shaped API; replace the separate extent and callee-cleanup walks with
+Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
 machine and semantic instruction effects; make the entity catalog genuinely
 immutable before constructing comparison context; continue splitting
-`source/index.py` by responsibility; finish typed diagnosis payloads; migrate test table
-markers away from `AsmRole`. Keep cvdump and Unicorn as separate input and
+`source/index.py` by responsibility; finish typed diagnosis payloads.
+Keep cvdump and Unicorn as separate input and
 execution engines.
 
 Approved disk cleanup removed about 32 GB of Imperialism Rust incremental
