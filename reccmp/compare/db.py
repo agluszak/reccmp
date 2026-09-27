@@ -5,7 +5,7 @@ addresses/symbols that we want to compare between the original and recompiled bi
 import bisect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 from reccmp.types import EntityType, ImageId
 
 
@@ -325,6 +325,7 @@ class EntityDb:
         self._addr_order = {ImageId.ORIG: [], ImageId.RECOMP: []}
 
         self._sections = {ImageId.ORIG: [], ImageId.RECOMP: []}
+        self._equivalence_groups: dict[int, int] = {}
         self._frozen = False
         self._generation = 0
 
@@ -343,6 +344,46 @@ class EntityDb:
     def freeze(self) -> None:
         """Seal pairing/identity after ingest. Resolver caches may follow."""
         self._frozen = True
+
+    def set_equivalence_groups(self, groups: Mapping[int, int]) -> None:
+        """Install project-declared canonical original addresses during ingest."""
+        if dict(groups) == self._equivalence_groups:
+            return
+        self._require_mutable()
+        self._equivalence_groups = dict(groups)
+        self._bump_generation()
+
+    def canonical_orig(
+        self,
+        image_id: ImageId,
+        addr: int,
+        groups: Mapping[int, int] | None = None,
+        entity: ReccmpEntity | None = None,
+    ) -> int | None:
+        """Proven original identity of a paired, folded, or declared alias."""
+        canonical = self.alias_canonical_orig(image_id, addr)
+        if canonical is None and entity is not None and entity.matched:
+            canonical = entity.orig_addr
+        if (
+            canonical is None
+            and image_id == ImageId.ORIG
+            and addr in self._entities[image_id]
+        ):
+            canonical = addr
+        if canonical is None:
+            return None
+        chosen_groups = groups if groups is not None else self._equivalence_groups
+        mapped = chosen_groups.get(canonical)
+        if mapped is not None:
+            return mapped
+        if (
+            image_id == ImageId.ORIG
+            and addr not in self._matches[image_id]
+            and addr not in self._aliases[image_id]
+            and not (entity is not None and entity.matched)
+        ):
+            return None
+        return canonical
 
     def _require_mutable(self) -> None:
         if self.frozen:

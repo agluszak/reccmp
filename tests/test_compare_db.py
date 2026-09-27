@@ -649,3 +649,18 @@ def test_independent_sets(db: EntityDb):
     assert ent.fact(ImageId.ORIG, "name") == "test"
     assert ent.fact(ImageId.RECOMP, "name") == "asdf"
     assert db.get(ImageId.ORIG, 100) is ent
+
+
+def test_catalog_canonical_identity_combines_pairs_and_aliases(db: EntityDb):
+    db.set_equivalence_groups({0x110: 0x100})
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x100, type=EntityType.FUNCTION)
+        batch.set(ImageId.ORIG, 0x110, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x500, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x510, type=EntityType.FUNCTION)
+        batch.match(0x100, 0x500)
+    assert db.set_alias(ImageId.RECOMP, 0x510, 0x100)
+    assert db.canonical_orig(ImageId.ORIG, 0x100) == 0x100
+    assert db.canonical_orig(ImageId.ORIG, 0x110) == 0x100
+    assert db.canonical_orig(ImageId.RECOMP, 0x500) == 0x100
+    assert db.canonical_orig(ImageId.RECOMP, 0x510) == 0x100

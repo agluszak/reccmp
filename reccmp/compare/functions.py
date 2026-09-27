@@ -157,6 +157,11 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     algebraic_identities: bool = True
 
     def __post_init__(self):
+        self.db.set_equivalence_groups(self.equivalence_groups)
+        self._refresh_lookup_state()
+
+    def _refresh_lookup_state(self) -> None:
+        """Discard lookup and proof caches after catalog mutation."""
         self._call_facts_cache: dict[Hashable, CallFacts | None] | None = None
         self._fp_cache: dict[
             tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
@@ -175,7 +180,6 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             ImageId.ORIG,
             create_bin_lookup(self.orig_bin),
             self.types.get_name_for_offset,
-            self.equivalence_groups,
             jump_target=lambda addr: read_e9_jmp_target(self.orig_bin, addr),
         )
         self.recomp_addr_test = create_valid_addr_lookup(
@@ -186,13 +190,12 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             ImageId.RECOMP,
             create_bin_lookup(self.recomp_bin),
             self.types.get_name_for_offset,
-            self.equivalence_groups,
             jump_target=lambda addr: read_e9_jmp_target(self.recomp_bin, addr),
         )
 
     def rebuild_lookups(self) -> None:
-        """Rebuild name-lookup closures after the entity catalog is frozen."""
-        self.__post_init__()
+        """Rebuild lookups after catalog construction changes identities."""
+        self._refresh_lookup_state()
 
     def _source_ref_of_recomp_addr(self, recomp_addr: int | None) -> str | None:
         if recomp_addr is None:

@@ -105,9 +105,7 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
             recomp_addr=entity.recomp_addr,
             name=name,
             fingerprint=needle,
-            identity=entity_proof_identity(
-                self.db, ImageId.RECOMP, entity, 0, self.equivalence_groups
-            ),
+            identity=entity_proof_identity(self.db, ImageId.RECOMP, entity),
             byte_size=recomp_size,
             effect_summary=summarize_helper_effects(needle),
         )
