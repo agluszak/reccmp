@@ -27,7 +27,13 @@ from typing import Any
 
 import z3  # type: ignore[import-untyped]
 
-from reccmp.compare.asm.verifier.state import WIDTHS
+from reccmp.compare.asm.verifier.state import (
+    Branch,
+    Observation,
+    ReturnValue,
+    Store,
+    WIDTHS,
+)
 from reccmp.compare.diagnosis import SolverOutcome, SolverResult
 
 # Resource units per query (see SolverOutcome.rlimit), and a wall-clock
@@ -382,33 +388,34 @@ def predicates_equal(a: Any, b: Any) -> bool:
     return compare((a, b, None, "predicate")).result is SolverResult.PROVED
 
 
-def entries_equal(entry_o: Any, entry_r: Any) -> bool:
+def entries_equal(entry_o: Observation, entry_r: Observation) -> bool:
     """Whether two observations agree, up to bit-vector equivalence of the
     values they carry: return values, stored values and branch predicates.
-    Every other part (tags, addresses, widths, destinations) must be equal."""
+    Every other part (types, addresses, widths, destinations) must be equal."""
     if entry_o == entry_r:
         return True
-    if not isinstance(entry_o, tuple) or not isinstance(entry_r, tuple):
-        return False
-    if not entry_o or len(entry_o) != len(entry_r) or entry_o[0] != entry_r[0]:
-        return False
-    tag = entry_o[0]
-    if tag == "retval":
-        return all(values_equal(o, r) for o, r in zip(entry_o[1:], entry_r[1:]))
-    bits = WIDTHS.get(entry_o[2]) if tag == "store" and len(entry_o) == 4 else None
-    if bits is not None:
-        return entry_o[1:3] == entry_r[1:3] and values_equal(
-            entry_o[3], entry_r[3], 8 * bits
-        )
-    return (
-        tag == "branch"
-        and len(entry_o) == 3
-        and entry_o[2] == entry_r[2]
-        and predicates_equal(entry_o[1], entry_r[1])
-    )
+    match entry_o, entry_r:
+        case ReturnValue(values_o), ReturnValue(values_r):
+            return len(values_o) == len(values_r) and all(
+                values_equal(o, r) for o, r in zip(values_o, values_r)
+            )
+        case Store(address_o, size_o, value_o), Store(address_r, size_r, value_r):
+            bits = WIDTHS.get(size_o)
+            return (
+                bits is not None
+                and (address_o, size_o) == (address_r, size_r)
+                and values_equal(value_o, value_r, 8 * bits)
+            )
+        case Branch(predicate_o, destination_o), Branch(predicate_r, destination_r):
+            return destination_o == destination_r and predicates_equal(
+                predicate_o, predicate_r
+            )
+    return False
 
 
-def observations_equal(obs_o: Sequence[Any], obs_r: Sequence[Any]) -> bool:
+def observations_equal(
+    obs_o: Sequence[Observation], obs_r: Sequence[Observation]
+) -> bool:
     return len(obs_o) == len(obs_r) and all(
         entries_equal(o, r) for o, r in zip(obs_o, obs_r)
     )

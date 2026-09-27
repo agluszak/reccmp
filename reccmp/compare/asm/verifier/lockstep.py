@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
+from dataclasses import replace
 
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
@@ -27,15 +28,22 @@ from reccmp.compare.asm.verifier.obligations import (
 )
 from reccmp.compare.asm.verifier.semantics import execute
 from reccmp.compare.asm.verifier.state import (
-    CONTROL_TAGS,
+    Branch,
     Context,
     FunctionMetadata,
+    Jump,
+    Loop,
+    Observation,
     SideState,
     clone_state,
     commit_memory,
     guard_state_size,
+    is_conditional_observation,
+    is_control_observation,
+    observation_values,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder, InconclusiveReason, StopDetail
+from reccmp.types import ImageId
 
 
 def verify_effective_match(
@@ -74,9 +82,9 @@ def verify_effective_match(
             last_index_o, last_index_r = index_o, index_r
             if index_o is None or index_r is None:
                 side = recomp if index_o is None else orig
-                other_side = orig if index_o is None else recomp
+                which = ImageId.RECOMP if index_o is None else ImageId.ORIG
                 row = recomp_rows[index_r] if index_o is None else orig_rows[index_o]  # type: ignore[index]
-                if not one_sided_ok(side, other_side, ctx, idx, row):
+                if not one_sided_ok(which, side, ctx, idx, row):
                     if recorder is not None:
                         recorder.mark_inconclusive(
                             InconclusiveReason.ALIGNMENT_FAILURE,
@@ -93,8 +101,8 @@ def verify_effective_match(
                 record_operand_candidate(
                     ctx, index_o, index_r, ins_o, ins_r, (orig, recomp)
                 )
-                obs_o: list = []
-                obs_r: list = []
+                obs_o: list[Observation] = []
+                obs_r: list[Observation] = []
                 before_o = dict(orig.regs)
                 before_r = dict(recomp.regs)
                 state_before_o = clone_state(orig)
@@ -139,7 +147,8 @@ def verify_effective_match(
                 return False
             invalidate_save_slots(ctx, obs_o)
             for entry in obs_o:
-                ctx.add_matched(entry)
+                for value in observation_values(entry):
+                    ctx.add_matched(value)
 
             # The same value written by both sides in this step (even to
             # different registers) is proven correspondence: remember it so
@@ -174,11 +183,8 @@ def verify_effective_match(
             # Divergent registers at a jcc are a CFG problem even when both
             # values appear in the predicate (xchg + inverted compare) or are
             # "scratch" initials of different families.
-            if any(entry[0] in CONTROL_TAGS for entry in obs_o):
-                conditional = any(
-                    entry[0] in {"branch", "loop", "loope", "loopne", "jcxz", "jecxz"}
-                    for entry in obs_o
-                )
+            if any(is_control_observation(entry) for entry in obs_o):
+                conditional = any(is_conditional_observation(entry) for entry in obs_o)
                 if conditional and orig.regs != recomp.regs:
                     return False
                 if not divergences_justified(ctx, orig, recomp):
@@ -201,15 +207,15 @@ def verify_effective_match(
 
 
 def _rewrite_control_observables(
-    obs: list, row: DecodedInstruction, ids: dict[int, int]
+    obs: list[Observation], row: DecodedInstruction, ids: dict[int, int]
 ) -> None:
     """A branch observation's destination as a row index or an identity,
     never a relative displacement."""
     local = ids.get(row.branch_target) if row.branch_target is not None else None
     for index, entry in enumerate(obs):
-        if not entry or entry[0] not in CONTROL_TAGS - {"jmpind"}:
+        if not isinstance(entry, (Branch, Jump, Loop)):
             continue
-        destination: object
+        destination: Hashable | None
         if local is not None:
             destination = ("L", local)
         elif row.control_target is not None:
@@ -217,5 +223,5 @@ def _rewrite_control_observables(
         elif row.branch_target is not None:
             destination = ("ext", ("unresolved", None, row.branch_target))
         else:
-            destination = entry[-1]
-        obs[index] = (*entry[:-1], destination)
+            destination = entry.destination
+        obs[index] = replace(entry, destination=destination)

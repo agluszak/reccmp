@@ -7,7 +7,17 @@ from reccmp.compare.asm.model import Reject
 from reccmp.compare.asm.operand import Imm, Mem, Reg, Sym
 from reccmp.compare.asm.verifier.semantics import mem_address
 from reccmp.compare.asm.verifier.state import (
-    CONTROL_TAGS,
+    Branch,
+    Call,
+    FrameArguments,
+    Jump,
+    Loop,
+    Observation,
+    ReturnFpu,
+    ReturnSaved,
+    ReturnStack,
+    ReturnValue,
+    Store,
     WIDTHS,
     Context,
     SideState,
@@ -175,8 +185,8 @@ def record_observable_difference(
     index_r: int,
     ins_o: DecodedInstruction,
     ins_r: DecodedInstruction,
-    obs_o: list,
-    obs_r: list,
+    obs_o: list[Observation],
+    obs_r: list[Observation],
 ) -> None:
     # pylint: disable=too-many-arguments,too-many-positional-arguments
     # pylint: disable=too-many-return-statements,too-many-locals
@@ -184,13 +194,11 @@ def record_observable_difference(
     recorder = ctx.recorder
     if recorder is None or recorder.difference is not None:
         return
-    first_o: tuple = obs_o[0] if obs_o else ()
-    first_r: tuple = obs_r[0] if obs_r else ()
-    tag_o = first_o[0] if first_o else None
-    tag_r = first_r[0] if first_r else None
+    first_o = obs_o[0] if obs_o else None
+    first_r = obs_r[0] if obs_r else None
 
-    if tag_o == tag_r == "call":
-        if first_o[1] != first_r[1]:
+    if isinstance(first_o, Call) and isinstance(first_r, Call):
+        if first_o.target != first_r.target:
             recorder.record_difference(
                 DifferenceKind.CALL_TARGET,
                 index_o,
@@ -200,63 +208,66 @@ def record_observable_difference(
             )
             return
         registers = _checked_call_registers(ctx, ins_o)
-        for position, register in enumerate(registers, start=2):
-            if position >= min(len(first_o), len(first_r)):
-                break
-            if first_o[position] != first_r[position]:
+        for register, value_o, value_r in zip(
+            registers, first_o.arguments, first_r.arguments
+        ):
+            if value_o != value_r:
                 recorder.record_difference(
                     DifferenceKind.CALL_ARGUMENT,
                     index_o,
                     index_r,
-                    Observed(value=render(first_o[position]), register=register),
-                    Observed(value=render(first_r[position]), register=register),
+                    Observed(value=render(value_o), register=register),
+                    Observed(value=render(value_r), register=register),
                 )
                 return
         # With the frame promoted, the arguments the callee reads from each
         # side's stack follow the call (see iso_cfg._pass_frame).
-        passed_o = next((e for e in obs_o if e[0] == "frame_args"), None)
-        passed_r = next((e for e in obs_r if e[0] == "frame_args"), None)
+        passed_o = next((e for e in obs_o if isinstance(e, FrameArguments)), None)
+        passed_r = next((e for e in obs_r if isinstance(e, FrameArguments)), None)
         if passed_o != passed_r:
             recorder.record_difference(
                 DifferenceKind.CALL_ARGUMENT,
                 index_o,
                 index_r,
-                Observed(value=render(passed_o)),
-                Observed(value=render(passed_r)),
+                Observed(value=render(passed_o.values if passed_o else None)),
+                Observed(value=render(passed_r.values if passed_r else None)),
             )
             return
 
-    if tag_o == tag_r == "store":
-        if first_o[1] != first_r[1]:
+    if isinstance(first_o, Store) and isinstance(first_r, Store):
+        if first_o.address != first_r.address:
             recorder.record_difference(
                 DifferenceKind.MEMORY_ADDRESS,
                 index_o,
                 index_r,
                 Observed(operand=ins_o.operands[0] if ins_o.operands else None),
                 Observed(operand=ins_r.operands[0] if ins_r.operands else None),
-                **_solved((("addr", first_o[1]), ("addr", first_r[1]), 32, "value")),
+                **_solved(
+                    (("addr", first_o.address), ("addr", first_r.address), 32, "value")
+                ),
             )
             return
-        if first_o[3] != first_r[3]:
-            width = WIDTHS.get(first_o[2])
+        if first_o.value != first_r.value:
+            width = WIDTHS.get(first_o.size)
             recorder.record_difference(
                 DifferenceKind.MEMORY_VALUE,
                 index_o,
                 index_r,
-                shown(first_o[3]),
-                shown(first_r[3]),
+                shown(first_o.value),
+                shown(first_r.value),
                 **_solved(
-                    (first_o[3], first_r[3], 8 * width, "value")
-                    if width is not None and first_o[2] == first_r[2]
+                    (first_o.value, first_r.value, 8 * width, "value")
+                    if width is not None and first_o.size == first_r.size
                     else None
                 ),
             )
             return
 
-    branch_tags = CONTROL_TAGS - {"jmpind"}
-    if tag_o in branch_tags and tag_r in branch_tags:
-        predicate_o = first_o[1] if tag_o == "branch" else None
-        predicate_r = first_r[1] if tag_r == "branch" else None
+    if isinstance(first_o, (Branch, Jump, Loop)) and isinstance(
+        first_r, (Branch, Jump, Loop)
+    ):
+        predicate_o = first_o.predicate if isinstance(first_o, Branch) else None
+        predicate_r = first_r.predicate if isinstance(first_r, Branch) else None
         if predicate_o != predicate_r:
             recorder.record_difference(
                 DifferenceKind.BRANCH_CONDITION,
@@ -283,30 +294,47 @@ def record_observable_difference(
         return
 
     for entry_o, entry_r in zip(obs_o, obs_r):
-        if entry_o == entry_r:
+        if entry_o == entry_r or type(entry_o) is not type(entry_r):
             continue
-        if entry_o and entry_r and entry_o[0] == entry_r[0]:
-            if entry_o[0] in ("retval", "retfpu"):
-                recorder.record_difference(
-                    DifferenceKind.RETURN_VALUE,
-                    index_o,
-                    index_r,
-                    shown(entry_o[1]),
-                    shown(entry_r[1]),
-                    **_solved(
-                        (entry_o[1], entry_r[1], None, "value")
-                        if entry_o[0] == "retval" and len(entry_o) == len(entry_r) == 2
-                        else None
-                    ),
-                )
-                return
-            if entry_o[0] in ("retsaved", "retstack"):
-                recorder.record_difference(
-                    DifferenceKind.PRESERVED_STATE,
-                    index_o,
-                    index_r,
-                    shown(entry_o[1]),
-                    shown(entry_r[1]),
-                )
-                return
+        if isinstance(entry_o, ReturnValue) and isinstance(entry_r, ReturnValue):
+            recorder.record_difference(
+                DifferenceKind.RETURN_VALUE,
+                index_o,
+                index_r,
+                shown(entry_o.values[0]),
+                shown(entry_r.values[0]),
+                **_solved(
+                    (entry_o.values[0], entry_r.values[0], None, "value")
+                    if len(entry_o.values) == len(entry_r.values) == 1
+                    else None
+                ),
+            )
+            return
+        if isinstance(entry_o, ReturnFpu) and isinstance(entry_r, ReturnFpu):
+            recorder.record_difference(
+                DifferenceKind.RETURN_VALUE,
+                index_o,
+                index_r,
+                shown(entry_o.value),
+                shown(entry_r.value),
+            )
+            return
+        if isinstance(entry_o, ReturnSaved) and isinstance(entry_r, ReturnSaved):
+            recorder.record_difference(
+                DifferenceKind.PRESERVED_STATE,
+                index_o,
+                index_r,
+                shown(entry_o.values),
+                shown(entry_r.values),
+            )
+            return
+        if isinstance(entry_o, ReturnStack) and isinstance(entry_r, ReturnStack):
+            recorder.record_difference(
+                DifferenceKind.PRESERVED_STATE,
+                index_o,
+                index_r,
+                shown(entry_o.operands),
+                shown(entry_r.operands),
+            )
+            return
     recorder.mark_inconclusive(InconclusiveReason.ANALYSIS_LIMIT)

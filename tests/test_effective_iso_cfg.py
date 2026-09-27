@@ -33,7 +33,7 @@ from reccmp.compare.asm.verifier.dataflow import (
 from reccmp.compare.asm.verifier.iso_cfg import (
     verify_isomorphic_cfg_effective_match as verify_product_images,
 )
-from reccmp.compare.asm.verifier.state import SideState
+from reccmp.compare.asm.verifier.state import LoadObligation, SideState
 from reccmp.types import ImageId
 from reccmp.compare.diagnosis import (
     ComparisonStatus,
@@ -1142,8 +1142,18 @@ def test_cfg_join_rejects_uncorrelated_trap_parity():
     fall_o.load_log.add((addr, gen))
     taken_o, taken_r = SideState(), SideState()
     taken_r.load_log.add((addr, gen))
-    fall = CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
-    taken = CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
+    fall = CfgState(
+        fall_o,
+        fall_r,
+        gen,
+        load_obligations=[LoadObligation(ImageId.RECOMP, addr, gen)],
+    )
+    taken = CfgState(
+        taken_o,
+        taken_r,
+        gen,
+        load_obligations=[LoadObligation(ImageId.ORIG, addr, gen)],
+    )
     assert join_states(fall, taken, 0) is None
 
 

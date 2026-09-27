@@ -3,7 +3,7 @@ with block-local alignment."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from collections.abc import Sequence
@@ -52,8 +52,14 @@ from reccmp.compare.asm.verifier.obligations import (
 from reccmp.compare.asm.verifier.schedule import schedule_like
 from reccmp.compare.asm.verifier.semantics import canon_condition, esp_add, execute
 from reccmp.compare.asm.verifier.state import (
-    CONTROL_TAGS,
+    Branch,
+    Call,
+    FrameArguments,
+    IndirectJump,
     JCC_MNEMONICS,
+    Jump,
+    Loop,
+    Observation,
     Context,
     FunctionMetadata,
     SideState,
@@ -309,14 +315,14 @@ def _verify_product(
             if index_o is None or index_r is None:
                 if index_o is None:
                     assert index_r is not None
-                    side, other_side = recomp_state, orig_state
+                    side, which = recomp_state, ImageId.RECOMP
                     row, position = recomp_rows[index_r], index_r
                 else:
-                    side, other_side = orig_state, recomp_state
+                    side, which = orig_state, ImageId.ORIG
                     row, position = orig_rows[index_o], index_o
                 # A one-sided instruction can never store (any observable
                 # rejects it), so the memory generation is unaffected.
-                if not one_sided_ok(side, other_side, ctx, position, row):
+                if not one_sided_ok(which, side, ctx, position, row):
                     recorder.mark_inconclusive(
                         InconclusiveReason.ALIGNMENT_FAILURE,
                         index_o,
@@ -331,8 +337,8 @@ def _verify_product(
                 record_operand_candidate(
                     ctx, index_o, index_r, ins_o, ins_r, (orig_state, recomp_state)
                 )
-                obs_o: list = []
-                obs_r: list = []
+                obs_o: list[Observation] = []
+                obs_r: list[Observation] = []
                 state_before_o = clone_state(orig_state)
                 state_before_r = clone_state(recomp_state)
                 execute(orig_state, ctx, index_o, ins_o, obs_o)
@@ -367,7 +373,7 @@ def _verify_product(
                 commit_memory(ctx, obs_o, index_o)
                 continue
 
-            if promote and any(entry[0] == "call" for entry in obs_o):
+            if promote and any(isinstance(entry, Call) for entry in obs_o):
                 # What reaches the callee from each side's own frame.
                 effects = _agreed_effects(
                     _call_effect(metadata, 0, ins_o), _call_effect(metadata, 1, ins_r)
@@ -398,15 +404,15 @@ def _verify_product(
             if kind is FlowKind.CONDITIONAL and edges_o.get(TAKEN) is not None:
                 for entries in (obs_o, obs_r):
                     for k, obs_entry in enumerate(entries):
-                        if obs_entry[0] in CONTROL_TAGS - {"jmpind"}:
-                            entries[k] = (*obs_entry[:-1], ("L", "jcc"))
+                        if isinstance(obs_entry, (Branch, Jump, Loop)):
+                            entries[k] = replace(obs_entry, destination=("L", "jcc"))
             if kind is FlowKind.JUMP and switch:
                 idx_o = switch_index_observation(state_before_o, ins_o)
                 idx_r = switch_index_observation(state_before_r, ins_r)
                 for entries, idx in ((obs_o, idx_o), (obs_r, idx_r)):
                     for k, obs_entry in enumerate(entries):
-                        if obs_entry[0] == "jmpind":
-                            entries[k] = ("jmpind", ("L", "switch"), idx)
+                        if isinstance(obs_entry, IndirectJump):
+                            entries[k] = IndirectJump(("L", "switch"), idx)
 
             if not accept_agreeing_pair(
                 ctx,
@@ -418,7 +424,7 @@ def _verify_product(
                 (obs_o, obs_r),
             ):
                 return False
-            if any(obs_entry[0] == "jmpind" for obs_entry in obs_o):
+            if any(isinstance(obs_entry, IndirectJump) for obs_entry in obs_o):
                 # Recognized switch tables already expanded to caseN edges.
                 if not switch:
                     recorder.mark_inconclusive(
@@ -596,8 +602,8 @@ def _form_node(cfg_o: Blocks, cfg_r: Blocks, head_o: int, head_r: int) -> _Node:
 
 
 def _inverted_branch(
-    obs_o: list,
-    obs_r: list,
+    obs_o: list[Observation],
+    obs_r: list[Observation],
     *,
     ins_r: DecodedInstruction,
     state_before_r: SideState,
@@ -609,19 +615,26 @@ def _inverted_branch(
     complement of the recompiled condition (on the same flags) is the
     original's. If so, observe the recompiled branch as that complement,
     so the pair's predicates compare as equal."""
-    branch_o = next((k for k, e in enumerate(obs_o) if e[0] == "branch"), None)
-    branch_r = next((k for k, e in enumerate(obs_r) if e[0] == "branch"), None)
+    branch_o = next(
+        (k for k, entry in enumerate(obs_o) if isinstance(entry, Branch)), None
+    )
+    branch_r = next(
+        (k for k, entry in enumerate(obs_r) if isinstance(entry, Branch)), None
+    )
     if branch_o is None or branch_r is None:
         return False
-    if obs_o[branch_o][1] == obs_r[branch_r][1]:
+    original = obs_o[branch_o]
+    recompiled = obs_r[branch_r]
+    assert isinstance(original, Branch) and isinstance(recompiled, Branch)
+    if original.predicate == recompiled.predicate:
         return False
     complement = _COMPLEMENT_JCC.get(ins_r.mnemonic)
     if complement is None or not _exits_correspond(exits_o, exits_r, swapped=True):
         return False
     inverted = canon_condition(JCC_MNEMONICS[complement], state_before_r)
-    if inverted != obs_o[branch_o][1]:
+    if inverted != original.predicate:
         return False
-    obs_r[branch_r] = ("branch", inverted, *obs_r[branch_r][2:])
+    obs_r[branch_r] = replace(recompiled, predicate=inverted)
     return True
 
 
@@ -660,7 +673,7 @@ def _pass_frame(
     before: SideState,
     index: int,
     effect: CallStackEffect | None,
-) -> tuple:
+) -> FrameArguments:
     """A call with the frame promoted: the observation of the promoted
     slots the callee may read (its arguments, by offset from the stack
     pointer at the call; every slot above it when their extent is
@@ -672,7 +685,7 @@ def _pass_frame(
     if root != ("init", "sp"):
         if state.frame:
             raise Reject  # the arguments cannot be placed
-        return ("frame_args",)
+        return FrameArguments(None)
     arguments = effect.arguments if effect is not None else None
     for offset in [offset for offset in state.frame if offset < top]:
         # The callee's own frame, from the return address down.
@@ -689,4 +702,4 @@ def _pass_frame(
         state.frame[offset] = (width, ("callarg", index, offset - top, width))
     if effect is not None and effect.callee_pops is not None:
         state.write_reg("esp", esp_add(esp, effect.callee_pops))
-    return ("frame_args", tuple(passed))
+    return FrameArguments(tuple(passed))

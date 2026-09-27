@@ -20,12 +20,26 @@ from reccmp.compare.asm.verifier.frame import (
     write_slot,
 )
 from reccmp.compare.asm.verifier.state import (
+    Branch,
+    Call,
     CARRY_BINOPS,
     CC_CANON,
     COMMUTATIVE_BINOPS,
+    IndirectJump,
     JCC_MNEMONICS,
+    Jump,
+    LoadControlWord,
+    Loop,
+    LoopKind,
+    Observation,
     ORDERED_BINOPS,
+    ReturnFpu,
+    ReturnSaved,
+    ReturnStack,
+    ReturnValue,
+    Store,
     STRING_OPS,
+    StringOperation,
     WIDTHS,
     X87_CONSTANTS,
     X87_UNARY,
@@ -208,7 +222,11 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
 
 
 def write_operand(
-    state: SideState, ctx: Context, op: Operand, value: Value, obs: list
+    state: SideState,
+    ctx: Context,
+    op: Operand,
+    value: Value,
+    obs: list[Observation],
 ) -> None:
     match op:
         case Reg(name):
@@ -223,7 +241,7 @@ def write_operand(
                 return
             if ctx.trace is not None:
                 ctx.trace.append(("w", address, width, False))
-            obs.append(("store", address, size, value))
+            obs.append(Store(address, size, value))
         case St(index):
             state.x87.write(index, value)
         case _:
@@ -384,13 +402,17 @@ def _compare_width(op_a: Operand, op_b: Operand) -> int | str:
     return "unk"
 
 
-def _branch_obs_dest(ins: DecodedInstruction) -> object:
+def _branch_obs_dest(ins: DecodedInstruction) -> Hashable | None:
     """Proof identity of a direct transfer; never a relative displacement."""
     return ins.control_target
 
 
 def execute(
-    state: SideState, ctx: Context, idx: int, ins: DecodedInstruction, obs: list
+    state: SideState,
+    ctx: Context,
+    idx: int,
+    ins: DecodedInstruction,
+    obs: list[Observation],
 ) -> None:
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-branches,too-many-statements
@@ -535,7 +557,7 @@ def execute(
         else:
             if ctx.trace is not None:
                 ctx.trace.append(("w", new_esp, 4, "push"))
-            obs.append(("store", new_esp, "stack", value))
+            obs.append(Store(new_esp, "stack", value))
     elif mnemonic == "pop" and len(ops) == 1:
         esp = state.read_reg("esp")
         offset = frame_offset(state, ctx, esp, 4, slot=True)
@@ -571,21 +593,21 @@ def execute(
         ecx_argument, edx_argument = register_arguments(facts)
         target = _import_call(read_operand(state, ctx, ops[0]))
         virtual_target = _canonical_virtual_target(target, ctx)
-        entry = ["call", virtual_target or target]
+        arguments = []
         # A known virtual target is not proof that arguments agree. Always
         # observe the actual this/receiver (ecx). Include edx only when the
         # ABI says it is an argument — never merely because the call looked
         # virtual (edx often holds the vtable pointer, not an argument).
         if virtual_target is not None:
-            entry.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
+            arguments.append(receiver_equivalence_class(state.read_reg("ecx"), ctx))
             if facts is not None and facts.uses_edx:
-                entry.append(state.read_reg("edx"))
+                arguments.append(state.read_reg("edx"))
         else:
             if ecx_argument:
-                entry.append(state.read_reg("ecx"))
+                arguments.append(state.read_reg("ecx"))
             if edx_argument:
-                entry.append(state.read_reg("edx"))
-        obs.append(tuple(entry))
+                arguments.append(state.read_reg("edx"))
+        obs.append(Call(virtual_target or target, tuple(arguments)))
         incoming_esp = state.read_reg("esp")
         for reg in ("eax", "ecx", "edx"):
             state.write_reg(reg, ("callret", idx, reg))
@@ -596,44 +618,46 @@ def execute(
         state.carry = ("callcf", idx)
         state.x87 = X87Stack(epoch=idx + 1)
     elif mnemonic == "ret":
-        obs.append(("retstack", ins.operands, state.x87.state_key()[1:]))
+        obs.append(ReturnStack(ins.operands, state.x87.state_key()[1:]))
         # Externally observable machine state at return must match exactly:
         # the callee-saved registers, the stack pointer, and the return
         # value as determined by the function's return kind. Without
         # return-type metadata from the PDB, eax must match exactly.
         obs.append(
-            (
-                "retsaved",
-                tuple(state.regs[f] for f in ("b", "si", "di", "bp", "sp")),
-            )
+            ReturnSaved(tuple(state.regs[f] for f in ("b", "si", "di", "bp", "sp")))
         )
         kind = ctx.metadata.return_kind if ctx.metadata is not None else "unknown"
         if kind == "void":
             pass
         elif kind == "float":
-            obs.append(("retfpu", state.x87.read(0)))
+            obs.append(ReturnFpu(state.x87.read(0)))
         elif kind == "i8":
-            obs.append(("retval", state.read_reg("al")))
+            obs.append(ReturnValue((state.read_reg("al"),)))
         elif kind == "i16":
-            obs.append(("retval", state.read_reg("ax")))
+            obs.append(ReturnValue((state.read_reg("ax"),)))
         elif kind == "i64":
-            obs.append(("retval", state.read_reg("eax"), state.read_reg("edx")))
+            obs.append(ReturnValue((state.read_reg("eax"), state.read_reg("edx"))))
         elif state.x87.known:
             # x87 return value: st(0) must match; eax is scratch.
-            obs.append(("retfpu", state.x87.known[0]))
+            obs.append(ReturnFpu(state.x87.known[0]))
         else:
-            obs.append(("retval", state.read_reg("eax")))
+            obs.append(ReturnValue((state.read_reg("eax"),)))
     elif mnemonic in JCC_MNEMONICS and len(ops) == 1:
         pred = canon_condition(JCC_MNEMONICS[mnemonic], state)
-        obs.append(("branch", pred, _branch_obs_dest(ins)))
+        obs.append(Branch(pred, _branch_obs_dest(ins)))
     elif mnemonic == "jmp" and len(ops) == 1:
         if isinstance(ops[0], Mem):
-            obs.append(("jmpind", read_operand(state, ctx, ops[0])))
+            obs.append(IndirectJump(read_operand(state, ctx, ops[0])))
         else:
-            obs.append(("jmp", _branch_obs_dest(ins)))
+            obs.append(Jump(_branch_obs_dest(ins)))
     elif mnemonic in ("loop", "loope", "loopne", "jcxz", "jecxz") and len(ops) == 1:
         obs.append(
-            (mnemonic, state.read_reg("ecx"), state.flags, _branch_obs_dest(ins))
+            Loop(
+                LoopKind(mnemonic),
+                state.read_reg("ecx"),
+                state.flags,
+                _branch_obs_dest(ins),
+            )
         )
         if mnemonic.startswith("loop"):
             state.write_reg("ecx", ("loopdec", state.read_reg("ecx")))
@@ -655,13 +679,12 @@ def execute(
             maybe_frame_pointer(state.regs[family]) for family in ("si", "di")
         ):
             raise Reject  # it may read or write a promoted slot
-        key = (mnemonic, ins.prefix)
-        observed = [key]
-        for family in reads.split():
-            observed.append(state.regs[family])
+        observed = [state.regs[family] for family in reads.split()]
         if ins.prefix:
             observed.append(state.regs["c"])
-        obs.append(tuple(observed))
+        obs.append(
+            StringOperation(mnemonic, ins.prefix, tuple(observed), _writes_memory)
+        )
         for family in writes.split():
             state.regs[family] = ("strres", idx, family)
         if ins.prefix:
@@ -679,7 +702,10 @@ def execute(
 
 
 def execute_x87(
-    state: SideState, ctx: Context, ins: DecodedInstruction, obs: list
+    state: SideState,
+    ctx: Context,
+    ins: DecodedInstruction,
+    obs: list[Observation],
 ) -> None:
     # pylint: disable=too-many-branches,too-many-statements
     mnemonic = ins.mnemonic
@@ -757,7 +783,7 @@ def execute_x87(
     elif mnemonic == "fldcw" and len(ops) == 1:
         # Loading the control word affects rounding of subsequent operations;
         # the loaded value flows in via a checked channel only if it differs.
-        obs.append(("fldcw", read_operand(state, ctx, ops[0])))
+        obs.append(LoadControlWord(read_operand(state, ctx, ops[0])))
     elif mnemonic in ("fprem", "fscale"):
         x87.write(0, (mnemonic, x87.read(0), x87.read(1)))
     elif mnemonic in ("fpatan", "fyl2x"):

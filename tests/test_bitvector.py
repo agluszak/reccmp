@@ -1,7 +1,7 @@
 """Bit-vector equivalence of the verifier's symbolic values (z3)."""
 
 from reccmp.compare.asm.verifier import bitvector
-from reccmp.compare.asm.verifier.state import FunctionMetadata
+from reccmp.compare.asm.verifier.state import Call, FunctionMetadata, Store
 from tests.asm_rows import verify_effective_match
 
 EAX = ("init", "a")
@@ -80,15 +80,20 @@ def test_terms_it_cannot_lower_are_not_proven():
 
 
 def test_observations():
-    store = ("store", ("mem", "", ((ECX, 1),), 4, ()), "byte")
+    address = ("mem", "", ((ECX, 1),), 4, ())
     assert bitvector.entries_equal(
-        (*store, ("and", imm(1), ("l8", LOAD))), (*store, ("l8", ("and", imm(1), LOAD)))
+        Store(address, "byte", ("and", imm(1), ("l8", LOAD))),
+        Store(address, "byte", ("l8", ("and", imm(1), LOAD))),
     )
     # the address and width must be the same, not merely equivalent
-    other = ("store", ("mem", "", ((ECX, 1),), 8, ()), "byte")
-    assert not bitvector.entries_equal((*store, ("l8", LOAD)), (*other, ("l8", LOAD)))
+    other = ("mem", "", ((ECX, 1),), 8, ())
     assert not bitvector.entries_equal(
-        ("call", "f", EAX), ("call", "f", ("add", EAX, imm(0)))
+        Store(address, "byte", ("l8", LOAD)),
+        Store(other, "byte", ("l8", LOAD)),
+    )
+    assert not bitvector.entries_equal(
+        Call(("sym", "f"), (EAX,)),
+        Call(("sym", "f"), (("add", EAX, imm(0)),)),
     )
 
 

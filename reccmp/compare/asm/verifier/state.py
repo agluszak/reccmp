@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass, field
 from collections.abc import Hashable
-from typing import TYPE_CHECKING, Callable
+from enum import Enum
+from typing import TYPE_CHECKING, Callable, TypeAlias
 
 from reccmp.call_facts import CallFacts
 
@@ -15,6 +13,7 @@ from reccmp.compare.asm.model import (
     REGISTERS,
     Reject,
 )
+from reccmp.compare.asm.operand import Operand
 from reccmp.compare.asm.verifier.addresses import (
     Value,
     abs_stack_offset,
@@ -25,6 +24,7 @@ from reccmp.compare.asm.verifier.addresses import (
     unwind_spadd,
 )
 from reccmp.compare.diagnosis import AnalysisRecorder, EffectiveReason
+from reccmp.types import ImageId
 
 if TYPE_CHECKING:
     from reccmp.compare.callee_cleanup import CallStackEffect
@@ -249,6 +249,172 @@ def register_arguments(facts: CallFacts | None) -> tuple[bool, bool]:
     return (facts.uses_ecx is not False, facts.uses_edx is not False)
 
 
+class LoopKind(Enum):
+    LOOP = "loop"
+    LOOPE = "loope"
+    LOOPNE = "loopne"
+    JCXZ = "jcxz"
+    JECXZ = "jecxz"
+
+
+@dataclass(frozen=True, slots=True)
+class Store:
+    address: Value
+    size: str
+    value: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Call:
+    target: Value
+    arguments: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Branch:
+    predicate: Value
+    destination: Hashable | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndirectJump:
+    target: Value
+    selector: tuple = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Jump:
+    destination: Hashable | None
+
+
+@dataclass(frozen=True, slots=True)
+class Loop:
+    kind: LoopKind
+    counter: Value
+    flags: Value
+    destination: Hashable | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnValue:
+    values: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnFpu:
+    value: Value
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnStack:
+    operands: tuple[Operand, ...]
+    x87_state: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnSaved:
+    values: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameArguments:
+    values: tuple[tuple[int, int, Value], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class StringOperation:
+    mnemonic: str
+    prefix: str
+    values: tuple[Value, ...]
+    writes_memory: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LoadControlWord:
+    value: Value
+
+
+Observation: TypeAlias = (
+    Store
+    | Call
+    | Branch
+    | IndirectJump
+    | Jump
+    | Loop
+    | ReturnValue
+    | ReturnFpu
+    | ReturnStack
+    | ReturnSaved
+    | FrameArguments
+    | StringOperation
+    | LoadControlWord
+)
+ControlObservation: TypeAlias = Branch | IndirectJump | Jump | Loop
+
+
+def is_control_observation(observation: Observation) -> bool:
+    return isinstance(observation, (Branch, IndirectJump, Jump, Loop))
+
+
+def is_conditional_observation(observation: Observation) -> bool:
+    return isinstance(observation, (Branch, Loop))
+
+
+def observation_values(observation: Observation) -> tuple[Value, ...]:
+    values: tuple[Value, ...] = ()
+    match observation:
+        case Store(address, _, value):
+            values = (address, value)
+        case Call(target, arguments):
+            values = (target, *arguments)
+        case Branch(predicate, destination):
+            values = (
+                (predicate, destination)
+                if isinstance(destination, tuple)
+                else (predicate,)
+            )
+        case IndirectJump(target, selector):
+            values = (target, *selector)
+        case Jump(destination) if isinstance(destination, tuple):
+            values = (destination,)
+        case Loop(_, counter, flags, destination):
+            values = (counter, flags)
+            if isinstance(destination, tuple):
+                values = (*values, destination)
+        case ReturnValue(found) | ReturnSaved(found):
+            values = found
+        case ReturnFpu(value) | LoadControlWord(value):
+            values = (value,)
+        case FrameArguments(tuple() as arguments):
+            values = tuple(value for _, _, value in arguments)
+        case StringOperation(values=found):
+            values = found
+    return values
+
+
+@dataclass(slots=True)
+class CalleeSaveSubstitution:
+    orig_family: str
+    recomp_family: str
+    address: Value
+    valid: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class LoadObligation:
+    side: ImageId
+    address: Value
+    generation: int | Value
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchPush:
+    side: ImageId
+    offset: int
+    value: Value
+    tag: Value
+
+
 @dataclass
 class Context:
     # pylint: disable=too-many-instance-attributes
@@ -289,18 +455,15 @@ class Context:
     # When not None, every memory access performed by execute() is recorded
     # here as ("r"|"w", address value, width, is_stack_slot).
     trace: list | None = None
-    # Pending callee-save register substitutions: mutable records
-    # [orig family, recomp family, stack slot address, still_valid].
-    # A potentially aliasing write to the slot clears still_valid.
-    save_stack: list[list] = field(default_factory=list)
-    # Trap-parity obligations from one-sided memory reads: (other side's
-    # state, address value, memory generation). Discharged at the end of
-    # the verification scope against the other side's load_log.
-    load_obligations: list[tuple] = field(default_factory=list)
-    # Live one-sided spills: [side state, entry-sp offset, value, event
-    # tag]. Must be empty at every call: a pushed value still live at a
-    # call would be an argument the other side never passed.
-    scratch_pushes: list[list] = field(default_factory=list)
+    # Pending callee-save register substitutions. A potentially aliasing
+    # write to the slot marks the substitution invalid.
+    save_stack: list[CalleeSaveSubstitution] = field(default_factory=list)
+    # Trap-parity obligations from one-sided memory reads. Discharged at the
+    # end of the verification scope against the other side's load_log.
+    load_obligations: list[LoadObligation] = field(default_factory=list)
+    # Live one-sided spills. Must be empty at every call: a pushed value still
+    # live at a call would be an argument the other side never passed.
+    scratch_pushes: list[ScratchPush] = field(default_factory=list)
     # Which acceptance features fired, for debug/audit logging.
     categories: set[EffectiveReason] = field(default_factory=set)
     # PDB-derived return-type and callee-convention facts, if available.
@@ -401,35 +564,33 @@ def commit_clobber(ctx: Context, marker) -> None:
     ctx.gen = tag
 
 
-def commit_memory(ctx: Context, obs: list, marker) -> None:
+def commit_memory(ctx: Context, obs: list[Observation], marker) -> None:
     """Commit the memory effects of one verified instruction pair. Deferred
     until after both sides executed so that loads within the pair observe
     the same pre-instruction memory."""
     for k, entry in enumerate(obs):
-        kind = entry[0]
-        if kind == "store":
-            _, address, size, value = entry
-            width = 4 if size == "stack" else WIDTHS.get(size)
-            stack = "push" if size == "stack" else False
-            tag = ("mem", marker, k)
-            ctx.mem_events.append((tag, (address, width, stack)))
-            ctx.receiver_values[(address, width)] = (tag, value)
-            ctx.gen = tag
-            if frame_pointer_value(value):
-                ctx.stack_escaped = True
-        elif kind == "call":
-            if ctx.scratch_pushes:
-                # A one-sided spill still on the stack at a call would be
-                # an extra argument: not provably equivalent.
-                raise Reject
-            for argument in entry[2:]:
-                if frame_pointer_value(argument):
+        match entry:
+            case Store(address, size, value):
+                width = 4 if size == "stack" else WIDTHS.get(size)
+                stack = "push" if size == "stack" else False
+                tag = ("mem", marker, k)
+                ctx.mem_events.append((tag, (address, width, stack)))
+                ctx.receiver_values[(address, width)] = (tag, value)
+                ctx.gen = tag
+                if frame_pointer_value(value):
                     ctx.stack_escaped = True
-            commit_clobber(ctx, (marker, k))
-        elif isinstance(kind, tuple):
-            # String instruction: (mnemonic, prefix). Writers clobber; the
-            # data they copy was already committed by its original store.
-            if STRING_OPS.get(kind[0], ("", "", False))[2]:
+            case Call(arguments=arguments):
+                if ctx.scratch_pushes:
+                    # A one-sided spill still on the stack at a call would be
+                    # an extra argument: not provably equivalent.
+                    raise Reject
+                for argument in arguments:
+                    if frame_pointer_value(argument):
+                        ctx.stack_escaped = True
+                commit_clobber(ctx, (marker, k))
+            case StringOperation(writes_memory=True):
+                # Writers clobber; the data they copy was already committed
+                # by its original store.
                 commit_clobber(ctx, (marker, k))
 
 
@@ -490,12 +651,6 @@ STRING_OPS = {
     **{f"scas{s}": ("a di", "di", False) for s in "bwd"},
     **{f"cmps{s}": ("si di", "si di", False) for s in "bwd"},
 }
-
-
-# Observable tags of instructions that may transfer control locally.
-CONTROL_TAGS = frozenset(
-    {"branch", "jmp", "jmpind", "loop", "loope", "loopne", "jcxz", "jecxz"}
-)
 
 
 def clone_state(state: SideState) -> SideState:

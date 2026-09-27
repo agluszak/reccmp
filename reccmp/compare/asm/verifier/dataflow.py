@@ -3,16 +3,16 @@ entry states, their joins at merge points, and convergence checks."""
 
 from __future__ import annotations
 
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from reccmp.compare.asm.verifier.addresses import Value
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
 from reccmp.compare.asm.verifier.state import (
+    CalleeSaveSubstitution,
     FAMILIES,
+    LoadObligation,
+    ScratchPush,
     Context,
     SideState,
     clone_state,
@@ -51,65 +51,39 @@ class CfgState:
     matched_nodes: set[Value] = field(default_factory=set)
     matched_ids: set[int] = field(default_factory=set)
     keepalive: list = field(default_factory=list)
-    save_stack: list[list] = field(default_factory=list)
-    scratch_pushes: list[list] = field(default_factory=list)
-    load_obligations: list[tuple] = field(default_factory=list)
-
-
-def _remap_scratch(
-    records: list[list],
-    old_orig: SideState,
-    old_recomp: SideState,
-    new_orig: SideState,
-    new_recomp: SideState,
-) -> list[list]:
-    remapped = []
-    for record in records:
-        cloned = list(record)
-        if cloned and cloned[0] is old_orig:
-            cloned[0] = new_orig
-        elif cloned and cloned[0] is old_recomp:
-            cloned[0] = new_recomp
-        remapped.append(cloned)
-    return remapped
+    save_stack: list[CalleeSaveSubstitution] = field(default_factory=list)
+    scratch_pushes: list[ScratchPush] = field(default_factory=list)
+    load_obligations: list[LoadObligation] = field(default_factory=list)
 
 
 def _scratch_keys(state: CfgState) -> tuple:
-    keys = []
-    for record in state.scratch_pushes:
-        side = "orig" if record[0] is state.orig else "recomp"
-        keys.append((side, record[1], record[2], record[3]))
-    return tuple(keys)
-
-
-def _remap_obligations(
-    records: list[tuple],
-    old_orig: SideState,
-    old_recomp: SideState,
-    new_orig: SideState,
-    new_recomp: SideState,
-) -> list[tuple]:
-    remapped = []
-    for other, *rest in records:
-        if other is old_orig:
-            other = new_orig
-        elif other is old_recomp:
-            other = new_recomp
-        remapped.append((other, *rest))
-    return remapped
+    return tuple(
+        (record.side, record.offset, record.value, record.tag)
+        for record in state.scratch_pushes
+    )
 
 
 def _obligation_keys(state: CfgState) -> tuple:
-    keys = []
-    for record in state.load_obligations:
-        other = record[0]
-        side = "orig" if other is state.orig else "recomp"
-        keys.append((side, *record[1:]))
-    return tuple(sorted(keys, key=repr))
+    return tuple(
+        sorted(
+            (
+                (
+                    record.side,
+                    record.address,
+                    record.generation,
+                )
+                for record in state.load_obligations
+            ),
+            key=repr,
+        )
+    )
 
 
 def _save_keys(state: CfgState) -> tuple:
-    return tuple(tuple(record) for record in state.save_stack)
+    return tuple(
+        (record.orig_family, record.recomp_family, record.address, record.valid)
+        for record in state.save_stack
+    )
 
 
 def clone_cfg_state(state: CfgState) -> CfgState:
@@ -124,13 +98,9 @@ def clone_cfg_state(state: CfgState) -> CfgState:
         matched_nodes=set(state.matched_nodes),
         matched_ids={id(node) for node in state.matched_nodes},
         keepalive=list(state.matched_nodes),
-        save_stack=[list(record) for record in state.save_stack],
-        scratch_pushes=_remap_scratch(
-            state.scratch_pushes, state.orig, state.recomp, orig, recomp
-        ),
-        load_obligations=_remap_obligations(
-            state.load_obligations, state.orig, state.recomp, orig, recomp
-        ),
+        save_stack=[replace(record) for record in state.save_stack],
+        scratch_pushes=list(state.scratch_pushes),
+        load_obligations=list(state.load_obligations),
     )
 
 
@@ -140,8 +110,8 @@ def seed_context_from_cfg(ctx: Context, flow: CfgState) -> None:
     ctx.matched_nodes = set(flow.matched_nodes)
     ctx.matched_ids = {id(node) for node in flow.matched_nodes}
     ctx.keepalive = list(flow.matched_nodes)
-    ctx.save_stack = [list(record) for record in flow.save_stack]
-    ctx.scratch_pushes = [list(record) for record in flow.scratch_pushes]
+    ctx.save_stack = [replace(record) for record in flow.save_stack]
+    ctx.scratch_pushes = list(flow.scratch_pushes)
     ctx.load_obligations = list(flow.load_obligations)
 
 
@@ -155,8 +125,8 @@ def capture_cfg_state(orig: SideState, recomp: SideState, ctx: Context) -> CfgSt
         matched_nodes=set(ctx.matched_nodes),
         matched_ids={id(node) for node in ctx.matched_nodes},
         keepalive=list(ctx.matched_nodes),
-        save_stack=[list(record) for record in ctx.save_stack],
-        scratch_pushes=[list(record) for record in ctx.scratch_pushes],
+        save_stack=[replace(record) for record in ctx.save_stack],
+        scratch_pushes=list(ctx.scratch_pushes),
         load_obligations=list(ctx.load_obligations),
     )
 
@@ -350,17 +320,9 @@ def join_states(
             id(node) for node in (entry.matched_nodes | incoming.matched_nodes)
         },
         keepalive=list(entry.matched_nodes | incoming.matched_nodes),
-        save_stack=[list(record) for record in entry.save_stack],
-        scratch_pushes=_remap_scratch(
-            entry.scratch_pushes, entry.orig, entry.recomp, out_o, out_r
-        ),
-        load_obligations=_remap_obligations(
-            chosen_obl.load_obligations,
-            chosen_obl.orig,
-            chosen_obl.recomp,
-            out_o,
-            out_r,
-        ),
+        save_stack=[replace(record) for record in entry.save_stack],
+        scratch_pushes=list(entry.scratch_pushes),
+        load_obligations=list(chosen_obl.load_obligations),
     )
 
 
