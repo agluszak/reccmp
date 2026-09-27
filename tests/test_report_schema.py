@@ -39,12 +39,12 @@ def test_current_report_round_trip_keeps_type_and_varying_address():
 @pytest.mark.parametrize(
     "change",
     [
-        lambda report: report.update(format=1),
-        lambda report: report["data"][0].pop("type"),
-        lambda report: report["data"][0].pop("comparison"),
-        lambda report: report["data"][0].update(effective=True),
-        lambda report: report["data"][0].update(recomp="various"),
-        lambda report: report["data"][0].update(recomp_varies=True),
+        lambda payload: payload.update(format=1),
+        lambda payload: payload["data"][0].pop("type"),
+        lambda payload: payload["data"][0].pop("comparison"),
+        lambda payload: payload["data"][0].update(effective=True),
+        lambda payload: payload["data"][0].update(recomp="various"),
+        lambda payload: payload["data"][0].update(recomp_varies=True),
     ],
 )
 def test_old_or_ambiguous_report_facts_are_rejected(change):

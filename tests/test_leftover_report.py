@@ -16,7 +16,6 @@ from reccmp.source import keyed
 from reccmp.compare import Compare
 from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
-    DataRegion,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -396,7 +395,7 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         index_register="eax",
     )
     graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
-    assert graph.table_dests == ()
+    assert not graph.table_dests
 
 
 def test_first_class_jump_table_accepts_scale4_indexed_jmp():

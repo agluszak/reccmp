@@ -203,7 +203,7 @@ def test_switch_case_order_is_part_of_alias_identity(db: EntityDb) -> None:
         return FunctionImage(start, 11, ExtentKind.KNOWN, code, (table,))
 
     comparator = _comparator(db, bytes(11), bytes(11))
-    comparator._load_function_image = Mock(  # type: ignore[method-assign]
+    comparator._load_function_image = Mock(  # type: ignore[method-assign]  # pylint: disable=protected-access
         side_effect=[image(ORIG_BODY, False), image(RECOMP_BODY, True)]
     )
     assert not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, 11)
