@@ -6,7 +6,7 @@ from reccmp.call_facts import CallFacts
 from reccmp.cvdump.analysis import CvdumpNode
 from reccmp.cvdump.types import CvdumpTypesParser
 from reccmp.source import DeclarationKey, SourceIndex, SourceMarker, keyed
-from reccmp.source.index import SourceDeclaration
+from reccmp.source.records import SourceDeclaration
 from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
 from reccmp.compare.functions import (

@@ -14,7 +14,8 @@ from reccmp.source import (
     SourceIndexError,
     keyed,
 )
-from reccmp.source.index import SourceDeclaration, source_digest
+from reccmp.source.index import source_digest
+from reccmp.source.records import SourceDeclaration
 
 
 def _declaration(**fields) -> dict:

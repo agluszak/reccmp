@@ -22,14 +22,8 @@ from typing import Iterator, Mapping, Sequence
 import uuid
 
 from reccmp.parser.marker import ProjectAliases
-from .index import (
-    RecordPool,
-    SourceIndex,
-    SourceIndexError,
-    TranslationUnitRecords,
-    record_command,
-    relative_unit_id,
-)
+from .index import SourceIndex, record_command, relative_unit_id
+from .observations import RecordPool, SourceIndexError, TranslationUnitRecords
 
 logger = logging.getLogger(__name__)
 

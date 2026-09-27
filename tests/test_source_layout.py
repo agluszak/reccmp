@@ -24,13 +24,15 @@ from reccmp.source import (
 )
 from reccmp.source import SourceAbi, keyed
 from reccmp.source.index import (
+    _layout_identity,
+)
+from reccmp.source.records import (
     DeclarationKey,
     SourceComparison,
     SourceComparisonOperand,
     SourceDeclaration,
     SourceFunctionFacts,
     SourceMarker,
-    _layout_identity,
 )
 
 

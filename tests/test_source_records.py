@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from reccmp.source.index import SourceIndexError
+from reccmp.source.observations import SourceIndexError
 from reccmp.source import SourceCollector, SourceIndex, record_command
 
 DECLARATION = {
