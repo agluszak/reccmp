@@ -55,9 +55,65 @@ never gain exact proof from equal display text.
   declarations. This is a corpus-only input artifact, not a compatibility path
   in reccmp.
 
-## Publication follow-up
+## Publication
 
-The reccmp branch has not been pushed or opened as a PR. The Wizardry agent6
-change `wltkuuul` still pins `reccmp` to `6c3d6f53` with `[witness]`; update
-that pin only after this branch has a stable published revision, preserving
-that checkout's other active changes.
+The structured-identities work is on reccmp PR #42 at `71a79dec`. Wizardry
+agent6 pins that revision with `[witness]` in PR #693. Keep later function-image
+work separate until its corpus evidence and review are complete.
+
+## Function-image and graph continuation (2026-09-27)
+
+The continuation is on local branch
+`refactor/function-image-graph`, based on `71a79dec`.
+
+Commits on this branch:
+
+- `33207099`: `FunctionImage.instructions` contains only instructions;
+  jump tables and embedded data are separate and the renderer interleaves them.
+- `c70c24eb`: build one `FunctionGraph` from decoded code and tables; extent
+  closure and the product verifier read this graph.
+- `84adc0b2`: accept only current structured report format 2; remove the
+  format-1 importer, `udiff`, and legacy effective reconstruction.
+- `7ee6d0d3`: matched entities link original and recompiled side records
+  without merging their dictionaries.
+- `b50d1435`: entity catalog owns canonical original identities and project
+  equivalence groups.
+- `844e318b`: production assembly entry points use pure `decode_function()`;
+  the old mutable `ParseAsm.parse_asm()` API is gone.
+- `6faafa55`: external conditional graph edges keep their taken label, and
+  embedded-data differences block effective proof without hiding earlier
+  mismatch diagnostics.
+- `c0e595a4`: CRT startup and body-equivalence analysis use the same function
+  decoder instead of accessing `InstructGen` directly or decoding a body again.
+- `558be1d6`: compiler fact dataclasses live in `source/records.py` rather
+  than sharing a file with index orchestration and layout queries.
+
+Full Python suite: 1,387 passed, 221 skipped, 3 expected failures. Mypy and
+Pylint pass for the latest changed production modules. The Wizardry WIZ8
+corpus retained all 2,684 exact and 284 effective proofs against the pinned
+`71a79dec` baseline. The final decoder-migration run had exactly the same
+status and reason for all 6,098 entries as the preceding local run. Against
+the pinned baseline, 14 inconclusive entries became mismatch and 8 mismatches
+became inconclusive; those diagnosis changes remain under review. The web UI
+lints and builds; Playwright Chromium
+could not start because the browser executable is not installed locally.
+
+The positional CFG verifier cannot yet be removed: a product-only probe
+retained its successful proofs but lost branch-target diagnoses on 63 WIZ8
+functions when the product graph alignment failed. Lockstep, diff-aligned,
+and relocation strategies also have successful proofs the product strategy
+does not yet cover. Port those proof and diagnosis capabilities before
+deleting their implementations.
+
+Still open: make `InstructGen` private to function decoding and remove its
+section-shaped API; replace the separate extent and callee-cleanup walks with
+queries over the canonical graph where their evidence permits it; unify
+machine and semantic instruction effects; make the entity catalog genuinely
+immutable before constructing comparison context; continue splitting
+`source/index.py` by responsibility; finish typed diagnosis payloads; migrate test table
+markers away from `AsmRole`. Keep cvdump and Unicorn as separate input and
+execution engines.
+
+Approved disk cleanup removed about 32 GB of Imperialism Rust incremental
+artifacts and 124 MB of Wizardry temporary probe artifacts, without touching
+source checkouts or retail evidence.
