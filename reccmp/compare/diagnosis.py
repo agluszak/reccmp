@@ -186,7 +186,13 @@ class ComparisonDifference:
             raise ValueError(f"Unknown mismatch kind: {self.kind}")
 
 
-STRATEGIES = ("lockstep", "diff_aligned", "relocation", "isomorphic_cfg")
+STRATEGIES = (
+    "lockstep",
+    "diff_aligned",
+    "relocation",
+    "isomorphic_cfg",
+    "unanchored_product",
+)
 
 # Strategies whose instruction pairing is anchored by position or by matched
 # CFG blocks. The others pair instructions heuristically (diff opcodes,

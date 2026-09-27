@@ -174,11 +174,13 @@ def analyze_effective_match(
     # structure. Tolerates different instruction counts (folded loads,
     # elided copies) and the shifted branch displacements they cause.
     iso = new_recorder()
+    unanchored = new_recorder()
     if verify_isomorphic_cfg_effective_match(
         orig,
         recomp,
         metadata=metadata,
         recorder=iso,
+        unanchored=unanchored,
     ):
         logger.debug("effective match: isomorphic cfg")
         return finish_effective(iso.effective_reasons())
@@ -187,6 +189,8 @@ def analyze_effective_match(
     if relocated is not None:
         attempts.append(relocation.attempt("relocation"))
     attempts.append(iso.attempt("isomorphic_cfg"))
+    if unanchored.best_difference is not None or unanchored.inconclusive_reason:
+        attempts.append(unanchored.attempt("unanchored_product"))
 
     def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
         return dataclasses.replace(

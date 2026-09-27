@@ -301,6 +301,7 @@ def verify_isomorphic_cfg_effective_match(
     recomp_addrs=None,
     orig_tables=(),
     recomp_tables=(),
+    unanchored=None,
 ):
     from reccmp.compare.asm.verifier import (
         verify_isomorphic_cfg_effective_match as verify,
@@ -337,6 +338,7 @@ def verify_isomorphic_cfg_effective_match(
         fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
         metadata,
         recorder,
+        unanchored,
     )
 
 

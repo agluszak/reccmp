@@ -86,11 +86,11 @@ def test_clusters_group_the_same_shape_and_rank_the_useful_bucket_first():
 
 
 def test_non_isomorphic_graphs_cluster_by_where_the_product_stopped():
-    def blocked(address, stop):
+    def blocked(address, product):
         location = {
             "address": 0x401000,
             "image": "orig",
-            "facts": {"failure": "edge_roles", "product_stop": stop},
+            "facts": {"failure": "edge_roles"},
         }
         return {
             "address": address,
@@ -99,15 +99,26 @@ def test_non_isomorphic_graphs_cluster_by_where_the_product_stopped():
                 "status": "inconclusive",
                 "inconclusive_reason": "non_isomorphic_cfg",
                 "inconclusive_location": location,
-                "attempts": [{"strategy": "isomorphic_cfg", "location": location}],
+                "attempts": [
+                    {
+                        "strategy": "isomorphic_cfg",
+                        "blocker": "non_isomorphic_cfg",
+                        "location": location,
+                    },
+                    {"strategy": "unanchored_product", **product},
+                ],
             },
         }
 
+    alignment = {
+        "blocker": "alignment_failure",
+        "location": {"facts": {"stage": "block_alignment"}},
+    }
     clusters = triage.triage(
         [
-            blocked("0x1", "alignment_failure/block_alignment"),
-            blocked("0x2", "alignment_failure/block_alignment"),
-            blocked("0x3", "memory_address"),
+            blocked("0x1", alignment),
+            blocked("0x2", alignment),
+            blocked("0x3", {"difference": {"kind": "memory_address"}}),
         ]
     )
     assert [(cluster.key.detail, cluster.count) for cluster in clusters] == [

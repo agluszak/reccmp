@@ -355,12 +355,14 @@ def test_reject_divergent_branch_structure():
         orig_addrs=[0x1000, 0x1002, 0x1004, 0x1005],
         recomp_addrs=[0x2000, 0x2002, 0x2003, 0x2005],
     )
+    unanchored = AnalysisRecorder(recorder.orig_addrs, recorder.recomp_addrs)
     assert not verify_isomorphic_cfg_effective_match(
         orig,
         recomp,
         [None, 3, None, None],
         [None, None, 3, None],
         recorder=recorder,
+        unanchored=unanchored,
     )
     analysis = recorder.failure_analysis()
     assert analysis.inconclusive_reason == "non_isomorphic_cfg"
@@ -370,9 +372,10 @@ def test_reject_divergent_branch_structure():
     assert location.facts["orig_block_count"] == 3
     assert location.facts["recomp_block_count"] == 2
     # What the product found says where to look, without being the verdict.
-    assert location.facts["product_stop"] == "branch_condition"
-    assert location.facts["product_orig_address"] == 0x1002
-    assert location.facts["product_recomp_address"] == 0x2003
+    lead = unanchored.attempt("unanchored_product").difference
+    assert lead is not None and lead.kind == "branch_condition"
+    assert lead.orig.address == 0x1002
+    assert lead.recomp.address == 0x2003
 
 
 def test_a_branch_against_none_cannot_pair():

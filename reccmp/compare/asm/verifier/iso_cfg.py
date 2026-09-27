@@ -60,7 +60,7 @@ from reccmp.compare.asm.verifier.state import (
     commit_memory,
     guard_state_size,
 )
-from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 if TYPE_CHECKING:
     from reccmp.compare.callee_cleanup import CallStackEffect
@@ -71,6 +71,7 @@ def verify_isomorphic_cfg_effective_match(
     recomp: FunctionImage,
     metadata: FunctionMetadata | None = None,
     recorder: AnalysisRecorder | None = None,
+    unanchored: AnalysisRecorder | None = None,
 ) -> bool:
     """CFG verification that tolerates different instruction counts:
     per-side block graphs matched structurally, block contents aligned
@@ -80,6 +81,9 @@ def verify_isomorphic_cfg_effective_match(
 
     Recognized switch jump tables become ``caseN`` edges so isomorphic
     pairing compares entry count and case→block topology.
+
+    When the blocks do not pair one to one, ``recorder`` gets why, and
+    ``unanchored`` where the product stopped under its guessed pairing.
     """
     orig_rows, recomp_rows = orig.instructions, recomp.instructions
     cfg_o = build_side_cfg(orig, recorder=recorder, side="orig")
@@ -93,11 +97,12 @@ def verify_isomorphic_cfg_effective_match(
     # pairs where the graphs differ is a guess: enough to prove the two
     # equal, but a difference found under it may be the guess's own (a
     # redundant test on one side paired with the other's next branch). Such
-    # a failure reports why the blocks do not pair one to one instead.
+    # a failure reports why the blocks do not pair one to one, and the
+    # difference goes to ``unanchored``: a lead, not a verdict.
     anchored = pair_cfg_blocks(cfg_o, cfg_r) is not None
     product_recorder = recorder
     if recorder is not None and not anchored:
-        product_recorder = AnalysisRecorder(*addrs)
+        product_recorder = unanchored or AnalysisRecorder(*addrs)
     proved = _verify_product(
         cfg_o, cfg_r, orig_rows, recomp_rows, metadata, product_recorder
     )
@@ -118,13 +123,7 @@ def verify_isomorphic_cfg_effective_match(
         if proved:
             recorder.reasons |= product_recorder.reasons
         else:
-            pair_cfg_blocks(
-                cfg_o,
-                cfg_r,
-                recorder,
-                _product_stop(product_recorder),
-                (orig_rows, recomp_rows),
-            )
+            pair_cfg_blocks(cfg_o, cfg_r, recorder, (orig_rows, recomp_rows))
     return proved
 
 
@@ -621,33 +620,6 @@ def _inverted_branch(
         return False
     obs_r[branch_r] = ("branch", inverted, *obs_r[branch_r][2:])
     return True
-
-
-def _product_stop(recorder: AnalysisRecorder) -> dict[str, FactValue]:
-    """Where and why the product stopped, as facts of the failure it does
-    not report: a difference's kind, or a blocker with its stage."""
-    difference = recorder.best_difference
-    if difference is not None:
-        return {
-            "product_stop": difference.kind,
-            "product_orig_address": difference.orig.address,
-            "product_recomp_address": difference.recomp.address,
-        }
-    stop = recorder.inconclusive_reason or "analysis_limit"
-    location = recorder.inconclusive_location
-    if location is None:
-        return {"product_stop": stop}
-    detail = location.facts.get("stage") or location.facts.get("failure")
-    recomp_address = (
-        location.facts.get("recomp_address")
-        if location.image == "orig"
-        else location.address
-    )
-    return {
-        "product_stop": f"{stop}/{detail}" if detail else stop,
-        "product_orig_address": location.address if location.image == "orig" else None,
-        "product_recomp_address": recomp_address,
-    }
 
 
 def _dp_line(row: DecodedInstruction, promote: bool) -> DpLine:

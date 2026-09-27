@@ -140,10 +140,21 @@ def _detail(comparison: Mapping[str, Any]) -> str:
         details.append("field facts")
     if "source_comparisons" in recomp:
         details.append("source comparisons")
-    location = (comparison.get("inconclusive_location") or {}).get("facts") or {}
-    if "product_stop" in location:
-        details.append(f"product: {location['product_stop']}")
+    for attempt in comparison.get("attempts") or ():
+        if attempt.get("strategy") == "unanchored_product":
+            details.append(f"product: {_stop(attempt)}")
     return ", ".join(details)
+
+
+def _stop(attempt: Mapping[str, Any]) -> str:
+    """Where an attempt stopped: its difference's kind, or its blocker and
+    the blocker's stage."""
+    if attempt.get("difference"):
+        return str(attempt["difference"].get("kind"))
+    facts = (attempt.get("location") or {}).get("facts") or {}
+    stage = facts.get("stage") or facts.get("failure")
+    blocker = attempt.get("blocker")
+    return f"{blocker}/{stage}" if stage else str(blocker)
 
 
 def triage_key(

@@ -14,7 +14,7 @@ from reccmp.compare.asm.ir import (
 )
 from reccmp.compare.asm.verifier.evidence import target_facts
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
-from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
+from reccmp.compare.diagnosis import AnalysisRecorder
 
 # Each side's basic-block graph is built independently; blocks pair by
 # control-flow structure, so branch targets compare as matched blocks, not
@@ -354,16 +354,14 @@ def pair_cfg_blocks(
     cfg_o: _SideCfg,
     cfg_r: _SideCfg,
     recorder: AnalysisRecorder | None = None,
-    facts: dict[str, FactValue] | None = None,
     rows: tuple[Sequence[DecodedInstruction], Sequence[DecodedInstruction]] = ((), ()),
 ) -> list[tuple[int, int]] | None:
     """Match the two sides' reachable blocks into a structural bijection,
     starting from the entry blocks and following same-role edges. Returns
     the matched pairs in discovery order, or None if the reachable graphs
-    are not isomorphic; ``facts`` join the ones recorded then. With the
+    are not isomorphic. With the
     ``rows``, a branch whose same-role edges reach blocks paired elsewhere
     is recorded as a branch-target difference."""
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
     map_o: dict[int, int] = {}
     map_r: dict[int, int] = {}
     order: list[tuple[int, int]] = []
@@ -393,7 +391,6 @@ def pair_cfg_blocks(
                     orig_index=cfg_o.starts[block_o],
                     recomp_index=cfg_r.starts[block_r],
                     facts={
-                        **(facts or {}),
                         "failure": "block_mapping_conflict",
                         "orig_block_count": len(cfg_o.starts),
                         "recomp_block_count": len(cfg_r.starts),
@@ -415,7 +412,6 @@ def pair_cfg_blocks(
                     orig_index=cfg_o.starts[block_o],
                     recomp_index=cfg_r.starts[block_r],
                     facts={
-                        **(facts or {}),
                         "failure": "edge_roles",
                         "orig_block_count": len(cfg_o.starts),
                         "recomp_block_count": len(cfg_r.starts),
@@ -433,7 +429,6 @@ def pair_cfg_blocks(
                         orig_index=cfg_o.starts[block_o],
                         recomp_index=cfg_r.starts[block_r],
                         facts={
-                            **(facts or {}),
                             "failure": "external_edge",
                             "edge_role": role,
                             "orig_external": to_o == "external",
