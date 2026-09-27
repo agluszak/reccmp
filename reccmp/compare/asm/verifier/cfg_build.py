@@ -12,20 +12,13 @@ from reccmp.compare.asm.ir import (
     FunctionImage,
     instruction_semantic_key,
 )
+from reccmp.compare.asm.verifier.evidence import target_facts
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
 from reccmp.compare.diagnosis import AnalysisRecorder, FactValue
 
-# ---------------------------------------------------------------------------
-# Isomorphic-CFG verification (structure-matched, alignment-free)
-#
-# The positional CFG verifier above requires the two sequences to have equal
-# length and identical line-index branch structure. Register-allocation
-# entropy breaks both: a folded load or an elided register copy shifts every
-# following line and every crossing branch displacement. This verifier
-# instead builds each side's basic-block graph independently, pairs blocks
-# by control-flow structure (so branch targets compare as matched blocks,
-# not displacement text), aligns each block pair's instructions locally,
-# and runs the same paired symbolic execution with dataflow joins.
+# Each side's basic-block graph is built independently; blocks pair by
+# control-flow structure, so branch targets compare as matched blocks, not
+# as displacements or instruction positions.
 
 
 _LOOPS = frozenset({"loop", "loope", "loopne", "jcxz", "jecxz"})
@@ -362,35 +355,52 @@ def pair_cfg_blocks(
     cfg_r: _SideCfg,
     recorder: AnalysisRecorder | None = None,
     facts: dict[str, FactValue] | None = None,
+    rows: tuple[Sequence[DecodedInstruction], Sequence[DecodedInstruction]] = ((), ()),
 ) -> list[tuple[int, int]] | None:
     """Match the two sides' reachable blocks into a structural bijection,
     starting from the entry blocks and following same-role edges. Returns
     the matched pairs in discovery order, or None if the reachable graphs
-    are not isomorphic; ``facts`` join the ones recorded then."""
+    are not isomorphic; ``facts`` join the ones recorded then. With the
+    ``rows``, a branch whose same-role edges reach blocks paired elsewhere
+    is recorded as a branch-target difference."""
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     map_o: dict[int, int] = {}
     map_r: dict[int, int] = {}
     order: list[tuple[int, int]] = []
-    queue: list[tuple[int, int]] = [(0, 0)]
+    # (orig block, recomp block, the paired blocks and role that reach them)
+    queue: list[tuple[int, int, tuple[int, int, str] | None]] = [(0, 0, None)]
     while queue:
-        block_o, block_r = queue.pop()
+        block_o, block_r, edge = queue.pop()
         seen_o = block_o in map_o
         seen_r = block_r in map_r
         if seen_o or seen_r:
             if map_o.get(block_o) != block_r or map_r.get(block_r) != block_o:
-                if recorder is not None:
-                    recorder.mark_inconclusive(
-                        "non_isomorphic_cfg",
-                        orig_index=cfg_o.starts[block_o],
-                        recomp_index=cfg_r.starts[block_r],
-                        facts={
-                            **(facts or {}),
-                            "failure": "block_mapping_conflict",
-                            "orig_block_count": len(cfg_o.starts),
-                            "recomp_block_count": len(cfg_r.starts),
-                            "orig_block": block_o,
-                            "recomp_block": block_r,
-                        },
+                if recorder is None:
+                    return None
+                if edge is not None and edge[2] != "fall" and all(rows):
+                    branch_o = cfg_o.ends[edge[0]] - 1
+                    branch_r = cfg_r.ends[edge[1]] - 1
+                    recorder.record_difference(
+                        "branch_target",
+                        branch_o,
+                        branch_r,
+                        target_facts(rows[0][branch_o], cfg_o.starts[block_o]),
+                        target_facts(rows[1][branch_r], cfg_r.starts[block_r]),
                     )
+                    return None
+                recorder.mark_inconclusive(
+                    "non_isomorphic_cfg",
+                    orig_index=cfg_o.starts[block_o],
+                    recomp_index=cfg_r.starts[block_r],
+                    facts={
+                        **(facts or {}),
+                        "failure": "block_mapping_conflict",
+                        "orig_block_count": len(cfg_o.starts),
+                        "recomp_block_count": len(cfg_r.starts),
+                        "orig_block": block_o,
+                        "recomp_block": block_r,
+                    },
+                )
                 return None
             continue
         map_o[block_o] = block_r
@@ -435,5 +445,5 @@ def pair_cfg_blocks(
                 return None
             if to_o != "external":
                 assert isinstance(to_o, int) and isinstance(to_r, int)
-                queue.append((to_o, to_r))
+                queue.append((to_o, to_r, (block_o, block_r, role)))
     return order

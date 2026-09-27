@@ -426,18 +426,3 @@ def local_destination_keys(
             return None
         keys.append(item)
     return tuple(keys)
-
-
-def local_branch_targets(rows: Sequence[DecodedInstruction]) -> list[int | None]:
-    """Each row's local branch destination, as the index of the row it
-    reaches; None for a row that is not a jump inside the rows (calls are
-    not local control flow)."""
-    index_of = {row.address: i for i, row in enumerate(rows) if row.address is not None}
-    return [
-        (
-            index_of.get(row.branch_target)
-            if row.branch_target is not None and not row.is_call
-            else None
-        )
-        for row in rows
-    ]

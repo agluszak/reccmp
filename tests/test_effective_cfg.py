@@ -11,7 +11,7 @@ from tests.asm_rows import rows
 from tests.asm_rows import (
     verify_effective_match,
     analyze_effective_match,
-    verify_cfg_effective_match,
+    verify_isomorphic_cfg_effective_match,
 )
 
 
@@ -36,7 +36,10 @@ def test_cfg_rename_live_across_branch():
     targets = [None, None, 4, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_cfg_commutative_x87_across_branch():
@@ -62,7 +65,10 @@ def test_cfg_commutative_x87_across_branch():
     targets = [None, None, 4, None, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_cfg_rejects_divergent_branch_arm():
@@ -84,7 +90,9 @@ def test_cfg_rejects_divergent_branch_arm():
         "ret",
     ]
     targets = [None, 4, None, 5, None, None]
-    assert verify_cfg_effective_match(orig, recomp, targets, targets) is False
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets) is False
+    )
 
 
 def test_cfg_rejects_divergence_reaching_join():
@@ -109,7 +117,10 @@ def test_cfg_rejects_divergence_reaching_join():
     ]
     targets = [None, 4, None, 5, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is False
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is False
+    )
 
 
 def test_cfg_accepts_identical_diamond():
@@ -125,7 +136,10 @@ def test_cfg_accepts_identical_diamond():
     targets = [None, 4, None, 5, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
     assert (
-        verify_cfg_effective_match(orig, list(orig), targets, targets, metadata) is True
+        verify_isomorphic_cfg_effective_match(
+            orig, list(orig), targets, targets, metadata
+        )
+        is True
     )
 
 
@@ -156,7 +170,10 @@ def test_cfg_virtual_call_receiver_phi_uses_equivalent_inputs():
     ]
     targets = [None, 4, None, 5, None, None, None, None, None]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_cfg_rejects_structural_difference():
@@ -164,7 +181,7 @@ def test_cfg_rejects_structural_difference():
     orig = ["cmp ecx, 0", "je 0x4", "inc edx", "inc edx", "ret"]
     recomp = ["cmp ecx, 0", "je 0x4", "inc edx", "inc edx", "ret"]
     assert (
-        verify_cfg_effective_match(
+        verify_isomorphic_cfg_effective_match(
             orig, recomp, [None, 3, None, None, None], [None, 4, None, None, None]
         )
         is False
@@ -177,7 +194,10 @@ def test_cfg_canonicalizes_branch_displacements():
     recomp = ["cmp ecx, 0", "je 0x20", "inc edx", "ret"]
     targets = [None, 3, None, None]
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_analysis_uses_structured_branch_targets():
@@ -234,7 +254,10 @@ def test_cfg_loop_with_identical_body():
     targets = [None, None, None, 1, None, None]
     metadata = FunctionMetadata(return_kind="void")
     assert (
-        verify_cfg_effective_match(orig, list(orig), targets, targets, metadata) is True
+        verify_isomorphic_cfg_effective_match(
+            orig, list(orig), targets, targets, metadata
+        )
+        is True
     )
 
 
@@ -249,7 +272,9 @@ def test_cfg_rejects_computed_jump_with_divergence():
         "jmp dword ptr [ecx*4 + <OFFSET1>]",
     ]
     targets: list[int | None] = [None, None]
-    assert verify_cfg_effective_match(orig, recomp, targets, targets) is False
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets) is False
+    )
 
 
 def test_cfg_rejects_divergent_state_at_external_jump():
@@ -257,7 +282,9 @@ def test_cfg_rejects_divergent_state_at_external_jump():
     orig = ["mov ebx, 1", "jmp target (FUNCTION)"]
     recomp = ["mov ebx, 2", "jmp target (FUNCTION)"]
     targets: list[int | None] = [None, None]
-    assert verify_cfg_effective_match(orig, recomp, targets, targets) is False
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets) is False
+    )
 
 
 def test_cfg_rejects_divergent_state_on_external_conditional_edge():
@@ -278,4 +305,7 @@ def test_cfg_rejects_divergent_state_on_external_conditional_edge():
     ]
     targets: list[int | None] = [None] * len(orig)
     metadata = FunctionMetadata(return_kind="void")
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is False
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is False
+    )

@@ -27,12 +27,11 @@ whole function is rejected (not an effective match).
 
 Layers, each importing only from the ones above it: addresses, state,
 evidence, semantics, obligations; relocation, cfg_build, block_align and
-dataflow support the strategies lockstep, cfg and iso_cfg; analysis runs
+dataflow support the strategies lockstep and iso_cfg; analysis runs
 the strategies in turn and picks what to report.
 """
 
 from .analysis import analyze_effective_match, compare_exact
-from .cfg import verify_cfg_effective_match
 from .iso_cfg import verify_isomorphic_cfg_effective_match
 from .lockstep import verify_effective_match
 from .state import CallFacts, FunctionMetadata
@@ -42,7 +41,6 @@ __all__ = [
     "FunctionMetadata",
     "analyze_effective_match",
     "compare_exact",
-    "verify_cfg_effective_match",
     "verify_effective_match",
     "verify_isomorphic_cfg_effective_match",
 ]

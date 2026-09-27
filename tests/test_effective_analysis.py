@@ -729,3 +729,11 @@ def test_relocate_rejects_esp_read_across_push():
     load, push = "8b4424fc", "51"  # mov eax, [esp - 4]; push ecx
     tail = "50" + _CALL_GLOBAL + "c3"  # push eax; call; ret
     assert not _relocation_match(load + push + tail, push + load + tail)
+
+
+def test_diff_codes_must_cover_every_row():
+    """Opcodes that leave rows unpaired prove nothing about those rows."""
+    orig = decode_function(bytes.fromhex("b801000000c3"), 0x1000).instructions
+    recomp = decode_function(bytes.fromhex("b802000000c3"), 0x2000).instructions
+    assert not verify_effective_match(orig, recomp, [])
+    assert not verify_effective_match(orig, recomp, [("equal", 1, 2, 1, 2)])

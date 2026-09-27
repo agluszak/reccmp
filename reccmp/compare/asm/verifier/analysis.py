@@ -12,7 +12,6 @@ from reccmp.compare.asm.ir import (
     control_flow_topology_keys,
     instruction_semantic_key,
 )
-from reccmp.compare.asm.verifier.cfg import verify_cfg_effective_match
 from reccmp.compare.asm.verifier.iso_cfg import verify_isomorphic_cfg_effective_match
 from reccmp.compare.asm.verifier.lockstep import verify_effective_match
 from reccmp.compare.asm.verifier.relocation import undo_relocations
@@ -171,14 +170,6 @@ def analyze_effective_match(
         logger.debug("effective match: instruction relocation")
         return finish_effective(relocation.effective_reasons({"instruction_reorder"}))
 
-    # CFG-aware verification with the lines paired by position.
-    cfg = new_recorder()
-    if verify_cfg_effective_match(
-        trimmed_orig, trimmed_recomp, metadata=metadata, recorder=cfg
-    ):
-        logger.debug("effective match: cfg")
-        return finish_effective(cfg.effective_reasons({"padding"} if padding else ()))
-
     # Isomorphic-CFG verification: per-side block graphs matched by
     # structure. Tolerates different instruction counts (folded loads,
     # elided copies) and the shifted branch displacements they cause.
@@ -195,7 +186,6 @@ def analyze_effective_match(
     attempts = [lockstep.attempt("lockstep"), diff_aligned.attempt("diff_aligned")]
     if relocated is not None:
         attempts.append(relocation.attempt("relocation"))
-    attempts.append(cfg.attempt("cfg"))
     attempts.append(iso.attempt("isomorphic_cfg"))
 
     def failed(recorder: AnalysisRecorder) -> ComparisonAnalysis:
@@ -203,25 +193,25 @@ def analyze_effective_match(
             recorder.failure_analysis(), attempts=tuple(attempts)
         )
 
-    # Only positional lockstep and the two CFG strategies establish trusted
+    # Only positional lockstep and the product CFG pairing establish trusted
     # program points. Diff alignment and relocation are proof-only. Of
     # those, report an observed difference (a value, store or control
     # transfer that differs) before an operand candidate, and the product
-    # pairing's, which follows both layouts, before the positional ones',
-    # which also stop at a mere layout difference.
-    trusted = (iso, lockstep, cfg)
+    # pairing's, which follows both layouts, before lockstep's, which also
+    # stops at a mere layout difference.
+    trusted = (iso, lockstep)
     for recorder in trusted:
         if recorder.difference is not None:
             return failed(recorder)
     for recorder in trusted:
         if recorder.best_difference is not None:
             return failed(recorder)
-    for candidate in (iso, cfg, lockstep):
+    for candidate in (iso, lockstep):
         if candidate.inconclusive_reason is not None:
             inconclusive = candidate
             break
     else:
-        inconclusive = cfg
+        inconclusive = lockstep
     analysis = failed(inconclusive)
     assert analysis.status == ComparisonStatus.INCONCLUSIVE
     return analysis

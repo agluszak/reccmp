@@ -118,7 +118,13 @@ def verify_isomorphic_cfg_effective_match(
         if proved:
             recorder.reasons |= product_recorder.reasons
         else:
-            pair_cfg_blocks(cfg_o, cfg_r, recorder, _product_stop(product_recorder))
+            pair_cfg_blocks(
+                cfg_o,
+                cfg_r,
+                recorder,
+                _product_stop(product_recorder),
+                (orig_rows, recomp_rows),
+            )
     return proved
 
 

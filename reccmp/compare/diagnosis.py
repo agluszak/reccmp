@@ -186,13 +186,13 @@ class ComparisonDifference:
             raise ValueError(f"Unknown mismatch kind: {self.kind}")
 
 
-STRATEGIES = ("lockstep", "diff_aligned", "relocation", "cfg", "isomorphic_cfg")
+STRATEGIES = ("lockstep", "diff_aligned", "relocation", "isomorphic_cfg")
 
 # Strategies whose instruction pairing is anchored by position or by matched
 # CFG blocks. The others pair instructions heuristically (diff opcodes,
 # undone relocations), so a difference they report may be an artifact of the
 # pairing rather than of the code.
-TRUSTED_ALIGNMENT_STRATEGIES = frozenset({"lockstep", "cfg", "isomorphic_cfg"})
+TRUSTED_ALIGNMENT_STRATEGIES = frozenset({"lockstep", "isomorphic_cfg"})
 
 
 @dataclass(frozen=True)

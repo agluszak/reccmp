@@ -233,7 +233,8 @@ def aligned_indices(
     """Pair up the two sequences (by index) for lockstep verification.
     Without diff opcodes, the sequences must have equal length. With them,
     unmatched insertions/deletions become one-sided entries, which the
-    verifier only accepts for whitelisted unobservable instructions."""
+    verifier only accepts for whitelisted unobservable instructions. None
+    unless every row of both sequences is visited once, in order."""
     if codes is None:
         if orig_len != recomp_len:
             return None
@@ -249,6 +250,10 @@ def aligned_indices(
             result.extend((i, None) for i in range(i1, i2))
         elif tag == "insert":
             result.extend((None, j) for j in range(j1, j2))
+    orig_order = [i for i, _ in result if i is not None]
+    recomp_order = [j for _, j in result if j is not None]
+    if orig_order != list(range(orig_len)) or recomp_order != list(range(recomp_len)):
+        return None
     return result
 
 

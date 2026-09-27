@@ -29,13 +29,15 @@ from reccmp.compare.asm.verifier.dataflow import (
     CfgState,
     join_states,
 )
+from reccmp.compare.asm.verifier.iso_cfg import (
+    verify_isomorphic_cfg_effective_match as verify_isomorphic_cfg_effective_match_images,
+)
 from reccmp.compare.asm.verifier.state import SideState
 from reccmp.compare.diagnosis import AnalysisRecorder, ComparisonStatus
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from tests.asm_rows import (
     image_from_bytes,
     verify_effective_match,
-    verify_cfg_effective_match,
     verify_isomorphic_cfg_effective_match,
 )
 
@@ -748,7 +750,10 @@ def test_test_self_equals_cmp_zero():
     metadata = FunctionMetadata(return_kind="void")
     assert verify_effective_match(orig, recomp, metadata=metadata) is False
     targets = [None, None, 4, None, None]
-    assert verify_cfg_effective_match(orig, recomp, targets, targets, metadata) is True
+    assert (
+        verify_isomorphic_cfg_effective_match(orig, recomp, targets, targets, metadata)
+        is True
+    )
 
 
 def test_test_self_equals_cmp_zeroed_register():
@@ -1203,3 +1208,25 @@ def test_cfg_join_rejects_uncorrelated_trap_parity():
     fall = CfgState(fall_o, fall_r, gen, load_obligations=[(fall_r, addr, gen)])
     taken = CfgState(taken_o, taken_r, gen, load_obligations=[(taken_o, addr, gen)])
     assert join_states(fall, taken, 0) is None
+
+
+def test_block_pairing_conflict_is_a_branch_target_difference():
+    """The taken edge reaches the join block on one side and another
+    return block on the other: the pairing conflict is reported at the
+    branch."""
+    # test eax, eax; je; jmp +0; mov eax, 1; ret; mov eax, 2; ret
+    orig = image_from_bytes(bytes.fromhex("85c07402eb00b801000000c3b802000000c3"))
+    recomp = image_from_bytes(
+        bytes.fromhex("85c07408eb00b801000000c3b802000000c3"), 0x2000
+    )
+    recorder = AnalysisRecorder(
+        [row.address for row in orig.instructions],
+        [row.address for row in recomp.instructions],
+    )
+    assert not verify_isomorphic_cfg_effective_match_images(
+        orig, recomp, recorder=recorder
+    )
+    assert recorder.difference is not None
+    assert recorder.difference.kind == "branch_target"
+    assert recorder.difference.orig.facts["target_instruction_index"] == 3
+    assert recorder.difference.recomp.facts["target_instruction_index"] == 5

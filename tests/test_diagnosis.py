@@ -315,7 +315,7 @@ def test_unsupported_instruction_is_inconclusive():
     by_strategy = {attempt.strategy: attempt for attempt in result.attempts}
     assert by_strategy["lockstep"].blocker == "unsupported_instruction"
     assert by_strategy["lockstep"].location.instruction_index == 0
-    assert by_strategy["cfg"].blocker == "unsupported_instruction"
+    assert by_strategy["isomorphic_cfg"].blocker == "unsupported_instruction"
 
 
 def test_mismatch_keeps_every_strategy_attempt():
@@ -324,7 +324,6 @@ def test_mismatch_keeps_every_strategy_attempt():
     assert [attempt.strategy for attempt in result.attempts] == [
         "lockstep",
         "diff_aligned",
-        "cfg",
         "isomorphic_cfg",
     ]
     lockstep = result.attempts[0]
@@ -338,13 +337,13 @@ def test_proven_results_carry_no_attempts():
     with pytest.raises(ValueError):
         ComparisonAnalysis(
             ComparisonStatus.EXACT,
-            attempts=(StrategyAttempt("cfg", blocker="missing_metadata"),),
+            attempts=(StrategyAttempt("lockstep", blocker="missing_metadata"),),
         )
 
 
 def test_attempt_has_exactly_one_outcome():
     with pytest.raises(ValueError):
-        StrategyAttempt("cfg")
+        StrategyAttempt("lockstep")
     with pytest.raises(ValueError):
         StrategyAttempt("unknown", blocker="analysis_limit")
 

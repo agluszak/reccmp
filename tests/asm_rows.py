@@ -202,28 +202,6 @@ def verify_effective_match(
     )
 
 
-def verify_cfg_effective_match(
-    orig, recomp, orig_targets=(), recomp_targets=(), metadata=None, recorder=None
-):
-    from reccmp.compare.asm.verifier import verify_cfg_effective_match as verify
-
-    return verify(
-        as_rows(
-            orig,
-            targets=orig_targets or None,
-            addresses=recorder.orig_addrs if recorder is not None else None,
-        ),
-        as_rows(
-            recomp,
-            targets=recomp_targets or None,
-            start=0x2000,
-            addresses=recorder.recomp_addrs if recorder is not None else None,
-        ),
-        metadata,
-        recorder,
-    )
-
-
 def verify_isomorphic_cfg_effective_match(
     orig,
     recomp,
