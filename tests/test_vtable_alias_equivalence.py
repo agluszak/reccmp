@@ -183,6 +183,4 @@ def test_equal_displays_with_different_branch_destinations_are_not_alias_equival
     orig = b"\x74\x06" + add3 + add3 + add6 + b"\xc3"
     recomp = b"\x74\x06" + add6 + add3 + add3 + b"\xc3"
     comparator = _comparator(db, orig, recomp)
-    assert comparator.orig_sanitize.parse_asm(
-        orig, ORIG_BODY
-    ) and not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))
+    assert not comparator.raw_pair_alias_equivalent(ORIG_BODY, RECOMP_BODY, len(orig))

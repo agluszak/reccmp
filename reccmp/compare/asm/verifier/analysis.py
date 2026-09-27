@@ -64,15 +64,18 @@ def analyze_effective_match(
     verifier can prove."""
     coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
     extent_closed = orig.extent_closed and recomp.extent_closed
-    orig_rows, recomp_rows = orig.excerpt, recomp.excerpt
+    orig_rows, recomp_rows = orig.instructions, recomp.instructions
     exact = admit_exact_analysis(
         bytes_equal=(
             orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
         ),
         topology_equal=local_branch_targets(orig_rows)
         == local_branch_targets(recomp_rows),
-        keys_equal=[instruction_semantic_key(row) for row in orig_rows]
-        == [instruction_semantic_key(row) for row in recomp_rows],
+        keys_equal=(
+            [instruction_semantic_key(row) for row in orig_rows]
+            == [instruction_semantic_key(row) for row in recomp_rows]
+            and orig.data_shape == recomp.data_shape
+        ),
         operands_complete=all(
             row.operand_model_complete for row in (*orig_rows, *recomp_rows)
         ),

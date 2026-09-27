@@ -1,4 +1,7 @@
 from reccmp.compare.asm.instgen import CodeSection, InstructGen, SectionType
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.render import render_function_rows
+from reccmp.compare.asm.verifier.cfg_build import build_side_cfg
 
 
 def test_ret():
@@ -53,6 +56,23 @@ def test_score_notify():
     assert len(ig.sections[1].contents) == 6
 
     # TODO: The data table at the end includes all of the 0xCC padding bytes.
+
+
+def test_decoded_image_keeps_tables_out_of_instructions():
+    start = 0x10001410
+    image = decode_function(SCORE_NOTIFY, start)
+    assert all(row.is_code for row in image.instructions)
+    assert len(image.jump_tables) == 1
+    assert len(image.data_regions) == 1
+    region = image.data_regions[0]
+    assert region.address == 0x100014EC
+    assert region.data == SCORE_NOTIFY[region.address - start :]
+    cfg = build_side_cfg(image.instructions, image.jump_tables)
+    assert cfg is not None and cfg.table_dests
+    rendered = render_function_rows(image)
+    assert sum(row.display == "Jump table:" for row in rendered) == 1
+    assert sum(row.display == "Data table:" for row in rendered) == 1
+    assert len(rendered) > len(image.instructions)
 
 
 SMACK_CASE = (

@@ -61,6 +61,14 @@ class JumpTable:
         )
 
 
+@dataclass(frozen=True)
+class DataRegion:
+    """Bytes embedded in a function body but not decoded as instructions."""
+
+    address: int
+    data: bytes
+
+
 def rebind_local_identities(
     excerpt: Sequence[DecodedInstruction],
     *,
@@ -141,7 +149,7 @@ class FunctionImage:
     # pylint: disable=too-many-instance-attributes
     """Lossless view of one decoded function for comparison.
 
-    Owns the extent evidence, decoded excerpt, jump tables, and coverage
+    Owns the extent evidence, decoded instructions, jump tables, and coverage
     flag for a single side (original or recompiled). Callers should not
     read long-lived state off a shared ``ParseAsm`` after construction.
     """
@@ -149,23 +157,47 @@ class FunctionImage:
     start_addr: int
     extent: int
     extent_kind: ExtentKind
-    excerpt: tuple[DecodedInstruction, ...]
+    instructions: tuple[DecodedInstruction, ...]
     jump_tables: tuple[JumpTable, ...] = ()
     coverage_incomplete: bool = False
     extent_closed: bool = True
     raw: bytes | None = None
+    data_regions: tuple[DataRegion, ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(not row.is_code for row in self.instructions):
+            raise ValueError("FunctionImage.instructions must contain code only")
 
     @property
     def instruction_ids(self) -> tuple[int, ...]:
         """Stable program-point ids owned by this image."""
         return tuple(
             row.instruction_id if row.instruction_id is not None else index
-            for index, row in enumerate(self.excerpt)
+            for index, row in enumerate(self.instructions)
         )
 
-    def with_excerpt(self, excerpt: Sequence[DecodedInstruction]) -> "FunctionImage":
-        """Return a copy whose excerpt (and ids) come from ``excerpt``."""
-        return replace(self, excerpt=tuple(excerpt))
+    def with_instructions(
+        self, instructions: Sequence[DecodedInstruction]
+    ) -> "FunctionImage":
+        """Return a copy with the supplied instructions and their ids."""
+        return replace(self, instructions=tuple(instructions))
+
+    @property
+    def data_shape(self) -> tuple:
+        """Embedded data and table positions relative to the function start."""
+        return (
+            tuple(
+                (region.address - self.start_addr, region.data)
+                for region in self.data_regions
+            ),
+            tuple(
+                (
+                    table.address - self.start_addr,
+                    tuple(entry - self.start_addr for entry, _target in table.entries),
+                )
+                for table in self.jump_tables
+            ),
+        )
 
     @property
     def control_flow_complete(self) -> bool:
@@ -179,7 +211,7 @@ class FunctionImage:
             not row.is_code
             or row.control_flow_known
             or (row.is_jump and row.address in switches)
-            for row in self.excerpt
+            for row in self.instructions
         )
 
 

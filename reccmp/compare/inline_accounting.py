@@ -3,6 +3,7 @@ expansions at call sites."""
 
 from collections.abc import Hashable
 
+from reccmp.compare.asm.ir import ExtentKind
 from reccmp.compare.asm.parse import AsmExcerpt
 from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.body_equivalence import BodyEquivalenceMixin
@@ -91,8 +92,10 @@ class InlineAccountingMixin(BodyEquivalenceMixin):
         except (InvalidVirtualAddressError, InvalidVirtualReadError):
             memo[entity.orig_addr] = None
             return None
-        excerpt = self.recomp_sanitize.parse_asm(raw, entity.recomp_addr)
-        needle = strip_helper_epilog(fingerprint_of(excerpt))
+        image = self._load_function_image(
+            ImageId.RECOMP, raw, entity.recomp_addr, ExtentKind.KNOWN
+        )
+        needle = strip_helper_epilog(fingerprint_of(image.instructions))
         if len(needle) < 3:
             memo[entity.orig_addr] = None
             return None

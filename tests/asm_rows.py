@@ -113,7 +113,7 @@ def image(
         start_addr=start,
         extent=len(lines),
         extent_kind=ExtentKind.KNOWN,
-        excerpt=rows(lines, targets, start=start),
+        instructions=rows(lines, targets, start=start),
         jump_tables=tuple(jump_tables),
         coverage_incomplete=coverage_incomplete,
         extent_closed=extent_closed,

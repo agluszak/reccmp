@@ -13,7 +13,6 @@ from reccmp.compare.asm.ir import (
     instruction_semantic_key,
     local_destination_keys,
 )
-from reccmp.compare.asm.parse import ParseAsm
 from reccmp.compare.inlines import Fingerprint, FingerprintRow
 from reccmp.compare.comparator_state import ComparatorState
 from reccmp.compare.db import ReccmpMatch
@@ -107,8 +106,6 @@ def _is_bare_jmp_island(raw: bytes) -> bool:
 class BodyEquivalenceMixin(ComparatorState):
     """Part of FunctionComparator; relies on its attributes."""
 
-    orig_sanitize: ParseAsm
-    recomp_sanitize: ParseAsm
     _load_function_image: Callable[..., FunctionImage]
 
     def raw_pair_alias_equivalent(
@@ -212,12 +209,12 @@ class BodyEquivalenceMixin(ComparatorState):
                 _proved=proved,
             )
         orig_image = self._load_function_image(
-            self.orig_sanitize, orig_raw, orig_addr, size, ExtentKind.KNOWN
+            ImageId.ORIG, orig_raw, orig_addr, ExtentKind.KNOWN
         )
         recomp_image = self._load_function_image(
-            self.recomp_sanitize, recomp_raw, recomp_addr, size, ExtentKind.KNOWN
+            ImageId.RECOMP, recomp_raw, recomp_addr, ExtentKind.KNOWN
         )
-        orig_rows, recomp_rows = orig_image.excerpt, recomp_image.excerpt
+        orig_rows, recomp_rows = orig_image.instructions, recomp_image.instructions
         if not orig_rows or len(orig_rows) != len(recomp_rows):
             return False
         orig_topology = local_destination_keys(

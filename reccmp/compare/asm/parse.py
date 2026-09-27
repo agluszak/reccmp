@@ -15,7 +15,17 @@ from typing_extensions import Buffer
 from reccmp.types import ImageId
 
 from .instgen import InstructGen, SectionType
-from .ir import AsmRole, DecodedInstruction, JumpTable, marker
+from .ir import (
+    AsmRole,
+    DataRegion,
+    DecodedInstruction,
+    ExtentKind,
+    FunctionImage,
+    JumpTable,
+    compute_extent_closed,
+    marker,
+    rebind_local_identities,
+)
 from .model import Reference, ResolvedAddress, format_instruction
 from .replacement import AddrTestProtocol, ReferenceResolver
 
@@ -253,6 +263,69 @@ class ParseAsm:
                     )
 
         return asm
+
+
+def decode_function(
+    data: Buffer,
+    start_addr: int,
+    *,
+    extent_kind: ExtentKind = ExtentKind.KNOWN,
+    addr_test: AddrTestProtocol | None = None,
+    resolver: ReferenceResolver | None = None,
+    is_32bit: bool = True,
+    image_id: ImageId | None = None,
+) -> FunctionImage:
+    """Decode one byte window into instructions and separate embedded data.
+
+    All discovery and sanitization state is local to this call. The returned
+    image is the only value subsequent analysis needs.
+    """
+    blob = bytes(data)
+    sanitizer = ParseAsm(addr_test, resolver, is_32bit, image_id)
+    sanitizer._body_start = start_addr
+    sanitizer._body_end = start_addr + len(blob)
+    sections = InstructGen(blob, start_addr, is_32bit)
+    instructions: list[DecodedInstruction] = []
+    data_regions: list[DataRegion] = []
+    for section in sections.sections:
+        if section.type == SectionType.CODE:
+            instructions.extend(sanitizer.sanitize_row(row) for row in section.contents)
+        elif section.type == SectionType.DATA_TAB and section.contents:
+            data_regions.append(
+                DataRegion(
+                    section.contents[0][0],
+                    bytes(value for _address, value in section.contents),
+                )
+            )
+    stamped = tuple(
+        replace(row, instruction_id=index) for index, row in enumerate(instructions)
+    )
+    tables = tuple(sections.jump_tables)
+    stamped = rebind_local_identities(
+        stamped,
+        start_addr=start_addr,
+        extent=len(blob),
+        jump_tables=tables,
+        image_id=image_id.name.lower() if image_id is not None else "unknown",
+    )
+    return FunctionImage(
+        start_addr=start_addr,
+        extent=len(blob),
+        extent_kind=extent_kind,
+        instructions=stamped,
+        jump_tables=tables,
+        coverage_incomplete=sections.coverage_incomplete,
+        extent_closed=compute_extent_closed(
+            stamped,
+            start_addr=start_addr,
+            extent=len(blob),
+            coverage_incomplete=sections.coverage_incomplete,
+            jump_tables=tables,
+            extent_kind=extent_kind,
+        ),
+        raw=blob,
+        data_regions=tuple(data_regions),
+    )
 
 
 # The operands `assert` receives in its line and file arguments: the macros,

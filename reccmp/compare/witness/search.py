@@ -676,7 +676,7 @@ def _excerpt_constants(image: FunctionImage, machine: SideMachine) -> set[int]:
     targets and ``ret N`` are not data; table rows are not instructions."""
     return {
         value & 0xFFFFFFFF
-        for row in image.excerpt
+        for row in image.instructions
         if row.is_code and not (row.is_call or row.is_jump or row.is_ret)
         for operand in row.operands
         if isinstance(operand, tuple)

@@ -71,11 +71,11 @@ def test_instruction_ids_survive_slice_and_reorder():
     stamped = tuple(replace(row, instruction_id=100 + i) for i, row in enumerate(rows))
     image = FunctionImage(0x1000, len(blob), ExtentKind.KNOWN, stamped)
     assert image.instruction_ids == (100, 101, 102)
-    sliced = image.with_excerpt(image.excerpt[:2])
+    sliced = image.with_instructions(image.instructions[:2])
     assert sliced.instruction_ids == (100, 101)
-    reordered = image.with_excerpt([image.excerpt[i] for i in (2, 0, 1)])
+    reordered = image.with_instructions([image.instructions[i] for i in (2, 0, 1)])
     assert reordered.instruction_ids == (102, 100, 101)
-    assert reordered.excerpt[0].display == image.excerpt[2].display
+    assert reordered.instructions[0].display == image.instructions[2].display
 
 
 def test_estimated_extent_without_terminal_is_open():
@@ -117,7 +117,7 @@ def test_known_extent_ending_in_ret_is_closed():
         start_addr=0x1000,
         extent=len(blob),
         extent_kind=ExtentKind.KNOWN,
-        excerpt=excerpt,
+        instructions=excerpt,
         extent_closed=compute_extent_closed(
             excerpt,
             start_addr=0x1000,

@@ -96,6 +96,7 @@ def extract_switch_tables(
         if func_start is None:
             func_start = row.address
         addr_index.setdefault(row.address, i)
+    entry_index = {row.address: i for i, row in enumerate(rows) if not row.is_code}
 
     def _is_table_header(index: int) -> bool:
         return rows[index].role == AsmRole.JUMP_TABLE_HEADER
@@ -111,24 +112,25 @@ def extract_switch_tables(
         # Metadata alone (a dispatch address on any jmp) is not enough.
         if not table.is_recognized_switch() or not _scale4_mem_jmp(rows[dispatch_i]):
             continue
-        entry_index = {row.address: i for i, row in enumerate(rows) if not row.is_code}
         dests: list[int] = []
         entry_indices: list[int] = []
         for entry_addr, target_va in table.entries:
-            entry_i = entry_index.get(entry_addr)
             dest_i = addr_index.get(target_va)
-            if entry_i is None or dest_i is None:
+            if dest_i is None:
                 dests = []
                 break
-            entry_indices.append(entry_i)
+            entry_i = entry_index.get(entry_addr)
+            if entry_i is not None:
+                entry_indices.append(entry_i)
             dests.append(dest_i)
         if not dests:
             continue
         table_dests[dispatch_i] = dests
         owned.update(entry_indices)
-        header_i = min(entry_indices) - 1
-        if header_i >= 0 and _is_table_header(header_i):
-            owned.add(header_i)
+        if entry_indices:
+            header_i = min(entry_indices) - 1
+            if header_i >= 0 and _is_table_header(header_i):
+                owned.add(header_i)
 
     i = 0
     while i < total:
