@@ -16,16 +16,43 @@ import re
 from collections.abc import Sequence
 from dataclasses import replace
 
-from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     ExtentKind,
+    FlowKind,
     FunctionImage,
     JumpTable,
 )
-from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.model import REGISTERS, Reference, Reject
+from reccmp.compare.asm.operand import (
+    Imm,
+    Mem,
+    Operand,
+    Reg,
+    ScaledReg,
+    SignedSymbol,
+    St,
+    Sym,
+)
 
 START = 0x1000
+
+_CONDITIONAL_JUMPS = frozenset(
+    "ja jae jb jbe jcxz je jecxz jg jge jl jle jne jno jnp jns jo jp js "
+    "loop loope loopne".split()
+)
+
+
+def _flow_kind(mnemonic: str) -> FlowKind:
+    if mnemonic in _CONDITIONAL_JUMPS:
+        return FlowKind.CONDITIONAL
+    return {
+        "jmp": FlowKind.JUMP,
+        "call": FlowKind.CALL,
+        "ret": FlowKind.RETURN,
+        "int3": FlowKind.TRAP,
+    }.get(mnemonic, FlowKind.NORMAL)
+
 
 _ST_RE = re.compile(r"^st(?:\((\d)\))?$")
 _MEM_RE = re.compile(
@@ -58,21 +85,26 @@ def _split_operands(op_str: str) -> list[str]:
     return [op for op in (o.strip() for o in operands) if op]
 
 
-def _parse_operand(text: str):
+def _reference(text: str) -> Reference:
+    """A fixture's symbol: its text is both what it shows and its identity."""
+    return Reference(text, text)
+
+
+def _parse_operand(text: str) -> Operand:
     if text in REGISTERS:
-        return ("reg", text)
+        return Reg(text)
 
     st_match = _ST_RE.match(text)
     if st_match:
-        return ("st", int(st_match.group(1) or 0))
+        return St(int(st_match.group(1) or 0))
 
     if _NUM_RE.match(text):
-        return ("imm", int(text, 0))
+        return Imm(int(text, 0))
 
     mem_match = _MEM_RE.match(text)
     if mem_match:
         size, seg, content = mem_match.groups()
-        reg_terms: list[tuple[str, int]] = []
+        registers: list[ScaledReg] = []
         disp = 0
         syms: list[tuple[int, str]] = []
         tokens = re.split(r" ([+-]) ", content)
@@ -85,22 +117,28 @@ def _parse_operand(text: str):
             if token in REGISTERS:
                 if sign < 0:
                     raise Reject
-                reg_terms.append((token, 1))
+                registers.append(ScaledReg(token, 1))
             elif (scaled := _SCALED_REG_RE.match(token)) is not None:
                 if sign < 0:
                     raise Reject
-                reg_terms.append((scaled.group(1), int(scaled.group(2))))
+                registers.append(ScaledReg(scaled.group(1), int(scaled.group(2))))
             elif _NUM_RE.match(token):
                 disp += sign * int(token, 0)
             else:
                 syms.append((sign, token))
-        return ("mem", size or "", seg or "", reg_terms, disp, tuple(sorted(syms)))
+        return Mem(
+            size or "",
+            seg or "",
+            tuple(registers),
+            disp,
+            tuple(SignedSymbol(sign, _reference(name)) for sign, name in sorted(syms)),
+        )
 
     # Symbol, placeholder, or anything else we treat as an opaque token.
-    return ("sym", text)
+    return Sym(_reference(text))
 
 
-def parse_instruction(line: str) -> tuple[str, str, tuple]:
+def parse_instruction(line: str) -> tuple[str, str, tuple[Operand, ...]]:
     """``(prefix, mnemonic, operands)`` of one line of Intel assembly text.
 
     Only test fixtures arrive as text; reccmp decodes machine code."""
@@ -125,7 +163,8 @@ def rows(
         address = start + index
         prefix, mnemonic, operands = parse_instruction(line)
         target = targets[index] if targets is not None else None
-        is_jump = mnemonic in JUMP_MNEMONICS
+        flow = _flow_kind(mnemonic)
+        is_jump = flow in (FlowKind.CONDITIONAL, FlowKind.JUMP)
         control_target = None
         if is_jump or mnemonic == "call":
             control_target = (
@@ -141,9 +180,7 @@ def rows(
                 prefix=prefix,
                 operands=operands,
                 display=line,
-                is_jump=is_jump,
-                is_call=mnemonic == "call",
-                is_ret=mnemonic == "ret",
+                flow=flow,
                 branch_target=start + target if target is not None else None,
                 # Text says nothing about implicit register effects.
                 register_access_known=False,
@@ -212,15 +249,14 @@ def as_rows(
                 targets is None
                 and row.is_jump
                 and row.operands
-                and row.operands[0][0] == "imm"
-                and isinstance(row.operands[0][1], int)
+                and isinstance(row.operands[0], Imm)
             ):
                 next_addr = (
                     addresses[index + 1]
                     if index + 1 < len(addresses)
                     else addresses[index] + row.size
                 )
-                destination = next_addr + row.operands[0][1]
+                destination = next_addr + row.operands[0].value
                 if destination in addresses:
                     target_index = addresses.index(destination)
                     changes["branch_target"] = destination
@@ -241,9 +277,7 @@ def as_rows(
                 "reads_flags",
                 "writes_flags",
                 "accesses_memory",
-                "is_jump",
-                "is_call",
-                "is_ret",
+                "flow",
                 "register_access_known",
                 "operand_model_complete",
                 "control_flow_known",

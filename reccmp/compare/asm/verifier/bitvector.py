@@ -27,7 +27,6 @@ from typing import Any
 
 import z3  # type: ignore[import-untyped]
 
-from reccmp.compare.asm.model import operand_identity
 from reccmp.compare.asm.verifier.state import WIDTHS
 
 # Resource units per query (see SolverOutcome.rlimit), and a wall-clock
@@ -71,11 +70,11 @@ class SolverOutcome:
 _OFFSET_IDENTITIES = frozenset({"entity", "symbol", "unmatched"})
 
 
-def _symbol_base(token: Any) -> tuple[Hashable, int]:
+def _symbol_base(identity: Hashable) -> tuple[Hashable, int]:
     """(base identity, byte offset) of a symbol in an address, from the
-    sanitizer's proof identity: `x+163` is x's identity at offset 163. A
-    token without such an identity is its own base."""
-    match operand_identity(token):
+    sanitizer's proof identity: `x+163` is x's identity at offset 163. An
+    identity without an offset is its own base."""
+    match identity:
         case (kind, *base, int() as offset) if kind in _OFFSET_IDENTITIES and base:
             return (("symbol", kind, *base), offset)
         case identity:
@@ -178,9 +177,9 @@ class _Lowering:
                 total = z3.BitVecVal(displacement, 32)
                 for term, scale in terms:
                     total = total + self.sized(term, 32) * scale
-                for sign, token in symbols:
-                    base, offset = _symbol_base(token)
-                    total = total + sign * (self.opaque(base) + offset)
+                for symbol in symbols:
+                    base, offset = _symbol_base(symbol.ref.identity)
+                    total = total + symbol.sign * (self.opaque(base) + offset)
                 return total
             case ("mem", *_):
                 raise _Unsupported(f"address {mem!r:.40}")

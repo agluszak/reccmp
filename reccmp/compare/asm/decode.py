@@ -7,8 +7,6 @@ happens when the function image is built.
 
 from __future__ import annotations
 
-import re
-
 from functools import cache
 from typing import Iterable
 
@@ -26,10 +24,11 @@ from capstone import (  # type: ignore
 )
 from capstone import x86_const  # type: ignore
 
-from .ir import DecodedInstruction
-from .model import REGISTERS, split_mnemonic_prefix
+from .ir import DecodedInstruction, FlowKind
+from .model import split_mnemonic_prefix
+from .operand import Imm, Mem, Opaque, Operand, Reg, ScaledReg, St
 
-_ST_RE = re.compile(r"^st(?:\((\d)\))?$")
+_ST_REGISTERS = {getattr(x86_const, f"X86_REG_ST{index}"): index for index in range(8)}
 
 _EFLAGS_READ_MASK = 0
 for _name in dir(x86_const):
@@ -80,14 +79,9 @@ def stop_at_int3_detail(instructions) -> Iterable:
         yield insn
 
 
-def _reg_operand(name: str):
-    """Map a Capstone register name to a typed operand."""
-    if name in REGISTERS:
-        return ("reg", name)
-    st_match = _ST_RE.match(name)
-    if st_match:
-        return ("st", int(st_match.group(1) or 0))
-    return ("sym", name)
+def _reg_operand(insn, register: int) -> Reg | St:
+    index = _ST_REGISTERS.get(register)
+    return St(index) if index is not None else Reg(insn.reg_name(register))
 
 
 def _mem_size_name(mnemonic: str, size: int) -> tuple[str, bool]:
@@ -106,39 +100,46 @@ def _mem_size_name(mnemonic: str, size: int) -> tuple[str, bool]:
 
 def capstone_operand(
     insn, op, mnemonic: str, operand_index: int
-) -> tuple[object, bool]:
+) -> tuple[Operand, bool]:
     """Convert one Capstone operand to a typed operand.
 
     Returns ``(operand, model_complete)``. Unsupported kinds become unique
-    opaque tuples so distinct unknowns cannot share match keys.
+    opaque operands so distinct unknowns cannot share match keys.
     """
     if op.type == x86_const.X86_OP_REG:
-        return _reg_operand(insn.reg_name(op.reg)), True
+        return _reg_operand(insn, op.reg), True
     if op.type == x86_const.X86_OP_IMM:
-        return ("imm", int(op.imm)), True
+        return Imm(int(op.imm)), True
     if op.type == x86_const.X86_OP_MEM:
         mem = op.mem
-        reg_terms: list[tuple[str, int]] = []
+        registers: list[ScaledReg] = []
         if mem.base:
-            reg_terms.append((insn.reg_name(mem.base), 1))
+            registers.append(ScaledReg(insn.reg_name(mem.base), 1))
         if mem.index:
-            reg_terms.append((insn.reg_name(mem.index), int(mem.scale)))
-        seg = insn.reg_name(mem.segment) if mem.segment else ""
+            registers.append(ScaledReg(insn.reg_name(mem.index), int(mem.scale)))
+        segment = insn.reg_name(mem.segment) if mem.segment else ""
         size_name, size_known = _mem_size_name(mnemonic, op.size)
         return (
-            (
-                "mem",
-                size_name,
-                seg or "",
-                reg_terms,
-                int(mem.disp),
-                (),
-            ),
+            Mem(size_name, segment, tuple(registers), int(mem.disp)),
             size_known,
         )
     # Rare / unsupported: machine bytes distinguish unknown operands without
     # letting Capstone's display spelling influence matching.
-    return ("opaque", op.type, bytes(insn.bytes), operand_index), False
+    return Opaque(op.type, bytes(insn.bytes), operand_index), False
+
+
+def _flow_kind(insn) -> FlowKind:
+    if insn.group(CS_GRP_RET):
+        return FlowKind.RETURN
+    if insn.group(CS_GRP_CALL):
+        return FlowKind.CALL
+    if insn.group(CS_GRP_JUMP):
+        return (
+            FlowKind.JUMP if insn.id == x86_const.X86_INS_JMP else FlowKind.CONDITIONAL
+        )
+    if insn.id == x86_const.X86_INS_INT3:
+        return FlowKind.TRAP
+    return FlowKind.NORMAL
 
 
 def from_capstone(insn) -> DecodedInstruction:
@@ -168,9 +169,8 @@ def from_capstone(insn) -> DecodedInstruction:
     operands = tuple(operand for operand, _complete in decoded_ops)
     operand_model_complete = all(complete for _operand, complete in decoded_ops)
     # Opaque operands mean jump/call targets are not fully modeled.
-    control_flow_known = operand_model_complete and all(
-        not (isinstance(operand, tuple) and operand and operand[0] == "opaque")
-        for operand in operands
+    control_flow_known = operand_model_complete and not any(
+        isinstance(operand, Opaque) for operand in operands
     )
     # An indirect call's destination expression is its modeled operand; it
     # needs no absolute branch_target for an exact instruction comparison.
@@ -202,9 +202,7 @@ def from_capstone(insn) -> DecodedInstruction:
         reads_flags=bool(insn.eflags & _EFLAGS_READ_MASK),
         writes_flags=bool(insn.eflags & ~_EFLAGS_READ_MASK),
         accesses_memory=any(op.type == x86_const.X86_OP_MEM for op in cs_operands),
-        is_jump=is_jump,
-        is_call=is_call,
-        is_ret=insn.group(CS_GRP_RET),
+        flow=_flow_kind(insn),
         branch_target=branch_target,
         register_access_known=register_access_known,
         operand_model_complete=operand_model_complete,

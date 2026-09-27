@@ -1,6 +1,7 @@
 """A call through an import thunk is a call through the import slot."""
 
 from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import SignedSymbol
 from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.asm.verifier.semantics import _import_call
 from reccmp.compare.db import EntityDb
@@ -37,18 +38,23 @@ def test_an_import_thunk_is_identified_by_the_slot_it_jumps_through():
 def test_calls_through_the_thunk_and_the_slot_have_one_callee():
     slot = ("entity", 0x7000, 0)
     reference = Reference(display=IMPORT, identity=slot)
-    through_slot = ("load", ("mem", "", (), 0, ((1, reference),)), "dword", 0)
+    through_slot = (
+        "load",
+        ("mem", "", (), 0, (SignedSymbol(1, reference),)),
+        "dword",
+        0,
+    )
     through_thunk = ("sym", ("jmp_through", slot))
     assert _import_call(through_slot) == _import_call(through_thunk)
     assert _import_call(through_thunk) == ("call_through", slot)
     # [slot + 4], [reg + slot], a word load and other symbols keep their identity
-    offset = ("load", ("mem", "", (), 4, ((1, reference),)), "dword", 0)
+    offset = ("load", ("mem", "", (), 4, (SignedSymbol(1, reference),)), "dword", 0)
     indexed = (
         "load",
-        ("mem", "", ((("init", "a"), 4),), 0, ((1, reference),)),
+        ("mem", "", ((("init", "a"), 4),), 0, (SignedSymbol(1, reference),)),
         "dword",
         0,
     )
-    word = ("load", ("mem", "", (), 0, ((1, reference),)), "word", 0)
+    word = ("load", ("mem", "", (), 0, (SignedSymbol(1, reference),)), "word", 0)
     for value in (offset, indexed, word, ("sym", ("entity", 0x1000, 0))):
         assert _import_call(value) == value

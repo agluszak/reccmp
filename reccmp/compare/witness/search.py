@@ -26,6 +26,7 @@ from typing import Callable, Iterator, Sequence
 from capstone.x86 import X86_OP_REG  # type: ignore
 
 from reccmp.compare.asm.ir import FunctionImage
+from reccmp.compare.asm.operand import Imm
 from reccmp.call_facts import CallFacts
 from reccmp.compare.db import EntityDb, EntityTypeLookup, ReccmpEntity
 from reccmp.compare.diagnosis import RefutationWitness as Witness
@@ -679,11 +680,8 @@ def _excerpt_constants(image: FunctionImage, machine: SideMachine) -> set[int]:
         for row in image.instructions
         if not (row.is_call or row.is_jump or row.is_ret)
         for operand in row.operands
-        if isinstance(operand, tuple)
-        and len(operand) == 2
-        and operand[0] == "imm"
-        and isinstance(value := operand[1], int)
-        and value & 0xFFFFFFFF not in machine.image_range
+        if isinstance(operand, Imm)
+        and (value := operand.value) & 0xFFFFFFFF not in machine.image_range
     }
 
 

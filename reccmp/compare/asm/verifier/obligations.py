@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.operand import Mem, Reg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import (
     Value,
@@ -23,8 +24,9 @@ from reccmp.compare.asm.verifier.semantics import (
     read_operand,
 )
 from reccmp.compare.asm.verifier.state import (
+    JCC_MNEMONICS,
+    STRING_OPS,
     is_scratch,
-    may_be_one_sided,
     ASSOCIATIVE_COMMUTATIVE_BINOPS,
     COMMUTATIVE_BINOPS,
     CONTROL_TAGS,
@@ -48,11 +50,10 @@ from reccmp.compare.diagnosis import AnalysisRecorder
 def switch_index_observation(state: SideState, ins: DecodedInstruction) -> tuple:
     """Index register values that select a recognized switch-table case."""
     op = ins.operands[0]
-    assert isinstance(op, tuple) and op[0] == "mem"
-    reg_terms = op[3]
+    assert isinstance(op, Mem)
     return tuple(
-        (scale, state.read_reg(reg))
-        for reg, scale in sorted(reg_terms, key=lambda t: (-t[1], t[0]))
+        (term.scale, state.read_reg(term.register))
+        for term in sorted(op.terms, key=lambda t: (-t.scale, t.register))
     )
 
 
@@ -358,6 +359,23 @@ def _meta_step(orig: SideState, recomp: SideState, meta, idx: int) -> bool:
 # One-sided instructions that are never unobservable: control flow, the
 # stack discipline (push/pop/leave/enter), x87 (stack-shape effects), and
 # instructions that can fault on operand values (division).
+_NEVER_ONE_SIDED = frozenset(
+    {"leave", "enter", "call", "ret", "jmp", "int3", "div", "idiv"}
+    | set(JCC_MNEMONICS)
+    | {"loop", "loope", "loopne", "jcxz", "jecxz"}
+    | set(STRING_OPS)
+)
+
+
+def may_be_one_sided(ins: DecodedInstruction) -> bool:
+    """Whether the verifier may accept ``ins`` on one side only (see
+    obligations.one_sided_ok): never control flow, stack frame setup, x87,
+    string or prefixed instructions, or potentially-faulting division."""
+    return not (
+        ins.prefix or ins.mnemonic in _NEVER_ONE_SIDED or ins.mnemonic.startswith("f")
+    )
+
+
 def _one_sided_push_ok(state: SideState, ctx: Context, ins, idx: int) -> bool:
     """One side spills a register the other side never needed (a save
     around a region, or a scratch spill). The slot is private: it lies
@@ -388,8 +406,11 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
     the function's own private scratch. When it provably reads back an
     intact one-sided push, the popped register regains the exact pushed
     value, so callee-save round-trips stay externally clean."""
-    if ins.operands[0][0] != "reg":
-        return False
+    match ins.operands[0]:
+        case Reg(name):
+            register = name
+        case _:
+            return False
     esp = state.read_reg("esp")
     root, offset = unwind_spadd(esp)
     if root != ("init", "sp") or offset >= 0 or ctx.stack_escaped:
@@ -402,7 +423,7 @@ def _one_sided_pop_ok(state: SideState, ctx: Context, ins) -> bool:
                 value = record[2]
             del ctx.scratch_pushes[k]
             break
-    state.write_reg(ins.operands[0][1], value)
+    state.write_reg(register, value)
     state.write_reg("esp", esp_add(esp, 4))
     ctx.categories.add("callee_save_substitution")
     return True
@@ -600,40 +621,46 @@ def callee_save_swap(ctx: Context, ins_o, ins_r, obs_o, obs_r, orig, recomp) -> 
         ctx.save_stack.append([obs_o[0][3][1], obs_r[0][3][1], obs_o[0][1], True])
         ctx.categories.add("callee_save_substitution")
         return True
-    if (
-        ins_o.mnemonic == "pop"
-        and ctx.save_stack
-        and ins_o.operands
-        and ins_r.operands
-        and ins_o.operands[0][0] == "reg"
-        and ins_r.operands[0][0] == "reg"
-    ):
-        family_o = REGISTERS[ins_o.operands[0][1]][0]
-        family_r = REGISTERS[ins_r.operands[0][1]][0]
-        saved_o, saved_r, slot_addr, valid = ctx.save_stack[-1]
-        popped_o = orig.regs.get(family_o)
-        popped_r = recomp.regs.get(family_r)
-        if (
-            (saved_o, saved_r) == (family_o, family_r)
-            and valid
-            # A frame address that escaped could have reached the saved
-            # slot through a pointer we cannot see.
-            and not orig.slots_escaped
-            and not recomp.slots_escaped
-            and isinstance(popped_o, tuple)
-            and popped_o
-            and popped_o[0] == "load"
-            and popped_o[1] == slot_addr
-            and isinstance(popped_r, tuple)
-            and popped_r
-            and popped_r[0] == "load"
-            and popped_r[1] == slot_addr
+    match ins_o.operands, ins_r.operands:
+        case (Reg(name_o),), (Reg(name_r),) if (
+            ins_o.mnemonic == "pop" and ctx.save_stack
         ):
-            ctx.save_stack.pop()
-            orig.regs[family_o] = ("init", family_o)
-            recomp.regs[family_r] = ("init", family_r)
-            return True
+            return _restores_swapped_save(
+                ctx, orig, recomp, REGISTERS[name_o][0], REGISTERS[name_r][0]
+            )
     return False
+
+
+def _restores_swapped_save(
+    ctx: Context, orig: SideState, recomp: SideState, family_o: str, family_r: str
+) -> bool:
+    """A pair of pops that restores the innermost substituted callee save:
+    both read back its intact slot, so each register regains its initial
+    value."""
+    saved_o, saved_r, slot_addr, valid = ctx.save_stack[-1]
+    popped_o = orig.regs.get(family_o)
+    popped_r = recomp.regs.get(family_r)
+    if not (
+        (saved_o, saved_r) == (family_o, family_r)
+        and valid
+        # A frame address that escaped could have reached the saved
+        # slot through a pointer we cannot see.
+        and not orig.slots_escaped
+        and not recomp.slots_escaped
+        and isinstance(popped_o, tuple)
+        and popped_o
+        and popped_o[0] == "load"
+        and popped_o[1] == slot_addr
+        and isinstance(popped_r, tuple)
+        and popped_r
+        and popped_r[0] == "load"
+        and popped_r[1] == slot_addr
+    ):
+        return False
+    ctx.save_stack.pop()
+    orig.regs[family_o] = ("init", family_o)
+    recomp.regs[family_r] = ("init", family_r)
+    return True
 
 
 def invalidate_save_slots(ctx: Context, obs: list) -> None:
@@ -720,9 +747,9 @@ def _commutative_order_used(
         return False
     try:
         for operand_o, operand_r in zip(ins_o.operands, ins_r.operands):
-            if operand_o[0] == operand_r[0] == "mem":
-                terms_o = operand_o[3]
-                terms_r = operand_r[3]
+            if isinstance(operand_o, Mem) and isinstance(operand_r, Mem):
+                terms_o = operand_o.terms
+                terms_r = operand_r.terms
                 if terms_o != terms_r and sorted(terms_o) == sorted(terms_r):
                     if mem_address(before_o, operand_o) == mem_address(
                         before_r, operand_r

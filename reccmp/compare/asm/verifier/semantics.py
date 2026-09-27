@@ -5,11 +5,8 @@ from __future__ import annotations
 from collections.abc import Hashable
 
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.model import (
-    REGISTERS,
-    Reject,
-    operand_identity,
-)
+from reccmp.compare.asm.model import REGISTERS, Reject
+from reccmp.compare.asm.operand import Imm, Mem, Operand, Reg, ScaledReg, St, Sym
 from reccmp.compare.asm.verifier.addresses import (
     Value,
     flatten_mem,
@@ -47,27 +44,26 @@ from reccmp.compare.asm.verifier.state import (
 
 
 def mem_address(
-    state: SideState, op, escape: bool = False, write: bool = False
+    state: SideState, op: Mem, escape: bool = False, write: bool = False
 ) -> Value:
     # pylint: disable=too-many-boolean-expressions
-    _, size, seg, reg_terms, disp, syms = op
-    disp_key: Value | int = disp
+    disp_key: Value | int = op.displacement
     if (
         state.rename_slots
-        and not seg
-        and not syms
-        and disp < 0
-        and any(reg == "ebp" for reg, _ in reg_terms)
+        and not op.segment
+        and not op.symbols
+        and op.displacement < 0
+        and any(term.register == "ebp" for term in op.terms)
         and stack_rooted(state.regs["bp"])
     ):
-        if not escape and reg_terms == [("ebp", 1)]:
+        if not escape and op.terms == (ScaledReg("ebp", 1),):
             # A plain frame-local slot: alpha-renamable across the sides.
-            disp_key = state.slot_ref(disp, size, write)
+            disp_key = state.slot_ref(op.displacement, op.size, write)
         else:
             # The slot's address escapes (lea) or the access is indexed
             # (a local array): renaming frame slots is no longer safe.
             state.slots_escaped = True
-    pairs = [(state.read_reg(reg), scale) for reg, scale in reg_terms]
+    pairs = [(state.read_reg(term.register), term.scale) for term in op.terms]
     if isinstance(disp_key, int):
         # Fold constant stack-pointer adjustments into the displacement so
         # that e.g. [esp + 8] before a push and [esp + 0xc] after it denote
@@ -86,31 +82,36 @@ def mem_address(
         # A stack address escapes into a register: pointers derived from it
         # could reach frame slots or saved registers on the stack.
         state.slots_escaped = True
-    return ("mem", seg, terms, disp_key, syms)
+    return ("mem", op.segment, terms, disp_key, op.symbols)
 
 
-def read_operand(state: SideState, ctx: Context, op) -> Value:
-    kind = op[0]
-    if kind == "reg":
-        return state.read_reg(op[1])
-    if kind == "imm":
-        return ("imm", op[1])
-    if kind == "sym":
-        return ("sym", operand_identity(op[1]))
-    if kind == "st":
-        return state.x87.read(op[1])
-    if kind == "mem":
-        address = mem_address(state, op)
-        width = WIDTHS.get(op[1])
-        offset = frame_offset(state, ctx, address, width, slot=False)
-        if offset is not None:
-            assert width is not None
-            return read_slot(state, offset, width)
-        if ctx.trace is not None:
-            ctx.trace.append(("r", address, width, False))
-        tag = memory_load_tag(ctx, address, width, False)
-        state.load_log.add((address, tag))
-        return ("load", address, op[1], tag)
+def read_operand(state: SideState, ctx: Context, op: Operand) -> Value:
+    # pylint: disable=too-many-return-statements
+    match op:
+        case Reg(name) if name in REGISTERS:
+            return state.read_reg(name)
+        case Reg(name):
+            # A register outside the model (a segment register) reads as a
+            # fixed symbol of the function.
+            return ("sym", name)
+        case Imm(value):
+            return ("imm", value)
+        case Sym(ref):
+            return ("sym", ref.identity)
+        case St(index):
+            return state.x87.read(index)
+        case Mem(size=size):
+            address = mem_address(state, op)
+            width = WIDTHS.get(size)
+            offset = frame_offset(state, ctx, address, width, slot=False)
+            if offset is not None:
+                assert width is not None
+                return read_slot(state, offset, width)
+            if ctx.trace is not None:
+                ctx.trace.append(("r", address, width, False))
+            tag = memory_load_tag(ctx, address, width, False)
+            state.load_log.add((address, tag))
+            return ("load", address, size, tag)
     raise Reject
 
 
@@ -206,36 +207,55 @@ def _canonical_virtual_target(target: Value, ctx: Context) -> Value | None:
     return ("vcall", receiver, slot)
 
 
-def write_operand(state: SideState, ctx: Context, op, value: Value, obs: list) -> None:
-    kind = op[0]
-    if kind == "reg":
-        state.write_reg(op[1], value)
-    elif kind == "mem":
-        address = mem_address(state, op, write=True)
-        width = WIDTHS.get(op[1])
-        offset = frame_offset(state, ctx, address, width, slot=False)
-        if offset is not None:
-            assert width is not None
-            write_slot(state, offset, width, value)
-            return
-        if ctx.trace is not None:
-            ctx.trace.append(("w", address, WIDTHS.get(op[1]), False))
-        obs.append(("store", address, op[1], value))
-    elif kind == "st":
-        state.x87.write(op[1], value)
-    else:
-        raise Reject
+def write_operand(
+    state: SideState, ctx: Context, op: Operand, value: Value, obs: list
+) -> None:
+    match op:
+        case Reg(name):
+            state.write_reg(name, value)
+        case Mem(size=size):
+            address = mem_address(state, op, write=True)
+            width = WIDTHS.get(size)
+            offset = frame_offset(state, ctx, address, width, slot=False)
+            if offset is not None:
+                assert width is not None
+                write_slot(state, offset, width, value)
+                return
+            if ctx.trace is not None:
+                ctx.trace.append(("w", address, width, False))
+            obs.append(("store", address, size, value))
+        case St(index):
+            state.x87.write(index, value)
+        case _:
+            raise Reject
 
 
-def _mul_registers(op) -> tuple[str, str]:
+def _operand_width(op: Operand) -> str:
+    """A memory operand's size keyword, or a register's part."""
+    match op:
+        case Mem(size=size):
+            return size
+        case Reg(name):
+            return REGISTERS[name][1]
+    raise Reject
+
+
+def _mul_registers(op: Operand) -> tuple[str, str]:
     """Accumulator/high register pair for single-operand mul/imul/div/idiv,
     depending on the operand width."""
-    width = op[1] if op[0] == "mem" else REGISTERS[op[1]][1]
+    width = _operand_width(op)
     if width in ("byte", "l8", "h8"):
         return "al", "ah"
     if width in ("word", "r16"):
         return "ax", "dx"
     return "eax", "edx"
+
+
+def _st_index(op: Operand) -> int:
+    match op:
+        case St(index):
+            return index
+    raise Reject
 
 
 def esp_add(value: Value, delta: int) -> Value:
@@ -277,9 +297,9 @@ def _absolute_symbol(address: Value) -> Hashable | None:
     if address[0] != "mem" or len(address) != 5:
         return None
     _, _, registers, displacement, symbols = address
-    if registers or displacement != 0 or len(symbols) != 1 or symbols[0][0] != 1:
+    if registers or displacement != 0 or len(symbols) != 1 or symbols[0].sign != 1:
         return None
-    return operand_identity(symbols[0][1])
+    return symbols[0].ref.identity
 
 
 def _constant_order(pred: str, a: Value, b: Value, width) -> tuple:
@@ -348,20 +368,15 @@ def canon_condition(cc: str, state: SideState) -> Value:
 _PART_BYTES = {"l8": 1, "h8": 1, "r8": 1, "r8h": 1, "r16": 2, "r32": 4}
 
 
-def _compare_width(op_a, op_b) -> int | str:
+def _compare_width(op_a: Operand, op_b: Operand) -> int | str:
     """Byte width of a CMP/TEST, used so signed/unsigned outcomes stay distinct."""
     for op in (op_a, op_b):
-        if not isinstance(op, tuple) or not op:
-            continue
-        if op[0] == "reg":
-            part = REGISTERS.get(op[1], (None, None))[1]
-            if part in _PART_BYTES:
-                return _PART_BYTES[part]
-        if op[0] == "mem":
-            size = op[1]
-            if size in WIDTHS:
+        match op:
+            case Reg(name) if REGISTERS.get(name, (None, None))[1] in _PART_BYTES:
+                return _PART_BYTES[REGISTERS[name][1]]
+            case Mem(size=size) if size in WIDTHS:
                 return WIDTHS[size]
-            if isinstance(size, str) and size.startswith("size"):
+            case Mem(size=size) if size.startswith("size"):
                 try:
                     return int(size[4:])
                 except ValueError:
@@ -387,10 +402,9 @@ def execute(
         write_operand(state, ctx, ops[0], read_operand(state, ctx, ops[1]), obs)
     elif mnemonic in ("movsx", "movzx") and len(ops) == 2:
         src = ops[1]
-        width = src[1] if src[0] == "mem" else REGISTERS[src[1]][1]
-        value = (mnemonic, width, read_operand(state, ctx, src))
+        value = (mnemonic, _operand_width(src), read_operand(state, ctx, src))
         write_operand(state, ctx, ops[0], value, obs)
-    elif mnemonic == "lea" and len(ops) == 2 and ops[1][0] == "mem":
+    elif mnemonic == "lea" and len(ops) == 2 and isinstance(ops[1], Mem):
         address = mem_address(state, ops[1], escape=True)
         write_operand(state, ctx, ops[0], _canonical_address_value(address), obs)
     elif mnemonic == "xchg" and len(ops) == 2:
@@ -552,8 +566,8 @@ def execute(
         # not match; otherwise it must match exactly.
         facts = None
         if ctx.metadata is not None and ctx.metadata.call_facts is not None:
-            if ops[0][0] == "sym":
-                facts = ctx.metadata.call_facts(operand_identity(ops[0][1]))
+            if isinstance(ops[0], Sym):
+                facts = ctx.metadata.call_facts(ops[0].ref.identity)
         ecx_argument, edx_argument = register_arguments(facts)
         target = _import_call(read_operand(state, ctx, ops[0]))
         virtual_target = _canonical_virtual_target(target, ctx)
@@ -613,7 +627,7 @@ def execute(
         pred = canon_condition(JCC_MNEMONICS[mnemonic], state)
         obs.append(("branch", pred, _branch_obs_dest(ins)))
     elif mnemonic == "jmp" and len(ops) == 1:
-        if ops[0][0] == "mem":
+        if isinstance(ops[0], Mem):
             obs.append(("jmpind", read_operand(state, ctx, ops[0])))
         else:
             obs.append(("jmp", _branch_obs_dest(ins)))
@@ -686,14 +700,14 @@ def execute_x87(
     elif mnemonic in ("fadd", "fmul", "faddp", "fmulp", "fiadd", "fimul"):
         op = "f" + ("add" if "add" in mnemonic else "mul")
         if mnemonic in ("faddp", "fmulp"):
-            dest = ops[0][1] if ops else 1
+            dest = _st_index(ops[0]) if ops else 1
             value = (op, *vsort(x87.read(dest), x87.read(0)))
             x87.write(dest, value)
             x87.pop()
-        elif len(ops) == 2 and ops[0] == ("st", 0):
-            x87.write(0, (op, *vsort(x87.read(0), x87.read(ops[1][1]))))
-        elif len(ops) == 2 and ops[1] == ("st", 0):
-            dest = ops[0][1]
+        elif len(ops) == 2 and ops[0] == St(0):
+            x87.write(0, (op, *vsort(x87.read(0), x87.read(_st_index(ops[1])))))
+        elif len(ops) == 2 and ops[1] == St(0):
+            dest = _st_index(ops[0])
             x87.write(dest, (op, *vsort(x87.read(dest), x87.read(0))))
         elif len(ops) == 1:
             x87.write(0, (op, *vsort(x87.read(0), read_operand(state, ctx, ops[0]))))
@@ -711,7 +725,7 @@ def execute_x87(
             x87.write(0, (op, x87.read(0), other))
     elif mnemonic in ("fsubp", "fsubrp", "fdivp", "fdivrp"):
         op = "fsub" if "sub" in mnemonic else "fdiv"
-        dest = ops[0][1] if ops else 1
+        dest = _st_index(ops[0]) if ops else 1
         if "r" in mnemonic[4:]:
             value = (op, x87.read(0), x87.read(dest))
         else:
@@ -721,7 +735,7 @@ def execute_x87(
     elif mnemonic in X87_UNARY and not ops:
         x87.write(0, (mnemonic, x87.read(0)))
     elif mnemonic == "fxch":
-        i = ops[0][1] if ops else 1
+        i = _st_index(ops[0]) if ops else 1
         a, b = x87.read(0), x87.read(i)
         x87.write(0, b)
         x87.write(i, a)
@@ -736,7 +750,7 @@ def execute_x87(
         x87.pop()
     elif mnemonic == "ftst":
         state.fpu_flags = ("fcom", x87.read(0), ("imm", 0))
-    elif mnemonic == "fnstsw" and ops == (("reg", "ax"),):
+    elif mnemonic == "fnstsw" and ops == (Reg("ax"),):
         state.write_reg("ax", ("fsw", state.fpu_flags))
     elif mnemonic == "fnstcw" and len(ops) == 1:
         write_operand(state, ctx, ops[0], ("fcw",), obs)

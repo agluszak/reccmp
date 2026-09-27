@@ -1,6 +1,5 @@
-"""The operand vocabulary: references, rendering operands and instructions
-to Intel text, and parsing Intel text (a boundary for assembly that arrives
-as text, never for text reccmp rendered).
+"""References, register families and Intel-text formatting helpers shared
+by the decoder, the operands and the verifier.
 
 Leaf module: no imports from ``ir`` or the verifier.
 """
@@ -44,18 +43,6 @@ class ResolvedAddress:
     entity_type: str | None = None
 
 
-def operand_display(value) -> str:
-    if isinstance(value, Reference):
-        return value.display
-    return str(value)
-
-
-def operand_identity(value) -> Hashable:
-    if isinstance(value, Reference):
-        return value.identity
-    return value
-
-
 # Register families. Writing e.g. `al` produces a new value for the whole
 # `a` family so that partial-register writes are never lost.
 REGISTERS: dict[str, tuple[str, str]] = {
@@ -79,77 +66,6 @@ def format_imm(value: int) -> str:
     if -9 <= value <= 9:
         return str(value)
     return hex(value)
-
-
-def format_operand(operand) -> str:
-    # pylint: disable=too-many-return-statements
-    """Render a structured operand back to Capstone-like Intel text."""
-    kind = operand[0]
-    if kind == "reg":
-        return operand[1]
-    if kind == "st":
-        return f"st({operand[1]})"
-    if kind == "imm":
-        return format_imm(operand[1])
-    if kind == "sym":
-        return operand_display(operand[1])
-    if kind == "opaque":
-        # The canonical operand carries machine bytes; the original decoded
-        # instruction retains Capstone text separately for display.
-        return "?"
-    if kind != "mem":
-        raise Reject
-
-    size, seg, reg_terms, disp, syms = (
-        operand[1],
-        operand[2],
-        operand[3],
-        operand[4],
-        operand[5],
-    )
-    parts: list[str] = []
-    for name, scale in reg_terms:
-        token = name if scale == 1 else f"{name}*{scale}"
-        if not parts:
-            parts.append(token)
-        else:
-            parts.append(f"+ {token}")
-    for sign, name in syms:
-        if not parts:
-            parts.append(
-                operand_display(name) if sign > 0 else f"-{operand_display(name)}"
-            )
-        else:
-            shown = operand_display(name)
-            parts.append(f"+ {shown}" if sign > 0 else f"- {shown}")
-    if disp or (not parts and not syms):
-        if not parts:
-            parts.append(format_imm(disp))
-        elif disp > 0:
-            parts.append(f"+ {format_imm(disp)}")
-        elif disp < 0:
-            parts.append(f"- {format_imm(-disp)}")
-
-    body = " ".join(parts)
-    if seg:
-        body = f"{seg}:[{body}]"
-    else:
-        body = f"[{body}]"
-    if size:
-        return f"{size} ptr {body}"
-    return body
-
-
-def format_instruction(mnemonic: str, prefix: str, operands: tuple) -> str:
-    """Build a display line from structured fields.
-
-    Zero-operand instructions keep a trailing space (``\"nop \"``) for
-    compatibility with the historical ``\" \".join((mnemonic, op_str))`` form.
-    """
-    head = f"{prefix} {mnemonic}".strip() if prefix else mnemonic
-    if not operands:
-        return f"{head} "
-    return f"{head} {', '.join(format_operand(op) for op in operands)}"
 
 
 def split_mnemonic_prefix(mnemonic: str) -> tuple[str, str]:

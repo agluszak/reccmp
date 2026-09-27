@@ -6,7 +6,7 @@ from dataclasses import replace
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
 )
-from reccmp.compare.asm.ir import DecodedInstruction
+from reccmp.compare.asm.ir import DecodedInstruction, FlowKind
 from tests.asm_rows import rows
 from tests.asm_rows import (
     verify_effective_match,
@@ -217,9 +217,7 @@ def test_analysis_uses_structured_branch_targets():
             reads_flags=True,
             writes_flags=False,
             accesses_memory=False,
-            is_jump=True,
-            is_call=False,
-            is_ret=False,
+            flow=FlowKind.CONDITIONAL,
             branch_target=target,
         )
 

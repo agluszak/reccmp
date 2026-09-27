@@ -8,10 +8,11 @@ that map is applied.
 from __future__ import annotations
 
 from collections.abc import Hashable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, NamedTuple, Sequence
 
 from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.operand import Mem, Operand, ScaledReg
 from reccmp.compare.diagnosis import StackPermutationEntry
 from reccmp.compare.pinned_sequences import DiffOpcode, SequenceMatcherWithPins
 from reccmp.cvdump.symbols import SymbolsEntry
@@ -186,7 +187,11 @@ def extract_stack_offset_from_operands(
     """The first ebp/esp-relative displacement among structured operands."""
     for op in operands:
         match op:
-            case ("mem", _, _, [(("ebp" | "esp") as register, _)], int() as disp, ()):
+            case Mem(
+                terms=(ScaledReg("ebp" | "esp" as register),),
+                displacement=disp,
+                symbols=(),
+            ):
                 slot = StackRegisterOffset(register, disp)
                 slot.attach_canonical()
                 return slot
@@ -371,19 +376,22 @@ def _remapped_key(
     row: DecodedInstruction, mapping: dict[tuple[str, int], tuple[str, int]]
 ) -> Hashable:
     """A row's match key with its stack slot moved through ``mapping``."""
-    operands = []
+    operands: list[Operand] = []
     for op in row.operands:
         match op:
-            case (
-                "mem",
-                size,
-                seg,
-                [(("ebp" | "esp") as register, 1)],
-                int() as disp,
-                (),
+            case Mem(
+                terms=(ScaledReg("ebp" | "esp" as register, 1),),
+                displacement=disp,
+                symbols=(),
             ) if (register, disp) in mapping:
                 new_register, new_disp = mapping[(register, disp)]
-                operands.append(("mem", size, seg, [(new_register, 1)], new_disp, ()))
+                operands.append(
+                    replace(
+                        op,
+                        terms=(ScaledReg(new_register, 1),),
+                        displacement=new_disp,
+                    )
+                )
             case _:
                 operands.append(op)
     return instruction_match_key(

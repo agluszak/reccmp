@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import SignedSymbol
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.diagnosis import (
     ComparisonAnalysis,
@@ -157,7 +158,7 @@ def _address(mem: Any, depth: int) -> str:
         render(term, depth + 1) if scale == 1 else f"{render(term, depth + 1)}*{scale}"
         for term, scale in terms
     ]
-    parts += [str(token) for _, token in symbols]
+    parts += [term.ref.display for term in symbols]
     match displacement:
         case 0 if parts:
             pass
@@ -239,7 +240,9 @@ def _identity_kinds(value: Any) -> set[str]:
     stack = [value]
     while stack:
         match node := stack.pop():
-            case Reference(identity=(kind, *_)):
+            case Reference(identity=(kind, *_)) | SignedSymbol(
+                ref=Reference(identity=(kind, *_))
+            ):
                 kinds.add(str(kind))
             case ("sym", (kind, *_)):
                 kinds.add(str(kind))

@@ -132,8 +132,8 @@ def test_unresolved_call_offsets_are_not_exact_or_effective():
     recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
     assert orig_rows[0].display == recomp_rows[0].display
     assert "<OFFSET" in orig_rows[0].display
-    orig_id = orig_rows[0].operands[0][1].identity
-    recomp_id = recomp_rows[0].operands[0][1].identity
+    orig_id = orig_rows[0].operands[0].ref.identity
+    recomp_id = recomp_rows[0].operands[0].ref.identity
     assert orig_id != recomp_id
 
     result = _compare_bytes(orig, recomp)
@@ -148,8 +148,8 @@ def test_unresolved_data_offsets_are_not_exact_or_effective():
     recomp = _mov_abs_ret(0x527000)
     orig_rows = decode_function(orig, 0x200, image_id=ImageId.ORIG).instructions
     recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
-    orig_ref = orig_rows[0].operands[1][5][0][1]
-    recomp_ref = recomp_rows[0].operands[1][5][0][1]
+    orig_ref = orig_rows[0].operands[1].symbols[0].ref
+    recomp_ref = recomp_rows[0].operands[1].symbols[0].ref
     assert orig_ref.identity == ("unresolved", "orig", 0x401000)
     assert recomp_ref.identity == ("unresolved", "recomp", 0x527000)
 
@@ -220,8 +220,8 @@ def test_unmatched_data_display_names_are_not_proof_identity():
     assert orig_rows[0].display == recomp_rows[0].display
     orig_mem = orig_rows[0].operands[1]
     recomp_mem = recomp_rows[0].operands[1]
-    orig_ref = orig_mem[5][0][1]
-    recomp_ref = recomp_mem[5][0][1]
+    orig_ref = orig_mem.symbols[0].ref
+    recomp_ref = recomp_mem.symbols[0].ref
     assert orig_ref.identity != recomp_ref.identity
 
     result = _compare_bytes(orig, recomp, db=db)

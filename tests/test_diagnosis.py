@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from reccmp.compare.asm.ir import DecodedInstruction
+from reccmp.compare.asm.ir import DecodedInstruction, FlowKind
 from reccmp.compare.asm.verifier import CallFacts, FunctionMetadata
 from reccmp.compare.asm.verifier.evidence import diagnostic_summaries
 from reccmp.compare.diagnosis import (
@@ -258,9 +258,7 @@ def _jump_meta(address: int, target: int) -> DecodedInstruction:
         reads_flags=True,
         writes_flags=False,
         accesses_memory=False,
-        is_jump=True,
-        is_call=False,
-        is_ret=False,
+        flow=FlowKind.CONDITIONAL,
         branch_target=target,
     )
 

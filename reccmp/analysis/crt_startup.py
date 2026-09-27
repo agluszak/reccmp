@@ -2,9 +2,9 @@ import enum
 import struct
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Sequence
 from typing_extensions import Buffer
-from reccmp.compare.asm.const import JUMP_MNEMONICS
+from reccmp.compare.asm.operand import Imm, Mem, Operand
 from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.formats import Image, PEImage
@@ -69,17 +69,13 @@ class CrtStartupArray:
     The thunk is what actually appeared in the ___xc_a/z list."""
 
 
-def _operand_addresses(operand) -> list[int]:
+def _operand_addresses(operand: Operand) -> list[int]:
     """The values in one operand that may be addresses: an immediate, or a
     memory operand's displacement."""
     match operand:
-        case ("imm", int() as value):
-            values = [value]
-        case ("mem", _, _, _, int() as displacement, _):
-            values = [displacement]
-        case _:
-            values = []
-    return [value & 0xFFFFFFFF for value in values]
+        case Imm(value) | Mem(displacement=value):
+            return [value & 0xFFFFFFFF]
+    return []
 
 
 def _code_instructions(raw: bytes, start: int) -> list[DecodedInstruction]:
@@ -98,7 +94,7 @@ class UsedAddressCollector:
         self.is_entity = is_entity
         self.seen_addrs = []
 
-    def _append_addrs(self, operands, used_how: UsedHow):
+    def _append_addrs(self, operands: Sequence[Operand], used_how: UsedHow):
         for operand in operands:
             for addr in _operand_addresses(operand):
                 if self.is_entity(addr):
@@ -106,13 +102,13 @@ class UsedAddressCollector:
 
     def analyze(self, data: Buffer, start_addr: int):
         for insn in _code_instructions(bytes(data), start_addr):
-            if insn.mnemonic == "ret":
+            if insn.is_ret:
                 break
-            if insn.mnemonic in JUMP_MNEMONICS:
+            if insn.is_jump:
                 continue
             if insn.is_call:
                 if insn.branch_target is not None:
-                    self._append_addrs([("imm", insn.branch_target)], UsedHow.CALL)
+                    self._append_addrs([Imm(insn.branch_target)], UsedHow.CALL)
                 else:
                     self._append_addrs(insn.operands, UsedHow.CALL)
             elif insn.mnemonic in ("mov", "fstp"):
@@ -360,7 +356,7 @@ def find_initializer_atexit_helpers(
             }:
                 continue
             match previous.mnemonic, previous.operands:
-                case "push", (("imm", int() as helper_addr),):
+                case "push", (Imm(helper_addr),):
                     pass
                 case _:
                     continue

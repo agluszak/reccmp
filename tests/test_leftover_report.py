@@ -19,11 +19,13 @@ from reccmp.compare import Compare
 from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
+    FlowKind,
     ExtentKind,
     JumpTable,
     rebind_local_identities,
 )
 from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import Mem, Reg, ScaledReg, Sym
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.replacement import create_resolver
 from reccmp.compare.db import EntityDb, FrozenEntityDbError, ReccmpMatch
@@ -89,9 +91,9 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         size=2,
         mnemonic="jmp",
         prefix="",
-        operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
+        operands=(Mem("dword", "", (ScaledReg("eax", 4),), 0x1004),),
         display="jmp dword ptr [eax*4+0x1004]",
-        is_jump=True,
+        flow=FlowKind.JUMP,
         branch_target=None,
         control_flow_known=False,
         instruction_id=0,
@@ -339,9 +341,9 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         size=3,
         mnemonic="jmp",
         prefix="",
-        operands=(("mem", "dword", "", (("eax", 1),), 0x1004, ()),),
+        operands=(Mem("dword", "", (ScaledReg("eax", 1),), 0x1004),),
         display="jmp dword ptr [eax+0x1004]",
-        is_jump=True,
+        flow=FlowKind.JUMP,
         instruction_id=0,
     )
     excerpt = (
@@ -365,9 +367,9 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         size=3,
         mnemonic="jmp",
         prefix="",
-        operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
+        operands=(Mem("dword", "", (ScaledReg("eax", 4),), 0x1004),),
         display="jmp dword ptr [eax*4+0x1004]",
-        is_jump=True,
+        flow=FlowKind.JUMP,
         instruction_id=0,
     )
     excerpt = (
@@ -617,8 +619,8 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
         mnemonic="lea",
         prefix="",
         operands=(
-            "eax",
-            Reference("<OFFSET>", ("local", 8)),
+            Reg("eax"),
+            Sym(Reference("<OFFSET>", ("local", 8))),
         ),
         display="lea eax, <OFFSET>",
         instruction_id=0,
@@ -630,11 +632,11 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
         extent=9,
         image_id="orig",
     )
-    assert rebound[0].operands[1].identity == ("local_insn", 1)
+    assert rebound[0].operands[1].ref.identity == ("local_insn", 1)
 
     data_ref = replace(
         lea,
-        operands=("eax", Reference("<OFFSET>", ("local", 4))),
+        operands=(Reg("eax"), Sym(Reference("<OFFSET>", ("local", 4)))),
     )
     rebound_data = rebind_local_identities(
         (data_ref, ret),
@@ -642,7 +644,7 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
         extent=16,
         image_id="orig",
     )
-    assert rebound_data[0].operands[1].identity == ("unresolved", "orig", 0x1004)
+    assert rebound_data[0].operands[1].ref.identity == ("unresolved", "orig", 0x1004)
 
     table = JumpTable(address=0x1004, entries=((0x1004, 0x1008),))
     rebound_table = rebind_local_identities(
@@ -652,7 +654,7 @@ def test_rebind_local_identities_uses_instruction_and_table_ids():
         jump_tables=(table,),
         image_id="orig",
     )
-    assert rebound_table[0].operands[1].identity == ("table", 0)
+    assert rebound_table[0].operands[1].ref.identity == ("table", 0)
 
 
 def test_find_inlines_resolves_helper_via_public_get_match():

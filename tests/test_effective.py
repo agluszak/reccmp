@@ -1039,9 +1039,6 @@ def test_unknown_register_access_meta_cannot_step_divergent_state():
             reads_flags=False,
             writes_flags=False,
             accesses_memory=False,
-            is_jump=False,
-            is_call=False,
-            is_ret=False,
             branch_target=None,
             register_access_known=known,
         )

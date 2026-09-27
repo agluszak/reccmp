@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .ir import DecodedInstruction, ExtentKind, JumpTable
+from .operand import Imm, Mem, Sym
 
 EdgeKind = Literal["local", "external", "fallout", "unknown"]
 
@@ -78,9 +79,7 @@ def _switch_table(
     if row.address is None:
         return None
     match row.operands:
-        case (("mem", _, _, reg_terms, _, _),) if any(
-            scale == 4 for _register, scale in reg_terms
-        ):
+        case (Mem(terms=terms),) if any(term.scale == 4 for term in terms):
             return next(
                 (
                     table
@@ -124,9 +123,9 @@ def build_function_graph(
     returns: set[int] = set()
     for index, row in enumerate(rows):
         assert row.address is not None
-        if row.is_ret or row.mnemonic == "int3":
-            if row.is_ret:
-                returns.add(index)
+        if row.is_ret:
+            returns.add(index)
+        if not (row.is_jump or row.falls_through):
             edges.append(())
             continue
         fall = row.address + row.size
@@ -135,7 +134,7 @@ def build_function_graph(
             if row.branch_target is not None:
                 branches = (
                     edge(
-                        "jmp" if row.mnemonic == "jmp" else "taken",
+                        "taken" if row.is_conditional else "jmp",
                         row.branch_target,
                         row,
                     ),
@@ -143,7 +142,7 @@ def build_function_graph(
             else:
                 table = _switch_table(row, jump_tables)
                 direct_external = bool(
-                    row.operands and row.operands[0][0] in ("imm", "sym")
+                    row.operands and isinstance(row.operands[0], (Imm, Sym))
                 )
                 branches = (
                     tuple(
@@ -157,7 +156,7 @@ def build_function_graph(
                     if table is not None and table.entries
                     else (
                         GraphEdge(
-                            "jmp" if row.mnemonic == "jmp" else "taken",
+                            "taken" if row.is_conditional else "jmp",
                             "external" if direct_external else "unknown",
                         ),
                     )
@@ -178,9 +177,7 @@ def build_function_graph(
                         )
                     )
             edges.append(
-                branches
-                if row.mnemonic == "jmp"
-                else (*branches, edge("fall", fall, row))
+                (*branches, edge("fall", fall, row)) if row.falls_through else branches
             )
             continue
         edges.append((edge("fall", fall, row),))
@@ -207,9 +204,9 @@ def build_function_graph(
             and (successor.label != "fall" or successor.target != index + 1)
             and successor.target is not None
         )
-        if (
-            rows[index].is_jump or rows[index].is_ret or rows[index].mnemonic == "int3"
-        ) and index + 1 < len(rows):
+        if (rows[index].is_jump or not rows[index].falls_through) and index + 1 < len(
+            rows
+        ):
             leaders.add(index + 1)
     order = sorted(leaders)
     blocks = tuple(

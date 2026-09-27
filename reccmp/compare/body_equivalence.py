@@ -1,9 +1,11 @@
 """Body-equivalence proofs for bodies that are not annotated pairs: folded
 COMDAT aliases, stale jmp islands and uniquely discoverable pairs."""
 
+from dataclasses import replace
 from typing import Callable
 
-from reccmp.compare.asm.const import JUMP_MNEMONICS
+from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import Imm, Mem, Operand, SignedSymbol, Sym
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
@@ -52,19 +54,12 @@ def _code_shape(raw: bytes, start: int) -> tuple | None:
         target = decoded.branch_target
         head = (decoded.prefix, decoded.mnemonic)
         if target is None:
-            shape.append((*head, _frozen(decoded.operands)))
+            shape.append((*head, decoded.operands))
         elif start <= target < start + len(raw):
             shape.append((*head, "local", target - start))
         else:
             shape.append((*head, "far", target))
     return tuple(shape) if cursor == start + len(raw) else None
-
-
-def _frozen(value):
-    match value:
-        case list() | tuple():
-            return tuple(_frozen(item) for item in value)
-    return value
 
 
 def _identical_code(image, first: int, second: int, size: int) -> bool:
@@ -80,16 +75,25 @@ def _identical_code(image, first: int, second: int, size: int) -> bool:
     return shape is not None and shape == _code_shape(b, second)
 
 
-def _erase_addresses(operand, valid_addr: Callable[[int], bool]):
+# What an operand the image calls an address becomes in a fingerprint.
+_ERASED_ADDRESS = Reference("<ADDR>", ("erased_address",))
+
+
+def _erase_addresses(operand: Operand, valid_addr: Callable[[int], bool]) -> Operand:
     """An operand with the values the image calls addresses erased."""
     match operand:
-        case ("imm", int() as value) if valid_addr(value):
-            return ("imm", "<ADDR>")
-        case ("mem", size, seg, reg_terms, int() as disp, syms) if disp and valid_addr(
-            abs(disp)
-        ):
-            return ("mem", size, seg, _frozen(reg_terms), "<ADDR>", syms)
-    return _frozen(operand)
+        case Imm(value) if valid_addr(value):
+            return Sym(_ERASED_ADDRESS)
+        case Mem(displacement=disp) if disp and valid_addr(abs(disp)):
+            return replace(
+                operand,
+                displacement=0,
+                symbols=(
+                    *operand.symbols,
+                    SignedSymbol(1 if disp > 0 else -1, _ERASED_ADDRESS),
+                ),
+            )
+    return operand
 
 
 def _is_bare_jmp_island(raw: bytes) -> bool:
@@ -268,7 +272,7 @@ class BodyEquivalenceMixin(ComparatorState):
             recomp_row.mnemonic,
         ):
             return False
-        if orig_row.mnemonic != "call" and orig_row.mnemonic not in JUMP_MNEMONICS:
+        if not (orig_row.is_call or orig_row.is_jump):
             return False
         orig_target, recomp_target = orig_row.branch_target, recomp_row.branch_target
         if orig_target is None or recomp_target is None:
@@ -474,7 +478,7 @@ class BodyEquivalenceMixin(ComparatorState):
                     tuple(
                         _erase_addresses(op, valid_addr)
                         for op in (
-                            (("imm", row.branch_target),)
+                            (Imm(row.branch_target),)
                             if row.branch_target is not None
                             else row.operands
                         )

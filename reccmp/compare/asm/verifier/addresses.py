@@ -34,7 +34,7 @@ def flatten_mem(addr: Value) -> Value:
             inner = value[1]
             terms += inner[2]
             disp += inner[3]
-            syms = tuple(sorted(set(syms) | set(inner[4])))
+            syms = tuple(sorted(set(syms) | set(inner[4]), key=repr))
             seg = seg or inner[1]
         else:
             for leaf in value[1:]:

@@ -3,6 +3,7 @@
 from typing import Literal
 
 from reccmp.compare.asm.ir import DecodedInstruction
+from reccmp.compare.asm.operand import Mem, Reg, ScaledReg
 from reccmp.compare.inlines import (
     HelperCatalogEntry,
     StoreEffect,
@@ -147,7 +148,7 @@ def test_asm_fingerprint_from_ir_uses_structured_operands():
             size=3,
             mnemonic="mov",
             prefix="",
-            operands=(("reg", "eax"), ("mem", "dword", "", (("ecx", 1),), 4, ())),
+            operands=(Reg("eax"), Mem("dword", "", (ScaledReg("ecx", 1),), 4)),
             display="mov eax, dword ptr [ecx + 0x4]",
         ),
     ]

@@ -12,6 +12,7 @@ from reccmp.compare.asm.ir import (
     FunctionImage,
     instruction_semantic_key,
 )
+from reccmp.compare.asm.operand import Mem
 from reccmp.compare.asm.verifier.evidence import target_facts
 from reccmp.compare.asm.verifier.state import JCC_MNEMONICS
 from reccmp.compare.diagnosis import AnalysisRecorder
@@ -87,7 +88,7 @@ def build_side_cfg(
     for i, successors in enumerate(graph.edges):
         if kinds[i] == "jmp" and any(edge.kind == "unknown" for edge in successors):
             switch_candidate = any(
-                op[0] == "mem" and any(scale == 4 for _reg, scale in op[3])
+                isinstance(op, Mem) and any(term.scale == 4 for term in op.terms)
                 for op in rows[i].operands
             )
             _mark_side_inconclusive(

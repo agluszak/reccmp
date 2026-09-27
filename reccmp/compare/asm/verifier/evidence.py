@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Hashable
 
 from reccmp.compare.asm.ir import DecodedInstruction
-from reccmp.compare.asm.model import (
-    format_operand,
-    Reject,
-    Reference,
-    operand_identity,
-)
+from reccmp.compare.asm.model import Reject
+from reccmp.compare.asm.operand import format_operand, Imm, Mem, Operand, Reg, Sym
 from reccmp.compare.asm.verifier.semantics import mem_address
 from reccmp.compare.asm.verifier.state import (
     CONTROL_TAGS,
-    JCC_MNEMONICS,
     WIDTHS,
     Context,
     SideState,
@@ -50,7 +46,7 @@ def _symbolic_summary(value, depth: int = 0) -> str:
     if tag == "mem" and len(value) >= 5:
         symbols = value[4]
         if symbols:
-            return str(symbols[0][1])
+            return symbols[0].ref.display
         terms = value[2]
         base = _symbolic_summary(terms[0][0], depth + 1) if terms else "absolute"
         return f"{base}{int(value[3]):+d}"
@@ -92,12 +88,14 @@ def diagnostic_summaries(value_o, value_r) -> tuple[str, str]:
     return summary_o, summary_r
 
 
-def identity_facts(prefix: str, token) -> dict[str, str | int | bool | None]:
+def identity_facts(
+    prefix: str, identity: Hashable
+) -> dict[str, str | int | bool | None]:
     """What a reference resolved to, from its proof identity (see
     asm.replacement.entity_proof_identity): its kind (``entity`` for a
     paired one, ``unresolved`` for an address nothing names, ...) and, for
     an entity, its original address and the offset into it."""
-    match operand_identity(token):
+    match identity:
         case ("entity", int() as address, int() as offset):
             return {
                 f"{prefix}_kind": "entity",
@@ -110,9 +108,9 @@ def identity_facts(prefix: str, token) -> dict[str, str | int | bool | None]:
             return {}
 
 
-def _memory_facts(op) -> dict[str, str | int | bool | None]:
-    """Primitive address components from one parsed memory operand."""
-    if op[0] != "mem":
+def _memory_facts(op: Operand) -> dict[str, str | int | bool | None]:
+    """Primitive address components from one memory operand."""
+    if not isinstance(op, Mem):
         return {
             "base_register": None,
             "index_register": None,
@@ -120,25 +118,25 @@ def _memory_facts(op) -> dict[str, str | int | bool | None]:
             "displacement": 0,
             "symbol": None,
         }
-    reg_terms = op[3]
-    base = next((reg for reg, scale in reg_terms if scale == 1), None)
-    index = next((reg for reg, scale in reg_terms if reg != base or scale != 1), None)
-    index_scale = next((scale for reg, scale in reg_terms if reg == index), 1)
-    symbols = op[5]
+    base = next((term.register for term in op.terms if term.scale == 1), None)
+    index_term = next(
+        (term for term in op.terms if term.register != base or term.scale != 1),
+        None,
+    )
     symbol = None
-    if symbols:
+    if op.symbols:
         symbol = " + ".join(
-            ("-" if sign < 0 else "") + str(name) for sign, name in symbols
+            ("-" if term.sign < 0 else "") + term.ref.display for term in op.symbols
         )
     facts: dict[str, str | int | bool | None] = {
         "base_register": base,
-        "index_register": index,
-        "scale": index_scale,
-        "displacement": op[4],
+        "index_register": index_term.register if index_term else None,
+        "scale": index_term.scale if index_term else 1,
+        "displacement": op.displacement,
         "symbol": symbol,
     }
-    if len(symbols) == 1 and symbols[0][0] == 1:
-        facts.update(identity_facts("symbol", symbols[0][1]))
+    if len(op.symbols) == 1 and op.symbols[0].sign == 1:
+        facts.update(identity_facts("symbol", op.symbols[0].ref.identity))
     return facts
 
 
@@ -147,31 +145,26 @@ def target_facts(
 ) -> dict[str, str | int | bool | None]:
     """A control transfer's destination: its address, what it names, its
     row in the excerpt, and the identity it resolves to."""
-    target_name = None
-    match ins.operands:
-        case (("imm", _), *_):
-            pass
-        case (operand, *_):
-            target_name = format_operand(operand)
     facts: dict[str, str | int | bool | None] = {
         "target": ins.branch_target,
-        "target_name": target_name,
+        "target_name": None,
         "target_instruction_index": target_index,
     }
-    if ins.operands:
-        operand = ins.operands[0]
-        if operand[0] == "sym":
-            facts.update(identity_facts("target", operand[1]))
-            if isinstance(operand[1], Reference):
-                facts["target_entity_type"] = operand[1].entity_type
-        elif operand[0] == "mem":
+    match ins.operands:
+        case (Imm(), *_) | ():
+            pass
+        case (Sym(ref), *_):
+            facts["target_name"] = ref.display
+            facts.update(identity_facts("target", ref.identity))
+            facts["target_entity_type"] = ref.entity_type
+        case (Mem(symbols=symbols) as operand, *_):
+            facts["target_name"] = format_operand(operand)
             facts["target_indirect"] = True
-            symbols = operand[5]
-            if len(symbols) == 1 and symbols[0][0] == 1:
-                reference = symbols[0][1]
-                facts.update(identity_facts("target", reference))
-                if isinstance(reference, Reference):
-                    facts["target_entity_type"] = reference.entity_type
+            if len(symbols) == 1 and symbols[0].sign == 1:
+                facts.update(identity_facts("target", symbols[0].ref.identity))
+                facts["target_entity_type"] = symbols[0].ref.entity_type
+        case (operand, *_):
+            facts["target_name"] = format_operand(operand)
     return facts
 
 
@@ -192,8 +185,9 @@ def _target_index(
 def _checked_call_registers(ctx: Context, ins: DecodedInstruction) -> list[str]:
     facts = None
     if ctx.metadata is not None and ctx.metadata.call_facts is not None:
-        if ins.operands and ins.operands[0][0] == "sym":
-            facts = ctx.metadata.call_facts(operand_identity(ins.operands[0][1]))
+        match ins.operands:
+            case (Sym(ref), *_):
+                facts = ctx.metadata.call_facts(ref.identity)
     ecx_argument, edx_argument = register_arguments(facts)
     return [
         register
@@ -203,7 +197,7 @@ def _checked_call_registers(ctx: Context, ins: DecodedInstruction) -> list[str]:
 
 
 def _operand_addresses(
-    states: tuple[SideState, SideState] | None, op_o, op_r
+    states: tuple[SideState, SideState] | None, op_o: Mem, op_r: Mem
 ) -> tuple | None:
     """The two memory operands' addresses as values, in the two states
     before their instructions; None when they cannot be computed."""
@@ -227,7 +221,7 @@ def _stack_adjustment(ins: DecodedInstruction) -> bool:
     return (
         ins.mnemonic in ("add", "sub")
         and len(ins.operands) == 2
-        and ins.operands[0] == ("reg", "esp")
+        and ins.operands[0] == Reg("esp")
     )
 
 
@@ -249,9 +243,9 @@ def record_operand_candidate(
         return
     if _stack_adjustment(ins_o) and _stack_adjustment(ins_r):
         return
-    if ins_o.mnemonic in JCC_MNEMONICS or ins_o.mnemonic.startswith("loop"):
+    if ins_o.is_conditional:
         return
-    if ins_o.mnemonic == "call":
+    if ins_o.is_call:
         # CALL observations diagnose canonical direct/indirect targets and
         # register arguments after symbolic execution. A raw memory-operand
         # candidate here would re-expose the physical vtable register after a
@@ -260,46 +254,47 @@ def record_operand_candidate(
     for op_o, op_r in zip(ins_o.operands, ins_r.operands):
         if op_o == op_r:
             continue
-        if op_o[0] == op_r[0] == "mem":
-            addresses = _operand_addresses(states, op_o, op_r)
-            if addresses is not None and (
-                addresses[0] == addresses[1]
-                or bitvector.compare(addresses).result == "proved"
-            ):
-                # Registers renamed, or one address spelled two ways.
-                continue
-            facts_o, facts_r = _memory_facts(op_o), _memory_facts(op_r)
-            if facts_o != facts_r:
+        match op_o, op_r:
+            case Mem(), Mem():
+                addresses = _operand_addresses(states, op_o, op_r)
+                if addresses is not None and (
+                    addresses[0] == addresses[1]
+                    or bitvector.compare(addresses).result == "proved"
+                ):
+                    # Registers renamed, or one address spelled two ways.
+                    continue
+                facts_o, facts_r = _memory_facts(op_o), _memory_facts(op_r)
+                if facts_o != facts_r:
+                    recorder.record_difference(
+                        "memory_address",
+                        index_o,
+                        index_r,
+                        facts_o,
+                        facts_r,
+                        candidate=True,
+                        **_symbolic_values(addresses),
+                    )
+                    return
+            case Imm(value_o), Imm(value_r):
                 recorder.record_difference(
-                    "memory_address",
+                    "immediate_value",
                     index_o,
                     index_r,
-                    facts_o,
-                    facts_r,
+                    {"value": value_o},
+                    {"value": value_r},
                     candidate=True,
-                    **_symbolic_values(addresses),
                 )
                 return
-        if op_o[0] == op_r[0] == "imm":
-            recorder.record_difference(
-                "immediate_value",
-                index_o,
-                index_r,
-                {"value": op_o[1]},
-                {"value": op_r[1]},
-                candidate=True,
-            )
-            return
-        if op_o[0] == op_r[0] == "sym":
-            recorder.record_difference(
-                "symbol_resolution",
-                index_o,
-                index_r,
-                {"symbol": str(op_o[1])},
-                {"symbol": str(op_r[1])},
-                candidate=True,
-            )
-            return
+            case Sym(ref_o), Sym(ref_r):
+                recorder.record_difference(
+                    "symbol_resolution",
+                    index_o,
+                    index_r,
+                    {"symbol": ref_o.display},
+                    {"symbol": ref_r.display},
+                    candidate=True,
+                )
+                return
 
 
 def record_observable_difference(

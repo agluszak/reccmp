@@ -21,6 +21,7 @@ import pytest
 from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.ir import DataRegion, JumpTable
 from reccmp.compare.asm.model import Reference
+from reccmp.compare.asm.operand import Sym
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
     FunctionMetadata,
@@ -66,9 +67,7 @@ def _sample_relocations(rows, raw, base):
             result.append(
                 replace(
                     row,
-                    operands=(
-                        ("sym", Reference(row.operands[0][1].display, identity)),
-                    ),
+                    operands=(Sym(Reference(row.operands[0].ref.display, identity)),),
                     control_target=identity,
                     branch_target=None,
                 )

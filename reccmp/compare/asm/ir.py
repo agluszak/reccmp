@@ -10,13 +10,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import cached_property
 from collections.abc import Hashable, Sequence
 from typing import TYPE_CHECKING
 
 from .model import Reference
+from .operand import Mem, Operand, SignedSymbol, Sym
 
 if TYPE_CHECKING:
     from .graph import FunctionGraph
+
+
+class FlowKind(Enum):
+    """Where execution goes after an instruction."""
+
+    NORMAL = "normal"  # the next instruction
+    CALL = "call"  # a callee, then the next instruction
+    CONDITIONAL = "conditional"  # a target or the next instruction (jcc, loop)
+    JUMP = "jump"  # a target only
+    RETURN = "return"  # the caller
+    TRAP = "trap"  # nowhere this function models (int3)
 
 
 class ExtentKind(Enum):
@@ -53,6 +66,15 @@ class DataRegion:
     data: bytes
 
 
+def instruction_ids(rows: Sequence[DecodedInstruction]) -> dict[int, int]:
+    """Instruction id (its position unless stamped) by address."""
+    return {
+        row.address: (row.instruction_id if row.instruction_id is not None else index)
+        for index, row in enumerate(rows)
+        if row.address is not None
+    }
+
+
 def rebind_local_identities(
     excerpt: Sequence[DecodedInstruction],
     *,
@@ -67,11 +89,7 @@ def rebind_local_identities(
     decoded instruction or a discovered jump table. Unpaired local data
     stays side-local.
     """
-    insn_ids = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
+    insn_ids = instruction_ids(excerpt)
     table_ids = {table.address: index for index, table in enumerate(jump_tables)}
     entry_ids: dict[int, tuple[int, int]] = {}
     for table_index, table in enumerate(jump_tables):
@@ -101,25 +119,27 @@ def rebind_local_identities(
             return ("unresolved", side, abs_addr)
         return ident
 
-    def rewrite_value(value):
-        match value:
-            case Reference(display=display, identity=identity, entity_type=entity_type):
-                bound = bind(identity)
-                return (
-                    value
-                    if bound == identity
-                    else Reference(display, bound, entity_type)
+    def rewrite_reference(ref: Reference) -> Reference:
+        bound = bind(ref.identity)
+        return ref if bound == ref.identity else replace(ref, identity=bound)
+
+    def rewrite_operand(operand: Operand) -> Operand:
+        match operand:
+            case Sym(ref):
+                return Sym(rewrite_reference(ref))
+            case Mem(symbols=symbols) if symbols:
+                return replace(
+                    operand,
+                    symbols=tuple(
+                        SignedSymbol(term.sign, rewrite_reference(term.ref))
+                        for term in symbols
+                    ),
                 )
-            case tuple():
-                return tuple(rewrite_value(item) for item in value)
-            case list():
-                return [rewrite_value(item) for item in value]
-            case _:
-                return value
+        return operand
 
     rebound: list[DecodedInstruction] = []
     for row in excerpt:
-        operands = rewrite_value(row.operands)
+        operands = tuple(rewrite_operand(operand) for operand in row.operands)
         control = bind(row.control_target) if row.control_target is not None else None
         if operands != row.operands or control != row.control_target:
             rebound.append(replace(row, operands=operands, control_target=control))
@@ -152,6 +172,15 @@ class FunctionImage:
     def __post_init__(self) -> None:
         if any(row.size <= 0 or not row.mnemonic for row in self.instructions):
             raise ValueError("FunctionImage.instructions must contain instructions")
+
+    @cached_property
+    def _ids_by_address(self) -> dict[int, int]:
+        return instruction_ids(self.instructions)
+
+    def index_of(self, address: int | None) -> int | None:
+        """The instruction at ``address``, by its position; None when no
+        instruction starts there."""
+        return None if address is None else self._ids_by_address.get(address)
 
     def with_instructions(
         self, instructions: Sequence[DecodedInstruction]
@@ -214,10 +243,7 @@ class DecodedInstruction:
     size: int
     mnemonic: str
     prefix: str
-    # Typed operands: ("reg", name), ("imm", value), ("st", index),
-    # ("sym", Reference), ("mem", size, segment, reg_terms, displacement,
-    # symbols), ("opaque", ...).
-    operands: tuple
+    operands: tuple[Operand, ...]
     # Rendered once, for humans and diffs; never read back.
     display: str
     # Capstone detail facts.
@@ -226,9 +252,7 @@ class DecodedInstruction:
     reads_flags: bool = False
     writes_flags: bool = False
     accesses_memory: bool = False
-    is_jump: bool = False
-    is_call: bool = False
-    is_ret: bool = False
+    flow: FlowKind = FlowKind.NORMAL
     branch_target: int | None = None
     # False when Capstone could not report register access (CsError). Empty
     # regs_read/regs_written then means "unknown", not "touches nothing".
@@ -244,24 +268,56 @@ class DecodedInstruction:
     # displacement; this is never that displacement.
     control_target: Hashable | None = None
 
+    @property
+    def is_jump(self) -> bool:
+        return self.flow in (FlowKind.CONDITIONAL, FlowKind.JUMP)
+
+    @property
+    def is_conditional(self) -> bool:
+        return self.flow is FlowKind.CONDITIONAL
+
+    @property
+    def is_call(self) -> bool:
+        return self.flow is FlowKind.CALL
+
+    @property
+    def is_ret(self) -> bool:
+        return self.flow is FlowKind.RETURN
+
+    @property
+    def falls_through(self) -> bool:
+        """Whether execution may continue at the next instruction."""
+        return self.flow in (FlowKind.NORMAL, FlowKind.CALL, FlowKind.CONDITIONAL)
+
 
 # Identities private to one image: across images such references match by
 # the placeholder or name they show, for scoring only.
 _SIDE_LOCAL = frozenset({"local", "unresolved", "unmatched"})
 
 
-def _freeze(value, *, semantic: bool = False) -> Hashable:
-    match value:
-        case list() | tuple():
-            return tuple(_freeze(item, semantic=semantic) for item in value)
-        case Reference(identity=identity) if semantic:
-            return identity
-        case Reference(display=display, identity=(kind, *_)) if kind in _SIDE_LOCAL:
-            return display
-        case Reference(identity=identity):
-            return identity
-        case _:
-            return value
+def _reference_key(ref: Reference, semantic: bool) -> Reference:
+    """The reference reduced to what it compares by: its identity, or for
+    scoring, the placeholder or name a side-local reference shows."""
+    match ref.identity:
+        case (str() as kind, *_) if not semantic and kind in _SIDE_LOCAL:
+            return Reference("", ("shown", ref.display))
+    return Reference("", ref.identity)
+
+
+def operand_key(operand: Operand, *, semantic: bool = False) -> Operand:
+    """The operand with its references reduced to what they compare by."""
+    match operand:
+        case Sym(ref):
+            return Sym(_reference_key(ref, semantic))
+        case Mem(symbols=symbols) if symbols:
+            return replace(
+                operand,
+                symbols=tuple(
+                    SignedSymbol(term.sign, _reference_key(term.ref, semantic))
+                    for term in symbols
+                ),
+            )
+    return operand
 
 
 def instruction_match_key(row: DecodedInstruction) -> Hashable:
@@ -274,9 +330,9 @@ def instruction_match_key(row: DecodedInstruction) -> Hashable:
     return ("ins", row.mnemonic, row.prefix, operand_match_key(row))
 
 
-def operand_match_key(row: DecodedInstruction) -> tuple[Hashable, ...]:
+def operand_match_key(row: DecodedInstruction) -> tuple[Operand, ...]:
     """The operands' part of ``instruction_match_key``."""
-    return tuple(_freeze(operand) for operand in row.operands)
+    return tuple(operand_key(operand) for operand in row.operands)
 
 
 def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
@@ -285,19 +341,18 @@ def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
         "ins",
         row.mnemonic,
         row.prefix,
-        _freeze(row.operands, semantic=True),
+        tuple(operand_key(operand, semantic=True) for operand in row.operands),
         row.control_target,
     )
 
 
 def _operand_identity(row: DecodedInstruction) -> Hashable:
     match row.operands:
-        case (("sym", Reference(identity=identity)), *_):
-            return identity
+        case (Sym(ref), *_):
+            return ref.identity
         case (operand, *_):
-            return _freeze(operand, semantic=True)
-        case _:
-            return None
+            return operand_key(operand, semantic=True)
+    return None
 
 
 def _local_destination_id(
@@ -359,11 +414,7 @@ def control_flow_topology_keys(
     address) — never a relative displacement. Switch tables contribute the
     tuple of case destination ids.
     """
-    addr_to_id = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
+    addr_to_id = instruction_ids(excerpt)
     keys: list[Hashable] = []
     for row in excerpt:
         if row.is_call:
@@ -404,11 +455,7 @@ def local_destination_keys(
     length; these keys make the destination explicit. Returns None when a
     destination falls inside the extent but not on an instruction boundary.
     """
-    addr_to_id = {
-        row.address: (row.instruction_id if row.instruction_id is not None else index)
-        for index, row in enumerate(excerpt)
-        if row.address is not None
-    }
+    addr_to_id = instruction_ids(excerpt)
 
     def key(target: int | None, tag: str) -> Hashable | None:
         if target is None or not start_addr <= target < start_addr + extent:

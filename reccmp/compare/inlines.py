@@ -7,12 +7,13 @@ diagnostic proposals — not automatic semantic proofs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Hashable
 from typing import Callable, Literal, Sequence
 
 from reccmp.compare.asm.ir import DecodedInstruction, operand_match_key
 from reccmp.compare.asm.model import REGISTERS
+from reccmp.compare.asm.operand import Mem, Operand, Reg, ScaledReg
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 
@@ -24,7 +25,7 @@ class FingerprintRow:
 
     prefix: str
     mnemonic: str
-    operands: tuple
+    operands: tuple[Operand, ...]
     callee: Hashable | None = None
 
 
@@ -139,12 +140,12 @@ class HelperCatalogEntry:
     effect_summary: HelperEffectSummary | None = None
 
 
-def _registers(operand) -> list[str]:
+def _registers(operand: Operand) -> list[str]:
     match operand:
-        case ("reg", name):
+        case Reg(name):
             return [name]
-        case ("mem", _, _, reg_terms, _, _):
-            return [name for name, _scale in reg_terms]
+        case Mem(terms=terms):
+            return [term.register for term in terms]
     return []
 
 
@@ -174,9 +175,12 @@ def summarize_helper_effects(
                 name for name in _registers(operand) if name in ("ecx", "edx")
             )
         match row.mnemonic, row.operands:
-            case mnemonic, (("reg", "eax"), _) if mnemonic.startswith("mov"):
+            case mnemonic, (Reg("eax"), _) if mnemonic.startswith("mov"):
                 return_kind = "register"
-            case mnemonic, (("mem", size, _, ((base, 1),), int() as disp, _), _) if (
+            case mnemonic, (
+                Mem(size, _, (ScaledReg(base, 1),), disp),
+                _,
+            ) if (
                 mnemonic in _STORE_MNEMONICS and size in _STORE_SIZES
             ):
                 if base == "ecx":
@@ -297,8 +301,8 @@ def collapse_indices(
     """Replace individual instruction indices with placeholders."""
     if not indices:
         return list(keys)
-    replace = dict(indices)
-    return [replace.get(i, key) for i, key in enumerate(keys)]
+    placeholders = dict(indices)
+    return [placeholders.get(i, key) for i, key in enumerate(keys)]
 
 
 def accuracy_after_inline_elision(
@@ -349,16 +353,21 @@ def _canon_reg_family(name: str, mapping: dict[str, str]) -> str | None:
     return f"{mapping[family]}.{width}"
 
 
-def _rename_operand(operand, mapping: dict[str, str]):
+def _rename_operand(operand: Operand, mapping: dict[str, str]) -> Operand:
     match operand:
-        case ("reg", name) if (renamed := _canon_reg_family(name, mapping)) is not None:
-            return ("reg", renamed)
-        case ("mem", size, seg, reg_terms, disp, syms):
-            terms = tuple(
-                (_canon_reg_family(name, mapping) or name, scale)
-                for name, scale in reg_terms
+        case Reg(name) if (renamed := _canon_reg_family(name, mapping)) is not None:
+            return Reg(renamed)
+        case Mem(terms=terms):
+            return replace(
+                operand,
+                terms=tuple(
+                    ScaledReg(
+                        _canon_reg_family(term.register, mapping) or term.register,
+                        term.scale,
+                    )
+                    for term in terms
+                ),
             )
-            return ("mem", size, seg, terms, disp, syms)
     return operand
 
 

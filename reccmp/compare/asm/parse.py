@@ -18,7 +18,6 @@ from typing_extensions import Buffer
 
 from reccmp.types import ImageId
 
-from .const import JUMP_MNEMONICS
 from .decode import disasm_detail
 from .graph import build_function_graph
 from .ir import (
@@ -29,7 +28,8 @@ from .ir import (
     JumpTable,
     rebind_local_identities,
 )
-from .model import Reference, ResolvedAddress, format_instruction
+from .model import Reference, ResolvedAddress
+from .operand import format_instruction, Imm, Mem, Operand, ScaledReg, SignedSymbol, Sym
 from .replacement import AddrTestProtocol, ReferenceResolver
 
 
@@ -66,8 +66,8 @@ def switch_index_register(insn: DecodedInstruction, table_addr: int) -> str | No
     if insn.mnemonic != "jmp" or insn.prefix:
         return None
     match insn.operands:
-        case (("mem", "dword", "", [(str() as index, 4)], int() as disp, ()),) if (
-            disp == table_addr
+        case (Mem("dword", "", (ScaledReg(index, 4),), displacement, ()),) if (
+            displacement == table_addr
         ):
             return index
     return None
@@ -78,8 +78,8 @@ def _table_displacement(insn: DecodedInstruction) -> int | None:
     where a jump or a load reads a table of addresses or bytes."""
     for operand in insn.operands:
         match operand:
-            case ("mem", _, _, reg_terms, int() as displacement, _) if (
-                reg_terms and displacement > 0
+            case Mem(terms=terms, displacement=displacement) if (
+                terms and displacement > 0
             ):
                 return displacement
     return None
@@ -266,7 +266,7 @@ class _SectionDiscovery:
                     if self.cur_addr >= self.section_end:
                         break
 
-                    if insn.mnemonic in JUMP_MNEMONICS:
+                    if insn.is_jump:
                         self._handle_jump(insn)
                     elif insn.mnemonic in ("mov", "movzx"):
                         # An indexed load reads a table of bytes there.
@@ -408,68 +408,60 @@ class AddressSanitizer:
         resolved = self.resolve(addr, exact=True)
         return resolved.identity if resolved is not None else self._local_identity(addr)
 
-    def _sanitize_mem_operand(self, operand, *, indirect: bool):
+    def _sanitize_mem_operand(self, operand: Mem, *, indirect: bool) -> Mem:
         """An address in a memory operand becomes a reference. An absolute
         operand is an address by its syntax: one nothing names gets this
         side's unresolved identity, never a numeric key the other side could
         share. A displacement is one only when the image relocates it. A
         segment-relative operand (``fs:[0]``) never is."""
         match operand:
-            case ("mem", size, "", [], int() as disp, ()):
-                return (
-                    "mem",
-                    size,
-                    "",
-                    [],
-                    0,
-                    ((1, self.reference(disp, indirect=indirect)),),
+            case Mem(segment="", terms=(), displacement=disp, symbols=()):
+                return replace(
+                    operand,
+                    displacement=0,
+                    symbols=(SignedSymbol(1, self.reference(disp, indirect=indirect)),),
                 )
-            case (
-                "mem",
-                size,
-                "",
-                reg_terms,
-                int() as disp,
-                (),
+            case Mem(
+                segment="", displacement=disp, symbols=()
             ) if disp and self.is_addr(abs(disp)):
-                sign = 1 if disp >= 0 else -1
-                return (
-                    "mem",
-                    size,
-                    "",
-                    list(reg_terms),
-                    0,
-                    ((sign, self.reference(abs(disp))),),
+                return replace(
+                    operand,
+                    displacement=0,
+                    symbols=(
+                        SignedSymbol(1 if disp >= 0 else -1, self.reference(abs(disp))),
+                    ),
                 )
         return operand
 
-    def _sanitize_imm_operand(self, mnemonic: str, operand):
+    def _sanitize_imm_operand(self, mnemonic: str, operand: Imm) -> Operand:
         """An immediate the image says is an address becomes a reference;
         one a `cmp` compares only when it names an entity."""
-        value = operand[1]
-        if not self.is_addr(value):
+        if not self.is_addr(operand.value):
             return operand
         if mnemonic == "cmp":
-            named = self.named_reference(value)
-            return ("sym", named) if named is not None else operand
-        return ("sym", self.reference(value))
+            named = self.named_reference(operand.value)
+            return Sym(named) if named is not None else operand
+        return Sym(self.reference(operand.value))
 
-    def _direct_transfer(self, insn: DecodedInstruction):
-        """(operand, control target, relative?) of a direct call or jump."""
+    def _direct_transfer(
+        self, insn: DecodedInstruction
+    ) -> tuple[Operand, Hashable, int | None]:
+        """(operand, control target, displacement shown for a local jump) of
+        a direct call or jump."""
         assert insn.address is not None and insn.branch_target is not None
         target = insn.branch_target
         if insn.is_call:
             ref = self.reference(target, exact=True)
-            return ("sym", ref), ref.identity, False
-        if insn.mnemonic == "jmp":
+            return Sym(ref), ref.identity, None
+        if not insn.is_conditional:
             # The unwind section jumps to other functions: name the target
             # when it has a name.
             named = self.named_reference(target, exact=True)
             if named is not None:
-                return ("sym", named), named.identity, False
+                return Sym(named), named.identity, None
         # A local jump shows its displacement, not its absolute target.
         displacement = target - (insn.address + insn.size)
-        return ("imm", displacement), self.control_identity(target), True
+        return Imm(displacement), self.control_identity(target), displacement
 
     def sanitize_row(self, insn: DecodedInstruction) -> DecodedInstruction:
         """Replace address operands by references; render the display."""
@@ -477,29 +469,28 @@ class AddressSanitizer:
         mnemonic = insn.mnemonic
         operands = list(insn.operands)
         control_target = None
-        relative = False
+        displacement = None
         if insn.branch_target is not None and (insn.is_call or insn.is_jump):
-            operands[0], control_target, relative = self._direct_transfer(insn)
+            operands[0], control_target, displacement = self._direct_transfer(insn)
         else:
             for i, op in enumerate(operands):
-                if op[0] == "mem":
-                    if mnemonic == "call":
+                match op:
+                    case Mem() if insn.is_call:
                         # Absolute indirect only; leave [reg+disp] alone.
-                        if not op[3]:
+                        if not op.terms:
                             operands[i] = self._sanitize_mem_operand(op, indirect=True)
-                    else:
+                    case Mem():
                         operands[i] = self._sanitize_mem_operand(op, indirect=False)
-                elif op[0] == "imm":
-                    if mnemonic == "push" and len(operands) == 1:
-                        if self.is_addr(op[1]):
-                            operands[i] = ("sym", self.reference(op[1]))
-                    else:
+                    case Imm(value) if mnemonic == "push" and len(operands) == 1:
+                        if self.is_addr(value):
+                            operands[i] = Sym(self.reference(value))
+                    case Imm():
                         operands[i] = self._sanitize_imm_operand(mnemonic, op)
 
         ops_tuple = tuple(operands)
-        if relative:
+        if displacement is not None:
             head = f"{insn.prefix} {mnemonic}".strip() if insn.prefix else mnemonic
-            display = f"{head} {hex(ops_tuple[0][1])}"
+            display = f"{head} {hex(displacement)}"
         elif ops_tuple == insn.operands:
             display = insn.display
         else:
@@ -575,11 +566,11 @@ def decode_function(
 
 # The operands `assert` receives in its line and file arguments: the macros,
 # not this build's numbers.
-_ASSERT_LINE = ("sym", Reference("__LINE__", ("assert_macro", "__LINE__")))
-_ASSERT_FILE = ("sym", Reference("__FILE__", ("assert_macro", "__FILE__")))
+_ASSERT_LINE = Sym(Reference("__LINE__", ("assert_macro", "__LINE__")))
+_ASSERT_FILE = Sym(Reference("__FILE__", ("assert_macro", "__FILE__")))
 
 
-def _with_operand(row: DecodedInstruction, operand) -> DecodedInstruction:
+def _with_operand(row: DecodedInstruction, operand: Operand) -> DecodedInstruction:
     return replace(
         row,
         operands=(operand,),

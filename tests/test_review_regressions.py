@@ -11,6 +11,7 @@ from dataclasses import replace
 from unittest.mock import Mock
 
 from reccmp.compare.asm.decode import disasm_detail
+from reccmp.compare.asm.operand import Imm
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.compare.asm.parse import decode_function
@@ -74,7 +75,7 @@ def test_a1_function_decoder_sees_mov_after_jump():
     for blob, imm in ((_A1_ORIG, 1), (_A1_RECOMP, 2)):
         decoded_movs = [ops for m, ops in _code_mnemonics(blob) if m == "mov"]
         assert decoded_movs, "function decoder must visit the mov after jmp-over-int3"
-        assert any(("imm", imm) in ops for ops in decoded_movs)
+        assert any(Imm(imm) in ops for ops in decoded_movs)
 
         detail = disasm_detail(blob, 0x1000)
         detail_movs = [insn for insn in detail if insn.mnemonic == "mov"]
@@ -82,7 +83,7 @@ def test_a1_function_decoder_sees_mov_after_jump():
             # Accept function-only coverage until the shared detail walker
             # also drains pending targets; still require unequal decoded rows.
             continue
-        assert any(("imm", imm) in insn.operands for insn in detail_movs)
+        assert any(Imm(imm) in insn.operands for insn in detail_movs)
 
 
 # --- A2: matched-node membership is not live-out proof at a branch ----------
@@ -258,9 +259,6 @@ def _bswap_meta(reads: tuple[str, ...], writes: tuple[str, ...]) -> DecodedInstr
         reads_flags=False,
         writes_flags=False,
         accesses_memory=False,
-        is_jump=False,
-        is_call=False,
-        is_ret=False,
         branch_target=None,
     )
 

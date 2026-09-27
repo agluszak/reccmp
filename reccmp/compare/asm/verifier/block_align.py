@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from collections.abc import Hashable
 
 from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
 from reccmp.compare.asm.model import REGISTERS
+from reccmp.compare.asm.operand import Mem, Operand, Reg, ScaledReg
 from reccmp.compare.asm.verifier.state import (
     JCC_MNEMONICS,
     STRING_OPS,
-    may_be_one_sided,
 )
+from reccmp.compare.asm.verifier.obligations import may_be_one_sided
 
 # Line-alignment costs (integers to keep DP ties exact): prefer exact text,
 # then identical instruction shape (registers anonymized), then a shared
@@ -49,7 +50,7 @@ class DpLine:
 def _dp_line_class(ins: DecodedInstruction) -> str:
     # pylint: disable=too-many-return-statements
     mnemonic = ins.mnemonic
-    if mnemonic == "call":
+    if ins.is_call:
         return "call"
     if mnemonic == "push":
         # Pushes pair with pushes, but may also go one-sided (a scratch
@@ -58,36 +59,33 @@ def _dp_line_class(ins: DecodedInstruction) -> str:
     if mnemonic in STRING_OPS or ins.prefix:
         return "store"
     if mnemonic in _X87_MEM_WRITERS_DP:
-        return "store" if any(op[0] == "mem" for op in ins.operands) else "none"
+        return "store" if any(isinstance(op, Mem) for op in ins.operands) else "none"
     if mnemonic in ("cmp", "test"):
         return "none"
-    if ins.operands and ins.operands[0][0] == "mem" and not mnemonic.startswith("j"):
+    if ins.operands and isinstance(ins.operands[0], Mem) and not ins.is_jump:
         return "store"
     return "none"
 
 
 def _dp_skeleton(ins: DecodedInstruction) -> tuple:
-    """Mnemonic plus operand kinds, keeping immediates, symbols, widths,
-    displacements and scale multisets."""
-    shape: list[tuple] = []
+    """Mnemonic plus operands with register identities erased: a register
+    keeps its width, a memory operand the multiset of its scales."""
+    shape: list[Operand] = []
     for op in ins.operands:
-        kind = op[0]
-        if kind == "reg":
-            shape.append(("reg", REGISTERS[op[1]][1]))
-        elif kind == "mem":
-            _, size, seg, reg_terms, disp, syms = op
-            shape.append(
-                (
-                    "mem",
-                    size,
-                    seg,
-                    tuple(sorted(scale for _, scale in reg_terms)),
-                    disp,
-                    syms,
+        match op:
+            case Reg(name) if name in REGISTERS:
+                shape.append(Reg(REGISTERS[name][1]))
+            case Mem(terms=terms):
+                shape.append(
+                    replace(
+                        op,
+                        terms=tuple(
+                            sorted(ScaledReg("", term.scale) for term in terms)
+                        ),
+                    )
                 )
-            )
-        else:
-            shape.append(op)
+            case _:
+                shape.append(op)
     return (ins.prefix, ins.mnemonic, tuple(shape))
 
 

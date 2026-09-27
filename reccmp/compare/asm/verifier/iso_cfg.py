@@ -14,6 +14,7 @@ from reccmp.compare.asm.ir import (
     instruction_semantic_key,
 )
 from reccmp.compare.asm.model import Reject
+from reccmp.compare.asm.operand import Mem, ScaledReg
 from reccmp.compare.asm.verifier import bitvector
 from reccmp.compare.asm.verifier.addresses import Value, unwind_spadd
 from reccmp.compare.asm.verifier.frame import maybe_frame_pointer
@@ -656,7 +657,10 @@ def _dp_line(row: DecodedInstruction, promote: bool) -> DpLine:
     if not promote or line.line_class != "store":
         return line
     match row.operands:
-        case (("mem", _, "", [("esp" | "ebp", 1)], _, ()), *_) if (
+        case (
+            Mem(segment="", terms=(ScaledReg("esp" | "ebp", 1),), symbols=()),
+            *_,
+        ) if (
             not row.prefix and row.mnemonic not in STRING_OPS
         ):
             return dataclasses.replace(line, line_class="none")
