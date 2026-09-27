@@ -289,31 +289,6 @@ def test_structured_comparison_schema_round_trip():
     assert restored_analyses[3] == analyses[3]
 
 
-def test_old_effective_boolean_schema_is_accepted():
-    """Version-1 reports stored effective match as a bare boolean."""
-    old_report = json.dumps(
-        {
-            "file": "test.exe",
-            "format": 1,
-            "timestamp": 0,
-            "data": [
-                {
-                    "address": "0x400000",
-                    "name": "test",
-                    "matching": 0.5,
-                    "effective": True,
-                }
-            ],
-        }
-    )
-    report = deserialize_reccmp_report(old_report)
-    entity = report.entities[0x400000]
-    assert entity.is_effective_match is True
-    assert entity.accuracy == 0.5
-    assert entity.analysis.status == ComparisonStatus.EFFECTIVE
-    assert entity.analysis.effective_reasons == ()
-
-
 def test_webui_testdata_deserializes():
     """The Playwright fixture must remain loadable by reccmp-aggregate."""
     fixture = Path(__file__).resolve().parents[1] / "webui" / "testdata.json"
@@ -350,7 +325,7 @@ def add_entity(
     *,
     name: str = "test",
     accuracy: float = 1.0,
-    entity_type: EntityType | None = EntityType.FUNCTION,
+    entity_type: EntityType = EntityType.FUNCTION,
     library: bool = False,
 ) -> ReccmpComparedEntity:
     """Helper to add an entity with the attributes used by the filter tests."""
@@ -410,19 +385,6 @@ def test_filter_entities_function_name_exclude_list():
         lambda e: not (e.type == EntityType.FUNCTION and e.name in exclude)
     )
     assert set(report.entities) == {100, 300}
-
-
-def test_filter_entities_untyped_is_not_function_type():
-    """Potential gap: filtering on entity type instead of calling `entity.is_function()`
-    will miss functions that have type=None (version 1 compatibility)."""
-    report = ReccmpStatusReport(filename="test.exe")
-    add_entity(report, 100, name="hello", entity_type=None)
-
-    report.filter_entities(lambda e: e.type != EntityType.FUNCTION)
-    assert set(report.entities) == {100}
-
-    report.filter_entities(lambda e: not e.is_function())
-    assert not report.entities
 
 
 def test_filter_entities_sets_function_count():
@@ -529,13 +491,3 @@ def test_asmcmp_filtering_ignore_functions():
     report.asmcmp_filtering(nolib=False, ignore_functions=["Pizza"])
     assert set(report.entities) == {100, 300}
     assert report.function_count == 1
-
-
-def test_asmcmp_filtering_untyped_entity():
-    """An entity with no type is treated as a function,
-    so the ignore list applies to it. (Version 1 report compatibility.)"""
-    report = ReccmpStatusReport(filename="test.exe")
-    add_entity(report, 100, name="Pizza", entity_type=None)
-
-    report.asmcmp_filtering(nolib=False, ignore_functions=["Pizza"])
-    assert not report.entities

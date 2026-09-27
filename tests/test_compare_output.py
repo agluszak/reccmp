@@ -697,7 +697,7 @@ def test_report_function_alignment():
 def test_report_function_accuracy():
     def test_entity(
         addr: int,
-        entity_type: EntityType | None,
+        entity_type: EntityType,
         accuracy: float,
         *,
         effective: bool = False,
@@ -773,16 +773,6 @@ def test_report_function_accuracy():
         ]
     )
     assert report_function_accuracy(report) == (0, 0, 0)
-
-    # Assumes type=None is a function.
-    # This is to preserve compatibility with files that existed before #392.
-    report.entities = dict(
-        [
-            test_entity(0, EntityType.FUNCTION, 1.0),
-            test_entity(1, None, 0.5),
-        ]
-    )
-    assert report_function_accuracy(report) == (2, 1.5, 1.5)
 
 
 def test_compare_vtable_recomp_longer():

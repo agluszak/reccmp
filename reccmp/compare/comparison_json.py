@@ -254,7 +254,7 @@ def parse_diagnostic_normalizations(
         if not isinstance(item, str):
             raise ComparisonJsonError
         try:
-            tags.add(DiagnosticNormalization(item.removesuffix("_equivalent")))
+            tags.add(DiagnosticNormalization(item))
         except ValueError as ex:
             raise ComparisonJsonError from ex
     return tuple(tag for tag in DiagnosticNormalization if tag in tags)
