@@ -5,10 +5,7 @@ from functools import partial
 from typing import Callable, Iterator
 from typing_extensions import Buffer
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.instgen import (
-    InstructGen,
-    SectionType,
-)
+from reccmp.compare.asm.parse import decode_function
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.formats import Image, PEImage
 from reccmp.types import EntityType, ImageId
@@ -93,12 +90,7 @@ def _operand_addresses(operand) -> list[int]:
 
 
 def _code_instructions(raw: bytes, start: int) -> list[DecodedInstruction]:
-    return [
-        insn
-        for section in InstructGen(raw, start, True).sections
-        if section.type == SectionType.CODE
-        for insn in section.contents
-    ]
+    return list(decode_function(raw, start).instructions)
 
 
 class UsedAddressCollector:
