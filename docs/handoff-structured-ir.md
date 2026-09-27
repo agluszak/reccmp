@@ -99,6 +99,9 @@ Commits on this branch:
 - `cb0d9a77`: comparison gets a fresh `FunctionComparator` after the catalog
   freezes, so its resolver and proof caches start from final identities.
 - `774f1d8b`: compile-command normalization moved to `source/commands.py`.
+- Marker block merging, declaration binding, and marker JSON projection now
+  live in `source/markers.py`; the index passes compiler facts into that
+  boundary instead of implementing marker joins itself.
 - The entity catalog now seals side facts when it freezes. Matched entity
   views share the sealed records, and prepared-analysis pickle caching keeps
   them sealed after reload.
@@ -129,7 +132,7 @@ already reproduce (113 positional, 19 diff-aligned, ten relocation).
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
 machine and semantic instruction effects; finish separating source index
-marker binding, layout queries, and orchestration; finish typed diagnosis
+layout queries and orchestration; finish typed diagnosis
 payloads. The catalog's side fact maps are sealed, though entity pairing
 objects remain mutable Python objects and the catalog still uses key-value
 facts internally.

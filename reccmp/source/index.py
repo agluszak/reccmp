@@ -3,9 +3,9 @@
 The marker grammar (``reccmp.parser``) owns annotation syntax and addresses.
 Clang owns C++ names, function and variable kinds, types, linkage, class
 membership, inheritance, virtual declarations, and which declaration each
-marker block annotates. This module keeps the indexer's marker blocks, joins
-them to the declaration records by semantic id, and writes disposable JSON
-projections for downstream tools.
+marker block annotates. This module derives link-namespace facts and
+orchestrates the index; ``source.markers`` joins marker blocks to declarations
+and projects them for JSON output.
 
 Compiler records arrive as per-TU observations. Link-namespace partitioning,
 winner selection, and conflict derivation happen after collection — never by
@@ -26,10 +26,10 @@ from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence
 
 from reccmp.call_facts import CallFacts
-from reccmp.parser.marker import MarkerType, ProjectAliases
-from reccmp.parser.node import ParserFunction, ParserVtable
-from reccmp.parser.reader import MarkerBlock, local_paths, read_marker_blocks
+from reccmp.parser.marker import ProjectAliases
+from reccmp.parser.reader import MarkerBlock, local_paths
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
+from .markers import merge_marker_blocks, _marker_projection, _join_markers
 from .observations import (
     SourceIndexError,
     TranslationUnitRecords,
@@ -49,7 +49,6 @@ from .records import (
     SourceFunctionFacts,
     FunctionFacts,
     SourceAbi,
-    SourceBaseVtable,
     SourceClass,
     ResolvedField,
     SourceMarker,
@@ -169,15 +168,6 @@ def _add_observation(
     group = groups.setdefault(key, [])
     if not any(item is fact for item in group):
         group.append(fact)
-
-
-def merge_marker_blocks(blocks: Iterable[MarkerBlock]) -> tuple[MarkerBlock, ...]:
-    """One block per source position; a header is seen by many units."""
-    merged: dict[tuple[str, int], MarkerBlock] = {}
-    for block in blocks:
-        previous = merged.get(block.key)
-        merged[block.key] = block if previous is None else previous.merged(block)
-    return tuple(merged[key] for key in sorted(merged))
 
 
 class _RepositoryPaths:
@@ -490,149 +480,6 @@ def _keyed(
         target, unit_id = values.pop("target"), values.pop("unit_id")
         records[DeclarationKey(target, values[id_field], unit_id)] = parse(values)
     return records
-
-
-def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
-    """Serialize a marker with a declaration key instead of a nested copy."""
-    return {
-        "address": marker.address,
-        "marker_kind": marker.marker_kind,
-        "source_file": marker.source_file,
-        "line": marker.line,
-        "marker_name": marker.marker_name,
-        "folded": marker.folded,
-        "target": marker.target,
-        "declaration_key": (
-            marker.declaration_key.to_json()
-            if marker.declaration_key is not None
-            else None
-        ),
-    }
-
-
-def _join_markers(
-    target: str,
-    namespace: _NamespaceRecords,
-    blocks: Sequence[MarkerBlock],
-    *,
-    aliases: ProjectAliases | None,
-) -> tuple[dict[DeclarationKey, SourceClass], list[SourceMarker]]:
-    identity = {block.source_file: PurePath(block.source_file) for block in blocks}
-    symbols = [
-        symbol
-        for result in read_marker_blocks(blocks, identity, aliases=aliases)
-        for symbol in result.tokens
-        if symbol.module == target.upper()
-    ]
-    # By location as well as identity: TU-local functions of different files
-    # can share a mangled name.
-    definitions: dict[tuple[str, str, int], list[DeclarationKey]] = {}
-    for key, declaration in namespace.declarations.items():
-        if declaration.is_definition:
-            definitions.setdefault(
-                (declaration.semantic_id, declaration.source_file, declaration.line), []
-            ).append(key)
-
-    markers: list[SourceMarker] = []
-    for method_symbol in symbols:
-        if not isinstance(method_symbol, ParserFunction):
-            continue
-        relative = method_symbol.filename.as_posix()
-        marker_key: DeclarationKey | None = None
-        # Name-reference markers (TEMPLATE/SYNTHETIC/LIBRARY, and FUNCTION with a
-        # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
-        # name their entity instead of annotating a definition.
-        if (
-            method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
-            and not method_symbol.is_nameref()
-        ):
-            # One per definition. A TU-local function defined in a header
-            # has an identical copy in each including unit, and nothing here
-            # says which copy the marker's address is: it binds the first
-            # unit's.
-            candidates = [
-                min(found, key=DeclarationKey.sort_key)
-                for semantic_id in method_symbol.definitions
-                if (
-                    found := definitions.get(
-                        (semantic_id, relative, method_symbol.line_number)
-                    )
-                )
-            ]
-            if len(candidates) != 1:
-                raise SourceIndexError(
-                    f"{relative}:{method_symbol.line_number}: {method_symbol.type.name} "
-                    f"0x{method_symbol.offset:08x} "
-                    f"binds to {len(candidates)} function definitions"
-                )
-            marker_key = candidates[0]
-        marker_declaration = (
-            namespace.declarations[marker_key] if marker_key is not None else None
-        )
-        markers.append(
-            SourceMarker(
-                address=method_symbol.offset,
-                marker_kind=method_symbol.type.name,
-                source_file=relative,
-                line=method_symbol.line_number,
-                declaration=marker_declaration,
-                folded=method_symbol.is_folded,
-                target=target,
-                marker_name=(
-                    method_symbol.name if marker_declaration is None else None
-                ),
-                declaration_key=marker_key,
-            )
-        )
-
-    classes = dict(namespace.classes)
-    class_by_name = {item.qualified_name: key for key, item in classes.items()}
-    for vtable_symbol in symbols:
-        if not isinstance(vtable_symbol, ParserVtable):
-            continue
-        relative = vtable_symbol.filename.as_posix()
-        class_key = class_by_name.get(vtable_symbol.name)
-        if class_key is None:
-            source_class = SourceClass(
-                semantic_id=f"record:{vtable_symbol.name}",
-                qualified_name=vtable_symbol.name,
-                bases=(),
-                fields=(),
-                virtual_declarations=(),
-                source_file=relative,
-                line=vtable_symbol.line_number,
-                end_line=vtable_symbol.line_number,
-                vtable_address=vtable_symbol.offset,
-            )
-            class_key = DeclarationKey(target, source_class.semantic_id)
-            classes[class_key] = source_class
-            class_by_name[source_class.qualified_name] = class_key
-            continue
-        source_class = classes[class_key]
-        base_class = vtable_symbol.base_class
-        class_names = {
-            source_class.qualified_name,
-            source_class.qualified_name.rsplit("::", 1)[-1],
-        }
-        if base_class is not None and base_class not in class_names:
-            base_vtable = SourceBaseVtable(vtable_symbol.offset, base_class)
-            if base_vtable in source_class.base_vtables:
-                raise SourceIndexError(
-                    f"{relative}:{vtable_symbol.line_number}: duplicate VTABLE marker "
-                    f"for base {base_class}"
-                )
-            classes[class_key] = replace(
-                source_class,
-                base_vtables=(*source_class.base_vtables, base_vtable),
-            )
-            continue
-        if source_class.vtable_address is not None:
-            raise SourceIndexError(
-                f"{relative}:{vtable_symbol.line_number}: class has more than one "
-                "primary VTABLE marker"
-            )
-        classes[class_key] = replace(source_class, vtable_address=vtable_symbol.offset)
-    return classes, markers
 
 
 def _unique_class_map(
@@ -1064,7 +911,8 @@ class SourceIndex:
             files = target_files.get(target) if target_files is not None else None
             target_classes, target_markers = _join_markers(
                 target,
-                namespace,
+                namespace.declarations,
+                namespace.classes,
                 (
                     blocks
                     if files is None
