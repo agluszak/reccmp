@@ -96,11 +96,15 @@ Commits on this branch:
 - `630941a7`: per-TU Clang observation parsing and JSON fact construction
   moved to `source/observations.py`; `source/index.py` retains namespace
   derivation, marker binding, layout queries, and orchestration.
+- `cb0d9a77`: comparison gets a fresh `FunctionComparator` after the catalog
+  freezes, so its resolver and proof caches start from final identities.
+- `774f1d8b`: compile-command normalization moved to `source/commands.py`.
 
 Full Python suite: 1,387 passed, 221 skipped, 3 expected failures. Mypy and
-Pylint pass for the latest changed production modules. The Wizardry WIZ8
+repository-wide Pylint pass. The Wizardry WIZ8
 corpus retained all 2,684 exact and 284 effective proofs against the pinned
-`71a79dec` baseline. The decoder, role-removal, and alias-guard runs had
+`71a79dec` baseline. The decoder, role-removal, alias-guard, and frozen-
+catalog comparator runs had
 exactly the same status and reason for all 6,098 entries. Against
 the pinned baseline, 14 inconclusive entries became mismatch and 8 mismatches
 became inconclusive; those diagnosis changes remain under review. The web UI
@@ -116,8 +120,8 @@ deleting their implementations.
 
 Still open: replace the separate extent and callee-cleanup walks with
 queries over the canonical graph where their evidence permits it; unify
-machine and semantic instruction effects; make the entity catalog genuinely
-immutable before constructing comparison context; finish separating source
+machine and semantic instruction effects; make the entity catalog's side
+facts immutable as well as guarding mutations through its methods; finish separating source
 index marker binding, layout queries, and orchestration; finish typed
 diagnosis payloads.
 Keep cvdump and Unicorn as separate input and
