@@ -31,7 +31,7 @@ dataflow support the strategies lockstep, cfg and iso_cfg; analysis runs
 the strategies in turn and picks what to report.
 """
 
-from .analysis import analyze_effective_match
+from .analysis import analyze_effective_match, compare_exact
 from .cfg import verify_cfg_effective_match
 from .iso_cfg import verify_isomorphic_cfg_effective_match
 from .lockstep import verify_effective_match
@@ -41,6 +41,7 @@ __all__ = [
     "CallFacts",
     "FunctionMetadata",
     "analyze_effective_match",
+    "compare_exact",
     "verify_cfg_effective_match",
     "verify_effective_match",
     "verify_isomorphic_cfg_effective_match",

@@ -5,7 +5,7 @@ from functools import partial
 from typing import Callable, Iterator
 from typing_extensions import Buffer
 from reccmp.compare.asm.const import JUMP_MNEMONICS
-from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.decode import disasm_detail
 from reccmp.compare.asm.ir import DecodedInstruction
 from reccmp.formats import Image, PEImage
 from reccmp.types import EntityType, ImageId
@@ -69,11 +69,6 @@ class CrtStartupArray:
     The thunk is what actually appeared in the ___xc_a/z list."""
 
 
-# Values below this are not taken for addresses: an image's addresses are
-# at least 0x100000 (six hex digits).
-_MIN_ADDRESS = 0x100000
-
-
 def _operand_addresses(operand) -> list[int]:
     """The values in one operand that may be addresses: an immediate, or a
     memory operand's displacement."""
@@ -84,13 +79,12 @@ def _operand_addresses(operand) -> list[int]:
             values = [displacement]
         case _:
             values = []
-    return [
-        value & 0xFFFFFFFF for value in values if (value & 0xFFFFFFFF) >= _MIN_ADDRESS
-    ]
+    return [value & 0xFFFFFFFF for value in values]
 
 
 def _code_instructions(raw: bytes, start: int) -> list[DecodedInstruction]:
-    return list(decode_function(raw, start).instructions)
+    """Unsanitized rows: the collector reads numeric addresses."""
+    return disasm_detail(raw, start)
 
 
 class UsedAddressCollector:
@@ -338,27 +332,6 @@ def create_crt_matches(
     return matches
 
 
-def _is_atexit_target(db: EntityDb, image_id: ImageId, addr: int) -> bool:
-    """Recognize the CRT entry by its input symbol through thunk edges."""
-    ref_key = "ref_orig" if image_id == ImageId.ORIG else "ref_recomp"
-    seen: set[int] = set()
-    for _ in range(8):
-        if addr in seen:
-            return False
-        seen.add(addr)
-        entity = db.get(image_id, addr, exact=True)
-        if entity is None:
-            return False
-        names = (entity.get("symbol"), entity.get("name"))
-        if any(name in ("atexit", "_atexit") for name in names):
-            return True
-        ref = entity.get(ref_key)
-        if not isinstance(ref, int):
-            return False
-        addr = ref
-    return False
-
-
 def find_initializer_atexit_helpers(
     db: EntityDb,
     image_id: ImageId,
@@ -381,7 +354,10 @@ def find_initializer_atexit_helpers(
         for previous, current in zip(instructions, instructions[1:]):
             if not current.is_call or current.branch_target is None:
                 continue
-            if not _is_atexit_target(db, image_id, current.branch_target):
+            if not db.callee_names(image_id, current.branch_target) & {
+                "atexit",
+                "_atexit",
+            }:
                 continue
             match previous.mnemonic, previous.operands:
                 case "push", (("imm", int() as helper_addr),):

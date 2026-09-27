@@ -32,27 +32,19 @@ class ExtentKind(Enum):
 class JumpTable:
     """One switch address table discovered during function decoding.
 
-    ``entries`` are ``(entry_address, target_address)`` pairs. Optional
-    ``dispatch_address`` is the ``jmp`` that indexes the table when known.
-    ``scale`` / ``entry_width`` / ``index_register`` describe the dispatch
-    addressing form; a table is only a recognized MSVC switch when the
-    dispatch is ``jmp dword ptr [index*4 + table]``.
+    ``entries`` are ``(entry_address, target_address)`` dword pairs.
+    ``dispatch_address`` and ``index_register`` are set only when decoding
+    found the ``jmp dword ptr [index*4 + table]`` that indexes the table
+    (see ``parse.switch_index_register``); only then is it a recognized switch.
     """
 
     address: int
     entries: tuple[tuple[int, int], ...]
     dispatch_address: int | None = None
-    scale: int = 4
-    entry_width: int = 4
     index_register: str | None = None
 
     def is_recognized_switch(self) -> bool:
-        return (
-            self.scale == 4
-            and self.entry_width == 4
-            and self.dispatch_address is not None
-            and self.index_register is not None
-        )
+        return self.dispatch_address is not None and self.index_register is not None
 
 
 @dataclass(frozen=True)
@@ -289,7 +281,12 @@ def instruction_match_key(row: DecodedInstruction) -> Hashable:
     placeholder or name it shows, so ``<OFFSET1>`` on both sides lines up.
     Proofs use ``instruction_semantic_key`` instead.
     """
-    return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
+    return ("ins", row.mnemonic, row.prefix, operand_match_key(row))
+
+
+def operand_match_key(row: DecodedInstruction) -> tuple[Hashable, ...]:
+    """The operands' part of ``instruction_match_key``."""
+    return tuple(_freeze(operand) for operand in row.operands)
 
 
 def instruction_semantic_key(row: DecodedInstruction) -> Hashable:

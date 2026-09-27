@@ -1,6 +1,7 @@
 """Address sanitization operates on decoded operands, not assembly text."""
 
 from reccmp.compare.asm.model import ResolvedAddress
+from reccmp.types import ImageId
 from reccmp.compare.asm.parse import AddressSanitizer, decode_function
 from tests.asm_rows import rows
 
@@ -31,9 +32,14 @@ def test_absolute_memory_uses_one_resolved_identity():
     assert first_ref.display == second_ref.display == "g_data"
 
 
-def test_unproven_absolute_memory_stays_numeric():
+def test_unresolved_absolute_memory_has_side_local_identity():
+    """Equal numeric addresses nothing names may hold different data on
+    each side, so they never share an identity."""
     row = _row("mov eax, dword ptr [0x1234]")
-    assert AddressSanitizer().sanitize_row(row).operands == row.operands
+    orig = AddressSanitizer(image_id=ImageId.ORIG).sanitize_row(row)
+    recomp = AddressSanitizer(image_id=ImageId.RECOMP).sanitize_row(row)
+    assert orig.operands[1][5][0][1].identity == ("unresolved", "orig", 0x1234)
+    assert recomp.operands[1][5][0][1].identity == ("unresolved", "recomp", 0x1234)
 
 
 def test_relocated_displacement_becomes_reference():

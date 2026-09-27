@@ -13,8 +13,9 @@ from reccmp.compare.asm.ir import (
     JumpTable,
     instruction_match_key,
 )
-from reccmp.compare.asm.verifier import analyze_effective_match
-from reccmp.compare.diagnosis import ComparisonStatus
+from reccmp.compare.asm.parse import decode_function
+from reccmp.compare.asm.verifier import analyze_effective_match, compare_exact
+from reccmp.compare.diagnosis import ComparisonAnalysis, ComparisonStatus
 
 
 def test_from_capstone_mem_operand_without_display_parse():
@@ -169,5 +170,32 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
 
     original = FunctionImage(0x1000, 1, ExtentKind.KNOWN, (row_a,))
     recompiled = FunctionImage(0x2000, 1, ExtentKind.KNOWN, (row_b,))
+    assert compare_exact(original, recompiled) is None
     analysis = analyze_effective_match([], original, recompiled)
     assert analysis.status != ComparisonStatus.EXACT
+
+
+def test_only_compare_exact_admits_exact():
+    image = decode_function(b"\xb8\x01\x00\x00\x00\xc3", 0x1000)
+    assert compare_exact(image, image) == ComparisonAnalysis.exact()
+    assert analyze_effective_match([], image, image).status != ComparisonStatus.EXACT
+
+
+def _switch_image(dispatch: bytes):
+    # dispatch; ret; two table entries pointing at the ret.
+    table = 0x1000 + len(dispatch) + 1
+    code = dispatch.replace(b"TTTT", table.to_bytes(4, "little")) + b"\xc3"
+    entry = (0x1000 + len(dispatch)).to_bytes(4, "little")
+    return decode_function(code + entry + entry, 0x1000)
+
+
+def test_indexed_switch_dispatch_is_recognized():
+    image = _switch_image(b"\xff\x24\x85TTTT")  # jmp [eax*4 + table]
+    assert [t.index_register for t in image.jump_tables] == ["eax"]
+    assert image.control_flow_complete
+
+
+def test_switch_dispatch_with_base_register_is_not_recognized():
+    image = _switch_image(b"\xff\xa4\x83TTTT")  # jmp [ebx + eax*4 + table]
+    assert not any(t.is_recognized_switch() for t in image.jump_tables)
+    assert not image.control_flow_complete

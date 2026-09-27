@@ -643,6 +643,20 @@ class EntityDb:
 
         return self._entities[img].get(addr)
 
+    def callee_names(self, img: ImageId, addr: int) -> set[str]:
+        """The symbol, name and import name of the entity a call to ``addr``
+        reaches, following thunk references to their target."""
+        ref_key = "ref_orig" if img == ImageId.ORIG else "ref_recomp"
+        seen: set[int] = set()
+        while addr not in seen and (entity := self.get(img, addr)) is not None:
+            seen.add(addr)
+            ref = entity.get(ref_key)
+            if not isinstance(ref, int):
+                names = (entity.get("symbol"), entity.name, entity.get("import_name"))
+                return {name for name in names if isinstance(name, str)}
+            addr = ref
+        return set()
+
     def get_functions(self) -> Iterator[ReccmpMatch]:
         """Return all function-like matched entities. Previously, all functions
         had type=FUNCTION but there are now THUNK and VTORDISP types."""

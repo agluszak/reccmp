@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from collections.abc import Hashable
 from typing import Callable, Literal, Sequence
 
-from reccmp.compare.asm.ir import DecodedInstruction, instruction_match_key
+from reccmp.compare.asm.ir import DecodedInstruction, operand_match_key
 from reccmp.compare.asm.model import REGISTERS
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
@@ -62,7 +62,7 @@ def fingerprint_of(rows: Sequence[DecodedInstruction]) -> Fingerprint:
         FingerprintRow(
             row.prefix,
             row.mnemonic,
-            instruction_match_key(row)[3],  # type: ignore[index]
+            operand_match_key(row),
             row.control_target if row.is_call else None,
         )
         for row in rows

@@ -1,7 +1,7 @@
 # pylint: disable=too-many-lines
 import dataclasses
 from dataclasses import dataclass, field
-from functools import cache
+from functools import cache, partial
 import struct
 from itertools import pairwise
 from collections.abc import Hashable
@@ -11,14 +11,13 @@ from reccmp.compare.thunk_resolve import read_e9_jmp_target
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 from reccmp.compare.asm.verifier import FunctionMetadata
 from reccmp.call_facts import CallFacts
-from reccmp.compare.asm.verifier import analyze_effective_match
+from reccmp.compare.asm.verifier import analyze_effective_match, compare_exact
 from reccmp.compare.asm.parse import assert_fixup, decode_function
 from reccmp.compare.asm.render import render_function_rows
 from reccmp.compare.asm.ir import (
     ExtentKind,
     FunctionImage,
     DecodedInstruction,
-    control_flow_topology_keys,
     instruction_match_key,
     instruction_semantic_key,
 )
@@ -29,7 +28,6 @@ from reccmp.compare.db import EntityDb, ReccmpMatch
 from reccmp.compare.diff import EntityCompareResult, RawDiffOutput
 from reccmp.compare.verification import (
     admit_effective,
-    admit_exact_analysis,
     admit_proof,
 )
 from reccmp.compare.stack_layout import analyze_stack_layout
@@ -229,6 +227,9 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             image_id=image_id,
         )
 
+    def _calls_assert(self, image_id: ImageId, addr: int) -> bool:
+        return bool(self.db.callee_names(image_id, addr) & {"_assert", "__assert"})
+
     def compare_function(
         self,
         match: ReccmpMatch,
@@ -300,11 +301,11 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
 
         # Check for assert calls only if we expect to find them
         if has_asserts(self.orig_bin):
-            assert_fixup(orig_rows)
+            assert_fixup(orig_rows, partial(self._calls_assert, ImageId.ORIG))
             orig_image = orig_image.with_instructions(orig_rows)
 
         if has_asserts(self.recomp_bin):
-            assert_fixup(recomp_rows)
+            assert_fixup(recomp_rows, partial(self._calls_assert, ImageId.RECOMP))
             recomp_image = recomp_image.with_instructions(recomp_rows)
 
         line_annotations = self._collect_line_annotations(
@@ -437,31 +438,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
             render_pins,
         ).ratio()
         display_similarity = render_diff.ratio()
-        operands_complete = all(
-            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
-        )
-        control_flow_complete = (
-            orig.control_flow_complete and recomp.control_flow_complete
-        )
-        orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
-        recomp_topology = control_flow_topology_keys(recomp_rows, recomp.jump_tables)
-        exact = admit_exact_analysis(
-            bytes_equal=(
-                orig.raw is not None
-                and recomp.raw is not None
-                and orig.raw == recomp.raw
-            ),
-            topology_equal=(
-                orig_topology is not None and orig_topology == recomp_topology
-            ),
-            keys_equal=(
-                orig_sem == recomp_sem and orig.data_shape == recomp.data_shape
-            ),
-            operands_complete=operands_complete,
-            control_flow_complete=control_flow_complete,
-            coverage_incomplete=coverage_incomplete,
-            extent_closed=extent_closed,
-        )
+        exact = compare_exact(orig, recomp)
         if exact is not None:
             analysis = exact
         else:

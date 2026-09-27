@@ -291,6 +291,7 @@ def analyze_effective_match(
     extent_closed=True,
 ):
     from reccmp.compare.asm.verifier import analyze_effective_match as analyze
+    from reccmp.compare.asm.verifier import compare_exact
 
     orig_rows = as_rows(orig, addresses=orig_addrs, meta=orig_meta)
     recomp_rows = as_rows(
@@ -314,4 +315,6 @@ def analyze_effective_match(
         coverage_incomplete,
         extent_closed,
     )
-    return analyze(codes, orig_image, recomp_image, metadata)
+    return compare_exact(orig_image, recomp_image) or analyze(
+        codes, orig_image, recomp_image, metadata
+    )

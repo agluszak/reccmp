@@ -13,7 +13,7 @@ import struct
 from dataclasses import replace
 from enum import Enum, auto
 from typing import Literal, NamedTuple
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from typing_extensions import Buffer
 
 from reccmp.types import ImageId
@@ -53,6 +53,24 @@ class _TabSection(NamedTuple):
 
 
 _FuncSection = _CodeSection | _TabSection
+
+
+def switch_index_register(insn: DecodedInstruction, table_addr: int) -> str | None:
+    """The index register of ``jmp dword ptr [index*4 + table_addr]``.
+
+    This is the only dispatch form a switch table is recognized for: one
+    index term at scale 4, no base, no segment, no symbol, and the table's
+    address as displacement. Any other register in the address would take
+    part in every target, so the table would not describe the jump.
+    """
+    if insn.mnemonic != "jmp" or insn.prefix:
+        return None
+    match insn.operands:
+        case (("mem", "dword", "", [(str() as index, 4)], int() as disp, ()),) if (
+            disp == table_addr
+        ):
+            return index
+    return None
 
 
 def _table_displacement(insn: DecodedInstruction) -> int | None:
@@ -103,31 +121,15 @@ class _SectionDiscovery:
                     address=table_addr,
                     entries=tuple(stuff),
                     dispatch_address=dispatch,
-                    scale=4,
-                    entry_width=4,
                     index_register=index_reg,
                 )
             )
 
     def _dispatch_for_table(self, table_addr: int) -> tuple[int | None, str | None]:
-        """Find a scale-4 ``jmp dword ptr [idx*4 + table]`` at ``table_addr``."""
+        """The ``jmp`` that indexes the table at ``table_addr``, and its index."""
         for addr, insn in self.decoded_by_addr.items():
-            if not insn.is_jump or insn.mnemonic != "jmp":
-                continue
-            for op in insn.operands:
-                if not isinstance(op, tuple) or op[0] != "mem":
-                    continue
-                _size, _seg, reg_terms, disp, _syms = (
-                    op[1],
-                    op[2],
-                    op[3],
-                    op[4],
-                    op[5],
-                )
-                index_reg = next((reg for reg, scale in reg_terms if scale == 4), None)
-                if index_reg is None or disp != table_addr:
-                    continue
-                return addr, index_reg
+            if (index := switch_index_register(insn, table_addr)) is not None:
+                return addr, index
         return None, None
 
     def _insert_confirmed_addr(self, addr: int, type_: _SectionType):
@@ -347,10 +349,6 @@ class AddressSanitizer:
         """Whether the image says ``value`` is an address (a relocation)."""
         return self.addr_test(value) if self.addr_test is not None else False
 
-    def _image_address(self, value: int) -> bool:
-        """Whether an absolute value is an address in the image."""
-        return self.is_addr(value) or self.resolve(value) is not None
-
     def resolve(
         self, addr: int, exact: bool = False, indirect: bool = False
     ) -> ResolvedAddress | None:
@@ -411,11 +409,13 @@ class AddressSanitizer:
         return resolved.identity if resolved is not None else self._local_identity(addr)
 
     def _sanitize_mem_operand(self, operand, *, indirect: bool):
-        """An address in a memory operand becomes a reference: an absolute
-        or displacement the image says is an address (a relocation or a
-        known entity). A segment-relative one (``fs:[0]``) never is."""
+        """An address in a memory operand becomes a reference. An absolute
+        operand is an address by its syntax: one nothing names gets this
+        side's unresolved identity, never a numeric key the other side could
+        share. A displacement is one only when the image relocates it. A
+        segment-relative operand (``fs:[0]``) never is."""
         match operand:
-            case ("mem", size, "", [], int() as disp, ()) if self._image_address(disp):
+            case ("mem", size, "", [], int() as disp, ()):
                 return (
                     "mem",
                     size,
@@ -579,13 +579,6 @@ _ASSERT_LINE = ("sym", Reference("__LINE__", ("assert_macro", "__LINE__")))
 _ASSERT_FILE = ("sym", Reference("__FILE__", ("assert_macro", "__FILE__")))
 
 
-def _calls_assert(row: DecodedInstruction) -> bool:
-    match row.operands:
-        case (("sym", Reference(display=name)),) if row.is_call:
-            return "_assert" in name
-    return False
-
-
 def _with_operand(row: DecodedInstruction, operand) -> DecodedInstruction:
     return replace(
         row,
@@ -594,10 +587,15 @@ def _with_operand(row: DecodedInstruction, operand) -> DecodedInstruction:
     )
 
 
-def assert_fixup(asm: list[DecodedInstruction]):
-    """Detect assert calls and replace the code filename and line number
-    arguments with the macros (from assert.h)."""
+def assert_fixup(asm: list[DecodedInstruction], is_assert: Callable[[int], bool]):
+    """Replace the line and file arguments of each call ``is_assert`` says
+    reaches the CRT ``_assert`` with the macros (from assert.h)."""
     for i, row in enumerate(asm):
-        if i >= 3 and _calls_assert(row):
+        if (
+            i >= 3
+            and row.is_call
+            and row.branch_target is not None
+            and is_assert(row.branch_target)
+        ):
             asm[i - 3] = _with_operand(asm[i - 3], _ASSERT_LINE)
             asm[i - 2] = _with_operand(asm[i - 2], _ASSERT_FILE)

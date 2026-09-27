@@ -263,13 +263,15 @@ def collect_stack_pairs(
             continue
         block: StackPairs = set()
         for row_o, row_r in zip(orig[i1:i2], recomp[j1:j2]):
-            if (slot_o := _stack_slot(row_o)) is None:
-                continue
-            if (slot_r := _stack_slot(row_r)) is None:
-                warnings.structural_mismatches_present = True
-                block = set()
-                break
-            block.add(StackPair(slot_o, slot_r))
+            match _stack_slot(row_o), _stack_slot(row_r):
+                case None, None:
+                    continue
+                case StackRegisterOffset() as slot_o, StackRegisterOffset() as slot_r:
+                    block.add(StackPair(slot_o, slot_r))
+                case _:
+                    warnings.structural_mismatches_present = True
+                    block = set()
+                    break
         stack_pairs |= block
     return stack_pairs, warnings
 

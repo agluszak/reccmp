@@ -1,5 +1,5 @@
-"""Strategy orchestration: EXACT admission, then each verifier strategy in
-turn, and the choice of the reported difference or blocker when none proves
+"""Function comparison: the one EXACT admission, then each verifier
+strategy in turn, and the choice of the reported difference or blocker when none proves
 equivalence."""
 
 import dataclasses
@@ -9,8 +9,8 @@ from typing import Sequence
 from reccmp.compare.asm.ir import (
     DecodedInstruction,
     FunctionImage,
+    control_flow_topology_keys,
     instruction_semantic_key,
-    local_branch_targets,
 )
 from reccmp.compare.asm.verifier.cfg import verify_cfg_effective_match
 from reccmp.compare.asm.verifier.iso_cfg import verify_isomorphic_cfg_effective_match
@@ -45,6 +45,40 @@ def _trim_padding(rows: Sequence[DecodedInstruction]) -> Sequence[DecodedInstruc
     return rows
 
 
+def compare_exact(
+    orig: FunctionImage, recomp: FunctionImage
+) -> ComparisonAnalysis | None:
+    """EXACT when both images have the same semantic keys, data shape and
+    control-flow identities (including switch cases), and either the same
+    bytes or complete operand and control-flow models. This is the only
+    place a function comparison is admitted EXACT."""
+    orig_rows, recomp_rows = orig.instructions, recomp.instructions
+    orig_topology = control_flow_topology_keys(orig_rows, orig.jump_tables)
+    return admit_exact_analysis(
+        bytes_equal=(
+            orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
+        ),
+        topology_equal=(
+            orig_topology is not None
+            and orig_topology
+            == control_flow_topology_keys(recomp_rows, recomp.jump_tables)
+        ),
+        keys_equal=(
+            [instruction_semantic_key(row) for row in orig_rows]
+            == [instruction_semantic_key(row) for row in recomp_rows]
+            and orig.data_shape == recomp.data_shape
+        ),
+        operands_complete=all(
+            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
+        ),
+        control_flow_complete=(
+            orig.control_flow_complete and recomp.control_flow_complete
+        ),
+        coverage_incomplete=orig.coverage_incomplete or recomp.coverage_incomplete,
+        extent_closed=orig.extent_closed and recomp.extent_closed,
+    )
+
+
 def analyze_effective_match(
     codes: Sequence[DiffOpcode],
     orig: FunctionImage,
@@ -52,7 +86,8 @@ def analyze_effective_match(
     metadata: FunctionMetadata | None = None,
 ) -> ComparisonAnalysis:
     # pylint: disable=too-many-locals,too-many-return-statements
-    """Canonical semantic analysis of two decoded functions.
+    """Semantic analysis of two decoded functions ``compare_exact`` did not
+    admit: EFFECTIVE, MISMATCH or INCONCLUSIVE, never EXACT.
 
     The relational verifier (see the verifier package) proves equivalence modulo
     register allocation, commutative-operand order and inverted compare/jump
@@ -65,28 +100,6 @@ def analyze_effective_match(
     coverage_incomplete = orig.coverage_incomplete or recomp.coverage_incomplete
     extent_closed = orig.extent_closed and recomp.extent_closed
     orig_rows, recomp_rows = orig.instructions, recomp.instructions
-    exact = admit_exact_analysis(
-        bytes_equal=(
-            orig.raw is not None and recomp.raw is not None and orig.raw == recomp.raw
-        ),
-        topology_equal=local_branch_targets(orig_rows)
-        == local_branch_targets(recomp_rows),
-        keys_equal=(
-            [instruction_semantic_key(row) for row in orig_rows]
-            == [instruction_semantic_key(row) for row in recomp_rows]
-            and orig.data_shape == recomp.data_shape
-        ),
-        operands_complete=all(
-            row.operand_model_complete for row in (*orig_rows, *recomp_rows)
-        ),
-        control_flow_complete=(
-            orig.control_flow_complete and recomp.control_flow_complete
-        ),
-        coverage_incomplete=coverage_incomplete,
-        extent_closed=extent_closed,
-    )
-    if exact is not None:
-        return exact
 
     # Embedded bytes can be read through indexed operands without appearing
     # as instruction effects. Until those reads are modeled against regions,

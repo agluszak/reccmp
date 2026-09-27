@@ -148,13 +148,14 @@ def test_unresolved_data_offsets_are_not_exact_or_effective():
     recomp = _mov_abs_ret(0x527000)
     orig_rows = decode_function(orig, 0x200, image_id=ImageId.ORIG).instructions
     recomp_rows = decode_function(recomp, 0x400, image_id=ImageId.RECOMP).instructions
-    assert orig_rows[0].display != recomp_rows[0].display
-    assert "0x401000" in orig_rows[0].display
+    orig_ref = orig_rows[0].operands[1][5][0][1]
+    recomp_ref = recomp_rows[0].operands[1][5][0][1]
+    assert orig_ref.identity == ("unresolved", "orig", 0x401000)
+    assert recomp_ref.identity == ("unresolved", "recomp", 0x527000)
 
     result = _compare_bytes(orig, recomp)
     assert result.analysis.status != ComparisonStatus.EXACT
     assert result.analysis.is_effective is False
-    assert result.display_similarity < 1.0
     assert result.match_ratio < 1.0
 
 
@@ -274,3 +275,12 @@ def db_lookup(db: EntityDb, image_id: ImageId):
         lambda _addr: None,
         lambda _key, _off: "",
     )
+
+
+def test_equal_bytes_reading_unresolved_absolute_memory_are_not_exact():
+    """``mov eax, [0x401000]`` in both images reads whatever each image
+    holds there; with nothing naming the address, equal bytes prove nothing."""
+    code = _mov_abs_ret(0x401000)
+    result = _compare_bytes(code, code)
+    assert result.analysis.status != ComparisonStatus.EXACT
+    assert result.analysis.is_effective is False

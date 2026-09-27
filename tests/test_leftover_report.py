@@ -417,8 +417,6 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         address=0x1004,
         entries=((0x1004, 0x1010), (0x1008, 0x1020)),
         dispatch_address=0x1000,
-        scale=4,
-        entry_width=4,
         index_register="eax",
     )
     graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
@@ -445,8 +443,6 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         address=0x1004,
         entries=((0x1004, 0x1010), (0x1008, 0x1020)),
         dispatch_address=0x1000,
-        scale=4,
-        entry_width=4,
         index_register="eax",
     )
     graph = build_function_graph(excerpt, (table,), start_addr=0x1000, extent=0x21)
