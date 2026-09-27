@@ -58,8 +58,8 @@ never gain exact proof from equal display text.
 ## Publication
 
 The structured-identities work is on reccmp PR #42 at `71a79dec`. Wizardry
-agent6 pins that revision with `[witness]` in PR #693. Keep later function-image
-work separate until its corpus evidence and review are complete.
+agent6 pins that revision with `[witness]` in PR #693. The PR #42 review
+findings are fixed on the function-image branch (see below), not on #42.
 
 ## Function-image and graph continuation (2026-09-27)
 
@@ -146,3 +146,47 @@ execution engines.
 Approved disk cleanup removed about 32 GB of Imperialism Rust incremental
 artifacts and 124 MB of Wizardry temporary probe artifacts, without touching
 source checkouts or retail evidence.
+
+## Review fixes and strategy consolidation (2026-09-27, later)
+
+Stacked on `480064a8`:
+
+- `79415e93`: PR #42 review. Every absolute memory operand is a reference
+  (unresolved ones keep a side-local identity); `compare_exact()` is the
+  only EXACT gate; switch tables are recognized only for
+  `jmp dword ptr [index*4 + table]` (`switch_index_register`); IMPORT
+  entities carry `import_module`/`import_name`, and
+  `EntityDb.callee_names()` serves both the CRT atexit recognizer and the
+  assert fixup; the CRT collector has no address threshold; stack slots
+  mismatch symmetrically; inline fingerprints use `operand_match_key()`.
+- `efa467eb`: dead code removed (text register swap, mismatch clusters,
+  unused comparator/catalog/admission helpers).
+- `6d927169`: relocation reads Capstone register/flag access instead of
+  its own opcode table; relocation tests are machine code.
+- `8a1abe97`: the positional CFG strategy is gone. It made no unique proof
+  on WIZ8/SURRENDER; at least 48 of its 58 WIZ8 branch-target mismatches
+  paired a branch with a non-branch. Block-pairing conflicts on a branch
+  edge are now branch-target differences (60 WIZ8 functions). Diff
+  opcodes must cover every row (an empty list used to verify vacuously).
+- `198b0dc7`: the Intel text parser lives in `tests/asm_rows.py` only.
+- The product's result under an unanchored block pairing is an
+  `unanchored_product` strategy attempt (a lead with the whole
+  difference), replacing the `product_stop` fact strings.
+
+Validation: full suite, mypy and Pylint pass. Corpus: WIZ8 and SURRENDER
+built by Wizardry agent6 (`a0277cff`, reccmp pin `71a79dec`) with its new
+source index. Proof counts are unchanged throughout (WIZ8 2,684 exact /
+284 effective; SURRENDER 859 / 26); only the diagnosis changes above moved.
+WIZ8 takes about 146 s.
+
+Per-strategy probe on WIZ8 (284 effective): the product pairing alone
+proves 263; diff-aligned lockstep has 3 unique proofs, relocation 1.
+The product fails the others by analysis limit (9), alignment (6),
+memory address (3), state join (2) and return value (1).
+
+Still open: product coverage of those 21 so diff-aligned lockstep and
+relocation can go; extent discovery and callee cleanup still walk Capstone
+themselves (`discover_extent` needs recursive descent, which the linear
+section discovery in `decode_function` does not do); block alignment's
+instruction classes; typed difference facts.
+
