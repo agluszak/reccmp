@@ -9,7 +9,7 @@ diffs and is never read back.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from enum import Enum, auto
+from enum import Enum
 from collections.abc import Hashable, Sequence
 from typing import TYPE_CHECKING
 
@@ -19,16 +19,6 @@ if TYPE_CHECKING:
     from .graph import FunctionGraph
 
 _STACK_SLOT = ("stack_slot",)
-
-
-class AsmRole(Enum):
-    """What kind of row this is in a function excerpt."""
-
-    CODE = auto()
-    JUMP_TABLE_HEADER = auto()
-    JUMP_TABLE_ENTRY = auto()
-    DATA_TABLE_HEADER = auto()
-    DATA_TABLE_ENTRY = auto()
 
 
 class ExtentKind(Enum):
@@ -90,7 +80,7 @@ def rebind_local_identities(
     insn_ids = {
         row.address: (row.instruction_id if row.instruction_id is not None else index)
         for index, row in enumerate(excerpt)
-        if row.address is not None and row.is_code
+        if row.address is not None
     }
     table_ids = {table.address: index for index, table in enumerate(jump_tables)}
     entry_ids: dict[int, tuple[int, int]] = {}
@@ -170,8 +160,8 @@ class FunctionImage:
     graph: FunctionGraph | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if any(not row.is_code for row in self.instructions):
-            raise ValueError("FunctionImage.instructions must contain code only")
+        if any(row.size <= 0 or not row.mnemonic for row in self.instructions):
+            raise ValueError("FunctionImage.instructions must contain instructions")
 
     @property
     def instruction_ids(self) -> tuple[int, ...]:
@@ -227,16 +217,14 @@ class FunctionImage:
             if table.is_recognized_switch()
         }
         return all(
-            not row.is_code
-            or row.control_flow_known
-            or (row.is_jump and row.address in switches)
+            row.control_flow_known or (row.is_jump and row.address in switches)
             for row in self.instructions
         )
 
 
 @dataclass(frozen=True)
 class DecodedInstruction:
-    """One canonical instruction (or table marker) in a function excerpt."""
+    """One canonical instruction in a function image."""
 
     # pylint: disable=too-many-instance-attributes
 
@@ -246,13 +234,11 @@ class DecodedInstruction:
     prefix: str
     # Typed operands: ("reg", name), ("imm", value), ("st", index),
     # ("sym", Reference), ("mem", size, segment, reg_terms, displacement,
-    # symbols), ("opaque", ...). A table marker's payload: ("case", offset
-    # from the function start) or ("byte", value).
+    # symbols), ("opaque", ...).
     operands: tuple
     # Rendered once, for humans and diffs; never read back.
     display: str
-    role: AsmRole = AsmRole.CODE
-    # Capstone detail facts (empty for table markers).
+    # Capstone detail facts.
     regs_read: tuple[str, ...] = ()
     regs_written: tuple[str, ...] = ()
     reads_flags: bool = False
@@ -275,10 +261,6 @@ class DecodedInstruction:
     # Proof identity of a jump/call destination. Display may be a relative
     # displacement; this is never that displacement.
     control_target: Hashable | None = None
-
-    @property
-    def is_code(self) -> bool:
-        return self.role == AsmRole.CODE
 
 
 # Identities private to one image: across images such references match by
@@ -307,15 +289,11 @@ def instruction_match_key(row: DecodedInstruction) -> Hashable:
     placeholder or name it shows, so ``<OFFSET1>`` on both sides lines up.
     Proofs use ``instruction_semantic_key`` instead.
     """
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     return ("ins", row.mnemonic, row.prefix, _freeze(row.operands))
 
 
 def instruction_semantic_key(row: DecodedInstruction) -> Hashable:
     """Proof key: every reference compares by identity."""
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     return (
         "ins",
         row.mnemonic,
@@ -401,27 +379,6 @@ def control_flow_topology_keys(
     }
     keys: list[Hashable] = []
     for row in excerpt:
-        if row.role == AsmRole.JUMP_TABLE_ENTRY:
-            target_id = None
-            for table in jump_tables:
-                for entry_addr, target in table.entries:
-                    if entry_addr == row.address:
-                        target_id = _local_destination_id(target, addr_to_id)
-                        keys.append(
-                            ("case", target_id)
-                            if target_id is not None
-                            else ("case_ext", ("unresolved", None, target))
-                        )
-                        break
-                else:
-                    continue
-                break
-            else:
-                keys.append(("table_entry", row.operands))
-            continue
-        if not row.is_code:
-            keys.append(())
-            continue
         if row.is_call:
             keys.append(("call", _operand_identity(row)))
             continue
@@ -448,7 +405,6 @@ def control_flow_topology_keys(
 
 def local_destination_keys(
     excerpt: Sequence[DecodedInstruction],
-    jump_tables: Sequence[JumpTable] = (),
     *,
     start_addr: int,
     extent: int,
@@ -466,11 +422,6 @@ def local_destination_keys(
         for index, row in enumerate(excerpt)
         if row.address is not None
     }
-    case_targets = {
-        entry_addr: target
-        for table in jump_tables
-        for entry_addr, target in table.entries
-    }
 
     def key(target: int | None, tag: str) -> Hashable | None:
         if target is None or not start_addr <= target < start_addr + extent:
@@ -480,9 +431,7 @@ def local_destination_keys(
 
     keys: list[Hashable] = []
     for row in excerpt:
-        if row.role == AsmRole.JUMP_TABLE_ENTRY and row.address is not None:
-            item = key(case_targets.get(row.address), "case")
-        elif row.is_jump:
+        if row.is_jump:
             item = key(row.branch_target, "local")
         else:
             item = ()
@@ -523,8 +472,6 @@ def _normalize_operand_stack(operand) -> Hashable:
 
 def stack_normalized_key(row: DecodedInstruction) -> Hashable:
     """The match key of a row with its stack slots' displacements erased."""
-    if row.role != AsmRole.CODE:
-        return ("table", row.role, row.operands)
     operands = tuple(_normalize_operand_stack(op) for op in row.operands)
     return ("ins", row.mnemonic, row.prefix, operands)
 

@@ -66,7 +66,7 @@ def fingerprint_of(rows: Sequence[DecodedInstruction]) -> Fingerprint:
             row.control_target if row.is_call else None,
         )
         for row in rows
-        if row.is_code and row.mnemonic
+        if row.mnemonic
     )
 
 

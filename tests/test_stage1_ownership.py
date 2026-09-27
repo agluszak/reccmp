@@ -36,7 +36,7 @@ def test_function_image_captures_excerpt_tables_and_coverage():
     image = decode_function(blob, 0x1000)
     assert image.extent_kind is ExtentKind.KNOWN
     assert image.coverage_incomplete is False
-    assert any(row.mnemonic == "mov" for row in image.instructions if row.is_code)
+    assert any(row.mnemonic == "mov" for row in image.instructions)
     stamped = image.with_instructions(
         tuple(
             replace(row, instruction_id=i) for i, row in enumerate(image.instructions)

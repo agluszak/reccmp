@@ -61,7 +61,7 @@ def test_score_notify():
 def test_decoded_image_keeps_tables_out_of_instructions():
     start = 0x10001410
     image = decode_function(SCORE_NOTIFY, start)
-    assert all(row.is_code for row in image.instructions)
+    assert all(row.mnemonic for row in image.instructions)
     assert len(image.jump_tables) == 1
     assert len(image.data_regions) == 1
     region = image.data_regions[0]

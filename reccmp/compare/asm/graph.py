@@ -102,7 +102,7 @@ def build_function_graph(
 ) -> FunctionGraph:
     """Build block boundaries, successors and reachable instructions."""
     rows = tuple(instructions)
-    if any(not row.is_code or row.address is None for row in rows):
+    if any(row.address is None for row in rows):
         raise ValueError("FunctionGraph requires decoded instructions only")
     by_addr = {row.address: index for index, row in enumerate(rows)}
     window = range(start_addr, start_addr + extent)

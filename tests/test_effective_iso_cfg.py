@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from reccmp.compare.asm.parse import decode_function
-from reccmp.compare.asm.ir import DataRegion
+from reccmp.compare.asm.ir import DataRegion, JumpTable
 from reccmp.compare.asm.model import Reference
 from reccmp.compare.asm.verifier import analyze_effective_match as analyze_images
 from reccmp.compare.asm.verifier import (
@@ -521,17 +521,17 @@ def test_a_shared_tail_must_match_each_copy():
 
 
 def test_unresolved_switch_reports_dispatch_location():
-    orig = ["jmp dword ptr [eax*4]", "Jump table:", "0x1000"]
-    recomp = ["jmp dword ptr [ecx*4]", "Jump table:", "0x2000"]
+    orig = ["jmp dword ptr [eax*4]"]
+    recomp = ["jmp dword ptr [ecx*4]"]
     recorder = AnalysisRecorder(
-        orig_addrs=[0x1000, 0x1002, 0x1006],
-        recomp_addrs=[0x2000, 0x2002, 0x2006],
+        orig_addrs=[0x1000],
+        recomp_addrs=[0x2000],
     )
     assert not verify_isomorphic_cfg_effective_match(
         orig,
         recomp,
-        [None, None, None],
-        [None, None, None],
+        [None],
+        [None],
         recorder=recorder,
     )
     analysis = recorder.failure_analysis()
@@ -974,7 +974,9 @@ def test_one_sided_push_live_at_call_rejected():
 # --- Recognized switch jump tables -----------------------------------------
 
 
-def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
+def _switch_fixture(
+    index_reg: str = "eax", scratch: str = "ebx", *, start: int = 0x1000
+):
     """Minimal cmp/ja + jmp-[idx*4+table] switch with two cases and a default."""
     asm = [
         # Shared stack argument so index-reg renames stay equivalent.
@@ -982,9 +984,6 @@ def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
         f"cmp {index_reg}, 1",
         "ja 0x24",
         f"jmp dword ptr [{index_reg}*4 + <OFFSET1>]",
-        "Jump table:",
-        "start + 0x14",
-        "start + 0x18",
         f"mov {scratch}, 1",
         "ret",
         f"mov {scratch}, 2",
@@ -992,46 +991,23 @@ def _switch_fixture(index_reg: str = "eax", scratch: str = "ebx"):
         f"xor {scratch}, {scratch}",
         "ret",
     ]
-    # Function start 0x1000; case0 at +0x14, case1 at +0x18, default at +0x24.
-    addrs: list[int | None] = [
-        0x1000,
-        0x1003,
-        0x1006,
-        0x1008,
-        None,
-        0x100C,  # table slot 0
-        0x1010,  # table slot 1
-        0x1014,  # case 0
-        0x1016,
-        0x1018,  # case 1
-        0x101A,
-        0x1024,  # default
-        0x1026,
+    # Case0 at +0x14, case1 at +0x18, default at +0x24.
+    addrs = [
+        start + offset for offset in (0, 3, 6, 8, 0x14, 0x16, 0x18, 0x1A, 0x24, 0x26)
     ]
-    # ja -> default at index 11; table fills the rest.
-    targets: list[int | None] = [
-        None,
-        None,
-        11,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ]
-    return asm, addrs, targets
+    targets: list[int | None] = [None, None, 8, None] + [None] * 6
+    table = JumpTable(
+        start + 0xC,
+        ((start + 0xC, start + 0x14), (start + 0x10, start + 0x18)),
+        start + 8,
+        index_register=index_reg,
+    )
+    return asm, addrs, targets, table
 
 
 def test_recognized_switch_table_iso_cfg_match_under_register_rename():
-    orig, orig_addrs, targets = _switch_fixture("eax", "edx")
-    recomp, recomp_addrs, _ = _switch_fixture("ecx", "edx")
-    # Shift recomp into a different VA range; relative start+ offsets unchanged.
-    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    orig, orig_addrs, targets, orig_table = _switch_fixture("eax", "edx")
+    recomp, recomp_addrs, _, recomp_table = _switch_fixture("ecx", "edx", start=0x2000)
     metadata = FunctionMetadata(return_kind="void")
     assert (
         verify_isomorphic_cfg_effective_match(
@@ -1042,18 +1018,22 @@ def test_recognized_switch_table_iso_cfg_match_under_register_rename():
             metadata=metadata,
             orig_addrs=orig_addrs,
             recomp_addrs=recomp_addrs,
+            orig_tables=(orig_table,),
+            recomp_tables=(recomp_table,),
         )
         is True
     )
 
 
 def test_recognized_switch_wrong_case_order_is_non_isomorphic():
-    orig, orig_addrs, targets = _switch_fixture()
-    recomp, recomp_addrs, _ = _switch_fixture()
+    orig, orig_addrs, targets, orig_table = _switch_fixture()
+    recomp, recomp_addrs, _, recomp_table = _switch_fixture(start=0x2000)
     # Swap case destinations in the recomp table.
-    recomp = list(recomp)
-    recomp[5], recomp[6] = recomp[6], recomp[5]
-    recomp_addrs = [None if a is None else a + 0x1000 for a in recomp_addrs]
+    (first_entry, first_target), (second_entry, second_target) = recomp_table.entries
+    recomp_table = replace(
+        recomp_table,
+        entries=((first_entry, second_target), (second_entry, first_target)),
+    )
     recorder = AnalysisRecorder(orig_addrs=orig_addrs, recomp_addrs=recomp_addrs)
     assert not verify_isomorphic_cfg_effective_match(
         orig,
@@ -1064,6 +1044,8 @@ def test_recognized_switch_wrong_case_order_is_non_isomorphic():
         recorder=recorder,
         orig_addrs=orig_addrs,
         recomp_addrs=recomp_addrs,
+        orig_tables=(orig_table,),
+        recomp_tables=(recomp_table,),
     )
     analysis = recorder.failure_analysis()
     assert analysis.status != ComparisonStatus.EFFECTIVE
@@ -1074,7 +1056,7 @@ def test_recognized_switch_wrong_case_order_is_non_isomorphic():
 
 
 def test_unresolved_switch_without_addrs_stays_jump_table_data():
-    orig, _addrs, targets = _switch_fixture()
+    orig, _addrs, targets, _table = _switch_fixture()
     recorder = AnalysisRecorder(
         orig_addrs=[0x1000] * len(orig),
         recomp_addrs=[0x2000] * len(orig),
@@ -1085,7 +1067,7 @@ def test_unresolved_switch_without_addrs_stays_jump_table_data():
         targets,
         list(targets),
         recorder=recorder,
-        # No addrs → cannot resolve start+ entries.
+        # No table facts → cannot resolve an indexed dispatch.
     )
     assert recorder.failure_analysis().inconclusive_reason == "jump_table_data"
 

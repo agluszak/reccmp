@@ -626,12 +626,6 @@ def test_reject_length_mismatch():
     assert verify_effective_match(orig, recomp) is False
 
 
-def test_data_tables_must_match_exactly():
-    orig = ["jmp dword ptr [eax*4 + <OFFSET1>]", "Jump table:", "start + 0x10"]
-    recomp = ["jmp dword ptr [eax*4 + <OFFSET1>]", "Jump table:", "start + 0x14"]
-    assert verify_effective_match(orig, recomp) is False
-
-
 def test_identical_sequences_match():
     orig = [
         "push ebp",

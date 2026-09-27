@@ -38,7 +38,7 @@ def _trim_padding(rows: Sequence[DecodedInstruction]) -> Sequence[DecodedInstruc
     """Strip trailing nop/int3 alignment padding, but only behind an
     instruction that does not fall through into it."""
     end = len(rows)
-    while end > 0 and rows[end - 1].is_code and rows[end - 1].mnemonic in _PADDING:
+    while end > 0 and rows[end - 1].mnemonic in _PADDING:
         end -= 1
     if 0 < end < len(rows) and rows[end - 1].mnemonic in ("ret", "jmp"):
         return rows[:end]

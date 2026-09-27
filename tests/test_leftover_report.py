@@ -16,7 +16,6 @@ from reccmp.source import keyed
 from reccmp.compare import Compare
 from reccmp.compare.asm.graph import build_function_graph
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DataRegion,
     DecodedInstruction,
     ExtentKind,
@@ -137,7 +136,6 @@ def test_jump_table_dispatch_closes_indirect_switch_extent():
         prefix="",
         operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
         display="jmp dword ptr [eax*4+0x1004]",
-        role=AsmRole.CODE,
         is_jump=True,
         branch_target=None,
         control_flow_known=False,
@@ -381,7 +379,6 @@ def test_first_class_jump_table_requires_scale4_indexed_jmp():
         prefix="",
         operands=(("mem", "dword", "", (("eax", 1),), 0x1004, ()),),
         display="jmp dword ptr [eax+0x1004]",
-        role=AsmRole.CODE,
         is_jump=True,
         instruction_id=0,
     )
@@ -410,7 +407,6 @@ def test_first_class_jump_table_accepts_scale4_indexed_jmp():
         prefix="",
         operands=(("mem", "dword", "", (("eax", 4),), 0x1004, ()),),
         display="jmp dword ptr [eax*4+0x1004]",
-        role=AsmRole.CODE,
         is_jump=True,
         instruction_id=0,
     )

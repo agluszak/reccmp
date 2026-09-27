@@ -7,7 +7,6 @@ from capstone import x86_const  # type: ignore[import-untyped]
 
 from reccmp.compare.asm.decode import capstone_operand, disasm_detail
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -91,7 +90,6 @@ def test_opaque_operands_remain_distinct_in_match_keys():
         prefix="",
         operands=(left,),
         display="ud2 mystery_a",
-        role=AsmRole.CODE,
         operand_model_complete=False,
         control_flow_known=False,
     )
@@ -102,7 +100,6 @@ def test_opaque_operands_remain_distinct_in_match_keys():
         prefix="",
         operands=(right,),
         display="ud2 mystery_b",
-        role=AsmRole.CODE,
         operand_model_complete=False,
         control_flow_known=False,
     )
@@ -157,7 +154,6 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
         prefix="",
         operands=(opaque_a,),
         display="nop a",
-        role=AsmRole.CODE,
         operand_model_complete=False,
     )
     row_b = DecodedInstruction(
@@ -167,7 +163,6 @@ def test_incomplete_operand_model_blocks_exact_from_collapsed_keys():
         prefix="",
         operands=(opaque_b,),
         display="nop b",
-        role=AsmRole.CODE,
         operand_model_complete=False,
     )
     assert instruction_match_key(row_a) == instruction_match_key(row_b)

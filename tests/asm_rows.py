@@ -16,7 +16,6 @@ from dataclasses import replace
 
 from reccmp.compare.asm.const import JUMP_MNEMONICS
 from reccmp.compare.asm.ir import (
-    AsmRole,
     DecodedInstruction,
     ExtentKind,
     FunctionImage,
@@ -25,33 +24,6 @@ from reccmp.compare.asm.ir import (
 from reccmp.compare.asm.model import parse_instruction
 
 START = 0x1000
-
-
-def _marker(line: str, address: int) -> DecodedInstruction | None:
-    """A rendered table line used only by assembly text fixtures."""
-    role: AsmRole | None = None
-    payload: tuple = ()
-    if line == "Jump table:":
-        role = AsmRole.JUMP_TABLE_HEADER
-    elif line == "Data table:":
-        role = AsmRole.DATA_TABLE_HEADER
-    elif line.startswith("start + "):
-        role = AsmRole.JUMP_TABLE_ENTRY
-        payload = (("case", int(line[len("start + ") :], 16)),)
-    elif line.startswith("0x") and " " not in line:
-        role = AsmRole.DATA_TABLE_ENTRY
-        payload = (("byte", int(line, 16)),)
-    if role is None:
-        return None
-    return DecodedInstruction(
-        address=address,
-        size=0,
-        mnemonic="",
-        prefix="",
-        operands=payload,
-        display=line,
-        role=role,
-    )
 
 
 def rows(
@@ -64,10 +36,6 @@ def rows(
     result: list[DecodedInstruction] = []
     for index, line in enumerate(lines):
         address = start + index
-        marker = _marker(line, address)
-        if marker is not None:
-            result.append(marker)
-            continue
         prefix, mnemonic, operands = parse_instruction(line)
         target = targets[index] if targets is not None else None
         is_jump = mnemonic in JUMP_MNEMONICS
@@ -202,9 +170,7 @@ def as_rows(
         for index, row in enumerate(updated[:-1]):
             following = updated[index + 1]
             if (
-                row.is_code
-                and following.is_code
-                and row.address is not None
+                row.address is not None
                 and following.address is not None
                 and following.address > row.address
             ):
@@ -268,6 +234,8 @@ def verify_isomorphic_cfg_effective_match(
     *,
     orig_addrs=None,
     recomp_addrs=None,
+    orig_tables=(),
+    recomp_tables=(),
 ):
     from reccmp.compare.asm.verifier import (
         verify_isomorphic_cfg_effective_match as verify,
@@ -279,51 +247,10 @@ def verify_isomorphic_cfg_effective_match(
             recomp_addrs if recomp_addrs is not None else recorder.recomp_addrs
         )
 
-    def fixture_image(lines, targets, addresses, start):
+    def fixture_image(lines, targets, addresses, start, tables):
         fixture_rows = as_rows(
             lines, targets=targets or None, addresses=addresses, start=start
         )
-        code = tuple(row for row in fixture_rows if row.is_code)
-        tables = []
-        for position, row in enumerate(fixture_rows):
-            if row.role != AsmRole.JUMP_TABLE_HEADER:
-                continue
-            dispatch = next(
-                (
-                    candidate
-                    for candidate in reversed(fixture_rows[:position])
-                    if candidate.is_code
-                ),
-                None,
-            )
-            if dispatch is None or dispatch.address is None:
-                continue
-            entries = []
-            for entry in fixture_rows[position + 1 :]:
-                if entry.role != AsmRole.JUMP_TABLE_ENTRY:
-                    break
-                if entry.address is not None:
-                    entries.append((entry.address, start + entry.operands[0][1]))
-            if not entries:
-                continue
-            index_reg = next(
-                (
-                    reg
-                    for op in dispatch.operands
-                    if op[0] == "mem"
-                    for reg, scale in op[3]
-                    if scale == 4
-                ),
-                None,
-            )
-            tables.append(
-                JumpTable(
-                    entries[0][0],
-                    tuple(entries),
-                    dispatch.address,
-                    index_register=index_reg,
-                )
-            )
         extent = max(
             (
                 row.address + row.size - start
@@ -332,11 +259,17 @@ def verify_isomorphic_cfg_effective_match(
             ),
             default=0,
         )
-        return FunctionImage(start, extent, ExtentKind.KNOWN, code, tuple(tables))
+        extent = max(
+            [extent]
+            + [entry + 4 - start for table in tables for entry, _ in table.entries]
+        )
+        return FunctionImage(
+            start, extent, ExtentKind.KNOWN, fixture_rows, tuple(tables)
+        )
 
     return verify(
-        fixture_image(orig, orig_targets, orig_addrs, START),
-        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000),
+        fixture_image(orig, orig_targets, orig_addrs, START, orig_tables),
+        fixture_image(recomp, recomp_targets, recomp_addrs, 0x2000, recomp_tables),
         metadata,
         recorder,
     )

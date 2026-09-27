@@ -32,8 +32,6 @@ _LOOPS = frozenset({"loop", "loope", "loopne", "jcxz", "jecxz"})
 
 
 def _control_kind(row: DecodedInstruction) -> str:
-    if not row.is_code:
-        return "data"
     if row.mnemonic in JCC_MNEMONICS or row.mnemonic in _LOOPS:
         return "jcc"
     if row.mnemonic in ("jmp", "ret"):

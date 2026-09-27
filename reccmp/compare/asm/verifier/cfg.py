@@ -95,9 +95,7 @@ def verify_cfg_effective_match(
     def classify(rows: Sequence[DecodedInstruction]) -> list[str]:
         kinds = []
         for row in rows:
-            if not row.is_code:
-                kinds.append("data")
-            elif row.mnemonic in JCC_MNEMONICS or row.mnemonic in (
+            if row.mnemonic in JCC_MNEMONICS or row.mnemonic in (
                 "loop",
                 "loope",
                 "loopne",

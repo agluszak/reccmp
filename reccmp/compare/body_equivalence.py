@@ -215,11 +215,23 @@ class BodyEquivalenceMixin(ComparatorState):
         orig_rows, recomp_rows = orig_image.instructions, recomp_image.instructions
         if not orig_rows or len(orig_rows) != len(recomp_rows):
             return False
+        # Table bytes and case ordering are body semantics even though table
+        # entries are not instructions. Only recognized all-local switches
+        # have comparable instruction-id destinations here.
+        orig_cases = orig_image.control_graph().table_dests
+        recomp_cases = recomp_image.control_graph().table_dests
+        if (
+            orig_image.data_shape != recomp_image.data_shape
+            or len(orig_cases) != len(orig_image.jump_tables)
+            or len(recomp_cases) != len(recomp_image.jump_tables)
+            or orig_cases != recomp_cases
+        ):
+            return False
         orig_topology = local_destination_keys(
-            orig_rows, orig_image.jump_tables, start_addr=orig_addr, extent=size
+            orig_rows, start_addr=orig_addr, extent=size
         )
         recomp_topology = local_destination_keys(
-            recomp_rows, recomp_image.jump_tables, start_addr=recomp_addr, extent=size
+            recomp_rows, start_addr=recomp_addr, extent=size
         )
         if orig_topology is None or recomp_topology is None:
             return False

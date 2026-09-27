@@ -91,11 +91,6 @@ def verify_effective_match(
 
             ins_o, ins_r = orig_rows[index_o], recomp_rows[index_r]
             same = instruction_semantic_key(ins_o) == instruction_semantic_key(ins_r)
-            if not ins_o.is_code or not ins_r.is_code:
-                if not same:
-                    return False
-                continue
-
             try:
                 record_operand_candidate(
                     ctx, index_o, index_r, ins_o, ins_r, (orig, recomp)
