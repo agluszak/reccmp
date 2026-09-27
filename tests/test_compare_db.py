@@ -616,8 +616,7 @@ def test_size_functions_matched_recomp_null(db: EntityDb):
 
 
 def test_independent_sets(db: EntityDb):
-    """If we modify a matched entity, the new values should be accessible
-    whether we access the entity via ORIG or RECOMP address space."""
+    """A matched entity retains both sides' facts as they change."""
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Hello")
         batch.set(ImageId.RECOMP, 200, name="Hello")
@@ -632,16 +631,21 @@ def test_independent_sets(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="asdf")
 
-    # reflected in orig
+    # The linked entity sees the recomp display name on either lookup.
     ent = db.get(ImageId.ORIG, 100)
     assert ent is not None
     assert ent.get("name") == "asdf"
+    assert ent.fact(ImageId.ORIG, "name") == "Hello"
+    assert ent.fact(ImageId.RECOMP, "name") == "asdf"
 
     # update orig side
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="test")
 
-    # reflected in recomp
+    # Updating the original never overwrites recomp-side evidence.
     ent = db.get(ImageId.RECOMP, 200)
     assert ent is not None
-    assert ent.get("name") == "test"
+    assert ent.get("name") == "asdf"
+    assert ent.fact(ImageId.ORIG, "name") == "test"
+    assert ent.fact(ImageId.RECOMP, "name") == "asdf"
+    assert db.get(ImageId.ORIG, 100) is ent
