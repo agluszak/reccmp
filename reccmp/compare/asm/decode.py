@@ -7,8 +7,9 @@ happens when the function image is built.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import cache
-from typing import Iterable
+from typing import Iterable, TypeVar
 
 from capstone import (  # type: ignore
     CS_ARCH_X86,
@@ -46,6 +47,8 @@ _SIZE_NAMES = {
     64: "zmmword",
 }
 
+_T = TypeVar("_T")
+
 
 @cache
 def get_detail_disassembler(is_32: bool = True) -> Cs:
@@ -70,6 +73,64 @@ def direct_branch_target(insn: CsInsn) -> int | None:
     ):
         return operands[0].imm
     return None
+
+
+def e9_jump_target(code: bytes, address: int) -> int | None:
+    """Target of the 5-byte ``jmp rel32`` at ``address``, when present."""
+    if len(code) < 5 or code[0] != 0xE9:
+        return None
+    return address + 5 + int.from_bytes(code[1:5], "little", signed=True)
+
+
+def jump_thunk_target(
+    insn: CsInsn | None, read_absolute: Callable[[int], _T | None]
+) -> int | _T | None:
+    """One ``jmp`` thunk step: its direct target, or ``read_absolute`` on an
+    absolute memory operand's slot. ``None`` when ``insn`` is not a supported
+    ``jmp`` form."""
+    if insn is None or insn.id != x86_const.X86_INS_JMP or not insn.operands:
+        return None
+    operand = insn.operands[0]
+    if operand.type == x86_const.X86_OP_IMM:
+        return operand.imm
+    if (
+        operand.type == x86_const.X86_OP_MEM
+        and not operand.mem.base
+        and not operand.mem.index
+    ):
+        return read_absolute(operand.mem.disp & 0xFFFFFFFF)
+    return None
+
+
+def jump_table_targets(
+    insn: CsInsn,
+    read_dword: Callable[[int], int | None],
+    start: int,
+    limit: int,
+) -> tuple[int, ...] | None:
+    """Targets of ``jmp dword ptr [index*4 + table]`` in the window.
+
+    Table entries are read until the first unreadable/out-of-window target.
+    ``None`` means ``insn`` is not that dispatch or produced no cases.
+    """
+    if insn.id != x86_const.X86_INS_JMP or not insn.operands:
+        return None
+    operand = insn.operands[0]
+    if (
+        operand.type != x86_const.X86_OP_MEM
+        or operand.mem.scale != 4
+        or not operand.mem.index
+        or operand.mem.base
+    ):
+        return None
+    table = operand.mem.disp & 0xFFFFFFFF
+    targets: list[int] = []
+    for index in range(256):
+        target = read_dword(table + 4 * index)
+        if target is None or not start <= target < start + limit:
+            break
+        targets.append(target)
+    return tuple(targets) or None
 
 
 def stop_at_int3_detail(instructions) -> Iterable:

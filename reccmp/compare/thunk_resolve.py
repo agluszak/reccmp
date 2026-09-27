@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from typing import TYPE_CHECKING
 
-from reccmp.compare.asm.decode import get_detail_disassembler
+from reccmp.compare.asm.decode import decode_one, e9_jump_target
 from reccmp.formats import Image
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
@@ -37,10 +37,7 @@ def read_e9_jmp_target(binfile: Image, addr: int) -> int | None:
         data = binfile.read(addr, 5)
     except (InvalidVirtualAddressError, InvalidVirtualReadError):
         return None
-    if len(data) < 5 or data[0] != 0xE9:
-        return None
-    (operand,) = struct.unpack("<i", data[1:5])
-    return addr + 5 + operand
+    return e9_jump_target(data, addr)
 
 
 def _in_executable_section(binfile: Image, addr: int) -> bool:
@@ -75,12 +72,8 @@ def _decodes_as_instruction(binfile: Image, addr: int) -> bool:
     # int3 / alignment padding is common in .text and is not a vtable target.
     if data[0] == 0xCC:
         return False
-    disassembler = get_detail_disassembler(is_32=True)
-    for insn in disassembler.disasm(data, addr, count=1):
-        if insn.mnemonic == "int3":
-            return False
-        return True
-    return False
+    insn = decode_one(data, addr)
+    return insn is not None and insn.mnemonic != "int3"
 
 
 def is_plausible_vtable_target(

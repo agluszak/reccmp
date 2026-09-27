@@ -32,6 +32,7 @@ from reccmp.compare.verification import (
 )
 from reccmp.compare.stack_layout import analyze_stack_layout
 from reccmp.compare.inlines import (
+    Fingerprint,
     HelperCatalogEntry,
 )
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol
@@ -161,9 +162,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
     def _refresh_lookup_state(self) -> None:
         """Discard lookup and proof caches after catalog mutation."""
         self._call_facts_cache: dict[Hashable, CallFacts | None] | None = None
-        self._fp_cache: dict[
-            tuple[ImageId, int, int], tuple[tuple[str, str], ...] | None
-        ] = {}
+        self._fp_cache: dict[tuple[ImageId, int, int], Fingerprint | None] = {}
         self._helper_catalog: list[HelperCatalogEntry] | None = None
         self._helper_by_orig: dict[int, HelperCatalogEntry | None] = {}
         self._witness_translator = None
@@ -336,7 +335,7 @@ class FunctionComparator(InlineAccountingMixin, RefutationMixin):
         if (
             not result.analysis.is_effective
             and match.orig_addr in self.equivalence_groups
-            and _is_bare_jmp_island(orig_raw)
+            and _is_bare_jmp_island(orig_raw, match.orig_addr)
         ):
             # The island is a modeled thunk to a grouped body; its guessed
             # byte window is not the function extent this proof depends on.

@@ -4,7 +4,7 @@ from unittest.mock import Mock
 from reccmp.compare.asm.replacement import entity_proof_identity
 from reccmp.compare.body_equivalence import _identical_code
 from reccmp.compare.db import EntityDb
-from reccmp.compare.functions import FunctionComparator
+from reccmp.compare.functions import FunctionComparator, create_valid_addr_lookup
 from reccmp.types import EntityType, ImageId
 
 
@@ -204,6 +204,14 @@ def test_fingerprint_rejects_one_sided_relocation():
     comparator.orig_bin = image(True)
     comparator.recomp_bin = image(False)
     comparator.is_32bit = True
+    comparator.orig_addr_test = create_valid_addr_lookup(
+        db, ImageId.ORIG, comparator.orig_bin
+    )
+    comparator.recomp_addr_test = create_valid_addr_lookup(
+        db, ImageId.RECOMP, comparator.recomp_bin
+    )
+    comparator.orig_resolver = lambda *_args, **_kwargs: None
+    comparator.recomp_resolver = lambda *_args, **_kwargs: None
 
     assert comparator._alias_fingerprint(
         ImageId.ORIG, 0x100, len(code)

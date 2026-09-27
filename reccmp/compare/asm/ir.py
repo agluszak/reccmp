@@ -303,7 +303,10 @@ def operand_key(operand: Operand, *, semantic: bool = False) -> Operand:
     return operand
 
 
-def instruction_match_key(row: DecodedInstruction) -> Hashable:
+InstructionMatchKey = tuple[str, str, str, tuple[Operand, ...]]
+
+
+def instruction_match_key(row: DecodedInstruction) -> InstructionMatchKey:
     """Hashable SequenceMatcher key for scoring and the diff.
 
     A resolved reference contributes its identity; a side-local one the

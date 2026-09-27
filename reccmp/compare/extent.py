@@ -10,16 +10,10 @@ body.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
 
-from capstone import (  # type: ignore[import-untyped]
-    CS_ARCH_X86,
-    CS_MODE_16,
-    CS_MODE_32,
-    Cs,
-)
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM  # type: ignore[import-untyped]
 
+from reccmp.compare.asm.decode import decode_one, jump_table_targets
 from reccmp.formats import Image
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
@@ -43,13 +37,6 @@ class EntityExtent:
     recorded: bool = True
 
 
-@cache
-def _disassembler(is_32bit: bool) -> Cs:
-    cs = Cs(CS_ARCH_X86, CS_MODE_32 if is_32bit else CS_MODE_16)
-    cs.detail = True
-    return cs
-
-
 def _read(image: Image, addr: int, size: int) -> bytes:
     try:
         return image.read(addr, size)
@@ -59,20 +46,13 @@ def _read(image: Image, addr: int, size: int) -> bytes:
 
 def _jump_table_targets(image: Image, insn, start: int, limit: int) -> list[int] | None:
     """Targets of ``jmp dword ptr [reg*4 + table]`` that land in the window."""
-    op = insn.operands[0]
-    if op.type != X86_OP_MEM or op.mem.scale != 4 or not op.mem.index or op.mem.base:
-        return None
-    table = op.mem.disp & 0xFFFFFFFF
-    targets: list[int] = []
-    for i in range(256):
-        raw = _read(image, table + 4 * i, 4)
-        if len(raw) != 4:
-            break
-        target = int.from_bytes(raw, "little")
-        if not start <= target < start + limit:
-            break
-        targets.append(target)
-    return targets or None
+
+    def read_dword(addr: int) -> int | None:
+        raw = _read(image, addr, 4)
+        return int.from_bytes(raw, "little") if len(raw) == 4 else None
+
+    targets = jump_table_targets(insn, read_dword, start, limit)
+    return list(targets) if targets is not None else None
 
 
 def discover_extent(
@@ -93,7 +73,6 @@ def discover_extent(
         code = _read(image, start, limit)
     if not code:
         return None
-    cs = _disassembler(is_32bit)
     end = start
     pending = [start]
     seen: set[int] = set()
@@ -107,7 +86,7 @@ def discover_extent(
                 return None
             seen.add(addr)
             offset = addr - start
-            insn = next(cs.disasm(code[offset : offset + 16], addr, 1), None)
+            insn = decode_one(code[offset : offset + 16], addr, is_32bit)
             if insn is None:
                 return None
             end = max(end, addr + insn.size)

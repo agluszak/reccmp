@@ -25,7 +25,12 @@ from capstone.x86 import (  # type: ignore
 )
 
 from reccmp.call_facts import CallFacts
-from reccmp.compare.asm.decode import decode_one, direct_branch_target
+from reccmp.compare.asm.decode import (
+    decode_one,
+    direct_branch_target,
+    jump_table_targets,
+    jump_thunk_target,
+)
 from reccmp.compare.extent import EntityExtent
 from reccmp.formats import Image
 
@@ -45,6 +50,20 @@ class Cleanup:
     certain: bool
 
 
+def _caller_cleanup_bytes(insn: CsInsn | None) -> int | None:
+    """Bytes an ``add esp, N`` immediately after a call removes."""
+    if (  # pylint: disable=too-many-boolean-expressions
+        insn is not None
+        and insn.id == X86_INS_ADD
+        and len(insn.operands) == 2
+        and insn.operands[0].type == X86_OP_REG
+        and insn.operands[0].reg == X86_REG_ESP
+        and insn.operands[1].type == X86_OP_IMM
+    ):
+        return insn.operands[1].imm
+    return None
+
+
 class CalleeCleanupMixin:
     """Part of SideMachine; relies on its attributes."""
 
@@ -52,6 +71,16 @@ class CalleeCleanupMixin:
     _pristine: bytes
     insn_at: Callable[[int], CsInsn | None]
     function_window: Callable[[int], EntityExtent | None]
+
+    def _decode(self, addr: int) -> CsInsn | None:
+        if addr not in self.image_range:
+            return None
+        offset = addr - self.image_range.start
+        return decode_one(self._pristine[offset : offset + 16], addr)
+
+    def _caller_cleanup(self, after_call: int) -> int | None:
+        """Bytes the caller removes right after the call (cdecl)."""
+        return _caller_cleanup_bytes(self.insn_at(after_call))
 
     def _callee_pop_bytes(self, target: int, depth: int = 0) -> Cleanup | None:
         """The ``ret N`` of a callee in the image, from the returns its
@@ -142,26 +171,15 @@ class CalleeCleanupMixin:
         """Targets of ``jmp dword ptr [reg*4 + table]`` inside ``[start,
         stop)``, read until the first entry outside it; none when ``insn``
         is not one."""
-        op = insn.operands[0] if insn.operands else None
-        if (
-            op is None
-            or op.type != X86_OP_MEM
-            or op.mem.scale != 4
-            or not op.mem.index
-            or op.mem.base
-        ):
-            return []
-        table = op.mem.disp & 0xFFFFFFFF
-        targets = []
-        for entry in range(256):
-            offset = table + 4 * entry - self.image_range.start
+
+        def read_dword(addr: int) -> int | None:
+            offset = addr - self.image_range.start
             if not 0 <= offset <= len(self._pristine) - 4:
-                break
-            case = int.from_bytes(self._pristine[offset : offset + 4], "little")
-            if not start <= case < stop:
-                break
-            targets.append(case)
-        return targets
+                return None
+            return int.from_bytes(self._pristine[offset : offset + 4], "little")
+
+        targets = jump_table_targets(insn, read_dword, start, stop - start)
+        return list(targets) if targets is not None else []
 
 
 def import_key(module: str, name: str) -> str:
@@ -225,12 +243,6 @@ class StaticCode(CalleeCleanupMixin):
         self.callee_pop_bytes = functools.cache(self._callee_pop_bytes)
         self.call_effect = functools.cache(self._call_effect)
 
-    def _decode(self, addr: int) -> CsInsn | None:
-        if addr not in self.image_range:
-            return None
-        offset = addr - self.image_range.start
-        return decode_one(self._pristine[offset : offset + 16], addr)
-
     def _slot_import(self, op) -> str | None:
         """The import a ``[slot]`` operand reads, if it is an import slot."""
         if op.type != X86_OP_MEM or op.mem.base or op.mem.index:
@@ -249,31 +261,13 @@ class StaticCode(CalleeCleanupMixin):
             return None
         target = op.imm
         for _ in range(4):
-            insn = self.insn_at(target)
-            if insn is None or insn.id != X86_INS_JMP or not insn.operands:
+            step = jump_thunk_target(self.insn_at(target), self.import_slots.get)
+            if isinstance(step, str):
+                return step
+            if step is None:
                 break
-            jump = insn.operands[0]
-            if jump.type == X86_OP_IMM:
-                target = jump.imm
-            elif (name := self._slot_import(jump)) is not None:
-                return name
-            else:
-                break
+            target = step
         return target
-
-    def _caller_cleanup(self, after_call: int) -> int | None:
-        """Bytes the caller removes right after the call (cdecl)."""
-        insn = self.insn_at(after_call)
-        if (  # pylint: disable=too-many-boolean-expressions
-            insn is not None
-            and insn.id == X86_INS_ADD
-            and len(insn.operands) == 2
-            and insn.operands[0].type == X86_OP_REG
-            and insn.operands[0].reg == X86_REG_ESP
-            and insn.operands[1].type == X86_OP_IMM
-        ):
-            return insn.operands[1].imm
-        return None
 
     def _call_effect(self, call_addr: int) -> CallStackEffect | None:
         """The stack effect of the call instruction at ``call_addr``."""

@@ -11,7 +11,11 @@ from dataclasses import dataclass, replace
 from collections.abc import Hashable
 from typing import Callable, Literal, Sequence
 
-from reccmp.compare.asm.ir import DecodedInstruction, operand_match_key
+from reccmp.compare.asm.ir import (
+    DecodedInstruction,
+    InstructionMatchKey,
+    instruction_match_key,
+)
 from reccmp.compare.asm.model import REGISTERS
 from reccmp.compare.asm.operand import Mem, Operand, Reg, ScaledReg
 from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
@@ -19,14 +23,24 @@ from reccmp.compare.pinned_sequences import SequenceMatcherWithPins
 
 @dataclass(frozen=True)
 class FingerprintRow:
-    """One instruction of a fingerprint: its shape (operands as the match
-    key freezes them: references by identity, side-local ones by the
-    placeholder they show), and for a direct call the callee's identity."""
+    """One instruction's canonical match key plus the control fact a call
+    needs for helper identity."""
 
-    prefix: str
-    mnemonic: str
-    operands: tuple[Operand, ...]
-    callee: Hashable | None = None
+    key: InstructionMatchKey
+    is_call: bool = False
+    control_target: Hashable | None = None
+
+    @property
+    def mnemonic(self) -> str:
+        return self.key[1]
+
+    @property
+    def prefix(self) -> str:
+        return self.key[2]
+
+    @property
+    def operands(self) -> tuple[Operand, ...]:
+        return self.key[3]
 
 
 Fingerprint = tuple[FingerprintRow, ...]
@@ -61,9 +75,8 @@ def fingerprint_of(rows: Sequence[DecodedInstruction]) -> Fingerprint:
     """The fingerprint of an excerpt's instructions (table rows skipped)."""
     return tuple(
         FingerprintRow(
-            row.prefix,
-            row.mnemonic,
-            operand_match_key(row),
+            instruction_match_key(row),
+            row.is_call,
             row.control_target if row.is_call else None,
         )
         for row in rows
@@ -379,11 +392,14 @@ def register_normalized(fingerprint: Fingerprint) -> Fingerprint:
     """
     mapping: dict[str, str] = {}
     return tuple(
-        FingerprintRow(
-            row.prefix,
-            row.mnemonic,
-            tuple(_rename_operand(op, mapping) for op in row.operands),
-            row.callee,
+        replace(
+            row,
+            key=(
+                "ins",
+                row.mnemonic,
+                row.prefix,
+                tuple(_rename_operand(op, mapping) for op in row.operands),
+            ),
         )
         for row in fingerprint
     )
@@ -443,9 +459,9 @@ def _span_match_kind(
 def find_call_sites(fingerprint: Fingerprint) -> list[tuple[int, Hashable]]:
     """``(index, callee identity)`` of every direct call in ``fingerprint``."""
     return [
-        (i, row.callee)
+        (i, row.control_target)
         for i, row in enumerate(fingerprint)
-        if row.mnemonic == "call" and row.callee is not None
+        if row.is_call and row.control_target is not None
     ]
 
 
