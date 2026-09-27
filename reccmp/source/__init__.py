@@ -15,7 +15,8 @@ from .records import (
     ResolvedField,
 )
 from .observations import SourceIndexError, TranslationUnitRecords
-from .index import SourceCollector, SourceIndex, keyed, record_command
+from .index import SourceCollector, SourceIndex, keyed
+from .commands import record_command
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
 __all__ = [
