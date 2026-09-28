@@ -47,6 +47,9 @@ _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 _RAW_LIMIT = 64
 _STRING_TYPES = (EntityType.STRING, EntityType.WIDECHAR)
 _PRISTINE_FOLDER = "pristine"
+# Changes whenever what reccmp does to a program before Ghidra's analysis
+# changes, so that analyses cached before the change are not reused.
+ANALYSIS_REVISION = 1
 
 
 @dataclass(frozen=True)
@@ -228,7 +231,63 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
         return result
 
+    def analyze_program(
+        self,
+        df_or_prog: Any,
+        require_symbols: bool,
+        force_analysis: bool = False,
+        verbose_analysis: bool = False,
+    ) -> Any:
+        """Correct the imports' stack purge before Ghidra's first analysis."""
+        from ghidra.program.util import GhidraProgramUtilities
+
+        # ghidriff closes the program it is handed.
+        program = self.project.openProgram("/", df_or_prog.getName(), False)
+        if GhidraProgramUtilities.shouldAskToAnalyze(program):
+            transaction = program.startTransaction("reccmp import purges")
+            try:
+                self._correct_import_purges(program)
+            finally:
+                program.endTransaction(transaction, True)
+        return super().analyze_program(
+            program, require_symbols, force_analysis, verbose_analysis
+        )
+
     # --- program preparation ----------------------------------------------
+
+    @staticmethod
+    def _correct_import_purges(program: "Program") -> None:
+        """Give imports the caller cleans up after a stack purge of zero.
+
+        With the imported library beside the binary, Ghidra takes each
+        import's stack purge from its own analysis of the library. That
+        analysis may count arguments pushed on a path that never returns,
+        such as a failed assertion's call to exit, as the function's own
+        purge. A caller that cleans up after the call then leaves the
+        decompiler's stack pointer off by that amount for the rest of the
+        function, and the parameter analysis gives its callers parameters
+        they do not have. A variadic or `__cdecl` function never pops its
+        arguments; the signature comes from the import's mangled name,
+        before analysis has applied it."""
+        from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+        from ghidra.program.model.lang import CompilerSpec
+
+        for function in program.getFunctionManager().getExternalFunctions():
+            if function.getStackPurgeSize() == 0:
+                continue
+            imported = function.getExternalLocation().getOriginalImportedName()
+            demangled = DemanglerUtil.demangle(imported or function.getName())
+            if not isinstance(demangled, DemangledFunction):
+                continue
+            if (
+                demangled.getCallingConvention()
+                == CompilerSpec.CALLING_CONVENTION_cdecl
+                or any(
+                    parameter.getType().isVarArgs()
+                    for parameter in demangled.getParameters()
+                )
+            ):
+                function.setStackPurgeSize(0)
 
     def _pair_type(self, orig_addr: int) -> EntityType | None:
         return self._pair_types.get(orig_addr)
