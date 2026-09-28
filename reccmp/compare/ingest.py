@@ -9,6 +9,7 @@ from reccmp.formats.exceptions import (
     InvalidStringError,
 )
 from reccmp.formats import PEImage, TextFile
+from reccmp.formats.image import ImageSectionFlags
 from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.parser import DecompCodebase
 from reccmp.parser.node import ParserVtable
@@ -55,6 +56,33 @@ def load_cvdump(cvdump_analysis: CvdumpAnalysis, db: EntityDb, recomp_bin: PEIma
 
             addr = recomp_bin.get_abs_addr(sym.section, sym.offset)
             sym.addr = addr
+
+            # Static CRT objects may contribute only a PUBLICS entry. A
+            # public in executable storage is still a callable function.
+            public_only_code = (
+                sym.symbol_entry is None
+                and bool(sym.public_names)
+                and bool(
+                    recomp_bin.get_section_by_index(sym.section).flags
+                    & ImageSectionFlags.EXECUTE
+                )
+            )
+            if public_only_code and sym.node_type is None:
+                sym.node_type = EntityType.FUNCTION
+            public_names = (
+                tuple(
+                    (
+                        name[1:]
+                        if name.startswith("_") and not name.startswith("__")
+                        else name
+                    )
+                    for name in sym.public_names
+                )
+                if public_only_code
+                else ()
+            )
+            if public_only_code and sym.friendly_name is None:
+                sym.friendly_name = public_names[-1]
 
             if addr in seen_addrs:
                 continue
@@ -113,6 +141,7 @@ def load_cvdump(cvdump_analysis: CvdumpAnalysis, db: EntityDb, recomp_bin: PEIma
                     name=sym.name(),
                     symbol=sym.decorated_name,
                     size=sym.size(),
+                    public_names=public_names,
                 )
                 if sym.parent_function is not None and recomp_bin.is_valid_section(
                     sym.parent_function.section

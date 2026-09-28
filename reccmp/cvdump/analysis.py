@@ -55,6 +55,7 @@ class CvdumpNode:
     offset: int
     # aka the mangled name from the PUBLICS section
     decorated_name: str | None = None
+    public_names: tuple[str, ...] = ()
     # optional "nicer" name (e.g. of a function from SYMBOLS section)
     friendly_name: str | None = None
     # To be determined by context after inserting data, unless the decorated
@@ -84,6 +85,8 @@ class CvdumpNode:
 
     def set_decorated(self, name: str):
         self.decorated_name = name
+        if name not in self.public_names:
+            self.public_names += (name,)
 
         if self.decorated_name.startswith("??_7"):
             self.node_type = EntityType.VTABLE

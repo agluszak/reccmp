@@ -700,3 +700,33 @@ def classify_exact_vtable_aliases(
             identities = canonical.get((name, raw), set())
             if len(identities) == 1:
                 db.set_alias(image_id, addr, next(iter(identities)))
+
+
+def classify_folded_vtable_aliases(
+    db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage
+) -> None:
+    """Link distinct rebuild tables only when all slots identify one retail table."""
+    originals: dict[tuple[int, tuple[int | None, ...]], set[int]] = {}
+    for entity in db.get_all():
+        addr = entity.addr(ImageId.ORIG)
+        size = entity.size(ImageId.ORIG)
+        if entity.get("type") != EntityType.VTABLE or addr is None or size is None:
+            continue
+        slots = _vtable_slot_identities(db, ImageId.ORIG, orig_bin, addr, size)
+        if slots is not None:
+            originals.setdefault((size, slots), set()).add(addr)
+
+    for candidate in tuple(db.unexplained(ImageId.RECOMP)):
+        addr = candidate.addr(ImageId.RECOMP)
+        size = candidate.size(ImageId.RECOMP)
+        if candidate.get("type") != EntityType.VTABLE or addr is None or size is None:
+            continue
+        slots = _vtable_slot_identities(db, ImageId.RECOMP, recomp_bin, addr, size)
+        if slots is None:
+            continue
+        identities = originals.get((size, slots), set())
+        if len(identities) == 1:
+            identity = next(iter(identities))
+            canonical = db.get(ImageId.ORIG, identity)
+            if canonical is not None and canonical.recomp_addr is not None:
+                db.set_alias(ImageId.RECOMP, addr, identity)

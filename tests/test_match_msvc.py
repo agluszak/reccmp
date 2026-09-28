@@ -147,6 +147,22 @@ def test_match_functions(db):
     assert db.count() == 1
 
 
+def test_match_functions_uses_each_public_name_at_one_address(db):
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 123, name="__alloca_probe", type=EntityType.FUNCTION)
+        batch.set(
+            ImageId.RECOMP,
+            555,
+            name="__chkstk",
+            type=EntityType.FUNCTION,
+            public_names=("__chkstk", "__alloca_probe"),
+        )
+
+    match_functions(db)
+
+    assert db.is_match(123, 555)
+
+
 def test_match_functions_no_match(db):
     """Skip entities with no match"""
     with db.batch() as batch:
