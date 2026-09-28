@@ -41,7 +41,8 @@ output shows. The exit status does not depend on them.
 
 Analysis failures name their cause: Ghidra has no function at the entry and
 could not create one (`no-function`); the entry lies inside a function Ghidra
-starts elsewhere (`entry-conflict`, with that function's address); the
+starts elsewhere (`entry-conflict`, with that function's address; the entry is
+inside the piece of that function holding its own entry); the
 decompiler failed (`decompile-error`).
 
 ## What both programs receive
@@ -54,7 +55,10 @@ Both programs are analyzed the same way, without debug information. Then:
   constants: without this, a `const` global would show as a name in one
   program and as its value in the other;
 - functions are created at every entry the catalog knows, with Ghidra's own
-  commands;
+  commands. A tail-called function that Ghidra's analysis absorbed into its
+  caller, as a separate piece of the caller's body, is split off at that
+  entry, and data Ghidra guessed over an entry (a string in the instruction
+  bytes) is removed;
 - every pair gets one name in both programs, its reccmp name (qualified with
   the original address when several pairs share a name). A duplicate the
   catalog identifies with a pair gets the pair's name;

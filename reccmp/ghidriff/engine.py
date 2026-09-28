@@ -363,10 +363,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
     def _create_functions(self, program: "Program", image_id: ImageId) -> None:
         """Make functions at the entries the catalog knows, through Ghidra's
-        own commands. An entry inside another function is a conflict to
-        report, not a reason to compare the containing function."""
+        own commands.
+
+        Ghidra's analysis may absorb a tail-called function into its caller
+        as a separate piece of the caller's body. An entry at such a piece
+        is split off into its own function. An entry inside the piece that
+        holds the containing function's own entry is a conflict to report,
+        not a reason to compare the containing function."""
         from ghidra.app.cmd.disassemble import DisassembleCommand
         from ghidra.app.cmd.function import CreateFunctionCmd
+        from ghidra.util.task import TaskMonitor
 
         functions = program.getFunctionManager()
         space = program.getAddressFactory().getDefaultAddressSpace()
@@ -393,11 +399,17 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
             }
         )
+        split = []
         for addr in sorted(known | requested.keys()):
             address = space.getAddress(addr)
             if functions.getFunctionAt(address) is not None:
                 continue
             containing = functions.getFunctionContaining(address)
+            if containing is not None and self._split_absorbed_piece(
+                containing, address
+            ):
+                split.append(containing)
+                containing = None
             if containing is not None:
                 if addr in requested:
                     self._fail(
@@ -409,12 +421,41 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         ),
                     )
                 continue
+            self._clear_data(program, address)
             DisassembleCommand(address, None, True).applyTo(program)
             CreateFunctionCmd(address).applyTo(program)
             if functions.getFunctionAt(address) is None and addr in requested:
                 self._fail(
                     requested[addr], AnalysisFailure(FailureKind.NO_FUNCTION, image_id)
                 )
+        for function in split:
+            CreateFunctionCmd.fixupFunctionBody(program, function, TaskMonitor.DUMMY)
+
+    @staticmethod
+    def _clear_data(program: "Program", address: "Address") -> None:
+        """Remove data Ghidra's analysis defined over a known function entry,
+        such as a string it guessed in the instruction bytes; it would keep
+        the entry from being disassembled."""
+        listing = program.getListing()
+        data = listing.getDataContaining(address)
+        if data is not None and data.isDefined():
+            listing.clearCodeUnits(data.getMinAddress(), data.getMaxAddress(), False)
+
+    @staticmethod
+    def _split_absorbed_piece(function: Any, address: "Address") -> bool:
+        """Remove the piece of `function`'s body that starts at `address`,
+        when that piece does not hold the function's entry. Returns whether
+        it was removed."""
+        from ghidra.program.model.address import AddressSet
+
+        body = function.getBody()
+        piece = body.getRangeContaining(address)
+        if piece is None or piece.contains(function.getEntryPoint()):
+            return False
+        if piece.getMinAddress() != address:
+            return False
+        function.setBody(body.subtract(AddressSet(piece)))
+        return True
 
     def _fail(self, entry: FunctionEntry, failure: AnalysisFailure) -> None:
         self._failures.setdefault(entry.orig_addr, []).append(failure)
