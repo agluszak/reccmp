@@ -54,7 +54,10 @@ takes import purges from its own analysis of the library, which can count the
 arguments of a call that never returns (a failed assertion's exit) as the
 function's purge. The decompiler's stack pointer is then off after every call
 to that import, so it gives the callers parameters they do not have, and can
-crash. After the analysis:
+crash. An import one program has no stack purge for gets the purge the other program
+has for the same import: without its library beside the binary, Ghidra leaves
+it unknown, and the stack depth after every call to it with it. After the
+analysis:
 
 - the original's memory blocks get the write permission of the recompiled
   blocks with the same name. A packed or protected original can have writable

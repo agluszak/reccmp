@@ -167,6 +167,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     try:
         engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
         engine.prune_programs([orig, recomp])
+        engine.align_import_purges(orig, recomp)
         engine.analyze_project()
         engine.reset_programs()
         engine.align_memory_permissions(orig, recomp)
