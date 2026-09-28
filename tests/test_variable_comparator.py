@@ -6,7 +6,7 @@ from reccmp.cvdump.types import (
     FieldListItem,
     TypeInfo,
 )
-from reccmp.compare.db import EntityDb, ReccmpMatch
+from reccmp.compare.db import EntityDb, ReccmpMatch, PairBasis
 from reccmp.source import SourceClass, SourceField, SourceIndex, SourceVariable, keyed
 from reccmp.types import EntityType, ImageId
 from .mock_types_db import MockTypesDb
@@ -48,7 +48,7 @@ def create_matched_variable(
         if size is not None:
             batch.set(ImageId.RECOMP, addr, size=size)
 
-        batch.match(addr, addr)
+        batch.match(addr, addr, basis=PairBasis.ANNOTATION)
 
 
 def test_compare_scalar_match(db: EntityDb, types: CvdumpTypesParser):
@@ -85,7 +85,7 @@ def test_compare_pointer_match(db: EntityDb, types: CvdumpTypesParser):
     # Entity at address 0x0004 required to match
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 8, name="Hello")
-        batch.match(4, 8)
+        batch.match(4, 8, basis=PairBasis.ANNOTATION)
 
     orig = RawImage.from_memory(b"\x04\x00\x00\x00")
     recomp = RawImage.from_memory(b"\x08\x00\x00\x00")
@@ -388,7 +388,7 @@ def test_compare_pointer_entity_offset(db: EntityDb, types: CvdumpTypesParser):
     create_matched_variable(db, 0, data_type=CVInfoTypeEnum.T_32PVOID)
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 6, size=10, type=EntityType.DATA, name="hello")
-        batch.match(4, 6)
+        batch.match(4, 6, basis=PairBasis.ANNOTATION)
 
     # Pointers each point to "hello+4"
     orig = RawImage.from_memory(b"\x08\x00\x00\x00", bss=12)

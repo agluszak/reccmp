@@ -25,7 +25,7 @@ from reccmp.analysis.crt_startup import (
     detect_crt_startup_arrays,
     get_crt_function_name,
 )
-from .db import EntityDb, ReccmpEntity, entity_name_from_string
+from .db import EntityDb, PairBasis, ReccmpEntity, entity_name_from_string
 from .queries import get_floats_without_data, get_strings_without_data
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def match_entry(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
 
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, recomp_bin.entry, type=EntityType.FUNCTION)
-        batch.match(orig_bin.entry, recomp_bin.entry)
+        batch.match(orig_bin.entry, recomp_bin.entry, basis=PairBasis.DERIVED)
 
 
 def create_crt_functions(db: EntityDb, image_id: ImageId, binfile: PEImage):
@@ -326,7 +326,7 @@ def match_exports(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
             if recomp_addr in recomp_thunks:
                 recomp_addr = recomp_thunks[recomp_addr]
 
-            batch.match(orig_addr, recomp_addr)
+            batch.match(orig_addr, recomp_addr, basis=PairBasis.DERIVED)
 
 
 def create_analysis_vtordisps(db: EntityDb, img_id: ImageId, binfile: PEImage):
@@ -573,7 +573,7 @@ def match_inferred_vtables_by_slots(
             equivalent.append(recomp_addr)
         if len(equivalent) == 1:
             pairs.append((orig_addr, equivalent[0]))
-    db.bulk_match(pairs)
+    db.bulk_match(pairs, basis=PairBasis.DERIVED)
 
 
 def classify_exact_vtable_aliases(

@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.verify import check_vtables
 from reccmp.types import EntityType, ImageId
 
@@ -42,7 +42,7 @@ def _add_vtable(
             name="TCivUnit::`vftable'",
             size=recomp_size,
         )
-        batch.match(0x20, 0x80)
+        batch.match(0x20, 0x80, basis=PairBasis.ANNOTATION)
 
 
 def test_vtable_boundary_warning_includes_interior_entity(

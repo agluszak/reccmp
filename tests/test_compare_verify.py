@@ -2,7 +2,7 @@
 
 import pytest
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.verify import check_vtables
 
 
@@ -33,7 +33,7 @@ def set_vtable_match(
             type=EntityType.VTABLE,
             size=recomp_size,
         )
-        batch.match(0, 0)
+        batch.match(0, 0, basis=PairBasis.ANNOTATION)
 
 
 def test_size_difference_not_warned(db, caplog):

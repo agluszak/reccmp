@@ -3,6 +3,7 @@ addresses/symbols that we want to compare between the original and recompiled bi
 """
 
 import bisect
+import enum
 import logging
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -20,6 +21,23 @@ def entity_name_from_string(text: str, wide: bool = False) -> str:
 EntityTypeLookup: dict[int, str] = {
     value: name for name, value in EntityType.__members__.items()
 }
+
+
+class PairBasis(enum.Enum):
+    """Why two addresses are paired as the same entity.
+
+    A pair means "compare these", never "these are equivalent". The basis
+    says how much independent evidence stands behind the correspondence.
+    """
+
+    # A source annotation or project declaration bound to a recompiled debug
+    # symbol or line.
+    ANNOTATION = "annotation"
+    # Follows from binary structure or from another pair: entry point,
+    # imports, exports, thunks, SEH records, CRT startup, vtable slots.
+    DERIVED = "derived"
+    # Equal contents only (string literals). Contents are not identity.
+    CONTENT = "content"
 
 
 class FrozenEntityDbError(RuntimeError):
@@ -216,7 +234,7 @@ class EntityBatch:
 
     _orig: dict[int, dict[str, Any]]
     _recomp: dict[int, dict[str, Any]]
-    _matches: list[tuple[int, int]]
+    _matches: list[tuple[int, int, PairBasis]]
 
     def __init__(self, backref: "EntityDb") -> None:
         self.base = backref
@@ -269,10 +287,10 @@ class EntityBatch:
     ):
         self.set(img, addr, ref=ref, displacement=displacement)
 
-    def match(self, orig: int, recomp: int):
-        self._matches.append((orig, recomp))
+    def match(self, orig: int, recomp: int, *, basis: PairBasis):
+        self._matches.append((orig, recomp, basis))
 
-    def _finalized_matches(self) -> Iterator[tuple[int, int]]:
+    def _finalized_matches(self) -> Iterator[tuple[int, int, PairBasis]]:
         """Reduce the list of matches so that each orig and recomp addr appears once.
         If an address is repeated, retain the first pair where it is used and ignore any others.
         """
@@ -281,11 +299,11 @@ class EntityBatch:
 
         # This should have the same effect as the original implementation
         # that used two dicts to check uniqueness during each call to match().
-        for orig, recomp in self._matches:
+        for orig, recomp, basis in self._matches:
             if orig not in used_orig and recomp not in used_recomp:
                 used_orig.add(orig)
                 used_recomp.add(recomp)
-                yield ((orig, recomp))
+                yield orig, recomp, basis
             else:
                 logger.warning(
                     "Match (%x, %x) collides with previous staged match", orig, recomp
@@ -298,8 +316,11 @@ class EntityBatch:
         if self._recomp:
             self.base.bulk_insert(ImageId.RECOMP, self._recomp.items())
 
-        if self._matches:
-            self.base.bulk_match(self._finalized_matches())
+        by_basis: dict[PairBasis, list[tuple[int, int]]] = {}
+        for orig, recomp, basis in self._finalized_matches():
+            by_basis.setdefault(basis, []).append((orig, recomp))
+        for basis, pairs in by_basis.items():
+            self.base.bulk_match(pairs, basis=basis)
 
         self.reset()
 
@@ -325,9 +346,11 @@ class EntityDb:
     def __init__(self):
         self._entities = {ImageId.ORIG: {}, ImageId.RECOMP: {}}
         self._matches = {ImageId.ORIG: {}, ImageId.RECOMP: {}}
-        # Side-local duplicate bodies that have been proven equivalent to a
-        # real matched pair.  The value is always the canonical original
-        # address; aliases deliberately do not occupy the one-to-one match map.
+        self._pair_basis: dict[int, PairBasis] = {}
+        # Side-local duplicates of a real matched pair (FOLDED annotations,
+        # identical duplicate emissions). The value is always the canonical
+        # original address; aliases deliberately do not occupy the one-to-one
+        # match map.
         self._aliases: dict[ImageId, dict[int, int]] = {
             ImageId.ORIG: {},
             ImageId.RECOMP: {},
@@ -337,21 +360,11 @@ class EntityDb:
         self._addr_order = {ImageId.ORIG: [], ImageId.RECOMP: []}
 
         self._sections = {ImageId.ORIG: [], ImageId.RECOMP: []}
-        self._equivalence_groups: dict[int, int] = {}
         self._frozen = False
-        self._generation = 0
 
     @property
     def frozen(self) -> bool:
         return getattr(self, "_frozen", False)
-
-    @property
-    def generation(self) -> int:
-        """Identity-cache generation; increments when pairings or aliases change."""
-        return getattr(self, "_generation", 0)
-
-    def _bump_generation(self) -> None:
-        self._generation = getattr(self, "_generation", 0) + 1
 
     def freeze(self) -> None:
         """Seal facts and pairing/identity after ingest. Resolver caches may follow."""
@@ -363,46 +376,6 @@ class EntityDb:
                 if side is not None:
                     side.freeze()
         self._frozen = True
-
-    def set_equivalence_groups(self, groups: Mapping[int, int]) -> None:
-        """Install project-declared canonical original addresses during ingest."""
-        if dict(groups) == self._equivalence_groups:
-            return
-        self._require_mutable()
-        self._equivalence_groups = dict(groups)
-        self._bump_generation()
-
-    def canonical_orig(
-        self,
-        image_id: ImageId,
-        addr: int,
-        groups: Mapping[int, int] | None = None,
-        entity: ReccmpEntity | None = None,
-    ) -> int | None:
-        """Proven original identity of a paired, folded, or declared alias."""
-        canonical = self.alias_canonical_orig(image_id, addr)
-        if canonical is None and entity is not None and entity.matched:
-            canonical = entity.orig_addr
-        if (
-            canonical is None
-            and image_id == ImageId.ORIG
-            and addr in self._entities[image_id]
-        ):
-            canonical = addr
-        if canonical is None:
-            return None
-        chosen_groups = groups if groups is not None else self._equivalence_groups
-        mapped = chosen_groups.get(canonical)
-        if mapped is not None:
-            return mapped
-        if (
-            image_id == ImageId.ORIG
-            and addr not in self._matches[image_id]
-            and addr not in self._aliases[image_id]
-            and not (entity is not None and entity.matched)
-        ):
-            return None
-        return canonical
 
     def _require_mutable(self) -> None:
         if self.frozen:
@@ -443,9 +416,8 @@ class EntityDb:
                 side.facts.update(values)
 
         self._update_addr_index(image, new_addrs)
-        self._bump_generation()
 
-    def bulk_match(self, pairs: Iterable[tuple[int, int]]):
+    def bulk_match(self, pairs: Iterable[tuple[int, int]], *, basis: PairBasis):
         """Expects iterable of `(orig_addr, recomp_addr)`."""
         self._require_mutable()
 
@@ -465,6 +437,7 @@ class EntityDb:
 
             self._matches[ImageId.ORIG][x] = y
             self._matches[ImageId.RECOMP][y] = x
+            self._pair_basis[x] = basis
             self._aliases[ImageId.ORIG].pop(x, None)
             self._aliases[ImageId.RECOMP].pop(y, None)
 
@@ -480,7 +453,6 @@ class EntityDb:
 
         self._update_addr_index(ImageId.ORIG, new_x)
         self._update_addr_index(ImageId.RECOMP, new_y)
-        self._bump_generation()
 
     def add_section(self, img: ImageId, range_: range):
         self._require_mutable()
@@ -535,7 +507,7 @@ class EntityDb:
                 yield recomp_entities[recomp_addr]
 
     def set_alias(self, image_id: ImageId, addr: int, canonical_orig: int) -> bool:
-        """Record a proven side-local duplicate of a real matched function.
+        """Record a side-local duplicate of a real matched entity.
 
         Aliases are accounting/identity edges, not matches: several addresses
         on either image may name the same canonical pair.  Return ``False``
@@ -553,7 +525,6 @@ class EntityDb:
         if existing is not None:
             return False
         self._aliases[image_id][addr] = canonical_orig
-        self._bump_generation()
         return True
 
     def alias_canonical_orig(self, image_id: ImageId, addr: int) -> int | None:
@@ -581,7 +552,7 @@ class EntityDb:
                 yield self._entities[image_id][addr], canonical
 
     def unexplained(self, image_id: ImageId) -> Iterator[ReccmpEntity]:
-        """Unmatched entities excluding proven aliases.
+        """Unmatched entities excluding aliases.
 
         ``unmatched`` remains the raw inventory API and intentionally includes
         aliases, so callers can report both headline and raw counts.
@@ -600,6 +571,10 @@ class EntityDb:
                 ent = entities[orig_addr]
                 assert isinstance(ent, ReccmpMatch)
                 yield ent
+
+    def pair_basis(self, orig_addr: int) -> PairBasis | None:
+        """How the pair at this original address was established."""
+        return self._pair_basis.get(orig_addr)
 
     def get_one_match(self, orig_addr: int) -> ReccmpMatch | None:
         if orig_addr not in self._entities[ImageId.ORIG]:

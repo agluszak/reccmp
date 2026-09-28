@@ -2,11 +2,17 @@ import enum
 import struct
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator
 from typing_extensions import Buffer
-from reccmp.compare.asm.operand import Imm, Mem, Operand
-from reccmp.compare.asm.decode import disasm_detail
-from reccmp.compare.asm.ir import DecodedInstruction
+from reccmp.analysis.x86 import (
+    direct_call_target,
+    instructions,
+    is_call,
+    is_jump,
+    is_ret,
+    operand_addresses,
+    pushed_immediate,
+)
 from reccmp.formats import Image, PEImage
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.db import EntityDb
@@ -69,20 +75,6 @@ class CrtStartupArray:
     The thunk is what actually appeared in the ___xc_a/z list."""
 
 
-def _operand_addresses(operand: Operand) -> list[int]:
-    """The values in one operand that may be addresses: an immediate, or a
-    memory operand's displacement."""
-    match operand:
-        case Imm(value) | Mem(displacement=value):
-            return [value & 0xFFFFFFFF]
-    return []
-
-
-def _code_instructions(raw: bytes, start: int) -> list[DecodedInstruction]:
-    """Unsanitized rows: the collector reads numeric addresses."""
-    return disasm_detail(raw, start)
-
-
 class UsedAddressCollector:
     seen_addrs: list[UsedAddress]
     """List of addrs that would be replaced by a name or placeholder."""
@@ -94,28 +86,24 @@ class UsedAddressCollector:
         self.is_entity = is_entity
         self.seen_addrs = []
 
-    def _append_addrs(self, operands: Sequence[Operand], used_how: UsedHow):
-        for operand in operands:
-            for addr in _operand_addresses(operand):
-                if self.is_entity(addr):
-                    self.seen_addrs.append((addr, used_how))
+    def _append_addrs(self, addrs: Iterable[int], used_how: UsedHow):
+        for addr in addrs:
+            if self.is_entity(addr):
+                self.seen_addrs.append((addr, used_how))
 
     def analyze(self, data: Buffer, start_addr: int):
-        for insn in _code_instructions(bytes(data), start_addr):
-            if insn.is_ret:
+        for insn in instructions(bytes(data), start_addr):
+            if is_ret(insn):
                 break
-            if insn.is_jump:
+            if is_jump(insn):
                 continue
-            if insn.is_call:
-                if insn.branch_target is not None:
-                    self._append_addrs([Imm(insn.branch_target)], UsedHow.CALL)
-                else:
-                    self._append_addrs(insn.operands, UsedHow.CALL)
+            if is_call(insn):
+                self._append_addrs(operand_addresses(insn), UsedHow.CALL)
             elif insn.mnemonic in ("mov", "fstp"):
-                self._append_addrs(insn.operands[:1], UsedHow.WRITE)
-                self._append_addrs(insn.operands[1:], UsedHow.READ)
+                self._append_addrs(operand_addresses(insn, 0, 1), UsedHow.WRITE)
+                self._append_addrs(operand_addresses(insn, 1), UsedHow.READ)
             else:
-                self._append_addrs(insn.operands, UsedHow.READ)
+                self._append_addrs(operand_addresses(insn), UsedHow.READ)
 
 
 def get_function_sample_size(db: EntityDb, image_id: ImageId, addr: int) -> int:
@@ -344,22 +332,18 @@ def find_initializer_atexit_helpers(
     for initializer_addr in initializer_addrs:
         size = get_function_sample_size(db, image_id, initializer_addr)
         raw = binfile.read(initializer_addr, size)
-        instructions = _code_instructions(raw, initializer_addr)
+        decoded = list(instructions(bytes(raw), initializer_addr))
 
         helpers: list[int] = []
-        for previous, current in zip(instructions, instructions[1:]):
-            if not current.is_call or current.branch_target is None:
+        for previous, current in zip(decoded, decoded[1:]):
+            target = direct_call_target(current)
+            if target is None:
                 continue
-            if not db.callee_names(image_id, current.branch_target) & {
-                "atexit",
-                "_atexit",
-            }:
+            if not db.callee_names(image_id, target) & {"atexit", "_atexit"}:
                 continue
-            match previous.mnemonic, previous.operands:
-                case "push", (Imm(helper_addr),):
-                    pass
-                case _:
-                    continue
+            helper_addr = pushed_immediate(previous)
+            if helper_addr is None:
+                continue
             helper = db.get(image_id, helper_addr, exact=True)
             if helper is not None and helper.get("type") == EntityType.FUNCTION:
                 helpers.append(helper_addr)

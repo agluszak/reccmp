@@ -1,7 +1,7 @@
 """Testing results of complex queries on the entity database"""
 
 import pytest
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.queries import (
     get_overloaded_functions,
     get_referencing_entity_matches,
@@ -58,7 +58,7 @@ def test_overloaded_functions(db: EntityDb):
         batch.set(ImageId.RECOMP, 300, name="Hello", type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 200, name="Hello", type=EntityType.FUNCTION)
         batch.set(ImageId.ORIG, 100, name="Hello", type=EntityType.FUNCTION)
-        batch.match(200, 200)
+        batch.match(200, 200, basis=PairBasis.ANNOTATION)
 
     # Should have three entities, one matched, all functions and all with the name "Hello".
     overloaded = list(get_overloaded_functions(db))
@@ -98,7 +98,7 @@ def test_get_referencing_entity_matches(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 100)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     # There are no referencing entities.
     assert not list(get_referencing_entity_matches(db))
@@ -116,7 +116,7 @@ def test_get_referencing_entity_matches(db: EntityDb):
 
     # Create the match as directed by the query.
     with db.batch() as batch:
-        batch.match(200, 300)
+        batch.match(200, 300, basis=PairBasis.ANNOTATION)
 
     # All child entities have already been matched.
     assert not list(get_referencing_entity_matches(db))
@@ -129,7 +129,7 @@ def test_get_referencing_entity_matches_check_entity_type(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 100)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
         batch.set(ImageId.ORIG, 200, type=EntityType.THUNK)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)

@@ -3,7 +3,7 @@
 import pytest
 
 from reccmp.analysis.funcinfo import UnwindMapEntry
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.match_folded import match_seh
 from reccmp.types import EntityType, ImageId
 
@@ -59,7 +59,7 @@ def test_match_seh_through_owner_and_unique_unwind_state(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 500, type=EntityType.FUNCTION)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
     add_seh_side(db, ImageId.ORIG, 100, 110, 120, unwinds=(UnwindMapEntry(-1, 130),))
     add_seh_side(db, ImageId.RECOMP, 500, 510, 520, unwinds=(UnwindMapEntry(-1, 530),))
 
@@ -74,7 +74,7 @@ def test_match_seh_skips_missing_or_ambiguous_owner_relationship(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 500, type=EntityType.FUNCTION)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
     add_seh_side(db, ImageId.ORIG, 100, 110, 120)
     add_seh_side(db, ImageId.ORIG, 100, 111, 121)
     add_seh_side(db, ImageId.RECOMP, 500, 510, 520)
@@ -102,7 +102,7 @@ def test_match_seh_skips_non_unique_unwind_target_state(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 500, type=EntityType.FUNCTION)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
     add_seh_side(
         db,
         ImageId.ORIG,

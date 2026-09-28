@@ -1,8 +1,8 @@
 """Validated local cache for expensive, deterministic analysis inputs.
 
-The cache deliberately stops before entity matching and semantic comparison.  A
-cache hit can reuse parsed PDB or source-marker data, but every invocation still
-rebuilds the entity database and executes the comparison verifier.
+A cache hit reuses parsed PDB or source-marker data, or a prepared entity
+catalog whose every input is fingerprinted. Code comparison results are never
+cached.
 """
 
 from __future__ import annotations

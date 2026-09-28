@@ -3,7 +3,7 @@
 from functools import partial
 import pytest
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.cvdump.types import CvdumpTypesParser, FieldListItem, CVInfoTypeEnum
 from reccmp.cvdump.cvinfo import CvdumpTypeKey as TK
 
@@ -62,7 +62,7 @@ def test_match_array(db: EntityDb, types_db: CvdumpTypesParser):
             data_type=0x1000,
             size=8,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -83,7 +83,7 @@ def test_match_array_key_unset(db: EntityDb):
             data_type=0x1000,
             size=8,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     # Empty types db so the key lookup will fail
     get_name = partial(name_for_address, db, CvdumpTypesParser())
@@ -106,7 +106,7 @@ def test_match_array_type_is_scalar(db: EntityDb):
             data_type=CVInfoTypeEnum.T_REAL32,
             size=8,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     # Scalars are not currently part of the type database dict, so use an empty one.
     get_name = partial(name_for_address, db, CvdumpTypesParser())
@@ -142,7 +142,7 @@ def test_match_array_type_is_struct(db: EntityDb, types_db: CvdumpTypesParser):
             data_type=0x1000,
             size=8,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     # Empty types db so the key lookup will fail
     get_name = partial(name_for_address, db, CvdumpTypesParser())
@@ -175,7 +175,7 @@ def test_match_array_type_orig_smaller(db: EntityDb, types_db: CvdumpTypesParser
         # It was previously calculated inside match_array_elements.
         batch.set(ImageId.ORIG, 100, max_size=4)
         batch.set(ImageId.ORIG, 104, name="blocker", type=EntityType.DATA)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -214,7 +214,7 @@ def test_match_array_array_of_structs(db: EntityDb, types_db: CvdumpTypesParser)
             data_type=0x1000,
             size=16,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -250,7 +250,7 @@ def test_match_array_array_of_arrays(db: EntityDb, types_db: CvdumpTypesParser):
             data_type=0x1000,
             size=16,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -305,7 +305,7 @@ def test_match_array_array_of_structs_limit(db: EntityDb, types_db: CvdumpTypesP
             data_type=0x1000,
             size=16,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -368,7 +368,7 @@ def test_match_array_array_of_union_structs(db: EntityDb, types_db: CvdumpTypesP
             data_type=0x1000,
             size=8,
         )
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 
@@ -420,7 +420,7 @@ def test_match_array_of_struct_bitfield(db: EntityDb, types_db: CvdumpTypesParse
             data_type=0x1000,
             size=32,
         )
-        batch.match(0x100, 0x100)
+        batch.match(0x100, 0x100, basis=PairBasis.ANNOTATION)
 
     get_name = partial(name_for_address, db, types_db)
 

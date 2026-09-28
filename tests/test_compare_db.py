@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 import pytest
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.types import EntityType, ImageId
 
 
@@ -47,7 +47,7 @@ def test_db_count(db):
     assert db.count() == 2
 
     with db.batch() as batch:
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     assert db.count() == 1
 
@@ -63,8 +63,8 @@ def test_db_all_order(db):
         for addr in (400, 300, 200, 100):
             batch.set(ImageId.ORIG, addr)
 
-        batch.match(200, 200)
-        batch.match(300, 300)
+        batch.match(200, 200, basis=PairBasis.ANNOTATION)
+        batch.match(300, 300, basis=PairBasis.ANNOTATION)
 
     addrs = [(e.orig_addr, e.recomp_addr) for e in db.get_all()]
 
@@ -169,7 +169,7 @@ def test_batch_match_attach(db):
     There is no existing entity with the orig addr being matched."""
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="Hello")
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     # Confirm match
     assert db.get(ImageId.ORIG, 100).name == "Hello"
@@ -186,7 +186,7 @@ def test_batch_match_combine(db):
 
     # Use separate batches to demonstrate
     with db.batch() as batch:
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     # Should combine
     assert len([*db.get_all()]) == 1
@@ -203,7 +203,7 @@ def test_batch_match_combine_except_null(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Test", test=123)
         batch.set(ImageId.RECOMP, 200, name="Hello", test=None)
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     assert db.get(ImageId.RECOMP, 200).get("test") == 123
 
@@ -213,7 +213,7 @@ def test_batch_match_combine_replace_null(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Test", test=None)
         batch.set(ImageId.RECOMP, 200, name="Hello", test=123)
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     assert db.get(ImageId.RECOMP, 200).get("test") == 123
 
@@ -221,7 +221,7 @@ def test_batch_match_combine_replace_null(db):
 def test_batch_match_create(db: EntityDb):
     """Matching two addrs will create an entity."""
     with db.batch() as batch:
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     ent = db.get(ImageId.ORIG, 100)
     assert ent is not None
@@ -254,14 +254,14 @@ def test_batch_cannot_alter_matched(db):
     # Set up the match
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="Test")
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     # Confirm it is there
     assert db.get(ImageId.ORIG, 100).recomp_addr == 200
 
     # Try to change recomp=200 to match orig=101
     with db.batch() as batch:
-        batch.match(101, 200)
+        batch.match(101, 200, basis=PairBasis.ANNOTATION)
 
     # Should not change it
     assert db.get(ImageId.RECOMP, 200).orig_addr == 100
@@ -274,8 +274,8 @@ def test_batch_match_repeat_orig_addr(db):
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="Hello")
         batch.set(ImageId.RECOMP, 201, name="Test")
-        batch.match(100, 200)
-        batch.match(100, 201)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
+        batch.match(100, 201, basis=PairBasis.ANNOTATION)
 
     assert db.get(ImageId.ORIG, 100).recomp_addr == 200
     assert db.get(ImageId.RECOMP, 201).orig_addr is None
@@ -286,8 +286,8 @@ def test_batch_match_repeat_recomp_addr(db):
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 200, name="Hello")
         batch.set(ImageId.RECOMP, 201, name="Test")
-        batch.match(100, 200)
-        batch.match(101, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
+        batch.match(101, 200, basis=PairBasis.ANNOTATION)
 
     assert db.get(ImageId.RECOMP, 200).orig_addr == 100
     assert db.get(ImageId.ORIG, 101) is None
@@ -299,7 +299,7 @@ def test_batch_exception_uncaught(db):
         with db.batch() as batch:
             batch.set(ImageId.ORIG, 100, name="Test")
             batch.set(ImageId.RECOMP, 200, test=123)
-            batch.match(100, 200)
+            batch.match(100, 200, basis=PairBasis.ANNOTATION)
             _ = 1 / 0
     except ZeroDivisionError:
         pass
@@ -313,7 +313,7 @@ def test_batch_exception_caught(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Test")
         batch.set(ImageId.RECOMP, 200, test=123)
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
         try:
             _ = 1 / 0
         except ZeroDivisionError:
@@ -366,7 +366,7 @@ def test_intersects_use_any_size(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Test")
         batch.set(ImageId.RECOMP, 100, size=8)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     assert db.intersects(ImageId.ORIG, 100) is True
     assert db.intersects(ImageId.RECOMP, 100) is True
@@ -574,7 +574,7 @@ def test_size_functions_matched_both_have_size(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, size=1)
         batch.set(ImageId.RECOMP, 100, size=5)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     entity = db.get(ImageId.ORIG, 100)
     assert entity is not None
@@ -589,7 +589,7 @@ def test_size_functions_matched_orig_null(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 100, size=5)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     entity = db.get(ImageId.ORIG, 100)
     assert entity is not None
@@ -604,7 +604,7 @@ def test_size_functions_matched_recomp_null(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, size=1)
         batch.set(ImageId.RECOMP, 100)
-        batch.match(100, 100)
+        batch.match(100, 100, basis=PairBasis.ANNOTATION)
 
     entity = db.get(ImageId.ORIG, 100)
     assert entity is not None
@@ -620,7 +620,7 @@ def test_independent_sets(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, name="Hello")
         batch.set(ImageId.RECOMP, 200, name="Hello")
-        batch.match(100, 200)
+        batch.match(100, 200, basis=PairBasis.ANNOTATION)
 
     # baseline
     ent = db.get(ImageId.RECOMP, 200)
@@ -651,16 +651,23 @@ def test_independent_sets(db: EntityDb):
     assert db.get(ImageId.ORIG, 100) is ent
 
 
-def test_catalog_canonical_identity_combines_pairs_and_aliases(db: EntityDb):
-    db.set_equivalence_groups({0x110: 0x100})
+def test_pair_basis_is_recorded_per_pair(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 0x100, type=EntityType.FUNCTION)
-        batch.set(ImageId.ORIG, 0x110, type=EntityType.FUNCTION)
-        batch.set(ImageId.RECOMP, 0x500, type=EntityType.FUNCTION)
-        batch.set(ImageId.RECOMP, 0x510, type=EntityType.FUNCTION)
-        batch.match(0x100, 0x500)
-    assert db.set_alias(ImageId.RECOMP, 0x510, 0x100)
-    assert db.canonical_orig(ImageId.ORIG, 0x100) == 0x100
-    assert db.canonical_orig(ImageId.ORIG, 0x110) == 0x100
-    assert db.canonical_orig(ImageId.RECOMP, 0x500) == 0x100
-    assert db.canonical_orig(ImageId.RECOMP, 0x510) == 0x100
+        batch.set(ImageId.ORIG, 0x200, type=EntityType.STRING)
+        batch.match(0x100, 0x500, basis=PairBasis.ANNOTATION)
+        batch.match(0x200, 0x600, basis=PairBasis.CONTENT)
+    db.bulk_match([(0x300, 0x700)], basis=PairBasis.DERIVED)
+
+    assert db.pair_basis(0x100) == PairBasis.ANNOTATION
+    assert db.pair_basis(0x200) == PairBasis.CONTENT
+    assert db.pair_basis(0x300) == PairBasis.DERIVED
+    assert db.pair_basis(0x400) is None
+
+
+def test_rejected_pair_keeps_the_first_basis(db: EntityDb):
+    with db.batch() as batch:
+        batch.match(0x100, 0x500, basis=PairBasis.ANNOTATION)
+    db.bulk_match([(0x100, 0x600)], basis=PairBasis.CONTENT)
+
+    assert db.pair_basis(0x100) == PairBasis.ANNOTATION

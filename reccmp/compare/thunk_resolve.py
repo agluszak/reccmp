@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from typing import TYPE_CHECKING
 
-from reccmp.compare.asm.decode import decode_one, e9_jump_target
+from reccmp.analysis.x86 import decode_one, e9_jump_target
 from reccmp.formats import Image
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,

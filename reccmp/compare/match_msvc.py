@@ -1,14 +1,13 @@
 import re
 
 from reccmp.types import EntityType
-from reccmp.compare.db import EntityDb, ReccmpEntity
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.event import (
     ReccmpEvent,
     ReccmpReportProtocol,
     reccmp_report_nop,
 )
-from reccmp.compare.equivalence import canonical_orig_addr
 from reccmp.compare.queries import get_referencing_entity_matches
 from reccmp.types import ImageId
 
@@ -86,7 +85,7 @@ def match_symbols(
                         msg=f"Matched 0x{ent.orig_addr:x} using non-unique symbol '{symbol}'",
                     )
 
-                batch.match(ent.orig_addr, recomp_addr)
+                batch.match(ent.orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
 
             else:
                 report(
@@ -121,18 +120,12 @@ def match_functions(
     report: ReccmpReportProtocol = reccmp_report_nop,
     *,
     truncate: bool = False,
-    equivalence_groups: dict[int, int] | None = None,
 ):
-    """Match functions by name only when the identity is unique on both sides.
+    """Match functions by name only when the name is unique on both sides.
 
     Multiple original addresses may carry the same name when the original
     binary emitted the same body more than once (e.g. a per-TU COMDAT copy).
-    If the project declares those addresses equivalent in an
-    ``equivalence-groups`` file, they count as a single identity here: the
-    canonical member takes the real match and the other members become
-    original-side aliases of it. Distinct (non-equivalent) bodies that merely
-    share a name are still reported as ambiguous."""
-    groups = equivalence_groups or {}
+    Such names are reported as ambiguous rather than guessed."""
 
     recomp_symbols: dict[int, str] = {}
     name_index = EntityIndex()
@@ -157,9 +150,8 @@ def match_functions(
         for ent in db.unmatched(ImageId.ORIG)
         if ent.get("type") == EntityType.FUNCTION and ent.get("name")
     ]
-    orig_by_addr: dict[int, ReccmpEntity] = {}
-    orig_name_identities: dict[str, set[int]] = {}
     normalized_names: dict[int, str] = {}
+    orig_name_count: dict[str, int] = {}
     for ent in orig_entities:
         assert ent.orig_addr is not None
         name = ent.get("name")
@@ -168,49 +160,12 @@ def match_functions(
             name = name[:255]
         name = match_name(name)
         normalized_names[ent.orig_addr] = name
-        orig_by_addr[ent.orig_addr] = ent
-        orig_name_identities.setdefault(name, set()).add(
-            canonical_orig_addr(groups, ent.orig_addr)
-        )
-
-    # For names that resolve to a single original identity, decide which
-    # entity owns the real match. Normally that is the entity itself; for an
-    # equivalence group it is the canonical member. If the canonical is not
-    # an unmatched entity under this name (already matched elsewhere or not
-    # an entity at all), the lowest-addressed member takes the match instead.
-    name_owners: dict[str, int] = {}
-    for name, identities in orig_name_identities.items():
-        if len(identities) != 1:
-            continue
-        canonical = next(iter(identities))
-        if db.get_one_match(canonical) is not None:
-            name_owners[name] = canonical
-            continue
-        owner = orig_by_addr.get(canonical)
-        if owner is None or normalized_names.get(canonical) != name:
-            owner = min(
-                (
-                    e
-                    for e in orig_entities
-                    if normalized_names.get(e.orig_addr or 0) == name
-                ),
-                key=lambda e: e.orig_addr or 0,
-            )
-        name_owners[name] = owner.orig_addr or 0
-
-    pending_aliases: list[tuple[int, int]] = []
+        orig_name_count[name] = orig_name_count.get(name, 0) + 1
 
     with db.batch() as batch:
         for ent in orig_entities:
             assert ent.orig_addr is not None
             name = normalized_names[ent.orig_addr]
-            identities = orig_name_identities[name]
-
-            if len(identities) == 1 and ent.orig_addr != name_owners[name]:
-                # Equivalent duplicate: the owner takes the real match and
-                # this address becomes an original-side alias of it.
-                pending_aliases.append((ent.orig_addr, name_owners[name]))
-                continue
 
             candidates = name_index.get(name)
             if not candidates:
@@ -221,33 +176,18 @@ def match_functions(
                 )
                 continue
 
-            if len(identities) != 1 or len(candidates) != 1:
+            if orig_name_count[name] != 1 or len(candidates) != 1:
                 symbols = [recomp_symbols.get(addr, "None") for addr in candidates]
                 report(
                     ReccmpEvent.AMBIGUOUS_MATCH,
                     ent.orig_addr,
                     msg=f"Ambiguous function name '{name}' has "
-                    f"{len(identities)} original and {len(candidates)} recomp candidates:\n"
+                    f"{orig_name_count[name]} original and {len(candidates)} recomp candidates:\n"
                     + ",\n".join(f"'{symbol}'" for symbol in symbols),
                 )
                 continue
 
-            batch.match(ent.orig_addr, name_index.pop(name))
-
-    for member_addr, owner_addr in pending_aliases:
-        # Aliases require a real canonical match. If the owner could not be
-        # matched its own report already covers the group.
-        if db.get_one_match(owner_addr) is None:
-            continue
-        if not db.set_alias(ImageId.ORIG, member_addr, owner_addr):
-            report(
-                ReccmpEvent.NO_MATCH,
-                member_addr,
-                msg=(
-                    f"Could not alias equivalent original 0x{member_addr:x} to "
-                    f"0x{owner_addr:x}"
-                ),
-            )
+            batch.match(ent.orig_addr, name_index.pop(name), basis=PairBasis.ANNOTATION)
 
 
 def _find_vtable_match(
@@ -322,7 +262,7 @@ def match_vtables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
                     candidate_name, candidate_base_class, vtable_name_index
                 )
                 if recomp_addr is not None:
-                    batch.match(ent.orig_addr, recomp_addr)
+                    batch.match(ent.orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
                     break
             else:
                 report(
@@ -386,7 +326,7 @@ def match_static_variables(
                     msg=f"Expected one static variable '{variable_name}' in function 0x{parent_match.recomp_addr:x}; found {len(candidates)}",
                 )
                 continue
-            batch.match(variable_addr, candidates[0])
+            batch.match(variable_addr, candidates[0], basis=PairBasis.ANNOTATION)
 
 
 def match_variables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop):
@@ -422,7 +362,7 @@ def match_variables(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_n
 
             if name in var_name_index:
                 recomp_addr = var_name_index.pop(name)
-                batch.match(ent.orig_addr, recomp_addr)
+                batch.match(ent.orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
             else:
                 report(
                     ReccmpEvent.NO_MATCH,
@@ -459,7 +399,7 @@ def match_strings(db: EntityDb, report: ReccmpReportProtocol = reccmp_report_nop
 
             if text in string_index:
                 recomp_addr = string_index.pop(text)
-                batch.match(ent.orig_addr, recomp_addr)
+                batch.match(ent.orig_addr, recomp_addr, basis=PairBasis.CONTENT)
             elif verified:
                 report(
                     ReccmpEvent.NO_MATCH,
@@ -528,7 +468,7 @@ def match_lines(
 
             # We match `line + 1` since `line` is the comment itself
             for recomp_addr in lines.search_line(filename, line + 1):
-                batch.match(ent.orig_addr, recomp_addr)
+                batch.match(ent.orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
                 break
             else:
                 # No results
@@ -552,7 +492,7 @@ def match_ref(
         with db.batch() as batch:
             for orig_addr, recomp_addr in get_referencing_entity_matches(db):
                 new_matches = True
-                batch.match(orig_addr, recomp_addr)
+                batch.match(orig_addr, recomp_addr, basis=PairBasis.DERIVED)
 
             if not new_matches:
                 break
@@ -594,4 +534,4 @@ def match_imports(db: EntityDb):
             orig_addr = orig_imports.get(name.upper())
             if orig_addr is not None:
                 assert isinstance(ent.recomp_addr, int)
-                batch.match(orig_addr, ent.recomp_addr)
+                batch.match(orig_addr, ent.recomp_addr, basis=PairBasis.DERIVED)
