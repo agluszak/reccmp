@@ -28,6 +28,7 @@ from .locations import (
     only_compared,
     register_operand,
 )
+from .project_cache import _PRISTINE_FOLDER
 from .results import (
     AnalysisFailure,
     Contents,
@@ -58,10 +59,11 @@ _ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
-_PRISTINE_FOLDER = "pristine"
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
+# Bump when prepared-program mutations change; the key includes the manifest.
+PREPARATION_REVISION = 1
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,10 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             for entry in self._comparable_entries()
         ]
 
+    def diff_nf_symbols(self, p1: Any, p2: Any) -> list[list[Any]]:
+        """Skip Ghidriff's unused whole-image symbol inventory."""
+        return [[], []]
+
     def decompile_func(
         self, prog: "Program", func: Any, timeout: int = 15
     ) -> DecompileResult:
@@ -277,22 +283,21 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 if domain_file.getName() not in keep:
                     domain_file.delete()
 
-    def reset_programs(self) -> None:
-        """Start from the analyzed programs, without names or functions a
-        previous run added. The analysis itself is kept and reused."""
-        from ghidra.util.task import TaskMonitor
-
-        root = self.project.getRootFolder()
-        pristine = root.getFolder(_PRISTINE_FOLDER) or root.createFolder(
-            _PRISTINE_FOLDER
+    def collect_prepared_references(self, path: Path, image_id: ImageId) -> None:
+        """Recreate per-run reference results from an already prepared image."""
+        program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(path), False
         )
-        for domain_file in root.getFiles():
-            saved = pristine.getFile(domain_file.getName())
-            if saved is None:
-                domain_file.copyTo(pristine, TaskMonitor.DUMMY)
-            else:
-                domain_file.delete()
-                saved.copyTo(root, TaskMonitor.DUMMY)
+        try:
+            self._require_functions(program, image_id)
+            transaction = program.startTransaction("reccmp references")
+            try:
+                self._collect_references(program, image_id)
+            finally:
+                program.endTransaction(transaction, True)
+            self._sides[self._program_key(program)] = image_id
+        finally:
+            self.project.close(program)
 
     def align_import_purges(self, orig: Path, recomp: Path) -> None:
         """Give an import whose stack purge one program does not know the

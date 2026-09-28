@@ -138,14 +138,25 @@ def _stage(name: str):
     """Report how long a pipeline stage took; the whole run is minutes long."""
     start = time.monotonic()
     yield
-    print(f"[STAGE] {name}: {time.monotonic() - start:.0f}s", file=sys.stderr, flush=True)
+    print(
+        f"[STAGE] {name}: {time.monotonic() - start:.0f}s", file=sys.stderr, flush=True
+    )
 
 
 def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manifest):
     # pylint: disable=import-outside-toplevel
     # Importing the engine does not start the JVM, but it does need ghidriff.
     import ghidriff
-    from reccmp.ghidriff.engine import ANALYSIS_REVISION, ReccmpDiffEngine
+    from reccmp.ghidriff.engine import (
+        ANALYSIS_REVISION,
+        PREPARATION_REVISION,
+        ReccmpDiffEngine,
+    )
+    from reccmp.ghidriff.project_cache import (
+        reset_programs,
+        restore_prepared,
+        save_prepared,
+    )
     from reccmp.ghidriff.report import RunInputs, print_summary, summary_json
     from reccmp.ghidriff.results import Outcome
 
@@ -175,21 +186,37 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         f"-reccmp{ANALYSIS_REVISION}"
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
+    prepared_stamp = projects / project_name / "prepared-key.txt"
+    prepared_key = f"v{PREPARATION_REVISION}:{manifest.digest()}"
     try:
         with _stage("set up project"):
-            engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
+            engine.setup_project(
+                [orig, recomp], projects, project_name, output / "symbols"
+            )
             engine.prune_programs([orig, recomp])
             engine.align_import_purges(orig, recomp)
         with _stage("analyze programs"):
             engine.analyze_project()
-        with _stage("reset and align programs"):
-            engine.reset_programs()
-            engine.align_import_purges(orig, recomp)
-            engine.align_memory_permissions(orig, recomp)
-        with _stage("prepare original"):
-            engine.prepare_program(orig, ImageId.ORIG)
-        with _stage("prepare recompiled"):
-            engine.prepare_program(recomp, ImageId.RECOMP)
+        with _stage("restore prepared programs"):
+            restored = not args.no_cache and restore_prepared(
+                engine.project, prepared_stamp, prepared_key
+            )
+        if restored:
+            with _stage("collect cached references"):
+                engine.collect_prepared_references(orig, ImageId.ORIG)
+                engine.collect_prepared_references(recomp, ImageId.RECOMP)
+        else:
+            with _stage("reset and align programs"):
+                reset_programs(engine.project)
+                engine.align_import_purges(orig, recomp)
+                engine.align_memory_permissions(orig, recomp)
+            with _stage("prepare original"):
+                engine.prepare_program(orig, ImageId.ORIG)
+            with _stage("prepare recompiled"):
+                engine.prepare_program(recomp, ImageId.RECOMP)
+            if not args.no_cache:
+                with _stage("save prepared programs"):
+                    save_prepared(engine.project, prepared_stamp, prepared_key)
         with _stage("decompile and diff"):
             pdiff = engine.diff_pairs(
                 orig, recomp, engine.function_matches(), force_diff=True
