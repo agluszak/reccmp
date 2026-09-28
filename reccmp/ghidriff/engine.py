@@ -56,7 +56,7 @@ _RAW_LIMIT = 64
 _PRISTINE_FOLDER = "pristine"
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
-ANALYSIS_REVISION = 1
+ANALYSIS_REVISION = 2
 
 
 @dataclass(frozen=True)
@@ -288,6 +288,58 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             else:
                 domain_file.delete()
                 saved.copyTo(root, TaskMonitor.DUMMY)
+
+    def align_import_purges(self, orig: Path, recomp: Path) -> None:
+        """Give an import whose stack purge one program does not know the
+        purge the other program has for it.
+
+        Ghidra takes an import's purge from the imported library when it
+        finds the library beside the binary, and leaves it unknown when it
+        does not. An unknown purge leaves the stack depth after every call
+        unknown, so stack variables and parameters go missing on one side
+        only. An imported function pops the same arguments whichever binary
+        calls it. Runs before analysis, which the purges shape, and again
+        after the pristine-project reset, which can restore an unknown purge."""
+        from ghidra.program.model.listing import Function
+
+        programs = [
+            self.project.openProgram("/", self.gen_proj_bin_name_from_path(path), False)
+            for path in (orig, recomp)
+        ]
+        try:
+            imports = [
+                {
+                    (
+                        function.getExternalLocation().getLibraryName().upper(),
+                        function.getExternalLocation().getOriginalImportedName()
+                        or function.getName(),
+                    ): function
+                    for function in program.getFunctionManager().getExternalFunctions()
+                }
+                for program in programs
+            ]
+            for program, own, other in (
+                (programs[0], imports[0], imports[1]),
+                (programs[1], imports[1], imports[0]),
+            ):
+                transaction = program.startTransaction("reccmp import purges")
+                try:
+                    for key, function in own.items():
+                        counterpart = other.get(key)
+                        if (
+                            counterpart is not None
+                            and function.getStackPurgeSize()
+                            == Function.UNKNOWN_STACK_DEPTH_CHANGE
+                            and counterpart.getStackPurgeSize()
+                            != Function.UNKNOWN_STACK_DEPTH_CHANGE
+                        ):
+                            function.setStackPurgeSize(counterpart.getStackPurgeSize())
+                finally:
+                    program.endTransaction(transaction, True)
+                self.project.save(program)
+        finally:
+            for program in programs:
+                self.project.close(program)
 
     def align_memory_permissions(self, orig: Path, recomp: Path) -> None:
         """Give the original's memory blocks the write permission of the

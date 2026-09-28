@@ -209,6 +209,15 @@ const char* g_strACTION = "ACTION";
 
 In this example, there is an `A` at address `0x10102040` and a 32-bit pointer to `0x10102040` at address `0x10102048`.
 
+A string literal the code uses under a name, written once in a `#define`, is annotated on the definition:
+
+```c++
+// STRING: LEGO1 0x100f0400
+#define FORMAT_NAME_AND_COUNT "%s (%d)"
+```
+
+The marker names the literal the macro expands to, wherever it is used.
+
 ## Lines
 
 Individual code lines can be annotated using the `LINE` marker:

@@ -279,6 +279,17 @@ def create_import_thunks(db: EntityDb, image_id: ImageId, binfile: Image):
 
     with db.batch() as batch:
         for thunk in find_import_thunks(binfile, function_starts):
+            entity = db.get(image_id, thunk.addr)
+            if (
+                entity is not None
+                and entity.orig_addr is not None
+                and entity.recomp_addr is not None
+                and entity.get("type") == EntityType.FUNCTION
+                and db.pair_basis(entity.orig_addr) == PairBasis.ANNOTATION
+            ):
+                # A source-identified function remains comparable even when
+                # the linker emits its entire body as a direct import jump.
+                continue
             batch.set(
                 image_id,
                 thunk.addr,
