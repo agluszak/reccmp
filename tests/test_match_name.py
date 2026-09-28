@@ -54,6 +54,14 @@ def test_match_vtables_of_template_classes(db):
     assert db.get(ImageId.ORIG, 120).recomp_addr is None
 
 
+def test_match_name_spells_value_arguments_in_decimal():
+    assert match_name("srClassSupport<srPalette, srClass, true, 0x2900>::vClone") == (
+        "srClassSupport<srPalette,srClass,1,10496>::vClone"
+    )
+    assert match_name("S<false,0X10>") == "S<0,16>"
+    assert match_name("f<my_true,0x10u>") == "f<my_true,0x10u>"
+
+
 def test_match_name_spells_template_arguments_tight():
     assert match_name("std::basic_string<char, struct std::char_traits<char> >") == (
         "std::basic_string<char,std::char_traits<char>>"
