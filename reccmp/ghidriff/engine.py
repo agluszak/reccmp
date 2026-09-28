@@ -36,7 +36,7 @@ from .results import (
 
 if TYPE_CHECKING:
     from ghidra.program.model.address import Address
-    from ghidra.program.model.listing import Program
+    from ghidra.program.model.listing import Function, Program
 
 # Ghidra names imports itself, the same way in both programs.
 _UNNAMED_TYPES = (EntityType.IMPORT, EntityType.IMPORT_THUNK)
@@ -404,7 +404,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             address = space.getAddress(addr)
             if functions.getFunctionAt(address) is not None:
                 continue
-            containing = functions.getFunctionContaining(address)
+            # Ghidra returns null when no function contains the address.
+            containing: "Function | None" = functions.getFunctionContaining(address)
             if containing is not None and self._split_absorbed_piece(
                 containing, address
             ):
@@ -422,8 +423,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     )
                 continue
             self._clear_data(program, address)
-            DisassembleCommand(address, None, True).applyTo(program)
-            CreateFunctionCmd(address).applyTo(program)
+            # A null restricted set leaves disassembly unrestricted.
+            DisassembleCommand(address, None, True).applyTo(  # type: ignore[call-overload]
+                program, TaskMonitor.DUMMY
+            )
+            CreateFunctionCmd(address).applyTo(program, TaskMonitor.DUMMY)
             if functions.getFunctionAt(address) is None and addr in requested:
                 self._fail(
                     requested[addr], AnalysisFailure(FailureKind.NO_FUNCTION, image_id)
