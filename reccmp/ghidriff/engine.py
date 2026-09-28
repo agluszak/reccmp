@@ -26,6 +26,7 @@ from .results import (
     FailureKind,
     FunctionResult,
     ObjectOffset,
+    PastEnd,
     PointerValue,
     RawBytes,
     StringValue,
@@ -47,6 +48,9 @@ _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 _RAW_LIMIT = 64
 _STRING_TYPES = (EntityType.STRING, EntityType.WIDECHAR)
 _PRISTINE_FOLDER = "pristine"
+# How far before the nearest array end to look for an array a loop bound
+# belongs to.
+_BOUND_SEARCH = 0x1000
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 1
@@ -97,6 +101,13 @@ class _Extents:
         spans.sort(key=lambda located: located.start)
         self._starts = [located.start for located in spans]
         self._spans = spans
+        # Paired objects of known extent, by the address just past them.
+        sized = sorted(
+            (span for span in spans if span.named is not None and span.size),
+            key=lambda span: span.start + (span.size or 0),
+        )
+        self._sized = sized
+        self._sized_ends = [span.start + (span.size or 0) for span in sized]
 
     def containing(self, addr: int) -> _Located | None:
         i = bisect.bisect_right(self._starts, addr) - 1
@@ -107,6 +118,73 @@ class _Extents:
         if offset == 0 or (span.size is not None and offset < span.size):
             return _Located(span.start, offset, span.size, span.entity_type, span.named)
         return None
+
+    def bound_at(self, addr: int) -> _Located | None:
+        """The paired object a loop bound at `addr` belongs to, located at
+        the bound's offset from it.
+
+        A loop over an array compares its pointer with the address just
+        past the array, or, stepping through one field of each element,
+        with that field's address in the element past the last: past the
+        array's end by less than one element, so by less than its size.
+        The exact end comes first; then a paired object starting at or
+        holding `addr` (other than a string, whose middle nothing compares
+        with), which the code compares with as itself; then the nearest
+        array whose end is that close."""
+        i = bisect.bisect_right(self._sized_ends, addr)
+        exact = i > 0 and self._sized_ends[i - 1] == addr
+        if not exact:
+            inside = self.containing(addr)
+            if inside is not None and inside.named is not None:
+                if inside.offset == 0 or inside.entity_type not in _STRING_TYPES:
+                    return None
+        for span in reversed(self._sized[:i]):
+            assert span.size is not None
+            offset = addr - span.start
+            if offset < 2 * span.size:
+                return _Located(
+                    span.start, offset, span.size, span.entity_type, span.named
+                )
+            if self._sized_ends[i - 1] - (span.start + span.size) > _BOUND_SEARCH:
+                break
+        return None
+
+
+def _only_compared(instruction: Any, value: int) -> bool:
+    """Whether an instruction uses a constant only to compare with it, by
+    its p-code: in comparisons, or in a difference kept only in a temporary
+    for the flags it sets."""
+    from ghidra.program.model.pcode import PcodeOp
+
+    comparisons = {
+        PcodeOp.INT_EQUAL,
+        PcodeOp.INT_NOTEQUAL,
+        PcodeOp.INT_LESS,
+        PcodeOp.INT_SLESS,
+        PcodeOp.INT_LESSEQUAL,
+        PcodeOp.INT_SLESSEQUAL,
+        PcodeOp.INT_CARRY,
+        PcodeOp.INT_SCARRY,
+        PcodeOp.INT_SBORROW,
+    }
+    used = False
+    for op in instruction.getPcode():
+        if not any(
+            vn.isConstant() and vn.getOffset() == value for vn in op.getInputs()
+        ):
+            continue
+        used = True
+        if op.getOpcode() in comparisons:
+            continue
+        output = op.getOutput()
+        if (
+            op.getOpcode() == PcodeOp.INT_SUB
+            and output is not None
+            and output.isUnique()
+        ):
+            continue
+        return False
+    return used
 
 
 def _literal_data_type(entity_type: EntityType | None, size: int | None) -> Any:
@@ -616,7 +694,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
             if function is None:
                 continue
-            targets: dict[int, "Address"] = {}
+            targets: dict[tuple[int, ObjectOffset | None], "Address"] = {}
             for instruction in program.getListing().getInstructions(
                 function.getBody(), True
             ):
@@ -628,11 +706,51 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         and functions.getFunctionContaining(to) is None
                         and self._is_data(image_id, to.getOffset())
                     ):
-                        targets.setdefault(to.getOffset(), to)
+                        end = self._compared_end(
+                            image_id, instruction, ref.getOperandIndex(), to
+                        )
+                        if end is not None:
+                            self._name_end(program, instruction, ref, end)
+                        targets.setdefault((to.getOffset(), end), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
-                self._reference(program, image_id, targets[addr])
-                for addr in sorted(targets)
+                self._reference(program, image_id, to, end)
+                for (_, end), to in sorted(
+                    targets.items(), key=lambda item: (item[0][0], item[0][1] is None)
+                )
             )
+
+    def _compared_end(
+        self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
+    ) -> ObjectOffset | None:
+        """The paired array a constant an instruction only compares with is
+        a loop bound over (see `_Extents.bound_at`), with the bound's offset.
+
+        A bound past an array's end lies at or in whatever the linker placed
+        next, which differs between the binaries; Ghidra names it after
+        that."""
+        ended = self._extents[image_id].bound_at(to.getOffset())
+        if ended is None or ended.named is None:
+            return None
+        scalar = instruction.getScalar(operand)
+        if scalar is None or scalar.getUnsignedValue() != to.getOffset():
+            return None
+        if not _only_compared(instruction, to.getOffset()):
+            return None
+        orig_addr = ended.named.orig_addr
+        return ObjectOffset(orig_addr, self._names[orig_addr], ended.offset)
+
+    def _name_end(
+        self, program: "Program", instruction: Any, ref: Any, end: ObjectOffset
+    ) -> None:
+        """Show the compared constant as its offset from its array. The
+        decompiler shows an equate for the constant, also when it adjusts
+        the constant by one to rewrite the comparison."""
+        name = self._ghidra_name(f"{end.name}+{end.offset:#x}")
+        value = ref.getToAddress().getOffset()
+        equates = program.getEquateTable()
+        equate = equates.getEquate(name) or equates.createEquate(name, value)
+        if equate.getValue() == value:
+            equate.addReference(instruction.getAddress(), ref.getOperandIndex())
 
     def _is_data(self, image_id: ImageId, addr: int) -> bool:
         """Import slots are compared by the import name Ghidra shows in the
@@ -644,8 +762,14 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         )
 
     def _reference(
-        self, program: "Program", image_id: ImageId, address: "Address"
+        self,
+        program: "Program",
+        image_id: ImageId,
+        address: "Address",
+        end: ObjectOffset | None = None,
     ) -> DataReference:
+        if end is not None:
+            return DataReference(address.getOffset(), end, PastEnd())
         located = self._extents[image_id].containing(address.getOffset())
         if located is None:
             return DataReference(

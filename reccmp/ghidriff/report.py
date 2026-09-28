@@ -13,6 +13,7 @@ from .results import (
     FunctionResult,
     ObjectOffset,
     Outcome,
+    PastEnd,
     PointerValue,
     RawBytes,
     StringValue,
@@ -61,6 +62,8 @@ def contents_json(contents: Contents) -> dict[str, Any]:
             return {"uninitialized": True}
         case UnknownExtent():
             return {"unknown_extent": True}
+        case PastEnd():
+            return {"past_end": True}
     raise TypeError(contents)
 
 
@@ -83,6 +86,8 @@ def contents_text(contents: Contents) -> str:
             return "uninitialized"
         case UnknownExtent():
             return "extent unknown"
+        case PastEnd():
+            return "end of the object"
     raise TypeError(contents)
 
 

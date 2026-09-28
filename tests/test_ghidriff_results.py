@@ -11,6 +11,7 @@ from reccmp.ghidriff.results import (
     FailureKind,
     ObjectOffset,
     Outcome,
+    PastEnd,
     PointerValue,
     RawBytes,
     StringValue,
@@ -157,6 +158,17 @@ def test_same_contents_through_different_objects_is_not_a_data_difference():
     findings = compare_references(
         (_ref(StringValue("%d"), ObjectOffset(0x5000, "g_format_d", 0)),),
         (_ref(StringValue("%d")),),
+    )
+    assert not findings
+
+
+def test_an_array_end_is_not_the_object_the_linker_placed_after_it():
+    """A loop bound names the end of its array on both sides, whatever
+    follows the array in either binary."""
+    end = ObjectOffset(0x5000, "g_buttons", 0x24)
+    findings = compare_references(
+        (_ref(PastEnd(), end, address=0x69B8D4),),
+        (_ref(PastEnd(), end, address=0x695134),),
     )
     assert not findings
 

@@ -76,7 +76,14 @@ crash. After the analysis:
   for other paired objects is removed, so the decompiler shows the shared name
   on both sides instead of a literal on one;
 - a reference into a paired object gets a label for the object and offset,
-  so `array + 4` cannot read as `array`.
+  so `array + 4` cannot read as `array`;
+- a constant an instruction only compares with, at a paired array's end or
+  past it by less than the array's size, is shown as its offset from the
+  array (`array+0x24`): a loop over an array compares its pointer with the
+  array's end, or with one field's address in the element past the last.
+  Ghidra would name it after whatever the linker placed there, which differs
+  between the binaries. A paired object starting there, or holding it (other
+  than a string), is compared with as itself;
 
 No reconstruction types, prototypes or calling conventions are applied: the
 recovered source must not shape both decompilations toward the same answer.
@@ -92,6 +99,8 @@ therefore compares the contents of the data each function refers to:
 - a paired object both sides refer to is compared by identity, over the
   catalog's extent for it (the recompiled PDB's size stands for the original
   when only it is known);
+- such a loop bound is identified by its array and offset, and has no
+  contents;
 - the remaining references have no counterpart, so only their contents are
   compared, as a multiset. A string on one side and the same bytes, untyped,
   on the other are consistent; so are zero-filled regions of any length. A

@@ -9,7 +9,11 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.engine import canonical_names, unpaired_names
+from reccmp.ghidriff.engine import (  # pylint: disable=protected-access
+    _Extents,
+    canonical_names,
+    unpaired_names,
+)
 from reccmp.types import EntityType, ImageId
 
 
@@ -53,3 +57,45 @@ def test_unpaired_names_never_look_like_a_correspondence():
         (ImageId.ORIG, 0x300): "Dup@0x300",
         (ImageId.ORIG, 0x400): "Dup@0x400",
     }
+
+
+def _data(orig_addr: int, name: str, size: int, entity_type=EntityType.DATA):
+    return NamedObject(
+        orig_addr=orig_addr,
+        recomp_addr=orig_addr + 0x1000,
+        name=name,
+        entity_type=entity_type,
+        orig_size=size,
+        recomp_size=size,
+        basis=PairBasis.ANNOTATION,
+    )
+
+
+def _extents(*objects: NamedObject) -> _Extents:
+    binary = BinaryInput(Path("x"), "0")
+    return _Extents(Manifest("T", binary, binary, (), objects, ()), ImageId.ORIG)
+
+
+def test_a_loop_bound_at_an_array_end_belongs_to_the_array():
+    table = _data(0x100, "g_table", 0x24)
+    flag = _data(0x124, "g_flag", 4)
+    bound = _extents(table, flag).bound_at(0x124)
+    # The array's end, not the object the linker placed after it.
+    assert bound is not None and bound.named == table and bound.offset == 0x24
+
+
+def test_a_field_bound_past_an_array_belongs_to_the_array():
+    # Six 12-byte elements; the loop steps through the field at offset 8.
+    table = _data(0x100, "g_animations", 0x48)
+    text = _data(0x148, "s_text", 0x24, EntityType.STRING)
+    bound = _extents(table, text).bound_at(0x150)
+    assert bound is not None and bound.named == table and bound.offset == 0x50
+
+
+def test_a_paired_object_at_a_bound_past_the_end_is_itself():
+    table = _data(0x100, "g_table", 0x48)
+    other = _data(0x150, "g_other", 8)
+    extents = _extents(table, other)
+    assert extents.bound_at(0x150) is None
+    assert extents.bound_at(0x154) is None
+    assert extents.bound_at(0x100 + 2 * 0x48) is None

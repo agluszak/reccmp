@@ -88,13 +88,27 @@ class UnknownExtent:
     there are no contents to show or compare."""
 
 
-Contents = StringValue | PointerValue | RawBytes | Uninitialized | UnknownExtent
+@dataclass(frozen=True)
+class PastEnd:
+    """The address just past a paired object, compared with as a bound. What
+    starts there is whatever the linker placed next, not something the code
+    refers to."""
+
+
+Contents = (
+    StringValue | PointerValue | RawBytes | Uninitialized | UnknownExtent | PastEnd
+)
 
 
 def contents_comparable(contents: Contents) -> bool:
     """Whether equal or unequal contents mean anything across binaries."""
     match contents:
-        case PointerValue(target=None) | RawBytes(relocated=True) | UnknownExtent():
+        case (
+            PointerValue(target=None)
+            | RawBytes(relocated=True)
+            | UnknownExtent()
+            | PastEnd()
+        ):
             return False
     return True
 
