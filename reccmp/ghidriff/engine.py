@@ -28,6 +28,7 @@ from .locations import (
     only_compared,
     register_operand,
 )
+from .project_cache import _PRISTINE_FOLDER
 from .results import (
     AnalysisFailure,
     Contents,
@@ -58,10 +59,11 @@ _ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
-_PRISTINE_FOLDER = "pristine"
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
+# Bump when prepared-program mutations change; the key includes the manifest.
+PREPARATION_REVISION = 1
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
     def __init__(self, manifest: Manifest, *args: Any, **kwargs: Any) -> None:
         self.manifest = manifest
+        # A focused comparison needs switch recovery only for its requested
+        # functions. Ghidra's whole-image switch pass dominates cold analysis.
+        self.focused_switch_analysis = len(manifest.functions) <= 32
         self._names = canonical_names(manifest.objects)
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
         self._pair_types = {obj.orig_addr: obj.entity_type for obj in manifest.objects}
@@ -178,6 +183,10 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             FunctionMatch(entry.orig_addr, entry.recomp_addr, ("reccmp",))
             for entry in self._comparable_entries()
         ]
+
+    def diff_nf_symbols(self, p1: Any, p2: Any) -> list[list[Any]]:
+        """Skip Ghidriff's unused whole-image symbol inventory."""
+        return [[], []]
 
     def decompile_func(
         self, prog: "Program", func: Any, timeout: int = 15
@@ -207,6 +216,10 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp import purges")
             try:
                 self._correct_import_purges(program)
+                if self.focused_switch_analysis:
+                    self.set_analysis_option(
+                        program, "Decompiler Switch Analysis", False
+                    )
             finally:
                 program.endTransaction(transaction, True)
         return super().analyze_program(
@@ -277,22 +290,21 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 if domain_file.getName() not in keep:
                     domain_file.delete()
 
-    def reset_programs(self) -> None:
-        """Start from the analyzed programs, without names or functions a
-        previous run added. The analysis itself is kept and reused."""
-        from ghidra.util.task import TaskMonitor
-
-        root = self.project.getRootFolder()
-        pristine = root.getFolder(_PRISTINE_FOLDER) or root.createFolder(
-            _PRISTINE_FOLDER
+    def collect_prepared_references(self, path: Path, image_id: ImageId) -> None:
+        """Recreate per-run reference results from an already prepared image."""
+        program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(path), False
         )
-        for domain_file in root.getFiles():
-            saved = pristine.getFile(domain_file.getName())
-            if saved is None:
-                domain_file.copyTo(pristine, TaskMonitor.DUMMY)
-            else:
-                domain_file.delete()
-                saved.copyTo(root, TaskMonitor.DUMMY)
+        try:
+            self._require_functions(program, image_id)
+            transaction = program.startTransaction("reccmp references")
+            try:
+                self._collect_references(program, image_id)
+            finally:
+                program.endTransaction(transaction, True)
+            self._sides[self._program_key(program)] = image_id
+        finally:
+            self.project.close(program)
 
     def align_import_purges(self, orig: Path, recomp: Path) -> None:
         """Give an import whose stack purge one program does not know the
@@ -389,6 +401,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             GhidraScriptUtil.acquireBundleHostReference()
             try:
                 FlatProgramAPI(program).analyzeChanges(program)
+                if self.focused_switch_analysis:
+                    self._recover_requested_switches(program, image_id)
+                    FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
             self._require_functions(program, image_id)
@@ -404,6 +419,42 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self.project.save(program)
         finally:
             self.project.close(program)
+
+    def _recover_requested_switches(
+        self, program: "Program", image_id: ImageId
+    ) -> None:
+        """Run Ghidra's switch command on the functions this run compares."""
+        from ghidra.app.cmd.function import DecompilerSwitchAnalysisCmd
+        from ghidra.app.decompiler import DecompInterface
+        from ghidra.app.plugin.core.analysis import SwitchAnalysisDecompileConfigurer
+        from ghidra.util.task import TaskMonitor
+
+        functions = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        decompiler = DecompInterface()
+        try:
+            SwitchAnalysisDecompileConfigurer(program).configure(decompiler)
+            if not decompiler.openProgram(program):
+                raise RuntimeError("Could not open program for switch analysis")
+            for entry in self._comparable_entries():
+                function = functions.getFunctionAt(
+                    space.getAddress(self._entry_addr(entry, image_id))
+                )
+                if function is None:
+                    continue
+                results = decompiler.decompileFunction(function, 60, TaskMonitor.DUMMY)
+                if not results.decompileCompleted():
+                    raise RuntimeError(
+                        f"Switch analysis failed at {function.getEntryPoint()}"
+                    )
+                if not DecompilerSwitchAnalysisCmd(results).applyTo(
+                    program, TaskMonitor.DUMMY
+                ):
+                    raise RuntimeError(
+                        f"Switch recovery failed at {function.getEntryPoint()}"
+                    )
+        finally:
+            decompiler.dispose()
 
     def _create_functions(self, program: "Program", image_id: ImageId) -> None:
         """Make functions at the entries the catalog knows, through Ghidra's
