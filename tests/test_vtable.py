@@ -13,15 +13,15 @@ from reccmp.tools import vtable
 def test_vtable_command_requires_a_selected_table(
     monkeypatch, capsys, class_filter, names, expected
 ):
-    args = SimpleNamespace(filter=class_filter)
-    engine = Mock()
-    engine.compare_vtables.return_value = [
-        SimpleNamespace(name=name, accuracy=1.0) for name in names
-    ]
-    engine.get_functions.return_value = []
+    args = SimpleNamespace(filter=class_filter, no_color=True)
+    catalog = Mock()
+    catalog.get_vtables.return_value = [SimpleNamespace(name=name) for name in names]
     monkeypatch.setattr(vtable, "parse_args", lambda: args)
     monkeypatch.setattr(vtable, "argparse_parse_project_target", lambda _: object())
-    monkeypatch.setattr(vtable.Compare, "from_target", lambda _: engine)
+    monkeypatch.setattr(vtable.Compare, "from_target", lambda _: catalog)
+    monkeypatch.setattr(
+        vtable, "compare_vtable", lambda *_: SimpleNamespace(matches=True)
+    )
 
     assert vtable.main() == expected
     assert ("100% match" in capsys.readouterr().out) is (expected == 0)

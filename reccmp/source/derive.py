@@ -11,8 +11,6 @@ from .records import (
     SourceAbi,
     SourceClass,
     SourceDeclaration,
-    SourceFunctionFacts,
-    SourceMemberUse,
 )
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
@@ -27,9 +25,6 @@ class _NamespaceRecords:
     declarations: dict[DeclarationKey, SourceDeclaration]
     variables: dict[DeclarationKey, SourceVariable]
     classes: dict[DeclarationKey, SourceClass]
-    # By the key of the function whose body makes them.
-    member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]]
-    function_facts: dict[DeclarationKey, SourceFunctionFacts]
     conflicts: tuple[SourceConflict, ...]
     size_assertions: dict[str, int]
     abi: SourceAbi | None = None
@@ -46,15 +41,12 @@ def derive_namespace(
     declarations: dict[DeclarationKey, list[SourceDeclaration]] = {}
     variables: dict[DeclarationKey, list[SourceVariable]] = {}
     classes: dict[DeclarationKey, list[SourceClass]] = {}
-    uses: dict[DeclarationKey, dict[tuple[Any, ...], SourceMemberUse]] = {}
-    function_facts: dict[DeclarationKey, SourceFunctionFacts] = {}
     for unit in selected:
         # Units share fact objects; each key keeps each object once.
-        local: dict[str, DeclarationKey] = {}
         for declaration in unit.declarations:
-            key = declaration.key(target, unit.unit_id)
-            local[declaration.semantic_id] = key
-            _add_observation(declarations, key, declaration)
+            _add_observation(
+                declarations, declaration.key(target, unit.unit_id), declaration
+            )
         for variable in unit.variables:
             _add_observation(
                 variables, DeclarationKey(target, variable.semantic_id), variable
@@ -62,17 +54,6 @@ def derive_namespace(
         for source_class in unit.classes:
             _add_observation(
                 classes, DeclarationKey(target, source_class.semantic_id), source_class
-            )
-        for use in unit.member_uses:
-            function = local.get(use.function_identity) or DeclarationKey(
-                target, use.function_identity
-            )
-            uses.setdefault(function, {}).setdefault(_member_use_key(use), use)
-        for facts in unit.function_facts:
-            # One body per key: template instantiations of it agree.
-            function_facts.setdefault(
-                local.get(facts.function) or DeclarationKey(target, facts.function),
-                facts,
             )
     assertions = [item for unit in selected for item in unit.size_assertions]
 
@@ -97,11 +78,6 @@ def derive_namespace(
             key: _apply_asserted_size(item, size_assertions.get(item.qualified_name))
             for key, item in derived_classes.items()
         },
-        member_uses={
-            key: tuple(found[use_key] for use_key in sorted(found))
-            for key, found in uses.items()
-        },
-        function_facts=function_facts,
         conflicts=declaration_conflicts + variable_conflicts + class_conflicts,
         size_assertions=size_assertions,
         abi=_derive_abi(selected),
@@ -114,25 +90,6 @@ def _add_observation(
     group = groups.setdefault(key, [])
     if not any(item is fact for item in group):
         group.append(fact)
-
-
-def _member_use_key(item: SourceMemberUse) -> tuple[Any, ...]:
-    """Deduplicate a repeated header observation without collapsing uses."""
-    return (
-        item.owner_identity or "",
-        item.field_identity,
-        item.function_identity,
-        item.use_file,
-        item.use_line,
-        item.use_column,
-        item.use_offset if item.use_offset is not None else -1,
-        item.operations,
-        tuple((index.constant, index.value or "") for index in item.array_indices),
-        tuple(
-            (conversion.kind, conversion.source_type, conversion.destination_type)
-            for conversion in item.conversions
-        ),
-    )
 
 
 def _derive_entities(

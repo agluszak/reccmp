@@ -19,7 +19,7 @@ from reccmp.compare.event import (
     reccmp_report_nop,
 )
 from .csv import ReccmpCsvParserError, ReccmpCsvFatalParserError, csv_parse
-from .db import EntityDb, entity_name_from_string
+from .db import EntityDb, PairBasis, entity_name_from_string
 from .lines import LinesDb
 
 logger = logging.getLogger(__name__)
@@ -217,7 +217,7 @@ def load_markers(
             )
 
             if recomp_addr is not None:
-                batch.match(fun.offset, recomp_addr)
+                batch.match(fun.offset, recomp_addr, basis=PairBasis.ANNOTATION)
 
         for fun in codebase.iter_name_functions():
             if fun.is_folded:

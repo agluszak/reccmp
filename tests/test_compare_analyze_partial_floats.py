@@ -4,7 +4,7 @@ from reccmp.compare.analyze import (
     complete_partial_floats,
 )
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.formats import PEImage
 
 
@@ -88,7 +88,7 @@ def test_complete_partial_floats_matched(
     """Will update matched entities by reading from whichever binary is provided."""
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, 0x100D5748, type=EntityType.FLOAT, size=8)
-        batch.match(0x100D5748, 0x100D5748)
+        batch.match(0x100D5748, 0x100D5748, basis=PairBasis.ANNOTATION)
 
     # Parametrized so we will use both address spaces as the key.
     complete_partial_floats(db, image_id, binfile)

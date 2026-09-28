@@ -84,8 +84,8 @@ rename and never locked; only building the collector takes a lock. Every
 collection writes `profile.json` to the cache: Python phase times, hits,
 misses with reasons (`new`, `forced`, `indexer_changed`, `command_changed`,
 `main_file_changed`, `dependency_changed:<path>`), and for fresh units the
-indexer's own phases (driver setup, frontend, our consumer, member-use
-traversal, marker blocks, serialization) plus records and bytes by kind.
+indexer's own phases (driver setup, frontend, our consumer, marker blocks,
+serialization) plus records and bytes by kind.
 
 Most of a unit's records describe headers that many units include (on the
 Wizardry corpus a declaration line recurs 32 times on average, a class 56
@@ -97,72 +97,26 @@ The index also lists, per unit, the repository files it includes
 
 ## Records
 
-Records retain compiler-owned source signatures, parameter reference forms, and
-field pointer depth. Declarations carry linkage, storage class, and variadic
-status; only external-linkage variables are indexed. Conflicting size
-assertions are errors inside one link namespace.
+The index keeps what marker binding, the retained checks and reports need:
+function declarations (kind, owning class, linkage, storage class, extent, and
+the signature the cross-unit consistency gate compares: calling convention,
+return and parameter types, variadic status), external-linkage variables, and
+class layouts with field pointer depth. Conflicting size assertions are
+errors inside one link namespace. The index does not describe function bodies:
+code is compared by decompiling it (`reccmp-reccmp`), not from source facts.
 
 Records are compiler facts: they say nothing about which target or unit they
 belong to, so units loaded through the `RecordPool` share them. That context
 is the record's `DeclarationKey`: `(target, semantic_id)` for external
 entities, plus the defining `unit_id` for TU-local ones, since TU-local
 functions of different units can share a mangled name. The index keys
-declarations, classes and variables by it, and member uses by the key of the
-function making them. Markers carry the key of their declaration. The JSON
-projection writes each record with its key's `target` and `unit_id` (member
-uses: `function_unit_id`), and markers a `[target, semantic_id, unit_id]`
+declarations, classes and variables by it. Markers carry the key of their
+declaration. The JSON projection writes each record with its key's `target`
+and `unit_id`, and markers a `[target, semantic_id, unit_id]`
 `declaration_key`. A marker on a TU-local function defined in a header binds
 the first including unit's copy: the copies are identical, and nothing states
-which one the marker's address is.
-
-### Function facts
-
-Every function declaration carries `call`, what a caller may assume: whether
-ecx and edx carry arguments, the argument bytes the callee removes, and the
-return kind. It is read from Clang's own ABI lowering (`CGFunctionInfo`, from
-a `CodeGenModule` that emits nothing), so hidden return pointers, `inalloca`
-argument blocks and small records returned in registers are Clang's decision,
-not ours. Anything not modelled exactly is `null`, never guessed: conventions
-other than cdecl/stdcall/thiscall/fastcall, expanded or coerced aggregates,
-constructors with a hidden virtual-base argument, incomplete types. The
-calling convention is the one Clang assigned. On the Wizardry corpus the stack
-cleanup agrees with the `ret N` MSVC emitted for every recompiled function
-checked (7,595).
-
-`SourceIndex.call_facts_for(key)` returns a declaration's facts;
-`call_facts_named(semantic_id)` answers by mangled name only when every
-declaration with that name agrees. The comparator takes each field from the
-PDB type record first, then from Clang (the declaration the function's marker
-binds, else the name lookup), then from the decorated name.
-
-Member uses state the object of the access (`base`): its root (`this`,
-`parameter` with its index, `local` or `global` with the declaration's
-identity, `call`, `other`) and the fields leading from the root to it, each
-step saying whether it went through a pointer; `arrow` says whether the access
-itself dereferences its base. `this->a.b.c` has root `this` and path `a, b`.
-A use's `conversions` are those of the field's own value: the casts wrapping
-the use before it becomes an operand of anything else. For integer,
-enumeration and pointer values they state widths and source signedness.
-
-`function-facts` records list a body's explicit calls (`CallExpr` nodes, not
-constructors, destructors or other implicit calls, so not a call graph): the
-callee's semantic id; for virtual calls every declaration introducing a slot
-the call may use (more than one under multiple inheritance) and the object's
-static class; the call's object; which arguments are plain field reads.
-They also list the body's built-in comparisons (overloaded comparison
-operators are calls): the operator, the type compared in after the usual
-arithmetic conversions, with its width and signedness, and each operand as
-written, with its type, field identity and constant value. A
-`branch_condition` mismatch shows the comparisons on the recompiled
-instruction's source line (`source_comparisons`): whether the source asks for
-a signed or an unsigned comparison, and at what width, is usually what a
-`jl`/`jb` difference comes down to.
-
-`SourceIndex.function_facts_for(key)` assembles one function's call facts,
-accesses, calls and comparisons into `FunctionFacts`.
-
-These facts describe the reconstruction. They may explain or constrain the
-recompiled side of a comparison; they never prove the original equivalent.
+which one the marker's address is. Fields that earlier indexers wrote and
+nothing reads any more are ignored when an index is read.
 
 ### Derivation
 

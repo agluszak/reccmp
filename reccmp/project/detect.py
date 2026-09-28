@@ -187,11 +187,7 @@ class RecCmpPartialTarget:
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] | None = None
 
-    # Proven-equivalent original-address groups (member|canonical rows)
-    equivalence_groups: list[Path] | None = None
-
     marker_aliases: dict[str, str] | None = None
-    algebraic_identities: bool = True
 
     # Clang source index holding this target's markers (from reccmp-build.yml).
     source_index: Path | None = None
@@ -235,13 +231,7 @@ class RecCmpTarget:
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] = field(default_factory=list)
 
-    # Proven-equivalent original-address groups (member|canonical rows)
-    equivalence_groups: list[Path] = field(default_factory=list)
-
     marker_aliases: dict[str, str] = field(default_factory=dict)
-
-    # The verifier may accept values z3 proves equal (see YmlVerifierConfig).
-    algebraic_identities: bool = True
 
     # Clang source index holding this target's markers (from reccmp-build.yml).
     source_index: Path | None = None
@@ -302,7 +292,6 @@ class RecCmpProject:
             ghidra = GhidraConfig()
 
         data_sources = target.data_sources or []
-        equivalence_groups = target.equivalence_groups or []
         marker_aliases = target.marker_aliases or {}
 
         if target.report_config is not None:
@@ -321,9 +310,7 @@ class RecCmpProject:
             source_paths=target.source_paths,
             ghidra_config=ghidra,
             data_sources=data_sources,
-            equivalence_groups=equivalence_groups,
             marker_aliases=marker_aliases,
-            algebraic_identities=target.algebraic_identities,
             report_config=report,
             source_index=target.source_index,
         )
@@ -444,9 +431,6 @@ class RecCmpProject:
             data_sources = [
                 project_directory / ds_path for ds_path in target.data_sources
             ]
-            equivalence_groups = [
-                project_directory / eq_path for eq_path in target.equivalence_groups
-            ]
 
             project.targets[target_id] = RecCmpPartialTarget(
                 target_id=target_id,
@@ -456,9 +440,7 @@ class RecCmpProject:
                 source_paths=source_paths,
                 ghidra_config=ghidra,
                 data_sources=data_sources,
-                equivalence_groups=equivalence_groups,
                 marker_aliases=target.marker_aliases,
-                algebraic_identities=target.verifier.algebraic_identities,
                 report_config=report,
             )
 

@@ -39,9 +39,6 @@
 #include "clang/Index/USRGeneration.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/Version.h"
-#include "clang/CodeGen/CGFunctionInfo.h"
-#include "clang/CodeGen/CodeGenABITypes.h"
-#include "clang/CodeGen/ModuleBuilder.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -64,9 +61,6 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/IR/DataLayout.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
@@ -81,9 +75,6 @@
 namespace {
 
 using namespace clang;
-using clang::CodeGen::ABIArgInfo;
-using clang::CodeGen::CGFunctionInfo;
-using clang::CodeGen::CGFunctionInfoArgInfo;
 
 // The collector supplies the physical compilation root, with a trailing slash.
 std::string repositoryPrefix;
@@ -134,7 +125,6 @@ struct Profile {
   double invocationMs = 0;   // driver, -cc1 job and CompilerInvocation
   double frontendMs = 0;     // ExecuteAction: parse, Sema and our consumer
   double consumerMs = 0;     // HandleTranslationUnit, inside frontendMs
-  double memberUseMs = 0;    // member-use traversal, inside consumerMs
   double markerMs = 0;       // marker blocks, inside consumerMs
   double serializeMs = 0;    // JSON rendering and writing, inside consumerMs
   llvm::StringMap<int64_t> records;
@@ -149,7 +139,6 @@ struct Profile {
         {"invocation_ms", invocationMs},
         {"frontend_ms", frontendMs},
         {"consumer_ms", consumerMs},
-        {"member_use_ms", memberUseMs},
         {"marker_ms", markerMs},
         {"serialize_ms", serializeMs},
         {"records", std::move(counts)},
@@ -216,11 +205,8 @@ class LineCommentCollector : public CommentHandler {
 class Indexer {
  public:
   Indexer(ASTContext& context, llvm::raw_ostream& out, Preprocessor& preprocessor,
-          const LineCommentCollector& comments, Profile& profile,
-          CodeGen::CodeGenModule* codegen, const llvm::DataLayout* layout)
+          const LineCommentCollector& comments, Profile& profile)
       : profile_(profile),
-        codegen_(codegen),
-        layout_(layout),
         context_(context),
         sources_(context.getSourceManager()),
         policy_(context.getPrintingPolicy()),
@@ -236,10 +222,6 @@ class Indexer {
   }
 
   Profile& profile_;
-  // Clang's IR generator, used only to ask for ABI arrangements; nothing is
-  // emitted.
-  CodeGen::CodeGenModule* codegen_;
-  const llvm::DataLayout* layout_;
 
  private:
   // One normalized absolute path and repository membership per FileID. System
@@ -477,23 +459,12 @@ class Indexer {
         .str();
   }
 
-  // A function's semantic id, as its declaration record states it.
-  std::string functionIdentity(const FunctionDecl* function) const {
-    return semanticId(
-        function, qualify(scopeOf(function->getDeclContext()), function->getNameAsString()));
-  }
-
   std::vector<std::string> parameterTypes(const FunctionDecl* function) const {
     std::vector<std::string> parameters;
     for (const ParmVarDecl* parameter : function->parameters()) {
       parameters.push_back(canonicalName(parameter->getType()));
     }
     return parameters;
-  }
-
-  static bool hasThis(llvm::StringRef semanticKind) {
-    return semanticKind == "constructor" || semanticKind == "destructor" ||
-           semanticKind == "instance_method";
   }
 
   // The convention Clang assigned: spelled, or the target default for the
@@ -569,205 +540,6 @@ class Indexer {
     return "invalid";
   }
 
-  std::string sourceSignature(const FunctionDecl* function, llvm::StringRef qualifiedName,
-                              llvm::StringRef semanticKind, llvm::StringRef returnType,
-                              llvm::StringRef convention) const {
-    std::string signature;
-    if (semanticKind != "constructor" && semanticKind != "destructor") {
-      signature += returnType.str();
-      signature += " ";
-      if (convention != "__cdecl" && convention != "__thiscall") {
-        signature += convention.str();
-        signature += " ";
-      }
-    }
-    signature += qualifiedName.str();
-    signature += "(";
-    for (unsigned index = 0; index < function->getNumParams(); ++index) {
-      if (index) signature += ", ";
-      const ParmVarDecl* parameter = function->getParamDecl(index);
-      signature += typeName(parameter->getOriginalType());
-      if (!parameter->getName().empty()) {
-        signature += " ";
-        signature += parameter->getNameAsString();
-      }
-    }
-    if (function->isVariadic()) {
-      if (function->getNumParams()) signature += ", ";
-      signature += "...";
-    }
-    signature += ")";
-    if (const auto* method = dyn_cast<CXXMethodDecl>(function); method && method->isConst()) {
-      signature += " const";
-    }
-    return signature;
-  }
-
-  // The identity a field has in every unit: its owner's USR, declaration
-  // position and index.
-  std::string fieldIdentity(const FieldDecl* field) const {
-    const auto* owner = dyn_cast<CXXRecordDecl>(field->getParent());
-    if (owner) {
-      const auto* definition = dyn_cast_or_null<CXXRecordDecl>(owner->getDefinition());
-      owner = definition ? definition : owner->getCanonicalDecl();
-    }
-    std::string ownerIdentity = owner ? declarationUsr(owner) : "";
-    if (ownerIdentity.empty()) ownerIdentity = "unknown-owner";
-    Location location = locate(field);
-    return ownerIdentity + "::field@" + relative(location.file) + ":" +
-           std::to_string(location.line) + ":" + std::to_string(location.column) + ":" +
-           std::to_string(field->getFieldIndex());
-  }
-
-  // Width in bits and signedness of an integer, enumeration or pointer value.
-  std::optional<std::pair<int64_t, bool>> integerShape(QualType type) const {
-    if (type.isNull() || type->isDependentType() || type->isIncompleteType()) return {};
-    QualType canonical = type.getCanonicalType();
-    if (canonical->isIntegralOrEnumerationType()) {
-      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)),
-                            canonical->isSignedIntegerOrEnumerationType());
-    }
-    if (canonical->isPointerType()) {
-      return std::make_pair(static_cast<int64_t>(context_.getTypeSize(canonical)), false);
-    }
-    return {};
-  }
-
-  // Register footprint of a returned value: void, i8/i16/i32/i64, float, or
-  // unknown (aggregates, whose return convention this does not decide).
-  std::string returnKind(QualType type) const {
-    if (type.isNull() || type->isDependentType()) return "unknown";
-    QualType canonical = type.getCanonicalType();
-    if (canonical->isVoidType()) return "void";
-    if (canonical->isRealFloatingType()) return "float";
-    if (auto shape = integerShape(canonical)) {
-      switch (shape->first) {
-        case 8: return "i8";
-        case 16: return "i16";
-        case 32: return "i32";
-        case 64: return "i64";
-        default: return "unknown";
-      }
-    }
-    if (canonical->isReferenceType()) return "i32";
-    return "unknown";
-  }
-
-  // What a caller may assume about calling `function`, read from Clang's own
-  // ABI lowering (CGFunctionInfo): register arguments, the argument bytes the
-  // callee removes, and the return kind. Anything this does not model
-  // exactly (other conventions, expanded aggregates, hidden constructor
-  // arguments, incomplete types) is unknown (null), never guessed.
-  llvm::json::Value callFacts(const FunctionDecl* function) const {
-    const CGFunctionInfo* info = arrange(function);
-    if (!info) return nullptr;
-    bool calleePops;
-    unsigned convention = info->getEffectiveCallingConvention();
-    switch (convention) {
-      case llvm::CallingConv::C: calleePops = false; break;
-      case llvm::CallingConv::X86_StdCall:
-      case llvm::CallingConv::X86_ThisCall:
-      case llvm::CallingConv::X86_FastCall: calleePops = !info->isVariadic(); break;
-      default: return nullptr;  // vectorcall, regcall, ...
-    }
-    const llvm::DataLayout& layout = *layout_;
-    auto slots = [](uint64_t bytes) -> int64_t { return static_cast<int64_t>((bytes + 3) / 4 * 4); };
-    int registers = 0;
-    int64_t stack = 0;
-    bool first = true;
-    for (const CGFunctionInfoArgInfo& argument : info->arguments()) {
-      const ABIArgInfo& abi = argument.info;
-      // x86_thiscallcc passes the first argument (`this`) in ecx by
-      // definition; Clang marks only fastcall's register arguments inreg.
-      bool thisInEcx = first && convention == llvm::CallingConv::X86_ThisCall;
-      first = false;
-      switch (abi.getKind()) {
-        case ABIArgInfo::Ignore:
-        case ABIArgInfo::InAlloca:  // counted with the argument struct
-          break;
-        case ABIArgInfo::Direct:
-        case ABIArgInfo::Extend:
-          if (abi.getInReg() || thisInEcx) ++registers;
-          else stack += slots(layout.getTypeAllocSize(abi.getCoerceToType()));
-          break;
-        case ABIArgInfo::Indirect:
-          if (abi.getInReg()) ++registers;
-          else if (abi.getIndirectByVal())
-            stack += slots(context_.getTypeSizeInChars(argument.type).getQuantity());
-          else stack += 4;
-          break;
-        default:  // Expand, CoerceAndExpand, IndirectAliased
-          return nullptr;
-      }
-    }
-    if (registers > 2) return nullptr;
-    const ABIArgInfo& returned = info->getReturnInfo();
-    std::string kind = returnKind(function->getReturnType());
-    if (returned.isIndirect() || returned.isInAlloca()) {
-      kind = "unknown";  // the value is returned through memory
-      if (returned.isIndirect() && !returned.getInReg()) stack += 4;
-    } else if (kind == "unknown" && (returned.isDirect() || returned.isExtend()) &&
-               returned.getCoerceToType()) {
-      // A small aggregate returned in eax or edx:eax.
-      switch (layout.getTypeAllocSize(returned.getCoerceToType())) {
-        case 1: kind = "i8"; break;
-        case 2: kind = "i16"; break;
-        case 4: kind = "i32"; break;
-        case 8: kind = "i64"; break;
-        default: break;
-      }
-    }
-    if (info->usesInAlloca()) {
-      // Every stack argument lives in one argument struct.
-      stack = slots(layout.getTypeAllocSize(info->getArgStruct()));
-    }
-    if (isa<CXXConstructorDecl>(function) || isa<CXXDestructorDecl>(function)) {
-      kind = "unknown";  // the Microsoft ABI returns `this` from structors
-    }
-    llvm::json::Value cleanup = nullptr;
-    cleanup = calleePops ? llvm::json::Value(stack) : llvm::json::Value(0);
-    return llvm::json::Object{
-        {"uses_ecx", registers >= 1},
-        {"uses_edx", registers >= 2},
-        {"stack_cleanup", std::move(cleanup)},
-        {"return_kind", kind},
-    };
-  }
-
-  // Clang's ABI arrangement of a concrete function, or null when it cannot
-  // be asked safely or its answer would miss hidden arguments.
-  const CGFunctionInfo* arrange(const FunctionDecl* function) const {
-    if (!codegen_ || function->isInvalidDecl() || function->isDependentContext() ||
-        function->getDescribedFunctionTemplate()) {
-      return nullptr;
-    }
-    auto complete = [&](QualType type) {
-      type = type.getCanonicalType();
-      return !type->isDependentType() && (type->isVoidType() || !type->isIncompleteType());
-    };
-    if (!complete(function->getReturnType())) return nullptr;
-    for (const ParmVarDecl* parameter : function->parameters()) {
-      if (!complete(parameter->getType())) return nullptr;
-    }
-    const auto* method = dyn_cast<CXXMethodDecl>(function);
-    if ((isa<CXXConstructorDecl>(function) || isa<CXXDestructorDecl>(function)) &&
-        method->getParent()->getNumVBases() > 0) {
-      return nullptr;  // hidden "most derived" argument
-    }
-    QualType type = function->getType();
-    if (method && method->isInstance()) {
-      return &CodeGen::arrangeCXXMethodType(*codegen_, method->getParent(),
-                                            type->castAs<FunctionProtoType>(), method);
-    }
-    CanQualType canonical = context_.getCanonicalType(type);
-    if (const auto* prototype = dyn_cast<FunctionProtoType>(canonical.getTypePtr())) {
-      return &CodeGen::arrangeFreeFunctionType(
-          *codegen_, CanQual<FunctionProtoType>::CreateUnsafe(QualType(prototype, 0)));
-    }
-    return &CodeGen::arrangeFreeFunctionType(
-        *codegen_, canonical.getAs<FunctionNoProtoType>());
-  }
-
   void emitDeclaration(const FunctionDecl* function, const Location& location) {
     const DeclContext* context = function->getDeclContext();
     bool isMember = isa<CXXRecordDecl>(context);
@@ -788,75 +560,37 @@ class Indexer {
       semanticKind = scope.empty() ? "free_function" : "namespace_function";
     }
 
-    // The record's compared identity dissolves typedef and elaborated
-    // spellings; the display signature keeps the spelled form.
+    // The compared identity dissolves typedef and elaborated spellings.
     std::string returnType;
-    std::string spelledReturn;
     if (semanticKind != "constructor" && semanticKind != "destructor") {
       returnType = canonicalName(function->getReturnType());
-      spelledReturn = typeName(function->getReturnType());
     }
+    llvm::json::Array parameters;
+    for (const std::string& parameter : parameterTypes(function)) parameters.push_back(parameter);
 
-    std::vector<std::string> parameters = parameterTypes(function);
-    llvm::json::Array parameterTypes;
-    for (const std::string& parameter : parameters) parameterTypes.push_back(parameter);
-    llvm::json::Array parameterReferences;
-    llvm::json::Array parameterReferenceForms;
-    for (const ParmVarDecl* parameter : function->parameters()) {
-      QualType original = parameter->getOriginalType();
-      parameterReferences.push_back(original->isReferenceType());
-      std::string kind = "value";
-      QualType referred;
-      if (const auto* reference = original->getAs<LValueReferenceType>()) {
-        referred = reference->getPointeeType();
-        if (referred->isPointerType()) kind = "lvalue-reference-to-pointer";
-        else if (referred->isArrayType()) kind = "lvalue-reference-to-array";
-        else if (referred->isFunctionType()) kind = "lvalue-reference-to-function";
-        else kind = "lvalue-reference-to-object";
-      } else if (const auto* reference = original->getAs<RValueReferenceType>()) {
-        referred = reference->getPointeeType();
-        if (referred->isPointerType()) kind = "rvalue-reference-to-pointer";
-        else if (referred->isArrayType()) kind = "rvalue-reference-to-array";
-        else if (referred->isFunctionType()) kind = "rvalue-reference-to-function";
-        else kind = "rvalue-reference-to-object";
-      }
-      parameterReferenceForms.push_back(llvm::json::Object{
-          {"kind", kind},
-          {"const", !referred.isNull() && referred.isConstQualified()},
-      });
-    }
-
-    std::string convention = callingConvention(function);
+    // The signature fields feed the cross-unit declaration consistency gate.
     llvm::json::Object record{
         {"record", "declaration"},
         {"semantic_id", functionIdentity},
         {"qualified_name", qualifiedName},
         {"semantic_kind", semanticKind},
-        {"calling_convention", convention},
+        {"calling_convention", callingConvention(function)},
+        {"return_type", returnType},
+        {"parameter_types", std::move(parameters)},
+        {"is_variadic", function->isVariadic()},
         {"linkage", linkageName(function->getLinkageInternal())},
         {"storage_class", storageClassName(function->getStorageClass())},
-        {"source_signature",
-         sourceSignature(function, qualifiedName, semanticKind, spelledReturn, convention)},
-        {"parameter_references", std::move(parameterReferences)},
-        {"parameter_reference_forms", std::move(parameterReferenceForms)},
-        {"return_type", returnType},
-        {"parameter_types", std::move(parameterTypes)},
         {"owning_class", isMember ? llvm::json::Value(scope) : llvm::json::Value(nullptr)},
-        {"has_this", hasThis(semanticKind)},
-        {"is_virtual", isVirtual(function)},
-        {"is_variadic", function->isVariadic()},
         {"source_file", relative(location.file)},
         {"line", location.line},
         {"end_line", location.endLine},
-        // A primary template body is source for its dependent member uses, but
-        // its definition is not a concrete emitted function that owns a reccmp
-        // FUNCTION marker. Keep its marker-join row declaration-only; an emitted
-        // specialization carries the concrete function identity and extent.
+        // A primary template's definition is not a concrete emitted function
+        // that owns a reccmp FUNCTION marker. Keep its marker-join row
+        // declaration-only; an emitted specialization carries the concrete
+        // function identity and extent.
         {"is_definition", isEmittedDefinition(function)},
-        {"call", callFacts(function)},
     };
     emit(std::move(record));
-    emitMemberUses(function, functionIdentity, qualifiedName, location);
   }
 
   // One variable definition or declaration. Parameters are VarDecls too,
@@ -904,540 +638,6 @@ class Indexer {
   static bool isEmittedDefinition(const FunctionDecl* function) {
     return function->doesThisDeclarationHaveABody() && !function->isLateTemplateParsed() &&
            !function->getDescribedFunctionTemplate();
-  }
-
-  class MemberUseVisitor : public RecursiveASTVisitor<MemberUseVisitor> {
-   public:
-    MemberUseVisitor(Indexer& indexer, llvm::StringRef functionIdentity,
-                     llvm::StringRef functionName,
-                     const Location& functionLocation)
-        : indexer_(indexer),
-          functionIdentity_(functionIdentity),
-          functionName_(functionName),
-          functionLocation_(functionLocation) {}
-
-    bool VisitMemberExpr(MemberExpr* expression) {
-      const auto* field = dyn_cast<FieldDecl>(expression->getMemberDecl());
-      if (field) emitResolved(expression, field);
-      return true;
-    }
-
-    bool VisitCXXDependentScopeMemberExpr(CXXDependentScopeMemberExpr* expression) {
-      Location useLocation = indexer_.locate(expression->getMemberLoc());
-      std::string owner = indexer_.typeName(expression->getBaseType());
-      std::string name = expression->getMember().getAsString();
-      emit(nullptr, expression, useLocation, owner, name, "", "", nullptr);
-      return true;
-    }
-
-    // Every call the body makes: the callee's identity (or, for a virtual
-    // call, the declaration that introduces the vtable slot), and which
-    // arguments are plain field reads.
-    bool VisitCallExpr(CallExpr* call) {
-      llvm::json::Object entry;
-      const FunctionDecl* callee = call->getDirectCallee();
-      entry["callee"] = callee ? llvm::json::Value(indexer_.functionIdentity(callee))
-                               : llvm::json::Value(nullptr);
-      const auto* member = dyn_cast<CXXMemberCallExpr>(call);
-      const CXXMethodDecl* method = member ? member->getMethodDecl() : nullptr;
-      const auto* access =
-          member ? dyn_cast<MemberExpr>(member->getCallee()->IgnoreParens()) : nullptr;
-      bool isVirtual = method && method->isVirtual() && !(access && access->hasQualifier());
-      entry["virtual"] = isVirtual;
-      if (isVirtual) {
-        // Every method that introduces a slot this call may use: under
-        // multiple inheritance one override can fill several.
-        std::set<std::string> roots;
-        std::vector<const CXXMethodDecl*> pending{method};
-        while (!pending.empty()) {
-          const CXXMethodDecl* current = pending.back();
-          pending.pop_back();
-          if (current->size_overridden_methods() == 0) {
-            roots.insert(indexer_.functionIdentity(current));
-          }
-          for (const CXXMethodDecl* overridden : current->overridden_methods()) {
-            pending.push_back(overridden);
-          }
-        }
-        llvm::json::Array slots;
-        for (const std::string& root : roots) slots.push_back(root);
-        entry["slots"] = std::move(slots);
-        entry["object_class"] = indexer_.recordSemanticId(
-            member->getImplicitObjectArgument()->getType());
-      }
-      if (member) {
-        entry["object"] = baseKind(member->getImplicitObjectArgument());
-      }
-      llvm::json::Array arguments;
-      for (const Expr* argument : call->arguments()) {
-        const auto* read = dyn_cast<MemberExpr>(argument->IgnoreParenImpCasts());
-        const auto* field = read ? dyn_cast<FieldDecl>(read->getMemberDecl()) : nullptr;
-        arguments.push_back(field ? llvm::json::Value(indexer_.fieldIdentity(field))
-                                  : llvm::json::Value(nullptr));
-      }
-      entry["field_arguments"] = std::move(arguments);
-      Location where = indexer_.locate(call->getBeginLoc());
-      entry["line"] = where.line;
-      entry["offset"] = where.offset >= 0 ? llvm::json::Value(where.offset)
-                                          : llvm::json::Value(nullptr);
-      calls_.push_back(std::move(entry));
-      return true;
-    }
-
-    // Every built-in comparison the body makes (overloaded operators are
-    // calls): the operator, the type it compares in after the usual
-    // conversions (so its width and signedness), and each operand as written.
-    bool VisitBinaryOperator(BinaryOperator* binary) {
-      if (!binary->isComparisonOp() || binary->isValueDependent()) return true;
-      QualType compared = binary->getLHS()->getType();
-      llvm::json::Object entry{
-          {"operator", binary->getOpcodeStr().str()},
-          {"type", indexer_.canonicalName(compared)},
-      };
-      if (auto shape = indexer_.integerShape(compared)) {
-        entry["bits"] = shape->first;
-        entry["signed"] = shape->second;
-      }
-      entry["floating"] = compared->isRealFloatingType();
-      llvm::json::Array operands;
-      for (const Expr* side : {binary->getLHS(), binary->getRHS()}) {
-        const Expr* written = side->IgnoreParenImpCasts();
-        llvm::json::Object operand{{"type", indexer_.canonicalName(written->getType())}};
-        const auto* read = dyn_cast<MemberExpr>(written);
-        const auto* field = read ? dyn_cast<FieldDecl>(read->getMemberDecl()) : nullptr;
-        if (field) operand["field"] = indexer_.fieldIdentity(field);
-        Expr::EvalResult value;
-        if (!written->isValueDependent() &&
-            written->EvaluateAsInt(value, indexer_.context_) && value.Val.isInt()) {
-          const llvm::APSInt& constant = value.Val.getInt();
-          operand["constant"] = constant.isSigned()
-                                    ? constant.getSExtValue()
-                                    : static_cast<int64_t>(constant.getZExtValue());
-        }
-        operands.push_back(std::move(operand));
-      }
-      entry["operands"] = std::move(operands);
-      Location where = indexer_.locate(binary->getOperatorLoc());
-      entry["line"] = where.line;
-      entry["offset"] = where.offset >= 0 ? llvm::json::Value(where.offset)
-                                          : llvm::json::Value(nullptr);
-      comparisons_.push_back(std::move(entry));
-      return true;
-    }
-
-    llvm::json::Array takeCalls() { return std::move(calls_); }
-    llvm::json::Array takeComparisons() { return std::move(comparisons_); }
-
-   private:
-    // What the object of a member access or call is: this, a parameter
-    // (with its index), a local, a global, another member, or other.
-    // The object an access or call applies to: its root (this, parameter
-    // with index, local or global with identity, call, other) and the fields
-    // leading from the root to it; each step says whether it went through a
-    // pointer (->).
-    llvm::json::Object baseKind(const Expr* base) const {
-      llvm::json::Array path;
-      std::vector<llvm::json::Object> steps;
-      const Expr* current = base ? base->IgnoreParenImpCasts() : nullptr;
-      while (const auto* member = dyn_cast_or_null<MemberExpr>(current)) {
-        const auto* field = dyn_cast<FieldDecl>(member->getMemberDecl());
-        if (!field) break;
-        steps.push_back(llvm::json::Object{{"field", indexer_.fieldIdentity(field)},
-                                           {"arrow", member->isArrow()}});
-        current = member->getBase()->IgnoreParenImpCasts();
-      }
-      for (auto step = steps.rbegin(); step != steps.rend(); ++step) {
-        path.push_back(std::move(*step));
-      }
-      llvm::json::Object root = rootKind(current);
-      root["path"] = std::move(path);
-      return root;
-    }
-
-    llvm::json::Object rootKind(const Expr* root) const {
-      if (!root || isa<CXXThisExpr>(root)) return llvm::json::Object{{"kind", "this"}};
-      if (const auto* reference = dyn_cast<DeclRefExpr>(root)) {
-        if (const auto* parameter = dyn_cast<ParmVarDecl>(reference->getDecl())) {
-          return llvm::json::Object{
-              {"kind", "parameter"},
-              {"index", static_cast<int64_t>(parameter->getFunctionScopeIndex())}};
-        }
-        if (const auto* variable = dyn_cast<VarDecl>(reference->getDecl())) {
-          if (variable->hasLocalStorage()) {
-            return llvm::json::Object{{"kind", "local"},
-                                      {"identity", indexer_.declarationUsr(variable)}};
-          }
-          return llvm::json::Object{
-              {"kind", "global"},
-              {"identity",
-               indexer_.variableSemanticId(variable, variable->getQualifiedNameAsString())}};
-        }
-      }
-      if (isa<CallExpr>(root)) return llvm::json::Object{{"kind", "call"}};
-      return llvm::json::Object{{"kind", "other"}};
-    }
-
-    static bool contains(const Stmt* root, const Stmt* sought) {
-      if (!root) return false;
-      if (root == sought) return true;
-      for (const Stmt* child : root->children()) {
-        if (contains(child, sought)) return true;
-      }
-      return false;
-    }
-
-    static bool transparent(const Stmt* statement) {
-      return isa<CastExpr>(statement) || isa<ParenExpr>(statement) ||
-             isa<ExprWithCleanups>(statement) ||
-             isa<MaterializeTemporaryExpr>(statement) ||
-             isa<CXXBindTemporaryExpr>(statement) || isa<ConstantExpr>(statement) ||
-             isa<CXXDefaultArgExpr>(statement) || isa<CXXDefaultInitExpr>(statement);
-    }
-
-    std::vector<const Stmt*> parents(const Stmt* statement) const {
-      std::vector<const Stmt*> result;
-      DynTypedNode current = DynTypedNode::create(*statement);
-      for (unsigned depth = 0; depth < 128; ++depth) {
-        DynTypedNodeList found = indexer_.context_.getParents(current);
-        if (found.empty()) break;
-        const Stmt* parent = nullptr;
-        for (const DynTypedNode& candidate : found) {
-          if ((parent = candidate.get<Stmt>())) break;
-        }
-        if (!parent) break;
-        result.push_back(parent);
-        current = DynTypedNode::create(*parent);
-      }
-      return result;
-    }
-
-    static bool isNonEvaluated(const std::vector<const Stmt*>& ancestors) {
-      for (const Stmt* ancestor : ancestors) {
-        if (const auto* unary = dyn_cast<UnaryExprOrTypeTraitExpr>(ancestor)) {
-          if (unary->getKind() == UETT_SizeOf || unary->getKind() == UETT_AlignOf)
-            return true;
-        }
-        if (isa<CXXNoexceptExpr>(ancestor) || isa<TypeTraitExpr>(ancestor)) return true;
-      }
-      return false;
-    }
-
-    static std::string integerValue(const Expr* expression) {
-      expression = expression->IgnoreParenImpCasts();
-      bool negative = false;
-      if (const auto* unary = dyn_cast<UnaryOperator>(expression)) {
-        if (unary->getOpcode() == UO_Minus) {
-          negative = true;
-          expression = unary->getSubExpr()->IgnoreParenImpCasts();
-        }
-      }
-      const auto* integer = dyn_cast<IntegerLiteral>(expression);
-      if (!integer) return "";
-      std::string value = llvm::toString(integer->getValue(), 10, true);
-      return negative ? "-" + value : value;
-    }
-
-    void addArrayIndex(const ArraySubscriptExpr* subscript,
-                       llvm::json::Array& indices) const {
-      std::string value = integerValue(subscript->getIdx());
-      llvm::json::Object index{{"constant", !value.empty()}};
-      if (!value.empty()) index["value"] = value;
-      indices.push_back(std::move(index));
-    }
-
-    static bool isAssignmentOperatorOverload(const CXXOperatorCallExpr* call) {
-      OverloadedOperatorKind kind = call->getOperator();
-      return kind == OO_Equal || kind == OO_PlusEqual || kind == OO_MinusEqual ||
-             kind == OO_StarEqual || kind == OO_SlashEqual || kind == OO_PercentEqual ||
-             kind == OO_AmpEqual || kind == OO_PipeEqual || kind == OO_CaretEqual ||
-             kind == OO_LessLessEqual || kind == OO_GreaterGreaterEqual;
-    }
-
-    static bool isCompoundAssignment(OverloadedOperatorKind kind) {
-      return kind != OO_Equal;
-    }
-
-    void classifyMemoryCall(const CallExpr* call, const Expr* member,
-                            std::set<std::string>& operations) const {
-      const FunctionDecl* callee = call->getDirectCallee();
-      if (!callee) return;
-      std::string name = callee->getQualifiedNameAsString();
-      std::string lowered = llvm::StringRef(name).lower();
-      int destination = -1;
-      int source = -1;
-      if (lowered == "memcpy" || lowered == "std::memcpy" || lowered == "memmove" ||
-          lowered == "std::memmove" || lowered == "strcpy" || lowered == "strncpy") {
-        destination = 0;
-        source = 1;
-      } else if (lowered == "memcpy_s" || lowered == "memmove_s") {
-        destination = 0;
-        source = 2;
-      } else if (lowered == "memset" || lowered == "std::memset") {
-        destination = 0;
-      } else if (lowered == "std::copy" || lowered == "copy" ||
-                 lowered == "std::copy_n" || lowered == "copy_n") {
-        source = 0;
-        destination = 2;
-      } else if (lowered == "std::copy_backward" || lowered == "copy_backward") {
-        source = 0;
-        destination = 2;
-      }
-      if (destination >= 0 && static_cast<unsigned>(destination) < call->getNumArgs() &&
-          contains(call->getArg(destination), member)) {
-        operations.insert("copy-memory-destination");
-      }
-      if (source >= 0 && static_cast<unsigned>(source) < call->getNumArgs() &&
-          contains(call->getArg(source), member)) {
-        operations.insert("copy-memory-source");
-      }
-    }
-
-    void emitResolved(const MemberExpr* expression, const FieldDecl* field) {
-      const CXXRecordDecl* owner = dyn_cast<CXXRecordDecl>(field->getParent());
-      if (owner) {
-        const CXXRecordDecl* definition =
-            dyn_cast<CXXRecordDecl>(owner->getDefinition());
-        owner = definition ? definition : owner->getCanonicalDecl();
-      }
-      std::string ownerName;
-      if (owner) {
-        llvm::raw_string_ostream stream(ownerName);
-        owner->printQualifiedName(stream, indexer_.policy_);
-        stream.flush();
-      }
-      Location declarationLocation = indexer_.locate(field);
-      Location useLocation = indexer_.locate(expression->getMemberLoc());
-      const std::string ownerIdentity = owner ? indexer_.declarationUsr(owner) : "";
-      const std::string fieldUsr = indexer_.declarationUsr(field);
-      emit(field, expression, useLocation, ownerName, field->getNameAsString(),
-           ownerIdentity, fieldUsr, &declarationLocation, indexer_.fieldIdentity(field));
-    }
-
-    void emit(const FieldDecl* field, const Expr* expression,
-              const Location& useLocation, llvm::StringRef ownerName,
-              llvm::StringRef fieldName, llvm::StringRef ownerIdentity,
-              llvm::StringRef fieldUsr, const Location* declarationLocation,
-              llvm::StringRef fieldIdentity = "") {
-      std::vector<const Stmt*> ancestors = parents(expression);
-      std::set<std::string> operations;
-      llvm::json::Array arrayIndices;
-      llvm::json::Array conversions;
-      std::string conversionSource = indexer_.canonicalName(expression->getType());
-      QualType conversionSourceType = expression->getType();
-      // Conversions of the field's own value: the casts wrapping the use
-      // before it becomes an operand of anything else (arithmetic, a call,
-      // a conditional). A cast of that larger expression is not a
-      // conversion of the field.
-      bool ownValue = true;
-      for (const Stmt* ancestor : ancestors) {
-        ownValue = ownValue && transparent(ancestor);
-        const auto* cast = ownValue ? dyn_cast<CastExpr>(ancestor) : nullptr;
-        if (cast) {
-          std::string destination = indexer_.canonicalName(cast->getType());
-          if (destination != conversionSource) {
-            llvm::json::Object conversion{
-                {"kind", cast->getCastKindName()},
-                {"source_type", conversionSource},
-                {"destination_type", destination},
-            };
-            auto from = indexer_.integerShape(conversionSourceType);
-            auto to = indexer_.integerShape(cast->getType());
-            if (from && to) {
-              conversion["source_bits"] = from->first;
-              conversion["source_signed"] = from->second;
-              conversion["destination_bits"] = to->first;
-            }
-            conversions.push_back(std::move(conversion));
-          }
-          conversionSource = destination;
-          conversionSourceType = cast->getType();
-        }
-        if (const auto* subscript = dyn_cast<ArraySubscriptExpr>(ancestor)) {
-          if (contains(subscript->getBase(), expression)) {
-            operations.insert("array-index");
-            addArrayIndex(subscript, arrayIndices);
-          }
-        }
-        if (const auto* unary = dyn_cast<UnaryOperator>(ancestor)) {
-          if (!contains(unary->getSubExpr(), expression)) continue;
-          if (unary->getOpcode() == UO_AddrOf) operations.insert("address-taken");
-          if (unary->isIncrementDecrementOp()) {
-            operations.insert("read");
-            operations.insert("write");
-          }
-        }
-        if (const auto* binary = dyn_cast<BinaryOperator>(ancestor)) {
-          if (!binary->isAssignmentOp()) continue;
-          if (contains(binary->getLHS(), expression)) {
-            operations.insert("write");
-            if (binary->isCompoundAssignmentOp()) operations.insert("read");
-            if (binary->getLHS()->IgnoreParenImpCasts() == expression &&
-                (expression->getType()->isRecordType() || expression->getType()->isArrayType())) {
-              operations.insert("copy-memory-destination");
-            }
-          }
-          if (contains(binary->getRHS(), expression)) {
-            operations.insert("read");
-            if (binary->getRHS()->IgnoreParenImpCasts() == expression &&
-                (expression->getType()->isRecordType() || expression->getType()->isArrayType())) {
-              operations.insert("copy-memory-source");
-            }
-          }
-        }
-        if (const auto* overload = dyn_cast<CXXOperatorCallExpr>(ancestor)) {
-          if (isAssignmentOperatorOverload(overload) && overload->getNumArgs() > 1) {
-            if (contains(overload->getArg(0), expression)) {
-              operations.insert("write");
-              if (isCompoundAssignment(overload->getOperator())) operations.insert("read");
-              if (overload->getOperator() == OO_Equal &&
-                  overload->getArg(0)->IgnoreParenImpCasts() == expression &&
-                  expression->getType()->isRecordType()) {
-                operations.insert("copy-memory-destination");
-              }
-            }
-            if (contains(overload->getArg(1), expression)) {
-              operations.insert("read");
-              if (overload->getOperator() == OO_Equal &&
-                  overload->getArg(1)->IgnoreParenImpCasts() == expression &&
-                  expression->getType()->isRecordType()) {
-                operations.insert("copy-memory-source");
-              }
-            }
-          }
-        }
-        if (const auto* call = dyn_cast<CallExpr>(ancestor)) {
-          classifyMemoryCall(call, expression, operations);
-        }
-        if (const auto* outerMember = dyn_cast<MemberExpr>(ancestor)) {
-          if (contains(outerMember->getBase(), expression)) operations.insert("member-base");
-        }
-      }
-
-      if (isNonEvaluated(ancestors)) operations.insert("unevaluated");
-      const bool hasArrayUse = operations.find("array-index") != operations.end();
-      const bool hasWrite = operations.find("write") != operations.end();
-      const bool hasAddress = operations.find("address-taken") != operations.end();
-      const bool memberBase = operations.find("member-base") != operations.end();
-      if (hasArrayUse && !hasWrite) operations.insert("read");
-      if (!hasWrite && !hasAddress && !memberBase &&
-          operations.find("read") == operations.end() &&
-          operations.find("unevaluated") == operations.end()) {
-        operations.insert("read");
-      }
-
-      llvm::json::Array operationList;
-      for (const std::string& operation : operations) operationList.push_back(operation);
-
-      int64_t offsetBits = -1;
-      int64_t extentBits = -1;
-      if (field) {
-        const CXXRecordDecl* owner = dyn_cast<CXXRecordDecl>(field->getParent());
-        if (owner) {
-          const CXXRecordDecl* definition =
-              dyn_cast<CXXRecordDecl>(owner->getDefinition());
-          owner = definition ? definition : owner;
-        }
-        if (owner && !owner->isDependentType() && owner->isCompleteDefinition() &&
-            !field->isInvalidDecl()) {
-          const ASTRecordLayout& layout = indexer_.context_.getASTRecordLayout(owner);
-          offsetBits = static_cast<int64_t>(layout.getFieldOffset(field->getFieldIndex()));
-          if (field->isBitField()) {
-            extentBits = static_cast<int64_t>(field->getBitWidthValue());
-          } else if (!field->getType()->isIncompleteType() &&
-                     field->getType()->isConstantSizeType()) {
-            extentBits = static_cast<int64_t>(indexer_.context_.getTypeSize(field->getType()));
-          }
-        }
-      }
-      llvm::json::Object record{
-          {"record", "member-use"},
-          {"owner_identity", ownerIdentity.empty() ? llvm::json::Value(nullptr)
-                                                   : llvm::json::Value(ownerIdentity.str())},
-          {"owner_status", ownerIdentity.empty() ? "unknown" : "resolved"},
-          {"owner", ownerName.str()},
-          {"field_identity", fieldIdentity.empty()
-                                 ? ("unknown-owner::field@" + relative(useLocation.file) + ":" +
-                                    std::to_string(useLocation.line) + ":" +
-                                    std::to_string(useLocation.column) + ":" + fieldName.str())
-                                 : fieldIdentity.str()},
-          {"field_usr", fieldUsr.empty() ? llvm::json::Value(nullptr)
-                                         : llvm::json::Value(fieldUsr.str())},
-          {"name", fieldName.str()},
-          {"declaration_file", declarationLocation ? relative(declarationLocation->file) : ""},
-          {"declaration_line", declarationLocation ? declarationLocation->line : 0},
-          {"declaration_column", declarationLocation ? declarationLocation->column : 0},
-          {"declaration_offset", declarationLocation ? llvm::json::Value(declarationLocation->offset)
-                                                       : llvm::json::Value(nullptr)},
-          {"offset_bits", offsetBits >= 0 ? llvm::json::Value(offsetBits)
-                                          : llvm::json::Value(nullptr)},
-          {"extent_bits", extentBits >= 0 ? llvm::json::Value(extentBits)
-                                          : llvm::json::Value(nullptr)},
-          {"offset_bytes", offsetBits >= 0 && offsetBits % 8 == 0
-                               ? llvm::json::Value(offsetBits / 8)
-                               : llvm::json::Value(nullptr)},
-          {"extent_bytes", extentBits >= 0 && extentBits % 8 == 0
-                               ? llvm::json::Value(extentBits / 8)
-                               : llvm::json::Value(nullptr)},
-          {"declared_type", field ? indexer_.canonicalName(field->getType())
-                                    : indexer_.canonicalName(expression->getType())},
-          {"function_identity", functionIdentity_.str()},
-          {"function", functionName_.str()},
-          {"function_file", relative(functionLocation_.file)},
-          {"function_line", functionLocation_.line},
-          {"use_file", relative(useLocation.file)},
-          {"use_line", useLocation.line},
-          {"use_column", useLocation.column},
-          {"use_offset", useLocation.offset >= 0 ? llvm::json::Value(useLocation.offset)
-                                                 : llvm::json::Value(nullptr)},
-          {"operations", std::move(operationList)},
-          {"array_indices", std::move(arrayIndices)},
-          {"conversions", std::move(conversions)},
-          {"base", baseKind(accessBase(expression))},
-          {"arrow", isArrow(expression)},
-      };
-      indexer_.emit(std::move(record));
-    }
-
-    static bool isArrow(const Expr* expression) {
-      if (const auto* member = dyn_cast<MemberExpr>(expression)) return member->isArrow();
-      if (const auto* dependent = dyn_cast<CXXDependentScopeMemberExpr>(expression)) {
-        return dependent->isArrow();
-      }
-      return false;
-    }
-
-    static const Expr* accessBase(const Expr* expression) {
-      if (const auto* member = dyn_cast<MemberExpr>(expression)) return member->getBase();
-      if (const auto* dependent = dyn_cast<CXXDependentScopeMemberExpr>(expression)) {
-        return dependent->isImplicitAccess() ? nullptr : dependent->getBase();
-      }
-      return nullptr;
-    }
-
-    Indexer& indexer_;
-    llvm::StringRef functionIdentity_;
-    llvm::StringRef functionName_;
-    Location functionLocation_;
-    llvm::json::Array calls_;
-    llvm::json::Array comparisons_;
-  };
-
-  void emitMemberUses(const FunctionDecl* function, llvm::StringRef functionIdentity,
-                      llvm::StringRef functionName, const Location& functionLocation) {
-    if (!function->doesThisDeclarationHaveABody()) return;
-    ScopedTimer timer(profile_.memberUseMs);
-    MemberUseVisitor visitor(*this, functionIdentity, functionName, functionLocation);
-    visitor.TraverseStmt(function->getBody());
-    llvm::json::Array calls = visitor.takeCalls();
-    llvm::json::Array comparisons = visitor.takeComparisons();
-    if (!calls.empty() || !comparisons.empty()) {
-      emit(llvm::json::Object{
-          {"record", "function-facts"},
-          {"function", functionIdentity.str()},
-          {"calls", std::move(calls)},
-          {"comparisons", std::move(comparisons)},
-      });
-    }
   }
 
   void emitClass(const CXXRecordDecl* record, llvm::StringRef qualifiedName,
@@ -1910,16 +1110,7 @@ class IndexConsumer : public ASTConsumer {
                 {"ms_abi", target.getCXXABI().isMicrosoft()},
             })
          << "\n";
-    llvm::LLVMContext llvmContext;
-    std::unique_ptr<CodeGenerator> codegen(CreateLLVMCodeGen(
-        instance_.getDiagnostics(), "reccmp-abi",
-        instance_.getFileManager().getVirtualFileSystemPtr(),
-        instance_.getHeaderSearchOpts(), instance_.getPreprocessorOpts(),
-        instance_.getCodeGenOpts(), llvmContext));
-    codegen->Initialize(context);
-    Indexer(context, out_, instance_.getPreprocessor(), comments_, profile_, &codegen->CGM(),
-            &codegen->GetModule()->getDataLayout())
-        .run();
+    Indexer(context, out_, instance_.getPreprocessor(), comments_, profile_).run();
     // The translation unit's transitive include set is the dependency list a
     // per-unit cache needs. The preprocessor tracks it independently of any
     // DetailedRecord / PreprocessingRecord.

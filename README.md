@@ -13,7 +13,7 @@ MxCore* MxObjectFactory::Create(const char* p_name)
 }
 ```
 
-This allows you to automatically verify the accuracy of functions, virtual tables, variable offsets and more. [Click to see the full syntax](docs/annotations.md).
+reccmp pairs each annotated function with its original, decompiles both with Ghidra and reports the differences; it also checks virtual tables, global data and variable layouts. [Click to see the full syntax](docs/annotations.md).
 
 You can supplement the code annotations with metadata from CSV files. See the [instructions and syntax](docs/csv.md).
 
@@ -34,7 +34,7 @@ The next steps differ based on what kind of project you have.
 2. Run `reccmp-project detect --search-path "path/to/folder/with/original/binaries"`.
 3. If there is no `reccmp-build.yml` after building: Navigate to the recompiled binaries folder and run `reccmp-project detect --what recompiled`.
 4. Look into `reccmp-project.yml` to see what the target is called.
-5. Run `reccmp-reccmp --target <YOURTARGET>`. You should see a list of functions and others together with their match percentage.
+5. Run `reccmp-reccmp --target <YOURTARGET>`. You should see which functions differ from the original.
 
 ### Setting up an existing decompilation project that has not used `reccmp` before
 
@@ -42,7 +42,7 @@ The next steps differ based on what kind of project you have.
 2. Annotate one function of your existing project as shown above and recompile. Note that the recompiled binary should have the same name file name as the original.
 3. Navigate to your recompiled binary and run `reccmp-project detect --what recompiled`. A file `reccmp-build.yml` will be generated. This file should also be user-specific (see below on how to auto-generate this file by the build toolchain).
 4. Look into `reccmp-project.yml` to see what the target is called.
-5. Run `reccmp-reccmp --target <YOURTARGET>` from the same directory. If all goes well, you will see match percentage of the function you annotated above.
+5. Run `reccmp-reccmp --target <YOURTARGET>` from the same directory. If all goes well, you will see the result for the function you annotated above.
 
 ### Fresh project
 
@@ -59,22 +59,14 @@ See the [documentation on the config files](./docs/project_files.md) for more in
 
 All scripts will become available to use in your terminal with the `reccmp-` prefix. Note that these scripts need to be executed in the directory where `reccmp-build.yml` is located.
 
-* [`aggregate`](/reccmp/tools/aggregate.py): Combines JSON reports into a single file.
-  * Aggregate using highest accuracy score: `reccmp-aggregate --samples ./sample0.json ./sample1.json ./sample2.json --output ./combined.json`
-  * Diff two saved reports: `reccmp-aggregate --diff ./before.json ./after.json`
-  * Diff against the aggregate: `reccmp-aggregate --samples ./sample0.json ./sample1.json ./sample2.json --diff ./before.json`
 * [`decomplint`](/reccmp/tools/decomplint.py): Checks the decompilation annotations (see above)
   * e.g. `reccmp-decomplint --target LEGO1`
   * Markers come from the Clang source index (see [docs/source-index.md](/docs/source-index.md)); set `source-index` in `reccmp-build.yml`, `RECCMP_SOURCE_INDEX`, or `--source-index`. `reccmp-reccmp` reads markers from the same index.
-* [`reccmp`](/reccmp/tools/asmcmp.py): Compares an original binary with a recompiled binary, provided a PDB file. For example:
-  * Display the diff for a single function: `reccmp-reccmp --target LEGO1 --verbose 0x100ae1a0`
-  * Generate a filtered JSON report: `reccmp-reccmp --target LEGO1 --orig-address 0x100ae1a0 --json one.json --json-diet --silent`
-  * Generate an HTML report: `reccmp-reccmp --target LEGO1 --html output.html`
-  * Create a base file for diffs: `reccmp-reccmp --target LEGO1 --json base.json --silent`
-  * Diff against a base file: `reccmp-reccmp --target LEGO1 --diff base.json`
-  * Filtered reports load only the required PDB object modules when they can be resolved conservatively. Parsed PDB and prepared entity analysis is cached in `.reccmp-cache` beside the PDB; binaries and source fingerprints invalidate it automatically. Pass `--no-cache` to diagnose a cache-independent run. Comparison and proof results are never cached.
-* [`stackcmp`](/reccmp/tools/stackcmp.py): Compares the stack layout for a given function that almost matches.
-  * e.g. `reccmp-stackcmp --target BETA10 0x1007165d`
+* [`reccmp`](/reccmp/tools/compare.py): Decompiles each annotated function and its original with Ghidra and diffs them with Ghidriff. Needs `GHIDRA_INSTALL_DIR`. See [docs/code-comparison.md](/docs/code-comparison.md).
+  * Every function: `reccmp-reccmp --target LEGO1`
+  * One function, with its diff: `reccmp-reccmp --target LEGO1 --orig-address 0x100ae1a0`
+  * Side-by-side HTML for review: `reccmp-reccmp --target LEGO1 --filter LegoWorld --sxs`
+  * Parsed PDB and prepared entity analysis is cached in `.reccmp-cache` beside the PDB, Ghidra's analysis of both binaries in `.reccmp-cache/ghidra`. Pass `--no-cache` to diagnose a cache-independent run.
 * [`roadmap`](/reccmp/tools/roadmap.py): Compares symbol locations in an original binary with the same symbol locations of a recompiled binary
 * [`verexp`](/reccmp/tools/verexp.py): Verifies exports by comparing the exports of the original DLL and the recompiled DLL
 * [`vtable`](/reccmp/tools/vtable.py): Asserts virtual table correctness by comparing a recompiled binary with the original
@@ -89,8 +81,6 @@ We also have tooling to import the information from the decompilation into [Ghid
 ## Best practices
 
 We have established some [best practices](docs/recommendations.md) that have no impact on `reccmp`'s output, but have made a positive impact on the LEGO Island decompilation.
-
-[`cydifflib`](https://github.com/rapidfuzz/CyDifflib) is a drop-in replacement for Python's builtin [`difflib`](https://docs.python.org/3/library/difflib.html) module that offers better performance. If `cydifflib` is installed in the environment where you run `reccmp`, we will use it.
 
 ## Contributing
 

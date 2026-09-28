@@ -68,7 +68,6 @@ class LoadedTargetAnalysis:
     pdb_file: CvdumpAnalysis
     code_files: list[TextFile]
     data_sources: list[TextFile]
-    equivalence_sources: list[TextFile]
     project_aliases: ProjectAliases
     codebase: DecompCodebase
     source_index: SourceIndex
@@ -211,8 +210,8 @@ def _load_cvdump(
     cvdump = _load_base_cvdump(target.recompiled_pdb, cache, pdb_fingerprint)
     symbols_by_address = codebase.symbols_for_offsets(orig_addrs)
     if any(not symbols_by_address.get(addr) for addr in orig_addrs):
-        # An address without an annotation can only be paired by discovery
-        # (body equivalence, unique call sites), which needs every symbol.
+        # An address without an annotation can only be paired through
+        # other pairs and binary structure, which needs every symbol.
         logger.debug("Targeted address has no annotation; using full symbols")
         return (
             _load_full_cvdump(target.recompiled_pdb, cache, pdb_fingerprint),
@@ -304,20 +303,10 @@ def load_target_analysis(
             encoding=target.encoding or "utf-8",
         )
     )
-    equivalence_sources = list(
-        TextFile.from_files(
-            target.equivalence_groups,
-            allow_error=True,
-            encoding=target.encoding or "utf-8",
-        )
-    )
     prepared_fingerprint = ""
     if use_cache:
         data_fingerprint = fingerprint_text_files(
             data_sources, context="data-sources-v1"
-        )
-        equivalence_fingerprint = fingerprint_text_files(
-            equivalence_sources, context="equivalence-groups-v1"
         )
         prepared_context = json.dumps(
             {
@@ -328,10 +317,6 @@ def load_target_analysis(
                 "pdb": pdb_fingerprint,
                 "data": data_fingerprint,
                 "data_order": [str(source.path) for source in data_sources],
-                "equivalence": equivalence_fingerprint,
-                "equivalence_order": [
-                    str(source.path) for source in equivalence_sources
-                ],
                 "symbols": symbol_scope,
                 # Declaration binding, keys, ownership and ABI facts are
                 # inputs too, and change with the collector, not only with
@@ -351,7 +336,6 @@ def load_target_analysis(
         pdb_file=pdb_file,
         code_files=code_files,
         data_sources=data_sources,
-        equivalence_sources=equivalence_sources,
         project_aliases={target.target_id: target.marker_aliases},
         codebase=codebase,
         source_index=source_index,

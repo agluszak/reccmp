@@ -4,7 +4,7 @@ from reccmp.compare.mutate import (
     set_max_size,
 )
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 
 
 @pytest.fixture(name="db")
@@ -209,7 +209,7 @@ def test_name_thunks_ref_crossed(db: EntityDb):
         batch.set(ImageId.RECOMP, 100, type=EntityType.FUNCTION, name="World")
         batch.set(ImageId.RECOMP, 200, ref=100)
         # Match the thunks but not the referenced functions.
-        batch.match(200, 200)
+        batch.match(200, 200, basis=PairBasis.ANNOTATION)
 
     name_thunks(db)
 

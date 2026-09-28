@@ -5,7 +5,7 @@
 from unittest.mock import Mock, ANY, patch
 import pytest
 from reccmp.types import EntityType, ImageId
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.match_msvc import (
     match_functions,
     match_static_variables,
@@ -220,38 +220,6 @@ def test_match_functions_ambiguous(db, report):
     assert db.count() == 4
 
 
-def test_match_functions_equivalence_group(db, report):
-    """Equivalent originals share one identity: the canonical member takes the
-    match and the other member becomes an original-side alias."""
-    with db.batch() as batch:
-        batch.set(ImageId.ORIG, 100, name="hello", type=EntityType.FUNCTION)
-        batch.set(ImageId.ORIG, 101, name="hello", type=EntityType.FUNCTION)
-        batch.set(ImageId.RECOMP, 500, name="hello", type=EntityType.FUNCTION)
-
-    match_functions(db, report, equivalence_groups={101: 100})
-
-    report.assert_not_called()
-    assert db.is_match(100, 500)
-    assert db.alias_canonical_orig(ImageId.ORIG, 101) == 100
-    # An alias is not a real match: the entities do not combine.
-    assert db.get(ImageId.ORIG, 101).recomp_addr is None
-    assert db.count() == 2
-
-
-def test_match_functions_equivalence_group_partial(db, report):
-    """Grouping does not rescue a name that still has distinct identities."""
-    with db.batch() as batch:
-        for addr in (100, 101, 102):
-            batch.set(ImageId.ORIG, addr, name="hello", type=EntityType.FUNCTION)
-        batch.set(ImageId.RECOMP, 500, name="hello", type=EntityType.FUNCTION)
-
-    match_functions(db, report, equivalence_groups={101: 100})
-
-    report.assert_any_call(ReccmpEvent.AMBIGUOUS_MATCH, 102, msg=ANY)
-    assert db.get(ImageId.RECOMP, 500).orig_addr is None
-    assert db.count() == 4
-
-
 def test_match_functions_ignore_already_matched(db, report):
     """If the name is non-unique but there is only one option available to match
     (i.e. if previous entities were matched by line number)
@@ -261,7 +229,7 @@ def test_match_functions_ignore_already_matched(db, report):
         batch.set(ImageId.RECOMP, 500, name="hello", type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 501, name="hello", type=EntityType.FUNCTION)
         # Match these addrs before calling match_functions()
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
     # 1 matched, 2 unmatched
     assert db.count() == 3
@@ -505,7 +473,7 @@ def test_match_static_var(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
-        batch.match(200, 300)
+        batch.match(200, 300, basis=PairBasis.ANNOTATION)
         batch.set(
             ImageId.RECOMP,
             500,
@@ -533,7 +501,7 @@ def test_match_static_var_rejects_same_name_in_other_function(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
-        batch.match(200, 300)
+        batch.match(200, 300, basis=PairBasis.ANNOTATION)
         batch.set(
             ImageId.RECOMP,
             500,
@@ -559,7 +527,7 @@ def test_match_static_var_rejects_ambiguous_candidates(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
         batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
-        batch.match(200, 300)
+        batch.match(200, 300, basis=PairBasis.ANNOTATION)
         for address in (500, 504):
             batch.set(
                 ImageId.RECOMP,
@@ -845,7 +813,7 @@ def test_match_ref(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 500)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
         batch.set(ImageId.ORIG, 200)
         batch.set_ref(ImageId.ORIG, 200, ref=100)
@@ -865,7 +833,7 @@ def test_match_ref_chained(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 500)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
         # First level
         batch.set(ImageId.ORIG, 200)
@@ -916,7 +884,7 @@ def test_match_ref_expected_order(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 500)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
         # Orig thunks
         for addr in (200, 201, 202):
@@ -941,7 +909,7 @@ def test_match_ref_include_vtordisp(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 500)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
         batch.set(ImageId.ORIG, 200)
         batch.set(ImageId.ORIG, 201)
@@ -967,7 +935,7 @@ def test_match_ref_include_vtordisp_order(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100)
         batch.set(ImageId.RECOMP, 500)
-        batch.match(100, 500)
+        batch.match(100, 500, basis=PairBasis.ANNOTATION)
 
         # Orig thunks
         for addr in (200, 201, 202):
@@ -1038,15 +1006,15 @@ def test_classify_exact_string_aliases_requires_unique_canonical(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 0x1000, type=EntityType.STRING, name="same")
         batch.set(ImageId.RECOMP, 0x2000, type=EntityType.STRING, name="same")
-        batch.match(0x1000, 0x2000)
+        batch.match(0x1000, 0x2000, basis=PairBasis.ANNOTATION)
         batch.set(ImageId.ORIG, 0x1010, type=EntityType.STRING, name="same")
         batch.set(ImageId.RECOMP, 0x2010, type=EntityType.STRING, name="same")
         batch.set(ImageId.ORIG, 0x1100, type=EntityType.STRING, name="ambiguous")
         batch.set(ImageId.RECOMP, 0x2100, type=EntityType.STRING, name="ambiguous")
-        batch.match(0x1100, 0x2100)
+        batch.match(0x1100, 0x2100, basis=PairBasis.ANNOTATION)
         batch.set(ImageId.ORIG, 0x1110, type=EntityType.STRING, name="ambiguous")
         batch.set(ImageId.RECOMP, 0x2110, type=EntityType.STRING, name="ambiguous")
-        batch.match(0x1110, 0x2110)
+        batch.match(0x1110, 0x2110, basis=PairBasis.ANNOTATION)
         batch.set(ImageId.ORIG, 0x1120, type=EntityType.STRING, name="ambiguous")
 
     classify_exact_string_aliases(db)

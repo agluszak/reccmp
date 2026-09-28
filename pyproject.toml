@@ -17,3 +17,7 @@ check_untyped_defs = true
 # The default `.pytest_cache` path is rejected by Ghidra 12.1.
 cache_dir="pytest_cache"
 xfail_strict=true
+[[tool.mypy.overrides]]
+# Ghidriff and JPype ship without type information.
+module = ["ghidriff", "ghidriff.*", "jpype"]
+ignore_missing_imports = true

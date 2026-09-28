@@ -2,29 +2,20 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, TextIO
 
-from reccmp.call_facts import CallFacts
 from reccmp.parser.reader import MarkerBlock
 from .records import (
     SourceAbi,
-    SourceAccessBase,
-    SourceAccessStep,
-    SourceArrayIndex,
     SourceBaseOffset,
     SourceBaseVtable,
-    SourceCall,
     SourceClass,
-    SourceComparison,
-    SourceComparisonOperand,
-    SourceConversion,
     SourceDeclaration,
     SourceField,
-    SourceFunctionFacts,
-    SourceMemberUse,
 )
 from .variables import SourceConflict, SourceConflictVariant, SourceVariable
 
@@ -53,8 +44,6 @@ class TranslationUnitRecords:
     declarations: list[SourceDeclaration] = field(default_factory=list)
     variables: list[SourceVariable] = field(default_factory=list)
     classes: list[SourceClass] = field(default_factory=list)
-    member_uses: list[SourceMemberUse] = field(default_factory=list)
-    function_facts: list[SourceFunctionFacts] = field(default_factory=list)
     size_assertions: list[_SizeAssertion] = field(default_factory=list)
     marker_blocks: list[MarkerBlock] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
@@ -102,10 +91,6 @@ class TranslationUnitRecords:
             return _variable_from_dict(values)
         if kind == "class":
             return _class_from_dict(values)
-        if kind == "member-use":
-            return _member_use_from_dict(values)
-        if kind == "function-facts":
-            return _function_facts_from_dict(values)
         raise SourceIndexError(
             f"the source indexer emitted an unknown record: {kind!r}"
         )
@@ -118,12 +103,8 @@ class TranslationUnitRecords:
         elif kind == "variable":
             if fact.is_external:
                 self.variables.append(fact)
-        elif kind == "class":
-            self.classes.append(fact)
-        elif kind == "function-facts":
-            self.function_facts.append(fact)
         else:
-            self.member_uses.append(fact)
+            self.classes.append(fact)
 
     @classmethod
     def load(
@@ -171,94 +152,20 @@ class RecordPool:
         self.facts: dict[bytes, tuple[str, Any]] = {}
 
 
+_DECLARATION_FIELDS = frozenset(
+    item.name for item in dataclasses.fields(SourceDeclaration)
+)
+
+
 def _declaration_from_dict(values: Mapping[str, Any]) -> SourceDeclaration:
-    data = dict(values)
-    for key in ("parameter_types", "parameter_references", "parameter_reference_forms"):
-        data[key] = tuple(data.get(key) or ())
-    if data.get("call") is not None:
-        data["call"] = CallFacts(**data["call"])
+    # Indexes collected by earlier indexers carry facts nothing reads now.
+    data = {key: value for key, value in values.items() if key in _DECLARATION_FIELDS}
+    data["parameter_types"] = tuple(data.get("parameter_types") or ())
     return SourceDeclaration(**data)
 
 
 def _variable_from_dict(values: Mapping[str, Any]) -> SourceVariable:
     return SourceVariable(**dict(values))
-
-
-def _member_use_from_dict(values: Mapping[str, Any]) -> SourceMemberUse:
-    data = dict(values)
-    data["operations"] = tuple(data.get("operations") or ())
-    data["array_indices"] = tuple(
-        SourceArrayIndex(
-            constant=bool(item.get("constant")),
-            value=(str(item["value"]) if item.get("value") is not None else None),
-        )
-        for item in data.get("array_indices") or ()
-    )
-    data["conversions"] = tuple(
-        SourceConversion(**item) for item in data.get("conversions") or ()
-    )
-    data["base"] = _access_base(data["base"])
-    for key in (
-        "owner_identity",
-        "field_usr",
-        "declaration_offset",
-        "offset_bits",
-        "extent_bits",
-        "offset_bytes",
-        "extent_bytes",
-        "use_offset",
-    ):
-        if (
-            key in data
-            and data[key] is not None
-            and key not in ("owner_identity", "field_usr")
-        ):
-            data[key] = int(data[key])
-    data.pop("record", None)
-    return SourceMemberUse(**data)
-
-
-def _access_base(values: Mapping[str, Any]) -> SourceAccessBase:
-    return SourceAccessBase(
-        **{
-            **values,
-            "path": tuple(
-                SourceAccessStep(**step) for step in values.get("path") or ()
-            ),
-        }
-    )
-
-
-def _function_facts_from_dict(values: Mapping[str, Any]) -> SourceFunctionFacts:
-    data = dict(values)
-    data["calls"] = tuple(
-        SourceCall(
-            **{
-                **call,
-                "field_arguments": tuple(call["field_arguments"]),
-                "slots": tuple(call.get("slots") or ()),
-                "object": (
-                    _access_base(call["object"])
-                    if call.get("object") is not None
-                    else None
-                ),
-            }
-        )
-        for call in data["calls"]
-    )
-    data["comparisons"] = tuple(
-        SourceComparison(
-            **{
-                **comparison,
-                "operands": tuple(
-                    SourceComparisonOperand(**operand)
-                    for operand in comparison["operands"]
-                ),
-            }
-        )
-        for comparison in data.get("comparisons") or ()
-    )
-    return SourceFunctionFacts(**data)
 
 
 def _conflict_from_dict(values: Mapping[str, Any]) -> SourceConflict:

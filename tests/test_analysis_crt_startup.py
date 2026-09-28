@@ -14,7 +14,7 @@ from reccmp.analysis.crt_startup import (
     find_initializer_atexit_helpers,
 )
 from reccmp.compare.analyze import create_imports
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.formats import PEImage
 from reccmp.formats.image import ImageImport
 from reccmp.types import ImageId, EntityType
@@ -46,7 +46,7 @@ def test_get_function_fingerprint_matched(binfile: PEImage):
     db = EntityDb()
     with db.batch() as batch:
         batch.set(ImageId.ORIG, G_MUTEX_ADDR, name="g_mutex", type=EntityType.DATA)
-        batch.match(G_MUTEX_ADDR, G_MUTEX_ADDR)
+        batch.match(G_MUTEX_ADDR, G_MUTEX_ADDR, basis=PairBasis.ANNOTATION)
 
     assert get_function_fingerprint(db, ImageId.ORIG, binfile, SET_DO_MUTEX_ADDR) == (
         (G_MUTEX_ADDR, UsedHow.WRITE),
@@ -67,7 +67,7 @@ def test_get_function_fingerprint_called_function():
     with db.batch() as batch:
         batch.set(ImageId.ORIG, start_addr, size=len(code))
         batch.set(ImageId.ORIG, other_addr, name="test", type=EntityType.FUNCTION)
-        batch.match(other_addr, other_addr)
+        batch.match(other_addr, other_addr, basis=PairBasis.ANNOTATION)
 
     assert get_function_fingerprint(db, ImageId.ORIG, binfile, start_addr) == (
         (other_addr, UsedHow.CALL),
@@ -89,7 +89,7 @@ def test_get_function_fingerprint_function_pointer():
     with db.batch() as batch:
         batch.set(ImageId.ORIG, start_addr, size=len(code))
         batch.set(ImageId.ORIG, other_addr, name="test", type=EntityType.FUNCTION)
-        batch.match(other_addr, other_addr)
+        batch.match(other_addr, other_addr, basis=PairBasis.ANNOTATION)
 
     assert get_function_fingerprint(db, ImageId.ORIG, binfile, start_addr) == (
         (other_addr, UsedHow.READ),
@@ -114,7 +114,7 @@ def test_get_function_fingerprint_indirect_call():
     with db.batch() as batch:
         batch.set(ImageId.ORIG, func_addr, size=len(code))
         batch.set(ImageId.ORIG, other_addr, name="test", type=EntityType.FUNCTION)
-        batch.match(other_addr, other_addr)
+        batch.match(other_addr, other_addr, basis=PairBasis.ANNOTATION)
 
     # TODO: Add the fingerprints here if this feature is added.
     assert get_function_fingerprint(db, ImageId.ORIG, binfile, func_addr)
@@ -171,7 +171,7 @@ def test_xca_fingerprints_not_variable(binfile: PEImage):
     db = EntityDb()
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 0x10102B28, name="g_spawnLocations")
-        batch.match(0x10102B28, 0x10102B28)
+        batch.match(0x10102B28, 0x10102B28, basis=PairBasis.ANNOTATION)
 
     array = read_crt_functions(binfile, XCA_XCZ_RANGE)
     fingerprint_crt_functions(db, ImageId.ORIG, binfile, array)
@@ -186,7 +186,7 @@ def test_xca_fingerprints_matched_variable(binfile: PEImage):
         batch.set(
             ImageId.ORIG, 0x10102B28, name="g_spawnLocations", type=EntityType.DATA
         )
-        batch.match(0x10102B28, 0x10102B28)
+        batch.match(0x10102B28, 0x10102B28, basis=PairBasis.ANNOTATION)
 
     array = read_crt_functions(binfile, XCA_XCZ_RANGE)
     fingerprint_crt_functions(db, ImageId.ORIG, binfile, array)

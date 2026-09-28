@@ -14,7 +14,7 @@ from reccmp.cvdump.demangler import (
 )
 from reccmp.formats import PEImage
 from reccmp.types import EntityType, ImageId
-from .db import EntityDb
+from .db import EntityDb, PairBasis
 from .queries import get_overloaded_functions, get_named_thunks
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,7 @@ def _match_crt_atexit_helpers(
                 and not orig_entity.matched
                 and not recomp_entity.matched
             ):
-                batch.match(orig_helper, recomp_helper)
+                batch.match(orig_helper, recomp_helper, basis=PairBasis.DERIVED)
 
 
 def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
@@ -186,7 +186,7 @@ def match_crt_startup(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
 
     with db.batch() as batch:
         for orig_addr, recomp_addr in matches:
-            batch.match(orig_addr, recomp_addr)
+            batch.match(orig_addr, recomp_addr, basis=PairBasis.DERIVED)
 
     _match_crt_atexit_helpers(
         db,

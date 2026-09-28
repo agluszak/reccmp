@@ -1,8 +1,9 @@
 capstone==5.0.9
 colorama>=0.4.6
-pystache==0.6.8
 pydantic==2.13.5
 ruamel.yaml==0.19.1
 pydemumble==0.0.1
 pyghidra==3.1.0
-z3-solver==5.1.0.0
+# Ghidriff with the same-basename decompiler-pool fix (agluszak/ghidriff#1) and
+# normalization of every default label on a line (normalize-all-labels).
+ghidriff @ https://github.com/agluszak/ghidriff/archive/9b746287bedabce195ff582296a6ac8fe6641b1a.tar.gz

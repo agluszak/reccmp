@@ -1,7 +1,7 @@
 """Matching for MSVC-specific shapes: SEH handler blocks and FOLDED
 annotations bound to an ICF-folded canonical pair."""
 
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.event import ReccmpEvent, ReccmpReportProtocol, reccmp_report_nop
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.match_msvc import match_name
@@ -166,8 +166,10 @@ def match_seh(db: EntityDb):
             if orig_funcinfo is None or recomp_funcinfo is None:
                 continue
 
-            batch.match(orig_handler_addr, recomp_handler_addr)
-            batch.match(orig_funcinfo_addr, recomp_funcinfo_addr)
+            batch.match(orig_handler_addr, recomp_handler_addr, basis=PairBasis.DERIVED)
+            batch.match(
+                orig_funcinfo_addr, recomp_funcinfo_addr, basis=PairBasis.DERIVED
+            )
 
             orig_unwinds = orig_funcinfo.get(_seh_side_key(ImageId.ORIG, "unwinds"), ())
             recomp_unwinds = recomp_funcinfo.get(
@@ -209,4 +211,4 @@ def match_seh(db: EntityDb):
                     db.get(ImageId.ORIG, orig_action) is not None
                     and db.get(ImageId.RECOMP, recomp_action) is not None
                 ):
-                    batch.match(orig_action, recomp_action)
+                    batch.match(orig_action, recomp_action, basis=PairBasis.DERIVED)

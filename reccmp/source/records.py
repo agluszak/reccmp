@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from reccmp.call_facts import CallFacts
-
 
 @dataclass(frozen=True)
 class DeclarationKey:
@@ -46,29 +44,13 @@ class SourceDeclaration:
     return_type: str
     parameter_types: tuple[str, ...]
     owning_class: str | None
-    has_this: bool
-    is_virtual: bool
     source_file: str
     line: int
     end_line: int
     is_definition: bool
-    source_signature: str | None = None
-    parameter_references: tuple[bool, ...] = ()
-    parameter_reference_forms: tuple[str, ...] = ()
     linkage: str = ""
     storage_class: str = ""
     is_variadic: bool = False
-    # How callers call it, under the Microsoft x86 ABI.
-    call: CallFacts | None = None
-
-    @property
-    def prototype(self) -> str:
-        """Render compiler-owned types for display, not ABI synchronization."""
-        parameters = ", ".join(self.parameter_types) or "void"
-        if self.is_variadic:
-            parameters = f"{parameters}, ..." if self.parameter_types else "..."
-        prefix = f"{self.return_type} " if self.return_type else ""
-        return f"{prefix}{self.qualified_name}({parameters})"
 
     @property
     def is_external(self) -> bool:
@@ -118,156 +100,6 @@ class SourceField:
     # Physical storage of one array element: scalar, pointer, reference,
     # embedded_record, array.
     array_element_kind: str | None = None
-
-
-@dataclass(frozen=True)
-class SourceArrayIndex:
-    """One source array selector observed at a member use."""
-
-    constant: bool
-    value: str | None = None
-
-
-@dataclass(frozen=True)
-class SourceConversion:
-    """One Clang conversion surrounding a member expression. For integer,
-    enumeration and pointer values it states the widths and whether the
-    source is signed: a widening from a signed source sign-extends."""
-
-    kind: str
-    source_type: str
-    destination_type: str
-    source_bits: int | None = None
-    source_signed: bool | None = None
-    destination_bits: int | None = None
-
-
-@dataclass(frozen=True)
-class SourceAccessStep:
-    """One field on the way from an access's root to its object."""
-
-    field: str  # field identity
-    arrow: bool  # reached through a pointer (->)
-
-
-@dataclass(frozen=True)
-class SourceAccessBase:
-    """The object of a member access or call: its root (``this``,
-    ``parameter`` with its index, ``local`` or ``global`` with the
-    declaration's identity, ``call``, ``other``) and the fields leading from
-    the root to it. ``this->a.b.c`` has root ``this`` and path ``a, b``."""
-
-    kind: str
-    index: int | None = None
-    identity: str | None = None
-    path: tuple[SourceAccessStep, ...] = ()
-
-
-@dataclass(frozen=True)
-# pylint: disable=too-many-instance-attributes
-class SourceMemberUse:
-    """One compiler-resolved field use in a source function body."""
-
-    owner_identity: str | None
-    owner_status: str
-    owner: str
-    field_identity: str
-    field_usr: str | None
-    name: str
-    declaration_file: str
-    declaration_line: int
-    declaration_column: int
-    declaration_offset: int | None
-    offset_bits: int | None
-    extent_bits: int | None
-    offset_bytes: int | None
-    extent_bytes: int | None
-    declared_type: str
-    function_identity: str
-    function: str
-    function_file: str
-    function_line: int
-    use_file: str
-    use_line: int
-    use_column: int
-    use_offset: int | None
-    operations: tuple[str, ...]
-    array_indices: tuple[SourceArrayIndex, ...]
-    conversions: tuple[SourceConversion, ...]
-    base: SourceAccessBase
-    arrow: bool = False  # the access dereferences its base (->)
-
-
-@dataclass(frozen=True)
-class SourceCall:
-    """One call in a source function body."""
-
-    callee: str | None  # semantic id of the called declaration
-    virtual: bool
-    # Per argument: the field identity when it is a plain field read.
-    field_arguments: tuple[str | None, ...]
-    line: int
-    offset: int | None
-    # Virtual calls: every declaration introducing a vtable slot the call
-    # may use (more than one under multiple inheritance), and the static
-    # class of the object.
-    slots: tuple[str, ...] = ()
-    object_class: str | None = None
-    object: SourceAccessBase | None = None
-
-
-@dataclass(frozen=True)
-class SourceComparisonOperand:
-    """One side of a comparison, as written (before conversions)."""
-
-    type: str
-    field: str | None = None  # field identity, for a plain field read
-    constant: int | None = None  # its value, when it is an integer constant
-
-
-@dataclass(frozen=True)
-class SourceComparison:
-    """One built-in comparison in a source function body."""
-
-    # pylint: disable=too-many-instance-attributes
-    operator: str  # <, <=, >, >=, ==, !=
-    # The type compared in, after the usual arithmetic conversions: this is
-    # what decides a signed or an unsigned machine comparison.
-    type: str
-    operands: tuple[SourceComparisonOperand, SourceComparisonOperand]
-    line: int
-    offset: int | None
-    bits: int | None = None  # integers, enumerations and pointers
-    signed: bool | None = None
-    floating: bool = False
-
-
-@dataclass(frozen=True)
-class SourceFunctionFacts:
-    """Facts about one function body beyond its field uses."""
-
-    function: str  # semantic id
-    # The explicit calls (CallExpr nodes) in the body: not constructors,
-    # destructors or other implicit calls, so not a complete call graph.
-    calls: tuple[SourceCall, ...]
-    # Built-in comparisons; overloaded comparison operators are calls.
-    comparisons: tuple[SourceComparison, ...] = ()
-
-
-@dataclass(frozen=True)
-class FunctionFacts:
-    """What the reconstruction's compiler says about one function: how it is
-    called, the fields it accesses and the calls it makes. These explain the
-    recompiled side; they never prove the original equivalent."""
-
-    key: DeclarationKey
-    call: CallFacts | None
-    accesses: tuple[SourceMemberUse, ...]
-    calls: tuple[SourceCall, ...]  # explicit calls only
-    comparisons: tuple[SourceComparison, ...] = ()
-
-    def comparisons_on_line(self, line: int) -> tuple[SourceComparison, ...]:
-        return tuple(item for item in self.comparisons if item.line == line)
 
 
 @dataclass(frozen=True)

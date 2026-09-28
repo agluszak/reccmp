@@ -1,7 +1,7 @@
 from unittest.mock import Mock, patch
 import struct
 import pytest
-from reccmp.compare.db import EntityDb
+from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.formats.image import ImageImport, ImageRegion
 from reccmp.formats import PEImage
 from reccmp.types import EntityType, ImageId
@@ -618,7 +618,7 @@ def test_classify_exact_vtable_aliases(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 0x1000, type=EntityType.VTABLE, name="Base", size=12)
         batch.set(ImageId.RECOMP, 0x2000, type=EntityType.VTABLE, name="Base", size=12)
-        batch.match(0x1000, 0x2000)
+        batch.match(0x1000, 0x2000, basis=PairBasis.ANNOTATION)
         batch.set(ImageId.ORIG, 0x1100, type=EntityType.VTABLE, name="Base", size=12)
 
     raw = b"one two three"
@@ -639,7 +639,7 @@ def test_match_inferred_vtables_requires_exact_slot_identities(db: EntityDb):
         ):
             batch.set(ImageId.ORIG, orig_addr, type=EntityType.FUNCTION, size=1)
             batch.set(ImageId.RECOMP, recomp_addr, type=EntityType.FUNCTION, size=1)
-            batch.match(orig_addr, recomp_addr)
+            batch.match(orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
         batch.set(
             ImageId.ORIG,
             0x3000,

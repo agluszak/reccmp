@@ -1,52 +1,59 @@
 # About this fork
 
 This is `agluszak/reccmp`, a fork of
-[isledecomp/reccmp](https://github.com/isledecomp/reccmp). It is kept as a
-small stack of feature commits on top of `upstream/master`, one per area:
+[isledecomp/reccmp](https://github.com/isledecomp/reccmp). It supplies
+reconstruction-specific correspondence, metadata, data checks and source
+integration; code comparison is [Ghidriff](https://github.com/clearbluejar/ghidriff)'s.
+The fork does not interpret or normalize machine instructions.
 
-1. Binary and PDB support
-2. Annotations and project files
-3. Source index
-4. Structured instruction IR
-5. Semantic verifier
-6. Entity identity
-7. Diagnostics and reports
-8. Comparator and tools
-9. Differential execution witnesses (`--witness`)
-10. Ghidra
-11. This file
+```text
+target configuration + binaries + PDB + source index
+                        |
+                        v
+          entity catalog (Compare): pairs, pair basis, names, extents
+                 |                              |
+                 v                              v
+   manifest -> Ghidra + Ghidriff        datacmp, vtable, decomplint
+   (reccmp-reccmp, reccmp/ghidriff)     (retained checks)
+                 |
+                 v
+   summary.json + Ghidriff report, linked to the source
+```
 
-A change to the fork amends the commit for its area, not a new commit on
-top. `git commit --fixup=<commit>` followed by
-`git rebase -i --autosquash upstream/master` does that.
+- `reccmp/compare/core.py` prepares the catalog: PDB, annotations, binary
+  structure. Every pair records its `PairBasis`. It runs no comparison.
+- `reccmp/compare/manifest.py` is what the differ receives: requested
+  functions (paired or not), shared names, extents, aliases, input digests.
+- `reccmp/ghidriff/` adapts Ghidriff: functions at known entries, names,
+  symmetric literal typing, referenced-data contents, one result per
+  requested function. See `docs/code-comparison.md`.
+- `reccmp/compare/vtables.py`, `variables.py` (datacmp) and the source
+  index's layout checks are independent of code comparison.
+
+Generic decompiler or report problems belong in Ghidriff or Ghidra, not here:
+`requirements.txt` pins a Ghidriff revision (currently the fork
+`agluszak/ghidriff` with the same-basename decompiler-pool fix) and fixes go
+upstream from there.
+
+## Deliberate deletions of upstream code
+
+Upstream's assembly comparison and its report are deleted: `compare/asm/`,
+`compare/functions.py`, `diff.py`, `pinned_sequences.py`, `report.py`,
+`difflib.py`, `tools/asmcmp.py`, `aggregate.py`, `stackcmp.py`, the HTML
+report assets and `webui/`. Upstream's handwritten C++ marker reader is
+deleted too: markers come only from the Clang source index
+(`docs/source-index.md`). When a rebase conflicts on one of these, keep it
+deleted; port a marker-grammar change to `reccmp/parser/reader.py` or
+`marker.py`.
 
 ## Keeping rebases cheap
 
-Upstream keeps changing its own files. Every line the fork changes in one of
-them can conflict on the next rebase. So:
-
 - **Put new logic in new modules.** Upstream-owned files should only get
-  hooks: an import, a call, a base class. For example, `FunctionComparator`
-  gets its fork behaviour from mixins in `body_equivalence.py`,
-  `function_metadata.py`, `source_pins.py`, `inline_accounting.py` and
-  `refutation.py` (which drives the `witness` package).
-  Report JSON lives in `comparison_json.py`, CLI text rendering in
-  `tools/asmcmp_text.py`, and SEH/FOLDED matching in `match_folded.py`.
-- **Use upstream's tooling.** Use `requirements-tests.txt` and upstream's
-  workflows. The only fork deltas there are the Ghidra version pin and the
-  `unicorn` test dependency (the optional `witness` extra). `z3-solver` is
-  a normal dependency: the verifier's algebraic identities must not depend
-  on what happens to be installed. A target's `verifier:
-  algebraic-identities: false` in `reccmp-project.yml` turns them off.
+  hooks.
+- **Use upstream's tooling**: `requirements-tests.txt` and upstream's
+  workflows.
 - **Don't reformat or tidy upstream code** that the fork doesn't otherwise
   need to change.
-
-One deliberate exception: markers come only from the Clang source index
-(`docs/source-index.md`), so upstream's handwritten C++ reader is deleted —
-`reccmp/parser/tokenizer.py`, `parser.py`, `util.py`, the `samples/*.cpp`
-corpus and the `test_tokenizer_*`/`test_parser*` tests. When a rebase
-conflicts on one of them, keep it deleted and port any marker-grammar change
-to `reccmp/parser/reader.py` (block grammar) or `marker.py` (marker lines).
 
 ## Rebasing onto upstream
 
@@ -61,12 +68,6 @@ pytest && pylint reccmp tests && mypy ./reccmp ./tests
 Downstream projects pin fork revisions by SHA. A rebase rewrites every fork
 commit, so tag the old tip before force-pushing.
 
-Before switching a downstream project to a rebased revision, save a report
-with the old revision and diff against it with the new one:
-
-```sh
-reccmp-reccmp --target <TARGET> --json old.json --silent   # old revision
-reccmp-reccmp --target <TARGET> --diff old.json            # new revision
-```
-
-Understand any change in the diff before switching.
+Before switching a downstream project to a new revision, keep the old
+revision's `summary.json` for the same binaries and compare outcomes per
+function with the new one. Understand every change before switching.

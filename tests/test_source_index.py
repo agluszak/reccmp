@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from reccmp.call_facts import CallFacts
 from reccmp.source import (
     DeclarationKey,
     SourceCollector,
@@ -26,8 +25,6 @@ def _declaration(**fields) -> dict:
         "return_type": "void",
         "parameter_types": [],
         "owning_class": None,
-        "has_this": False,
-        "is_virtual": False,
         "is_definition": True,
         "linkage": "external",
         "storage_class": "none",
@@ -125,8 +122,6 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
             return_type="int",
             parameter_types=["short"],
             owning_class="N::Widget",
-            has_this=True,
-            is_virtual=True,
             source_file="sample.cpp",
             line=7,
             end_line=7,
@@ -164,7 +159,6 @@ def test_source_index_joins_markers_to_clang_semantics(tmp_path: Path) -> None:
     assert declaration.calling_convention == "__thiscall"
     assert declaration.parameter_types == ("short",)
     assert declaration.owning_class == "N::Widget"
-    assert declaration.is_virtual
     assert list(index.classes.values())[0].bases == ("N::Base",)
     assert [
         (field.name, field.type) for field in list(index.classes.values())[0].fields
@@ -217,7 +211,6 @@ def test_source_index_preserves_template_specialization_owner(tmp_path: Path) ->
             return_type="Vec<float> *",
             parameter_types=["double"],
             owning_class="Vec<float>",
-            has_this=True,
             source_file="vector.cpp",
             line=2,
             end_line=2,
@@ -471,39 +464,6 @@ def test_internal_functions_are_distinct_per_translation_unit(tmp_path: Path) ->
     assert not namespace.conflicts
 
 
-def _member_use(function: str, name: str, unit: str) -> dict:
-    return {
-        "record": "member-use",
-        "owner_identity": "c:@S@Buffer",
-        "owner_status": "resolved",
-        "owner": "Buffer",
-        "field_identity": f"c:@S@Buffer::field@buffer.h:{name}",
-        "field_usr": None,
-        "name": name,
-        "declaration_file": "buffer.h",
-        "declaration_line": 1,
-        "declaration_column": 1,
-        "declaration_offset": None,
-        "offset_bits": 0,
-        "extent_bits": 32,
-        "offset_bytes": 0,
-        "extent_bytes": 4,
-        "declared_type": "int",
-        "function_identity": function,
-        "function": "copyMemory",
-        "function_file": unit,
-        "function_line": 1,
-        "use_file": unit,
-        "use_line": 2,
-        "use_column": 3,
-        "use_offset": None,
-        "operations": ["read"],
-        "array_indices": [],
-        "conversions": [],
-        "base": {"kind": "parameter", "index": 0},
-    }
-
-
 def test_tu_local_functions_with_one_mangled_name_bind_by_location(
     tmp_path: Path,
 ) -> None:
@@ -560,13 +520,6 @@ def test_tu_local_functions_with_one_mangled_name_bind_by_location(
             unit_id=unit,
         )
 
-    # Each copyMemory reads a different field.
-    for unit, field_name in (("huffman.cpp", "bits"), ("renderer.cpp", "pixels")):
-        collector.collect_record(
-            _member_use("?copyMemory@@YAPAXPAXPBXJ@Z", field_name, unit),
-            unit_id=unit,
-        )
-
     derived = SourceIndex.from_collector("TEST", collector)
     # Identity survives the JSON projection.
     index = SourceIndex.from_dict(json.loads(json.dumps(derived.to_dict())))
@@ -587,115 +540,6 @@ def test_tu_local_functions_with_one_mangled_name_bind_by_location(
         # A header's TU-local function: the first including unit's copy.
         0x3000: ("util.h", DeclarationKey("TEST", "?helper@@YAXXZ", "a.cpp")),
     }
-    assert {
-        key.unit_id: [use.name for use in uses]
-        for key, uses in index.member_uses.items()
-    } == {"huffman.cpp": ["bits"], "renderer.cpp": ["pixels"]}
-
-
-def test_function_facts_and_clang_call_facts(tmp_path: Path) -> None:
-    collector = SourceCollector(tmp_path)
-    run = "?Run@Widget@@UAEHH@Z"
-    collector.collect_record(
-        _declaration(
-            semantic_id=run,
-            qualified_name="Widget::Run",
-            semantic_kind="instance_method",
-            calling_convention="__thiscall",
-            source_file="w.cpp",
-            line=3,
-            call={
-                "uses_ecx": True,
-                "uses_edx": False,
-                "stack_cleanup": 4,
-                "return_kind": "i32",
-            },
-        ),
-        unit_id="w.cpp",
-    )
-    collector.collect_record(
-        {
-            "record": "member-use",
-            "owner_identity": "c:@S@Widget",
-            "owner_status": "resolved",
-            "owner": "Widget",
-            "field_identity": "c:@S@Widget::field@w.h:4:3:0",
-            "field_usr": "c:@S@Widget@FI@flags",
-            "name": "flags",
-            "declaration_file": "w.h",
-            "declaration_line": 4,
-            "declaration_column": 3,
-            "declaration_offset": 40,
-            "offset_bits": 32,
-            "extent_bits": 8,
-            "offset_bytes": 4,
-            "extent_bytes": 1,
-            "declared_type": "unsigned char",
-            "function_identity": run,
-            "function": "Widget::Run",
-            "function_file": "w.cpp",
-            "function_line": 3,
-            "use_file": "w.cpp",
-            "use_line": 4,
-            "use_column": 10,
-            "use_offset": 80,
-            "operations": ["read"],
-            "array_indices": [],
-            "conversions": [
-                {
-                    "kind": "IntegralCast",
-                    "source_type": "unsigned char",
-                    "destination_type": "int",
-                    "source_bits": 8,
-                    "source_signed": False,
-                    "destination_bits": 32,
-                }
-            ],
-            "base": {"kind": "this"},
-        },
-        unit_id="w.cpp",
-    )
-    collector.collect_record(
-        {
-            "record": "function-facts",
-            "function": run,
-            "calls": [
-                {
-                    "callee": "?Run@Base@@UAEHH@Z",
-                    "virtual": True,
-                    "slots": ["?Run@Base@@UAEHH@Z"],
-                    "object_class": "record:Base",
-                    "object": {"kind": "parameter", "index": 0},
-                    "field_arguments": ["c:@S@Widget::field@w.h:4:3:0", None],
-                    "line": 5,
-                    "offset": 120,
-                }
-            ],
-        },
-        unit_id="w.cpp",
-    )
-
-    derived = SourceIndex.from_collector("TEST", collector)
-    index = SourceIndex.from_dict(json.loads(json.dumps(derived.to_dict())))
-
-    key = DeclarationKey("TEST", run)
-    assert index.call_facts_for(key) == CallFacts(True, False, 4, "i32")
-    assert index.call_facts_named(run) == CallFacts(True, False, 4, "i32")
-    assert index.call_facts_for(DeclarationKey("TEST", "?Unknown@@YAXXZ")) is None
-    facts = index.function_facts_for(key)
-    assert facts is not None
-    assert facts.call == CallFacts(True, False, 4, "i32")
-    [access] = facts.accesses
-    assert (access.base.kind, access.offset_bytes, access.extent_bytes) == (
-        "this",
-        4,
-        1,
-    )
-    assert access.conversions[0].source_signed is False
-    [call] = facts.calls
-    assert call.virtual and call.slots == ("?Run@Base@@UAEHH@Z",)
-    assert call.object is not None and call.object.index == 0
-    assert call.field_arguments == ("c:@S@Widget::field@w.h:4:3:0", None)
 
 
 def test_a_targets_markers_come_from_its_own_source_files(tmp_path: Path) -> None:
@@ -747,8 +591,6 @@ def test_identity_changes_with_what_clang_reported(tmp_path: Path) -> None:
         "void",
         (),
         None,
-        False,
-        False,
         "f.cpp",
         2,
         3,

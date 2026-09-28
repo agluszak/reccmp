@@ -122,7 +122,7 @@ class CvdumpSymbolsParser:
         "S_OBJNAME",
         "S_THUNK32",
         "S_LABEL32",
-        "S_REGREL32",  # TODO: Seen as early as MSVC 7.00; might be relevant to Ghidra and/or stackcmp
+        "S_REGREL32",  # TODO: Seen as early as MSVC 7.00; might be relevant to Ghidra
         "S_UDT",
         "S_FRAMEPROC",
     ]
