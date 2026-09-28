@@ -261,6 +261,10 @@ class Compare:
         # This happens last because establishing all other entities first
         # will reduce false positives. For each address presumed to be a
         # float or string, skip if there is an existing entity at the address.
+        # A packed or protected original can leave its read-only sections
+        # writable. The recompiled image is the linker's own output: its
+        # sections say which data is constant in both.
+        write_permissions = self.recomp_bin.section_write_permissions()
         for img_id, binfile in (
             (ImageId.ORIG, self.orig_bin),
             (ImageId.RECOMP, self.recomp_bin),
@@ -268,7 +272,7 @@ class Compare:
             # Some float consts may appear to be strings.
             # Detect floats first because we can identify them with more confidence
             # and this eliminates them from consideration as strings.
-            create_analysis_floats(self._db, img_id, binfile)
+            create_analysis_floats(self._db, img_id, binfile, write_permissions)
             # Wide before Latin1: otherwise L"F1" is misread as the short string "F".
             create_analysis_widechars(self._db, img_id, binfile)
             create_analysis_strings(self._db, img_id, binfile, self.bin_encoding)

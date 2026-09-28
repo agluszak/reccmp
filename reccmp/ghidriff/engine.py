@@ -10,15 +10,22 @@ is shaped by the reconstruction's own types.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
-import bisect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ghidriff import GhidraDiffEngine
+from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+from .locations import (
+    STRING_TYPES,
+    Extents,
+    Located,
+    Use,
+    access_size,
+    only_compared,
+)
 from .results import (
     AnalysisFailure,
     Contents,
@@ -26,6 +33,7 @@ from .results import (
     FailureKind,
     FunctionResult,
     ObjectOffset,
+    PastEnd,
     PointerValue,
     RawBytes,
     StringValue,
@@ -45,65 +53,16 @@ _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
-_STRING_TYPES = (EntityType.STRING, EntityType.WIDECHAR)
 _PRISTINE_FOLDER = "pristine"
+# Changes whenever what reccmp does to a program before Ghidra's analysis
+# changes, so that analyses cached before the change are not reused.
+ANALYSIS_REVISION = 1
 
 
 @dataclass(frozen=True)
 class _Decompiled:
     code: str | None
     error: str | None
-
-
-@dataclass(frozen=True)
-class _Located:
-    """Where a referenced address falls in the catalog of one image."""
-
-    start: int
-    offset: int
-    size: int | None
-    entity_type: EntityType | None
-    # The pair the location belongs to; None for unpaired catalog data.
-    named: NamedObject | None
-
-
-class _Extents:
-    """Catalog entities of one image, by the address range they occupy."""
-
-    def __init__(self, manifest: Manifest, image_id: ImageId):
-        spans = [
-            _Located(obj.addr(image_id), 0, obj.extent(image_id), obj.entity_type, obj)
-            for obj in manifest.objects
-        ] + [
-            _Located(entity.addr, 0, entity.size, entity.entity_type, None)
-            for entity in manifest.unpaired
-            if entity.image_id == image_id
-        ]
-        pairs = {obj.orig_addr: obj for obj in manifest.objects}
-        spans += [
-            _Located(
-                alias.addr,
-                0,
-                alias.size or pairs[alias.canonical_orig].extent(image_id),
-                pairs[alias.canonical_orig].entity_type,
-                pairs[alias.canonical_orig],
-            )
-            for alias in manifest.aliases
-            if alias.image_id == image_id and alias.canonical_orig in pairs
-        ]
-        spans.sort(key=lambda located: located.start)
-        self._starts = [located.start for located in spans]
-        self._spans = spans
-
-    def containing(self, addr: int) -> _Located | None:
-        i = bisect.bisect_right(self._starts, addr) - 1
-        if i < 0:
-            return None
-        span = self._spans[i]
-        offset = addr - span.start
-        if offset == 0 or (span.size is not None and offset < span.size):
-            return _Located(span.start, offset, span.size, span.entity_type, span.named)
-        return None
 
 
 def _literal_data_type(entity_type: EntityType | None, size: int | None) -> Any:
@@ -178,6 +137,9 @@ def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:
     }
 
 
+# Matches come from the manifest through `diff_pairs` only; Ghidriff's
+# unused matcher raises NotImplementedError, which pylint reads as abstract.
+# pylint: disable-next=abstract-method
 class ReccmpDiffEngine(GhidraDiffEngine):
     """A GhidraDiffEngine whose function matches come from a manifest."""
 
@@ -189,7 +151,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
         self._pair_types = {obj.orig_addr: obj.entity_type for obj in manifest.objects}
         self._extents = {
-            image_id: _Extents(manifest, image_id)
+            image_id: Extents(manifest, image_id)
             for image_id in (ImageId.ORIG, ImageId.RECOMP)
         }
         self._failures: dict[int, list[AnalysisFailure]] = {}
@@ -205,46 +167,82 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         binaries as Ghidra sees them, under reccmp's names only."""
         return None
 
-    def find_matches(self, p1: "Program", p2: "Program") -> list:
+    def function_matches(self) -> list[FunctionMatch]:
         """Every requested pair that has a function on both sides."""
-        self._sides = {
-            self._program_key(p1): ImageId.ORIG,
-            self._program_key(p2): ImageId.RECOMP,
-        }
-        orig_functions = p1.getFunctionManager()
-        recomp_functions = p2.getFunctionManager()
-        orig_space = p1.getAddressFactory().getDefaultAddressSpace()
-        recomp_space = p2.getAddressFactory().getDefaultAddressSpace()
+        return [
+            FunctionMatch(entry.orig_addr, entry.recomp_addr, ("reccmp",))
+            for entry in self._comparable_entries()
+        ]
 
-        matched = []
-        for entry in self._comparable_entries():
-            assert entry.recomp_addr is not None
-            orig = orig_functions.getFunctionAt(orig_space.getAddress(entry.orig_addr))
-            recomp = recomp_functions.getFunctionAt(
-                recomp_space.getAddress(entry.recomp_addr)
-            )
-            if orig is not None and recomp is not None:
-                matched.append([orig.getSymbol(), recomp.getSymbol(), ["reccmp"]])
-        return [[], matched, []]
-
-    def syms_need_diff(self, *_: Any, **__: Any) -> bool:
-        """Decompile every requested pair. Equal size and reference counts
-        are exactly where subtle differences hide."""
-        return True
-
-    def decompile_func(self, prog: "Program", func: Any, timeout: int = 15) -> Any:
-        # ghidriff returns (error, code); pylint misreads its annotation.
-        # pylint: disable-next=unpacking-non-sequence
-        error, code = super().decompile_func(prog, func, timeout)
+    def decompile_func(
+        self, prog: "Program", func: Any, timeout: int = 15
+    ) -> DecompileResult:
+        result = super().decompile_func(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
             self._decompiled[(side, func.getEntryPoint().getOffset())] = _Decompiled(
-                code=str(code) if not error else None,
-                error=str(error) if error else None,
+                code=result.code if result.completed else None,
+                error=result.error,
             )
-        return error, code
+        return result
+
+    def analyze_program(
+        self,
+        df_or_prog: Any,
+        require_symbols: bool,
+        force_analysis: bool = False,
+        verbose_analysis: bool = False,
+    ) -> Any:
+        """Correct the imports' stack purge before Ghidra's first analysis."""
+        from ghidra.program.util import GhidraProgramUtilities
+
+        # ghidriff closes the program it is handed.
+        program = self.project.openProgram("/", df_or_prog.getName(), False)
+        if GhidraProgramUtilities.shouldAskToAnalyze(program):
+            transaction = program.startTransaction("reccmp import purges")
+            try:
+                self._correct_import_purges(program)
+            finally:
+                program.endTransaction(transaction, True)
+        return super().analyze_program(
+            program, require_symbols, force_analysis, verbose_analysis
+        )
 
     # --- program preparation ----------------------------------------------
+
+    @staticmethod
+    def _correct_import_purges(program: "Program") -> None:
+        """Give imports the caller cleans up after a stack purge of zero.
+
+        With the imported library beside the binary, Ghidra takes each
+        import's stack purge from its own analysis of the library. That
+        analysis may count arguments pushed on a path that never returns,
+        such as a failed assertion's call to exit, as the function's own
+        purge. A caller that cleans up after the call then leaves the
+        decompiler's stack pointer off by that amount for the rest of the
+        function, and the parameter analysis gives its callers parameters
+        they do not have. A variadic or `__cdecl` function never pops its
+        arguments; the signature comes from the import's mangled name,
+        before analysis has applied it."""
+        from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+        from ghidra.program.model.lang import CompilerSpec
+
+        for function in program.getFunctionManager().getExternalFunctions():
+            if function.getStackPurgeSize() == 0:
+                continue
+            imported = function.getExternalLocation().getOriginalImportedName()
+            demangled = DemanglerUtil.demangle(imported or function.getName())
+            if not isinstance(demangled, DemangledFunction):
+                continue
+            if (
+                demangled.getCallingConvention()
+                == CompilerSpec.CALLING_CONVENTION_cdecl
+                or any(
+                    parameter.getType().isVarArgs()
+                    for parameter in demangled.getParameters()
+                )
+            ):
+                function.setStackPurgeSize(0)
 
     def _pair_type(self, orig_addr: int) -> EntityType | None:
         return self._pair_types.get(orig_addr)
@@ -349,6 +347,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
+            self._require_functions(program, image_id)
 
             transaction = program.startTransaction("reccmp names")
             try:
@@ -357,6 +356,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 self._collect_references(program, image_id)
             finally:
                 program.endTransaction(transaction, True)
+            self._sides[self._program_key(program)] = image_id
             self.project.save(program)
         finally:
             self.project.close(program)
@@ -428,12 +428,18 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 program, TaskMonitor.DUMMY
             )
             CreateFunctionCmd(address).applyTo(program, TaskMonitor.DUMMY)
-            if functions.getFunctionAt(address) is None and addr in requested:
-                self._fail(
-                    requested[addr], AnalysisFailure(FailureKind.NO_FUNCTION, image_id)
-                )
         for function in split:
             CreateFunctionCmd.fixupFunctionBody(program, function, TaskMonitor.DUMMY)
+
+    def _require_functions(self, program: "Program", image_id: ImageId) -> None:
+        """Report requested entries still without a function once analysis
+        is done; ghidriff diffs supplied pairs only when both resolve."""
+        functions = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        for entry in self._comparable_entries():
+            address = space.getAddress(self._entry_addr(entry, image_id))
+            if functions.getFunctionAt(address) is None:
+                self._fail(entry, AnalysisFailure(FailureKind.NO_FUNCTION, image_id))
 
     @staticmethod
     def _clear_data(program: "Program", address: "Address") -> None:
@@ -565,7 +571,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
             if function is None:
                 continue
-            targets: dict[int, "Address"] = {}
+            targets: dict[Use, "Address"] = {}
             for instruction in program.getListing().getInstructions(
                 function.getBody(), True
             ):
@@ -577,11 +583,79 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         and functions.getFunctionContaining(to) is None
                         and self._is_data(image_id, to.getOffset())
                     ):
-                        targets.setdefault(to.getOffset(), to)
+                        bound = self._compared_end(
+                            image_id, instruction, ref.getOperandIndex(), to
+                        )
+                        access = access_size(instruction, to.getOffset())
+                        if bound is not None:
+                            self._name_end(program, instruction, ref, bound)
+                        elif access is None:
+                            to = self._string_start(program, image_id, to)
+                        targets.setdefault(Use(to.getOffset(), bound, access), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
-                self._reference(program, image_id, targets[addr])
-                for addr in sorted(targets)
+                self._reference(program, image_id, to, use)
+                for use, to in sorted(
+                    targets.items(),
+                    key=lambda item: (
+                        item[0].addr,
+                        item[0].bound is None,
+                        item[0].access or 0,
+                    ),
+                )
             )
+
+    def _string_start(
+        self, program: "Program", image_id: ImageId, address: "Address"
+    ) -> "Address":
+        """The string an address inside a string belongs to.
+
+        Scanning a string, as an inlined strlen does, leaves Ghidra's
+        constant propagation with a reference a byte or so into it; the
+        function refers to the string, not to its tail."""
+        from ghidra.program.model.data import StringDataInstance
+
+        located = self._extents[image_id].containing(address.getOffset())
+        if located is not None:
+            if located.entity_type in STRING_TYPES:
+                return address.subtract(located.offset)
+            return address
+        data = program.getListing().getDataContaining(address)
+        if data is not None and StringDataInstance.isString(data):
+            return data.getMinAddress()
+        return address
+
+    def _compared_end(
+        self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
+    ) -> ObjectOffset | None:
+        """The paired array a constant an instruction only compares with is
+        a loop bound over (see `Extents.bound_at`), with the bound's offset.
+
+        A bound past an array's end lies at or in whatever the linker placed
+        next, which differs between the binaries; Ghidra names it after
+        that."""
+        ended = self._extents[image_id].bound_at(to.getOffset())
+        if ended is None or ended.named is None:
+            return None
+        scalar = instruction.getScalar(operand)
+        if scalar is None or scalar.getUnsignedValue() != to.getOffset():
+            return None
+        if not only_compared(instruction, to.getOffset()):
+            return None
+        orig_addr = ended.named.orig_addr
+        return ObjectOffset(orig_addr, self._names[orig_addr], ended.offset)
+
+    def _name_end(
+        self, program: "Program", instruction: Any, ref: Any, end: ObjectOffset
+    ) -> None:
+        """Show the compared constant as its offset from its array. The
+        decompiler shows an equate for the constant, also when it adjusts
+        the constant by one to rewrite the comparison."""
+        name = self._ghidra_name(f"{end.name}+{end.offset:#x}")
+        value = ref.getToAddress().getOffset()
+        equates = program.getEquateTable()
+        equate = equates.getEquate(name) or equates.createEquate(name, value)
+        if equate.getValue() == value:
+            equate.addReference(instruction.getAddress(), ref.getOperandIndex())
 
     def _is_data(self, image_id: ImageId, addr: int) -> bool:
         """Import slots are compared by the import name Ghidra shows in the
@@ -593,15 +667,22 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         )
 
     def _reference(
-        self, program: "Program", image_id: ImageId, address: "Address"
+        self,
+        program: "Program",
+        image_id: ImageId,
+        address: "Address",
+        use: Use,
     ) -> DataReference:
+        if use.bound is not None:
+            return DataReference(address.getOffset(), use.bound, PastEnd())
         located = self._extents[image_id].containing(address.getOffset())
         if located is None:
-            return DataReference(
-                address.getOffset(),
-                None,
-                self._ghidra_contents(program, image_id, address),
+            contents = (
+                self._accessed_contents(program, image_id, address, use.access)
+                if use.access is not None
+                else self._ghidra_contents(program, image_id, address)
             )
+            return DataReference(address.getOffset(), None, contents)
         obj = None
         if located.named is not None:
             obj = ObjectOffset(
@@ -624,7 +705,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         program: "Program",
         image_id: ImageId,
         address: "Address",
-        located: _Located,
+        located: Located,
     ) -> Contents:
         """Contents over the catalog's extent for the entity, the same way
         in both images, whatever Ghidra's data typing on either side."""
@@ -636,8 +717,22 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         raw, relocated = read
         if relocated and self._relocation_at(program, address) and len(raw) >= 4:
             return self._pointer(program, image_id, raw)
-        if located.entity_type in _STRING_TYPES and not relocated:
+        if located.entity_type in STRING_TYPES and not relocated:
             return _decode_string(raw, located.entity_type)
+        return RawBytes(raw, relocated, extent_known=True)
+
+    def _accessed_contents(
+        self, program: "Program", image_id: ImageId, address: "Address", size: int
+    ) -> Contents:
+        """The bytes an instruction loads or stores at a location the
+        catalog does not know: what the function uses, whatever Ghidra's
+        data typing there (two float constants typed as one string)."""
+        read = self._read(program, address, size)
+        if read is None:
+            return Uninitialized()
+        raw, relocated = read
+        if relocated and self._relocation_at(program, address) and len(raw) >= 4:
+            return self._pointer(program, image_id, raw)
         return RawBytes(raw, relocated, extent_known=True)
 
     def _ghidra_contents(
@@ -729,7 +824,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
         if (
             located is not None
-            and located.entity_type in _STRING_TYPES
+            and located.entity_type in STRING_TYPES
             and located.size is not None
         ):
             read = self._read(program, target, located.size - located.offset)

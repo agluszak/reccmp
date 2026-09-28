@@ -557,5 +557,7 @@ class NEImage(Image):
     def get_data_regions(self) -> Iterator[ImageRegion]:
         raise NotImplementedError
 
-    def get_const_regions(self) -> Iterator[ImageRegion]:
+    def get_const_regions(
+        self, write_permissions: Mapping[str, bool] | None = None
+    ) -> Iterator[ImageRegion]:
         raise NotImplementedError

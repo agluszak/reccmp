@@ -134,7 +134,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     # pylint: disable=import-outside-toplevel
     # Importing the engine does not start the JVM, but it does need ghidriff.
     import ghidriff
-    from reccmp.ghidriff.engine import ReccmpDiffEngine
+    from reccmp.ghidriff.engine import ANALYSIS_REVISION, ReccmpDiffEngine
     from reccmp.ghidriff.report import RunInputs, print_summary, summary_json
     from reccmp.ghidriff.results import Outcome
 
@@ -161,6 +161,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     project_name = (
         f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
         f"-ghidra{ghidra_version}-ghidriff{ghidriff.__version__}"
+        f"-reccmp{ANALYSIS_REVISION}"
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     try:
@@ -171,7 +172,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         engine.align_memory_permissions(orig, recomp)
         engine.prepare_program(orig, ImageId.ORIG)
         engine.prepare_program(recomp, ImageId.RECOMP)
-        pdiff = engine.diff_bins(orig, recomp, force_diff=True)
+        pdiff = engine.diff_pairs(
+            orig, recomp, engine.function_matches(), force_diff=True
+        )
         results = engine.results()
     finally:
         engine.project.close()

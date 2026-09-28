@@ -4,6 +4,7 @@ pydantic==2.13.5
 ruamel.yaml==0.19.1
 pydemumble==0.0.1
 pyghidra==3.1.0
-# Ghidriff with the same-basename decompiler-pool fix (agluszak/ghidriff#1) and
-# normalization of every default label on a line (normalize-all-labels).
-ghidriff @ https://github.com/agluszak/ghidriff/archive/9b746287bedabce195ff582296a6ac8fe6641b1a.tar.gz
+# The agluszak/ghidriff fork's main: the same-basename decompiler-pool fix,
+# normalization of every default label, supplied function pairs, and
+# Ghidra 12.1.4 as its runtime baseline.
+ghidriff @ https://github.com/agluszak/ghidriff/archive/e2ef5605784c8c747541aa229ffefe10cf5e6d16.tar.gz

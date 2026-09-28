@@ -47,7 +47,14 @@ decompiler failed (`decompile-error`).
 
 ## What both programs receive
 
-Both programs are analyzed the same way, without debug information. Then:
+Both programs are analyzed the same way, without debug information. Before
+the analysis, an import whose mangled name makes it variadic or `__cdecl` gets
+a stack purge of zero. With the imported library beside the binary, Ghidra
+takes import purges from its own analysis of the library, which can count the
+arguments of a call that never returns (a failed assertion's exit) as the
+function's purge. The decompiler's stack pointer is then off after every call
+to that import, so it gives the callers parameters they do not have, and can
+crash. After the analysis:
 
 - the original's memory blocks get the write permission of the recompiled
   blocks with the same name. A packed or protected original can have writable
@@ -69,7 +76,14 @@ Both programs are analyzed the same way, without debug information. Then:
   for other paired objects is removed, so the decompiler shows the shared name
   on both sides instead of a literal on one;
 - a reference into a paired object gets a label for the object and offset,
-  so `array + 4` cannot read as `array`.
+  so `array + 4` cannot read as `array`;
+- a constant an instruction only compares with, at a paired array's end or
+  past it by less than the array's size, is shown as its offset from the
+  array (`array+0x24`): a loop over an array compares its pointer with the
+  array's end, or with one field's address in the element past the last.
+  Ghidra would name it after whatever the linker placed there, which differs
+  between the binaries. A paired object starting there, or holding it (other
+  than a string), is compared with as itself;
 
 No reconstruction types, prototypes or calling conventions are applied: the
 recovered source must not shape both decompilations toward the same answer.
@@ -85,6 +99,9 @@ therefore compares the contents of the data each function refers to:
 - a paired object both sides refer to is compared by identity, over the
   catalog's extent for it (the recompiled PDB's size stands for the original
   when only it is known);
+- such a loop bound is identified by its array and offset, and has no
+  contents; a reference into the middle of a string, which scanning it
+  leaves in Ghidra's analysis, is a reference to the string;
 - the remaining references have no counterpart, so only their contents are
   compared, as a multiset. A string on one side and the same bytes, untyped,
   on the other are consistent; so are zero-filled regions of any length. A
@@ -108,8 +125,8 @@ Each pair records why it exists (`basis` in the manifest and the summary):
 
 Ghidra's analysis of both binaries is kept in a Ghidra project
 (`--ghidra-projects`, default `.reccmp-cache/ghidra` beside the recompiled
-PDB), named by the original binary's digest and the Ghidra and Ghidriff
-versions. A new recompiled build replaces the previous one in that project;
+PDB), named by the original binary's digest, the Ghidra and Ghidriff
+versions, and a revision of what reccmp changes before the analysis. A new recompiled build replaces the previous one in that project;
 the original is analyzed once. The analyzed programs are kept pristine; each
 run starts from them and
 applies the current catalog, so a changed annotation never needs a new
