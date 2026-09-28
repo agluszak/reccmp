@@ -5,5 +5,6 @@ ruamel.yaml==0.19.1
 pydemumble==0.0.1
 pyghidra==3.1.0
 # The agluszak/ghidriff fork's main: the same-basename decompiler-pool fix,
-# normalization of every default label, and supplied function pairs.
-ghidriff @ https://github.com/agluszak/ghidriff/archive/c006bb64c56d9033846f95d7152ecbf3a7114d24.tar.gz
+# normalization of every default label, supplied function pairs, and
+# Ghidra 12.1.4 as its runtime baseline.
+ghidriff @ https://github.com/agluszak/ghidriff/archive/e2ef5605784c8c747541aa229ffefe10cf5e6d16.tar.gz
