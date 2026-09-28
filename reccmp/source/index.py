@@ -22,7 +22,6 @@ import json
 from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence
 
-from reccmp.call_facts import CallFacts
 from reccmp.parser.marker import ProjectAliases
 from reccmp.parser.reader import MarkerBlock, local_paths
 from .variables import SourceConflict, SourceVariable
@@ -34,17 +33,12 @@ from .observations import (
     TranslationUnitRecords,
     _declaration_from_dict,
     _variable_from_dict,
-    _member_use_from_dict,
-    _function_facts_from_dict,
     _conflict_from_dict,
     _class_from_dict,
 )
 from .records import (
     DeclarationKey,
     SourceDeclaration,
-    SourceMemberUse,
-    SourceFunctionFacts,
-    FunctionFacts,
     SourceAbi,
     SourceClass,
     SourceMarker,
@@ -200,8 +194,6 @@ class SourceIndex(SourceLayoutQueries):
         classes: Mapping[DeclarationKey, SourceClass],
         markers: Iterable[SourceMarker],
         variables: Mapping[DeclarationKey, SourceVariable] | None = None,
-        member_uses: Mapping[DeclarationKey, Sequence[SourceMemberUse]] | None = None,
-        function_facts: Mapping[DeclarationKey, SourceFunctionFacts] | None = None,
         conflicts: Iterable[SourceConflict] = (),
         abi: SourceAbi | None = None,
         target_abis: Mapping[str, SourceAbi] | None = None,
@@ -229,16 +221,6 @@ class SourceIndex(SourceLayoutQueries):
             sorted(markers, key=lambda item: (item.address, item.source_file))
         )
         self.variables = _sorted_by_key(variables or {})
-        # Field uses by the key of the function whose body makes them.
-        self.member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]] = {
-            key: tuple(uses) for key, uses in _sorted_by_key(member_uses or {}).items()
-        }
-        # Explicit calls by the key of the function whose body makes them.
-        self.function_facts: dict[DeclarationKey, SourceFunctionFacts] = _sorted_by_key(
-            function_facts or {}
-        )
-        self._keys_by_name: dict[str, list[DeclarationKey]] | None = None
-        self._owner_keys: dict[int, DeclarationKey] | None = None
         # The digest of the document this index was read from (see identity).
         self._document_digest = document_digest
         self.conflicts = tuple(sorted(conflicts, key=lambda item: item.semantic_id))
@@ -262,7 +244,7 @@ class SourceIndex(SourceLayoutQueries):
 
     def targets(self) -> set[str]:
         """The targets any record belongs to."""
-        keys = (*self.declarations, *self.classes, *self.variables, *self.member_uses)
+        keys = (*self.declarations, *self.classes, *self.variables)
         found = {key.target for key in keys} | {item.target for item in self.markers}
         return {target for target in found if target is not None}
 
@@ -282,8 +264,6 @@ class SourceIndex(SourceLayoutQueries):
             classes=scoped(self.classes),
             markers=(item for item in self.markers if item.target == target),
             variables=scoped(self.variables),
-            member_uses=scoped(self.member_uses),
-            function_facts=scoped(self.function_facts),
             conflicts=(item for item in self.conflicts if item.target == target),
             abi=abi,
             target_abis={target: abi} if abi is not None else {},
@@ -311,55 +291,6 @@ class SourceIndex(SourceLayoutQueries):
                 projection.encode("utf-8")
             ).hexdigest()
         return self._document_digest
-
-    def call_facts_for(self, key: DeclarationKey) -> CallFacts | None:
-        """Clang's call facts for the declaration with this key."""
-        declaration = self.declarations.get(key)
-        return declaration.call if declaration is not None else None
-
-    def declaration_key_at(self, address: int) -> DeclarationKey | None:
-        """The key of the declaration a function marker at ``address`` (an
-        original-binary address) binds, when exactly one owner does."""
-        if self._owner_keys is None:
-            try:
-                owners = self.functions_by_address()
-            except SourceIndexError:
-                owners = {}
-            self._owner_keys = {
-                address: marker.declaration_key
-                for address, marker in owners.items()
-                if marker.declaration_key is not None
-            }
-        return self._owner_keys.get(address)
-
-    def call_facts_named(self, semantic_id: str) -> CallFacts | None:
-        """Call facts by mangled name alone: only when every declaration with
-        that name states the same facts. TU-local functions can share a
-        name; prefer ``call_facts_for`` with a marker's key."""
-        if self._keys_by_name is None:
-            self._keys_by_name = {}
-            for key in self.declarations:
-                self._keys_by_name.setdefault(key.semantic_id, []).append(key)
-        found = {
-            self.declarations[key].call
-            for key in self._keys_by_name.get(semantic_id, ())
-        }
-        return found.pop() if len(found) == 1 else None
-
-    def function_facts_for(self, key: DeclarationKey) -> FunctionFacts | None:
-        """Everything Clang states about one function body, or None when the
-        index knows nothing of it."""
-        accesses = self.member_uses.get(key, ())
-        facts = self.function_facts.get(key)
-        if key not in self.declarations and not accesses and facts is None:
-            return None
-        return FunctionFacts(
-            key,
-            self.call_facts_for(key),
-            accesses,
-            facts.calls if facts is not None else (),
-            facts.comparisons if facts is not None else (),
-        )
 
     def stale_sources(self, paths: Iterable[PurePath]) -> list[PurePath]:
         """Source files that changed, or appeared, since the index was collected."""
@@ -402,8 +333,6 @@ class SourceIndex(SourceLayoutQueries):
         classes: dict[DeclarationKey, SourceClass] = {}
         markers: list[SourceMarker] = []
         variables: dict[DeclarationKey, SourceVariable] = {}
-        member_uses: dict[DeclarationKey, tuple[SourceMemberUse, ...]] = {}
-        function_facts: dict[DeclarationKey, SourceFunctionFacts] = {}
         conflicts: list[SourceConflict] = []
         abis: dict[str, SourceAbi] = {}
         for target, unit_ids in targets.items():
@@ -424,8 +353,6 @@ class SourceIndex(SourceLayoutQueries):
             classes.update(target_classes)
             markers.extend(target_markers)
             variables.update(namespace.variables)
-            member_uses.update(namespace.member_uses)
-            function_facts.update(namespace.function_facts)
             conflicts.extend(namespace.conflicts)
             if namespace.abi is not None:
                 abis[target] = namespace.abi
@@ -441,8 +368,6 @@ class SourceIndex(SourceLayoutQueries):
             classes=classes,
             markers=markers,
             variables=variables,
-            member_uses=member_uses,
-            function_facts=function_facts,
             conflicts=conflicts,
             abi=distinct.pop() if len(distinct) == 1 else None,
             target_abis=abis,
@@ -485,26 +410,11 @@ class SourceIndex(SourceLayoutQueries):
                     declaration_key=key,
                 )
             )
-        member_uses: dict[DeclarationKey, list[SourceMemberUse]] = {}
-        for item in document["member_uses"]:
-            values = dict(item)
-            key = DeclarationKey(
-                values.pop("target"),
-                values["function_identity"],
-                values.pop("function_unit_id"),
-            )
-            member_uses.setdefault(key, []).append(_member_use_from_dict(values))
         return cls(
             declarations=declarations,
             classes=_keyed(document["classes"], _class_from_dict),
             markers=markers,
             variables=_keyed(document["variables"], _variable_from_dict),
-            member_uses=member_uses,
-            function_facts=_keyed(
-                document["function_facts"],
-                _function_facts_from_dict,
-                id_field="function",
-            ),
             conflicts=(_conflict_from_dict(item) for item in document["conflicts"]),
             abi=SourceAbi(**document["abi"]) if document["abi"] is not None else None,
             target_abis={
@@ -585,15 +495,6 @@ class SourceIndex(SourceLayoutQueries):
             "declarations": _flattened(self.declarations),
             "classes": _flattened(self.classes),
             "variables": _flattened(self.variables),
-            "member_uses": [
-                {**_plain(use), "target": key.target, "function_unit_id": key.unit_id}
-                for key, uses in self.member_uses.items()
-                for use in uses
-            ],
-            "function_facts": [
-                {**_plain(facts), "target": key.target, "unit_id": key.unit_id}
-                for key, facts in self.function_facts.items()
-            ],
             "conflicts": [_plain(item) for item in self.conflicts],
             "marker_blocks": [item.to_dict() for item in self.marker_blocks],
             "source_digests": self.source_digests,

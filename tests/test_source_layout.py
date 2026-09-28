@@ -5,20 +5,9 @@ from __future__ import annotations
 import dataclasses
 
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-from reccmp.compare.asm.operand import Mem, ScaledReg
-from reccmp.compare.diagnosis import (
-    ComparisonAnalysis,
-    ComparisonDifference,
-    DifferenceKind,
-    DifferenceSide,
-    Observed,
-)
-from reccmp.types import ImageId
-from reccmp.compare.functions import FunctionComparator
 from reccmp.source import (
     SourceBaseOffset,
     SourceClass,
@@ -28,14 +17,6 @@ from reccmp.source import (
 )
 from reccmp.source import SourceAbi, keyed
 from reccmp.source.derive import _layout_identity
-from reccmp.source.records import (
-    DeclarationKey,
-    SourceComparison,
-    SourceComparisonOperand,
-    SourceDeclaration,
-    SourceFunctionFacts,
-    SourceMarker,
-)
 
 
 def test_layout_identity_ignores_type_spelling():
@@ -482,9 +463,9 @@ def test_asserted_size_mismatch_untrusts_layout():
 
 def test_source_index_reader_fails_when_a_field_is_missing():
     document = SourceIndex(declarations={}, classes={}, markers=()).to_dict()
-    del document["member_uses"]
+    del document["variables"]
 
-    with pytest.raises(KeyError, match="member_uses"):
+    with pytest.raises(KeyError, match="variables"):
         SourceIndex.from_dict(document)
 
 
@@ -813,137 +794,3 @@ def test_cross_target_class_name_is_not_last_wins():
     dll_foo = dll.class_named("Foo")
     assert exe_foo is not None and exe_foo.size == 8
     assert dll_foo is not None and dll_foo.size == 4
-
-
-def test_enrich_memory_address_with_layout_facts():
-    index = _index_with_layout()
-    lines_db = MagicMock()
-    lines_db.find_line_of_recomp_address.return_value = None
-    comparator = FunctionComparator(
-        db=MagicMock(),
-        lines_db=lines_db,
-        orig_bin=MagicMock(),
-        recomp_bin=MagicMock(),
-        report=MagicMock(),
-        types=MagicMock(),
-        source_index=index,
-    )
-
-    match = MagicMock()
-    match.orig_addr = 0x401000
-    match.name = "Foo::setFlag"
-    match.best_name.return_value = "Foo::setFlag"
-
-    analysis = ComparisonAnalysis.mismatch(
-        ComparisonDifference(
-            DifferenceKind.MEMORY_ADDRESS,
-            DifferenceSide(
-                ImageId.ORIG,
-                0,
-                0x401010,
-                Observed(operand=Mem("", "", (ScaledReg("ecx", 1),), 8, ())),
-            ),
-            DifferenceSide(
-                ImageId.RECOMP,
-                1,
-                0x501010,
-                Observed(operand=Mem("", "", (ScaledReg("ecx", 1),), 12, ())),
-            ),
-        )
-    )
-    enriched = (
-        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
-            analysis, match=match
-        )
-    )
-    assert enriched.difference is not None
-    assert enriched.difference.orig.field is not None
-    assert enriched.difference.orig.field.class_name == "Foo"
-    assert enriched.difference.orig.field.path == ("flag",)
-    assert enriched.difference.orig.field.offset == 8
-    assert enriched.difference.recomp.field is not None
-    assert enriched.difference.recomp.field.path == ("tail",)
-
-
-def test_branch_condition_shows_the_source_comparisons_on_its_line():
-    """A signedness or predicate difference is explained by the type the
-    recompiled source compares in."""
-    key = DeclarationKey("TEST", "?f@@YAHF@Z")
-    comparison = SourceComparison(
-        operator="<",
-        type="int",
-        operands=(
-            SourceComparisonOperand("short", field="c:@S@Foo@FI@s"),
-            SourceComparisonOperand("int", constant=65),
-        ),
-        line=12,
-        offset=None,
-        bits=32,
-        signed=True,
-    )
-    other_line = dataclasses.replace(comparison, line=13, operator="==")
-    index = SourceIndex(
-        declarations={},
-        classes={},
-        markers=[
-            SourceMarker(
-                address=0x401000,
-                marker_kind="FUNCTION",
-                source_file="f.cpp",
-                line=10,
-                declaration=SourceDeclaration(
-                    key.semantic_id,
-                    "f",
-                    "free_function",
-                    "__cdecl",
-                    "int",
-                    ("short",),
-                    None,
-                    False,
-                    False,
-                    "f.cpp",
-                    11,
-                    14,
-                    True,
-                ),
-                target="TEST",
-                declaration_key=key,
-            )
-        ],
-        function_facts={
-            key: SourceFunctionFacts(key.semantic_id, (), (comparison, other_line))
-        },
-    )
-    lines_db = MagicMock()
-    lines_db.find_line_of_recomp_address.return_value = None
-    lines_db.find_line_containing_recomp_address.return_value = (Path("f.cpp"), 12)
-    comparator = FunctionComparator(
-        db=MagicMock(),
-        lines_db=lines_db,
-        orig_bin=MagicMock(),
-        recomp_bin=MagicMock(),
-        report=MagicMock(),
-        types=MagicMock(),
-        source_index=index,
-    )
-    match = MagicMock()
-    match.orig_addr = 0x401000
-    match.recomp_addr = 0x501000
-    analysis = ComparisonAnalysis.mismatch(
-        ComparisonDifference(
-            DifferenceKind.BRANCH_CONDITION,
-            DifferenceSide(ImageId.ORIG, 0, 0x401010, Observed(value="lt_u:...")),
-            DifferenceSide(ImageId.RECOMP, 0, 0x501010, Observed(value="lt_s:...")),
-        )
-    )
-
-    enriched = (
-        comparator._enrich_analysis_with_source(  # pylint: disable=protected-access
-            analysis, match=match
-        )
-    )
-
-    assert enriched.difference is not None
-    assert enriched.difference.recomp.source_comparisons == (comparison,)
-    assert not enriched.difference.orig.source_comparisons
-    lines_db.find_line_containing_recomp_address.assert_called_with(0x501010, 0x501000)

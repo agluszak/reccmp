@@ -13,11 +13,7 @@ DECLARATION = {
     "calling_convention": "__thiscall",
     "return_type": "int",
     "parameter_types": ["int"],
-    "source_signature": "int Vector::Grow(int value)",
-    "parameter_references": [False],
     "owning_class": "Vector",
-    "has_this": True,
-    "is_virtual": False,
     "source_file": "include/wiz8/vector.h",
     "line": 20,
     "end_line": 20,
@@ -76,8 +72,6 @@ def test_definition_replaces_a_declaration_from_another_unit() -> None:
     assert kept.is_definition
     assert (kept.line, kept.end_line) == (105, 118)
     assert kept.parameter_types == ("int",)
-    assert kept.source_signature == "int Vector::Grow(int value)"
-    assert kept.parameter_references == (False,)
 
 
 def test_class_is_kept_from_the_first_unit_that_located_it() -> None:
@@ -269,8 +263,6 @@ def test_static_and_external_linkage_conflict() -> None:
                 "return_type": "void",
                 "parameter_types": [],
                 "owning_class": None,
-                "has_this": False,
-                "is_virtual": False,
                 "source_file": "src/wiz8/a.c",
                 "line": 10,
                 "end_line": 12,
@@ -292,8 +284,6 @@ def test_static_and_external_linkage_conflict() -> None:
                 "return_type": "int",
                 "parameter_types": [],
                 "owning_class": None,
-                "has_this": False,
-                "is_virtual": False,
                 "source_file": "src/wiz8/b.c",
                 "line": 4,
                 "end_line": 4,
@@ -318,8 +308,6 @@ def test_variadic_is_part_of_the_declaration_signature() -> None:
         "return_type": "int",
         "parameter_types": ["const char *"],
         "owning_class": None,
-        "has_this": False,
-        "is_virtual": False,
         "source_file": "a.c",
         "line": 1,
         "end_line": 1,
