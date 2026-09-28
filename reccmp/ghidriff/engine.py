@@ -10,7 +10,6 @@ is shaped by the reconstruction's own types.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
-import bisect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,6 +18,14 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+from .locations import (
+    STRING_TYPES,
+    Extents,
+    Located,
+    Use,
+    access_size,
+    only_compared,
+)
 from .results import (
     AnalysisFailure,
     Contents,
@@ -46,11 +53,7 @@ _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
-_STRING_TYPES = (EntityType.STRING, EntityType.WIDECHAR)
 _PRISTINE_FOLDER = "pristine"
-# How far before the nearest array end to look for an array a loop bound
-# belongs to.
-_BOUND_SEARCH = 0x1000
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 1
@@ -60,131 +63,6 @@ ANALYSIS_REVISION = 1
 class _Decompiled:
     code: str | None
     error: str | None
-
-
-@dataclass(frozen=True)
-class _Located:
-    """Where a referenced address falls in the catalog of one image."""
-
-    start: int
-    offset: int
-    size: int | None
-    entity_type: EntityType | None
-    # The pair the location belongs to; None for unpaired catalog data.
-    named: NamedObject | None
-
-
-class _Extents:
-    """Catalog entities of one image, by the address range they occupy."""
-
-    def __init__(self, manifest: Manifest, image_id: ImageId):
-        spans = [
-            _Located(obj.addr(image_id), 0, obj.extent(image_id), obj.entity_type, obj)
-            for obj in manifest.objects
-        ] + [
-            _Located(entity.addr, 0, entity.size, entity.entity_type, None)
-            for entity in manifest.unpaired
-            if entity.image_id == image_id
-        ]
-        pairs = {obj.orig_addr: obj for obj in manifest.objects}
-        spans += [
-            _Located(
-                alias.addr,
-                0,
-                alias.size or pairs[alias.canonical_orig].extent(image_id),
-                pairs[alias.canonical_orig].entity_type,
-                pairs[alias.canonical_orig],
-            )
-            for alias in manifest.aliases
-            if alias.image_id == image_id and alias.canonical_orig in pairs
-        ]
-        spans.sort(key=lambda located: located.start)
-        self._starts = [located.start for located in spans]
-        self._spans = spans
-        # Paired objects of known extent, by the address just past them.
-        sized = sorted(
-            (span for span in spans if span.named is not None and span.size),
-            key=lambda span: span.start + (span.size or 0),
-        )
-        self._sized = sized
-        self._sized_ends = [span.start + (span.size or 0) for span in sized]
-
-    def containing(self, addr: int) -> _Located | None:
-        i = bisect.bisect_right(self._starts, addr) - 1
-        if i < 0:
-            return None
-        span = self._spans[i]
-        offset = addr - span.start
-        if offset == 0 or (span.size is not None and offset < span.size):
-            return _Located(span.start, offset, span.size, span.entity_type, span.named)
-        return None
-
-    def bound_at(self, addr: int) -> _Located | None:
-        """The paired object a loop bound at `addr` belongs to, located at
-        the bound's offset from it.
-
-        A loop over an array compares its pointer with the address just
-        past the array, or, stepping through one field of each element,
-        with that field's address in the element past the last: past the
-        array's end by less than one element, so by less than its size.
-        The exact end comes first; then a paired object starting at or
-        holding `addr` (other than a string, whose middle nothing compares
-        with), which the code compares with as itself; then the nearest
-        array whose end is that close."""
-        i = bisect.bisect_right(self._sized_ends, addr)
-        exact = i > 0 and self._sized_ends[i - 1] == addr
-        if not exact:
-            inside = self.containing(addr)
-            if inside is not None and inside.named is not None:
-                if inside.offset == 0 or inside.entity_type not in _STRING_TYPES:
-                    return None
-        for span in reversed(self._sized[:i]):
-            assert span.size is not None
-            offset = addr - span.start
-            if offset < 2 * span.size:
-                return _Located(
-                    span.start, offset, span.size, span.entity_type, span.named
-                )
-            if self._sized_ends[i - 1] - (span.start + span.size) > _BOUND_SEARCH:
-                break
-        return None
-
-
-def _only_compared(instruction: Any, value: int) -> bool:
-    """Whether an instruction uses a constant only to compare with it, by
-    its p-code: in comparisons, or in a difference kept only in a temporary
-    for the flags it sets."""
-    from ghidra.program.model.pcode import PcodeOp
-
-    comparisons = {
-        PcodeOp.INT_EQUAL,
-        PcodeOp.INT_NOTEQUAL,
-        PcodeOp.INT_LESS,
-        PcodeOp.INT_SLESS,
-        PcodeOp.INT_LESSEQUAL,
-        PcodeOp.INT_SLESSEQUAL,
-        PcodeOp.INT_CARRY,
-        PcodeOp.INT_SCARRY,
-        PcodeOp.INT_SBORROW,
-    }
-    used = False
-    for op in instruction.getPcode():
-        if not any(
-            vn.isConstant() and vn.getOffset() == value for vn in op.getInputs()
-        ):
-            continue
-        used = True
-        if op.getOpcode() in comparisons:
-            continue
-        output = op.getOutput()
-        if (
-            op.getOpcode() == PcodeOp.INT_SUB
-            and output is not None
-            and output.isUnique()
-        ):
-            continue
-        return False
-    return used
 
 
 def _literal_data_type(entity_type: EntityType | None, size: int | None) -> Any:
@@ -270,7 +148,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
         self._pair_types = {obj.orig_addr: obj.entity_type for obj in manifest.objects}
         self._extents = {
-            image_id: _Extents(manifest, image_id)
+            image_id: Extents(manifest, image_id)
             for image_id in (ImageId.ORIG, ImageId.RECOMP)
         }
         self._failures: dict[int, list[AnalysisFailure]] = {}
@@ -694,7 +572,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
             if function is None:
                 continue
-            targets: dict[tuple[int, ObjectOffset | None], "Address"] = {}
+            targets: dict[Use, "Address"] = {}
             for instruction in program.getListing().getInstructions(
                 function.getBody(), True
             ):
@@ -706,18 +584,24 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         and functions.getFunctionContaining(to) is None
                         and self._is_data(image_id, to.getOffset())
                     ):
-                        end = self._compared_end(
+                        bound = self._compared_end(
                             image_id, instruction, ref.getOperandIndex(), to
                         )
-                        if end is not None:
-                            self._name_end(program, instruction, ref, end)
-                        else:
+                        access = access_size(instruction, to.getOffset())
+                        if bound is not None:
+                            self._name_end(program, instruction, ref, bound)
+                        elif access is None:
                             to = self._string_start(program, image_id, to)
-                        targets.setdefault((to.getOffset(), end), to)
+                        targets.setdefault(Use(to.getOffset(), bound, access), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
-                self._reference(program, image_id, to, end)
-                for (_, end), to in sorted(
-                    targets.items(), key=lambda item: (item[0][0], item[0][1] is None)
+                self._reference(program, image_id, to, use)
+                for use, to in sorted(
+                    targets.items(),
+                    key=lambda item: (
+                        item[0].addr,
+                        item[0].bound is None,
+                        item[0].access or 0,
+                    ),
                 )
             )
 
@@ -733,7 +617,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
         located = self._extents[image_id].containing(address.getOffset())
         if located is not None:
-            if located.entity_type in _STRING_TYPES:
+            if located.entity_type in STRING_TYPES:
                 return address.subtract(located.offset)
             return address
         data = program.getListing().getDataContaining(address)
@@ -745,7 +629,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
     ) -> ObjectOffset | None:
         """The paired array a constant an instruction only compares with is
-        a loop bound over (see `_Extents.bound_at`), with the bound's offset.
+        a loop bound over (see `Extents.bound_at`), with the bound's offset.
 
         A bound past an array's end lies at or in whatever the linker placed
         next, which differs between the binaries; Ghidra names it after
@@ -756,7 +640,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         scalar = instruction.getScalar(operand)
         if scalar is None or scalar.getUnsignedValue() != to.getOffset():
             return None
-        if not _only_compared(instruction, to.getOffset()):
+        if not only_compared(instruction, to.getOffset()):
             return None
         orig_addr = ended.named.orig_addr
         return ObjectOffset(orig_addr, self._names[orig_addr], ended.offset)
@@ -788,17 +672,18 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         program: "Program",
         image_id: ImageId,
         address: "Address",
-        end: ObjectOffset | None = None,
+        use: Use,
     ) -> DataReference:
-        if end is not None:
-            return DataReference(address.getOffset(), end, PastEnd())
+        if use.bound is not None:
+            return DataReference(address.getOffset(), use.bound, PastEnd())
         located = self._extents[image_id].containing(address.getOffset())
         if located is None:
-            return DataReference(
-                address.getOffset(),
-                None,
-                self._ghidra_contents(program, image_id, address),
+            contents = (
+                self._accessed_contents(program, image_id, address, use.access)
+                if use.access is not None
+                else self._ghidra_contents(program, image_id, address)
             )
+            return DataReference(address.getOffset(), None, contents)
         obj = None
         if located.named is not None:
             obj = ObjectOffset(
@@ -821,7 +706,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         program: "Program",
         image_id: ImageId,
         address: "Address",
-        located: _Located,
+        located: Located,
     ) -> Contents:
         """Contents over the catalog's extent for the entity, the same way
         in both images, whatever Ghidra's data typing on either side."""
@@ -833,8 +718,22 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         raw, relocated = read
         if relocated and self._relocation_at(program, address) and len(raw) >= 4:
             return self._pointer(program, image_id, raw)
-        if located.entity_type in _STRING_TYPES and not relocated:
+        if located.entity_type in STRING_TYPES and not relocated:
             return _decode_string(raw, located.entity_type)
+        return RawBytes(raw, relocated, extent_known=True)
+
+    def _accessed_contents(
+        self, program: "Program", image_id: ImageId, address: "Address", size: int
+    ) -> Contents:
+        """The bytes an instruction loads or stores at a location the
+        catalog does not know: what the function uses, whatever Ghidra's
+        data typing there (two float constants typed as one string)."""
+        read = self._read(program, address, size)
+        if read is None:
+            return Uninitialized()
+        raw, relocated = read
+        if relocated and self._relocation_at(program, address) and len(raw) >= 4:
+            return self._pointer(program, image_id, raw)
         return RawBytes(raw, relocated, extent_known=True)
 
     def _ghidra_contents(
@@ -926,7 +825,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             )
         if (
             located is not None
-            and located.entity_type in _STRING_TYPES
+            and located.entity_type in STRING_TYPES
             and located.size is not None
         ):
             read = self._read(program, target, located.size - located.offset)

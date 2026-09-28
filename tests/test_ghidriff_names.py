@@ -9,11 +9,8 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.engine import (  # pylint: disable=protected-access
-    _Extents,
-    canonical_names,
-    unpaired_names,
-)
+from reccmp.ghidriff.engine import canonical_names, unpaired_names
+from reccmp.ghidriff.locations import Extents
 from reccmp.types import EntityType, ImageId
 
 
@@ -71,9 +68,9 @@ def _data(orig_addr: int, name: str, size: int, entity_type=EntityType.DATA):
     )
 
 
-def _extents(*objects: NamedObject) -> _Extents:
+def _extents(*objects: NamedObject) -> Extents:
     binary = BinaryInput(Path("x"), "0")
-    return _Extents(Manifest("T", binary, binary, (), objects, ()), ImageId.ORIG)
+    return Extents(Manifest("T", binary, binary, (), objects, ()), ImageId.ORIG)
 
 
 def test_a_loop_bound_at_an_array_end_belongs_to_the_array():
