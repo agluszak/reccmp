@@ -59,6 +59,7 @@ from .analyze import (
     import_sections,
     normalize_original_zero_size_data,
     classify_exact_vtable_aliases,
+    classify_folded_function_aliases,
     match_inferred_vtables_by_slots,
 )
 from .ingest import (
@@ -254,6 +255,7 @@ class Compare:
         match_ref(self._db, self.report)
         match_inferred_vtables_by_slots(self._db, self.orig_bin, self.recomp_bin)
         classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
+        classify_folded_function_aliases(self._db, self.orig_bin, self.recomp_bin)
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)
 
