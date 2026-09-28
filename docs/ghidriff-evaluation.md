@@ -1,4 +1,11 @@
-# Ghidriff POC — findings
+# Ghidriff evaluation (proof of concept)
+
+The evaluation that led to comparing code with Ghidriff (`reccmp-reccmp`,
+see `code-comparison.md`). It ran a disposable engine outside reccmp on 50
+Wizardry 8 pairs; the production adapter replaced its content-derived data
+names with catalog correspondence and its string scanner with Ghidra's
+`StringDataInstance`, and reports every requested pair.
+
 
 Run: `Wiz8-retail.exe` vs `Wiz8-recomp.exe` (repin pre-fix build), 50 supplied
 reccmp pairs, 48 matched, 2 skipped (no Ghidra function at one side:
