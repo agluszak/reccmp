@@ -499,6 +499,28 @@ def test_create_fixed_base_import_thunk_from_six_byte_function(db: EntityDb):
     assert non_thunk.get("type") == EntityType.FUNCTION
 
 
+def test_source_matched_import_jump_remains_function(db: EntityDb):
+    """A named callback must remain in the function comparison set."""
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x3000, type=EntityType.FUNCTION, size=5)
+        batch.set(ImageId.RECOMP, 0x2000, type=EntityType.FUNCTION, size=6)
+        batch.match(0x3000, 0x2000, basis=PairBasis.ANNOTATION)
+
+    binfile = Mock(spec=PEImage)
+    binfile.imports = (ImageImport(addr=0x1000, module="TEST", name="Hello"),)
+    binfile.get_code_regions.return_value = (
+        ImageRegion(0x2000, b"\xff\x25\x00\x10\x00\x00"),
+    )
+    binfile.relocations = set()
+
+    create_import_thunks(db, ImageId.RECOMP, binfile)
+
+    function = db.get(ImageId.RECOMP, 0x2000)
+    assert function is not None
+    assert function.get("type") == EntityType.FUNCTION
+    assert list(db.get_functions()) == [function]
+
+
 def test_create_import_thunks_pe_only(db: EntityDb):
     """At the moment, we have seen import thunks on PE images only.
     create_import_thunks should be a no-op if the image is not PE."""
