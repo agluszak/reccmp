@@ -19,6 +19,11 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
 from .imports import import_locations, known_purge
+from .preparation import (
+    correct_import_purges,
+    infer_requested_callee_parameters,
+    recover_requested_switches,
+)
 from .locations import (
     STRING_TYPES,
     Extents,
@@ -215,7 +220,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         if GhidraProgramUtilities.shouldAskToAnalyze(program):
             transaction = program.startTransaction("reccmp import purges")
             try:
-                self._correct_import_purges(program)
+                correct_import_purges(program)
                 if self.focused_switch_analysis:
                     self.set_analysis_option(
                         program, "Decompiler Switch Analysis", False
@@ -227,40 +232,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         )
 
     # --- program preparation ----------------------------------------------
-
-    @staticmethod
-    def _correct_import_purges(program: "Program") -> None:
-        """Give imports the caller cleans up after a stack purge of zero.
-
-        With the imported library beside the binary, Ghidra takes each
-        import's stack purge from its own analysis of the library. That
-        analysis may count arguments pushed on a path that never returns,
-        such as a failed assertion's call to exit, as the function's own
-        purge. A caller that cleans up after the call then leaves the
-        decompiler's stack pointer off by that amount for the rest of the
-        function, and the parameter analysis gives its callers parameters
-        they do not have. A variadic or `__cdecl` function never pops its
-        arguments; the signature comes from the import's mangled name,
-        before analysis has applied it."""
-        from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
-        from ghidra.program.model.lang import CompilerSpec
-
-        for function in program.getFunctionManager().getExternalFunctions():
-            if function.getStackPurgeSize() == 0:
-                continue
-            imported = function.getExternalLocation().getOriginalImportedName()
-            demangled = DemanglerUtil.demangle(imported or function.getName())
-            if not isinstance(demangled, DemangledFunction):
-                continue
-            if (
-                demangled.getCallingConvention()
-                == CompilerSpec.CALLING_CONVENTION_cdecl
-                or any(
-                    parameter.getType().isVarArgs()
-                    for parameter in demangled.getParameters()
-                )
-            ):
-                function.setStackPurgeSize(0)
 
     def _pair_type(self, orig_addr: int) -> EntityType | None:
         return self._pair_types.get(orig_addr)
@@ -390,6 +361,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         program = self.project.openProgram(
             "/", self.gen_proj_bin_name_from_path(path), False
         )
+        requested = [
+            self._entry_addr(entry, image_id) for entry in self._comparable_entries()
+        ]
         try:
             transaction = program.startTransaction("reccmp functions")
             try:
@@ -402,7 +376,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             try:
                 FlatProgramAPI(program).analyzeChanges(program)
                 if self.focused_switch_analysis:
-                    self._recover_requested_switches(program, image_id)
+                    recover_requested_switches(program, requested)
                     FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
@@ -411,7 +385,13 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp names")
             try:
                 self._align_data_types(program, image_id)
-                self._infer_requested_callee_parameters(program, image_id)
+                paired = {
+                    addr
+                    for obj in self.manifest.objects
+                    if obj.entity_type in _FUNCTION_TYPES
+                    and (addr := obj.addr(image_id)) is not None
+                }
+                infer_requested_callee_parameters(program, requested, paired)
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
             finally:
@@ -420,86 +400,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self.project.save(program)
         finally:
             self.project.close(program)
-
-    def _infer_requested_callee_parameters(
-        self, program: "Program", image_id: ImageId
-    ) -> None:
-        """Infer paired callees' ABI from each image before decompiling callers.
-
-        Ghidra can assign an outer call's early-pushed argument to an untyped
-        inner callee. Its native Parameter ID pass resolves the callee's
-        arity from its own body, without projecting reconstruction types.
-        Restrict the pass to paired direct callees of requested functions so
-        focused comparisons do not analyze the whole image.
-        """
-        from ghidra.app.cmd.function import DecompilerParameterIdCmd
-        from ghidra.program.model.address import AddressSet
-        from ghidra.program.model.symbol import SourceType
-        from ghidra.util.task import TaskMonitor
-
-        paired = {
-            obj.addr(image_id)
-            for obj in self.manifest.objects
-            if obj.entity_type in _FUNCTION_TYPES
-        }
-        functions = program.getFunctionManager()
-        space = program.getAddressFactory().getDefaultAddressSpace()
-        entries = AddressSet()
-        for entry in self._comparable_entries():
-            root = functions.getFunctionAt(
-                space.getAddress(self._entry_addr(entry, image_id))
-            )
-            if root is None:
-                continue
-            for callee in root.getCalledFunctions(TaskMonitor.DUMMY):
-                if (
-                    callee.getEntryPoint().getOffset() in paired
-                    and callee.getSignatureSource() == SourceType.DEFAULT
-                ):
-                    entries.add(callee.getEntryPoint())
-        if entries.isEmpty():
-            return
-        command = DecompilerParameterIdCmd(
-            "reccmp paired callees", entries, SourceType.ANALYSIS, False, False, 15
-        )
-        if not command.applyTo(program, TaskMonitor.DUMMY):
-            raise RuntimeError(f"Ghidra Parameter ID failed: {command.getStatusMsg()}")
-
-    def _recover_requested_switches(
-        self, program: "Program", image_id: ImageId
-    ) -> None:
-        """Run Ghidra's switch command on the functions this run compares."""
-        from ghidra.app.cmd.function import DecompilerSwitchAnalysisCmd
-        from ghidra.app.decompiler import DecompInterface
-        from ghidra.app.plugin.core.analysis import SwitchAnalysisDecompileConfigurer
-        from ghidra.util.task import TaskMonitor
-
-        functions = program.getFunctionManager()
-        space = program.getAddressFactory().getDefaultAddressSpace()
-        decompiler = DecompInterface()
-        try:
-            SwitchAnalysisDecompileConfigurer(program).configure(decompiler)
-            if not decompiler.openProgram(program):
-                raise RuntimeError("Could not open program for switch analysis")
-            for entry in self._comparable_entries():
-                function = functions.getFunctionAt(
-                    space.getAddress(self._entry_addr(entry, image_id))
-                )
-                if function is None:
-                    continue
-                results = decompiler.decompileFunction(function, 60, TaskMonitor.DUMMY)
-                if not results.decompileCompleted():
-                    raise RuntimeError(
-                        f"Switch analysis failed at {function.getEntryPoint()}"
-                    )
-                if not DecompilerSwitchAnalysisCmd(results).applyTo(
-                    program, TaskMonitor.DUMMY
-                ):
-                    raise RuntimeError(
-                        f"Switch recovery failed at {function.getEntryPoint()}"
-                    )
-        finally:
-            decompiler.dispose()
 
     def _create_functions(self, program: "Program", image_id: ImageId) -> None:
         """Make functions at the entries the catalog knows, through Ghidra's
