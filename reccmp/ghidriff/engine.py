@@ -291,6 +291,42 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 domain_file.delete()
                 saved.copyTo(root, TaskMonitor.DUMMY)
 
+    def align_memory_permissions(self, orig: Path, recomp: Path) -> None:
+        """Give the original's memory blocks the write permission of the
+        recompiled blocks with the same name.
+
+        A packer or copy protection may leave the original's read-only
+        sections writable. The decompiler folds a read of read-only memory
+        into its value, so the same instruction would show a constant in one
+        program and a name in the other. The recompiled image is the
+        linker's own output, so its permissions are the ones both get."""
+        recomp_program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(recomp), True
+        )
+        try:
+            writable = {
+                block.getName(): block.isWrite()
+                for block in recomp_program.getMemory().getBlocks()
+            }
+        finally:
+            self.project.close(recomp_program)
+
+        program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(orig), False
+        )
+        try:
+            transaction = program.startTransaction("reccmp permissions")
+            try:
+                for block in program.getMemory().getBlocks():
+                    write = writable.get(block.getName())
+                    if write is not None and write != block.isWrite():
+                        block.setWrite(write)
+            finally:
+                program.endTransaction(transaction, True)
+            self.project.save(program)
+        finally:
+            self.project.close(program)
+
     def prepare_program(self, path: Path, image_id: ImageId) -> None:
         """Give one analyzed program reccmp's functions and names, and record
         the data each requested function refers to."""

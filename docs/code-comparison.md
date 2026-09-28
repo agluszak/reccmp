@@ -48,6 +48,11 @@ decompiler failed (`decompile-error`).
 
 Both programs are analyzed the same way, without debug information. Then:
 
+- the original's memory blocks get the write permission of the recompiled
+  blocks with the same name. A packed or protected original can have writable
+  read-only sections, and the decompiler folds reads of read-only memory into
+  constants: without this, a `const` global would show as a name in one
+  program and as its value in the other;
 - functions are created at every entry the catalog knows, with Ghidra's own
   commands;
 - every pair gets one name in both programs, its reccmp name (qualified with

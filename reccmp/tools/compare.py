@@ -168,6 +168,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         engine.prune_programs([orig, recomp])
         engine.analyze_project()
         engine.reset_programs()
+        engine.align_memory_permissions(orig, recomp)
         engine.prepare_program(orig, ImageId.ORIG)
         engine.prepare_program(recomp, ImageId.RECOMP)
         pdiff = engine.diff_bins(orig, recomp, force_diff=True)
