@@ -163,6 +163,27 @@ def test_symbol_overwrite(binfile: PEImage):
     assert entity.get("symbol") == "_strlwr"
 
 
+def test_public_only_crt_functions_keep_all_names(binfile: PEImage):
+    parser = CvdumpParser()
+    parser.read_section(
+        "PUBLICS",
+        dedent("""\
+            S_PUB32: [0001:0008B410], Flags: 00000002, _atexit
+            S_PUB32: [0001:0008B430], Flags: 00000002, __chkstk
+            S_PUB32: [0001:0008B430], Flags: 00000002, __alloca_probe
+            """),
+    )
+    db = EntityDb()
+    load_cvdump(CvdumpAnalysis(parser), db, binfile)
+
+    atexit = db.get(ImageId.RECOMP, 0x1008C410)
+    probe = db.get(ImageId.RECOMP, 0x1008C430)
+    assert atexit is not None and atexit.get("type") == EntityType.FUNCTION
+    assert atexit.get("name") == "atexit"
+    assert probe is not None and probe.get("type") == EntityType.FUNCTION
+    assert probe.fact(ImageId.RECOMP, "public_names") == ("__chkstk", "__alloca_probe")
+
+
 def test_string_without_section_contrib(binfile: PEImage):
     """Can create the string entity even if we don't have the exact length
     from the entry in SECTION CONTRIBUTIONS."""

@@ -135,13 +135,17 @@ def match_functions(
         name = ent.get("name")
         if ent.get("type") and ent.get("type") != EntityType.FUNCTION:
             continue
-        if not name:
+        public_names = ent.fact(ImageId.RECOMP, "public_names", ())
+        names = public_names or ((name,) if name else ())
+        if not names:
             continue
-        if truncate:
-            name = name[:255]
-        name = match_name(name)
         assert ent.recomp_addr is not None
-        name_index.add(name, ent.recomp_addr)
+        for candidate_name in dict.fromkeys(names):
+            if truncate:
+                candidate_name = candidate_name[:255]
+            candidate_name = match_name(candidate_name)
+            if ent.recomp_addr not in name_index.get(candidate_name):
+                name_index.add(candidate_name, ent.recomp_addr)
         if symbol is not None:
             recomp_symbols[ent.recomp_addr] = symbol
 

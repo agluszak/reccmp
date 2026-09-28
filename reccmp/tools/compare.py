@@ -2,8 +2,11 @@
 """reccmp-reccmp: decompile and diff reconstructed functions with Ghidriff."""
 
 import argparse
+import contextlib
 import json
 import logging
+import sys
+import time
 from pathlib import Path
 
 import colorama
@@ -130,6 +133,14 @@ def _selection(args: argparse.Namespace, target: RecCmpTarget):
     return select
 
 
+@contextlib.contextmanager
+def _stage(name: str):
+    """Report how long a pipeline stage took; the whole run is minutes long."""
+    start = time.monotonic()
+    yield
+    print(f"[STAGE] {name}: {time.monotonic() - start:.0f}s", file=sys.stderr, flush=True)
+
+
 def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manifest):
     # pylint: disable=import-outside-toplevel
     # Importing the engine does not start the JVM, but it does need ghidriff.
@@ -165,19 +176,26 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     try:
-        engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
-        engine.prune_programs([orig, recomp])
-        engine.align_import_purges(orig, recomp)
-        engine.analyze_project()
-        engine.reset_programs()
-        engine.align_import_purges(orig, recomp)
-        engine.align_memory_permissions(orig, recomp)
-        engine.prepare_program(orig, ImageId.ORIG)
-        engine.prepare_program(recomp, ImageId.RECOMP)
-        pdiff = engine.diff_pairs(
-            orig, recomp, engine.function_matches(), force_diff=True
-        )
-        results = engine.results()
+        with _stage("set up project"):
+            engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
+            engine.prune_programs([orig, recomp])
+            engine.align_import_purges(orig, recomp)
+        with _stage("analyze programs"):
+            engine.analyze_project()
+        with _stage("reset and align programs"):
+            engine.reset_programs()
+            engine.align_import_purges(orig, recomp)
+            engine.align_memory_permissions(orig, recomp)
+        with _stage("prepare original"):
+            engine.prepare_program(orig, ImageId.ORIG)
+        with _stage("prepare recompiled"):
+            engine.prepare_program(recomp, ImageId.RECOMP)
+        with _stage("decompile and diff"):
+            pdiff = engine.diff_pairs(
+                orig, recomp, engine.function_matches(), force_diff=True
+            )
+        with _stage("collect results"):
+            results = engine.results()
     finally:
         engine.project.close()
 
@@ -195,14 +213,15 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         for func in pdiff["functions"]["modified"]
         if int(func["old"]["address"], 16) in differing
     ]
-    engine.dump_pdiff_to_path(
-        f"{manifest.target_id}.ghidriff",
-        pdiff,
-        output,
-        side_by_side=args.side_by_side,
-        max_section_funcs=len(differing) or 1,
-        md_title=f"{manifest.target_id}: reconstructed functions with differences",
-    )
+    with _stage("write Ghidriff report"):
+        engine.dump_pdiff_to_path(
+            f"{manifest.target_id}.ghidriff",
+            pdiff,
+            output,
+            side_by_side=args.side_by_side,
+            max_section_funcs=len(differing) or 1,
+            md_title=f"{manifest.target_id}: reconstructed functions with differences",
+        )
 
     inputs = RunInputs(
         manifest_sha256=manifest.digest(),

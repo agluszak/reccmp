@@ -22,6 +22,7 @@ from reccmp.compare.analyze import (
     create_seh_entities,
     normalize_original_zero_size_data,
     classify_exact_vtable_aliases,
+    classify_folded_vtable_aliases,
     match_inferred_vtables_by_slots,
 )
 from reccmp.analysis.funcinfo import (
@@ -652,6 +653,26 @@ def test_classify_exact_vtable_aliases(db: EntityDb):
     classify_exact_vtable_aliases(db, orig_bin, recomp_bin)
 
     assert db.alias_canonical_orig(ImageId.ORIG, 0x1100) == 0x1000
+
+
+def test_classify_folded_vtable_aliases_by_paired_slots(db: EntityDb):
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x1000, type=EntityType.FUNCTION, size=1)
+        batch.set(ImageId.RECOMP, 0x2000, type=EntityType.FUNCTION, size=1)
+        batch.match(0x1000, 0x2000, basis=PairBasis.ANNOTATION)
+        batch.set(ImageId.ORIG, 0x3000, type=EntityType.VTABLE, name="First", size=4)
+        batch.set(ImageId.RECOMP, 0x4000, type=EntityType.VTABLE, name="First", size=4)
+        batch.match(0x3000, 0x4000, basis=PairBasis.ANNOTATION)
+        batch.set(ImageId.RECOMP, 0x4100, type=EntityType.VTABLE, name="Second", size=4)
+
+    orig_bin = Mock(spec=PEImage)
+    recomp_bin = Mock(spec=PEImage)
+    orig_bin.read.return_value = struct.pack("<I", 0x1000)
+    recomp_bin.read.side_effect = lambda addr, size: struct.pack("<I", 0x2000)
+
+    classify_folded_vtable_aliases(db, orig_bin, recomp_bin)
+
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x4100) == 0x3000
 
 
 def test_match_inferred_vtables_requires_exact_slot_identities(db: EntityDb):
