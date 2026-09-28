@@ -63,7 +63,7 @@ _RAW_LIMIT = 64
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 1
+PREPARATION_REVISION = 3
 
 
 @dataclass(frozen=True)
@@ -411,6 +411,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp names")
             try:
                 self._align_data_types(program, image_id)
+                self._infer_requested_callee_parameters(program, image_id)
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
             finally:
@@ -419,6 +420,50 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self.project.save(program)
         finally:
             self.project.close(program)
+
+    def _infer_requested_callee_parameters(
+        self, program: "Program", image_id: ImageId
+    ) -> None:
+        """Infer paired callees' ABI from each image before decompiling callers.
+
+        Ghidra can assign an outer call's early-pushed argument to an untyped
+        inner callee. Its native Parameter ID pass resolves the callee's
+        arity from its own body, without projecting reconstruction types.
+        Restrict the pass to paired direct callees of requested functions so
+        focused comparisons do not analyze the whole image.
+        """
+        from ghidra.app.cmd.function import DecompilerParameterIdCmd
+        from ghidra.program.model.address import AddressSet
+        from ghidra.program.model.symbol import SourceType
+        from ghidra.util.task import TaskMonitor
+
+        paired = {
+            obj.addr(image_id)
+            for obj in self.manifest.objects
+            if obj.entity_type in _FUNCTION_TYPES
+        }
+        functions = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        entries = AddressSet()
+        for entry in self._comparable_entries():
+            root = functions.getFunctionAt(
+                space.getAddress(self._entry_addr(entry, image_id))
+            )
+            if root is None:
+                continue
+            for callee in root.getCalledFunctions(TaskMonitor.DUMMY):
+                if (
+                    callee.getEntryPoint().getOffset() in paired
+                    and callee.getSignatureSource() == SourceType.DEFAULT
+                ):
+                    entries.add(callee.getEntryPoint())
+        if entries.isEmpty():
+            return
+        command = DecompilerParameterIdCmd(
+            "reccmp paired callees", entries, SourceType.ANALYSIS, False, False, 15
+        )
+        if not command.applyTo(program, TaskMonitor.DUMMY):
+            raise RuntimeError(f"Ghidra Parameter ID failed: {command.getStatusMsg()}")
 
     def _recover_requested_switches(
         self, program: "Program", image_id: ImageId
