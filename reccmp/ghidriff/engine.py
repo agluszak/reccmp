@@ -18,6 +18,7 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+from .imports import import_locations, known_purge
 from .locations import (
     STRING_TYPES,
     Extents,
@@ -25,6 +26,7 @@ from .locations import (
     Use,
     access_size,
     only_compared,
+    register_operand,
 )
 from .results import (
     AnalysisFailure,
@@ -94,30 +96,6 @@ def _decode_string(raw: bytes, entity_type: EntityType | None) -> StringValue:
     wide = entity_type == EntityType.WIDECHAR
     text = raw.decode("utf-16-le" if wide else "latin1", errors="replace")
     return StringValue(text.split("\0", 1)[0])
-
-
-def _import_locations(program: "Program") -> dict[tuple[str, str], Any]:
-    """A program's imports by library and imported name."""
-    manager = program.getExternalManager()
-    locations = {}
-    for library in manager.getExternalLibraryNames():
-        iterator = manager.getExternalLocations(library)
-        while iterator.hasNext():
-            location = iterator.next()
-            name = location.getOriginalImportedName() or location.getLabel()
-            locations[(str(library).upper(), str(name))] = location
-    return locations
-
-
-def _known_purge(location: Any) -> int | None:
-    """An import's stack purge, if its function has a known one."""
-    from ghidra.program.model.listing import Function
-
-    function = location.getFunction() if location is not None else None
-    if function is None:
-        return None
-    purge = int(function.getStackPurgeSize())
-    return None if purge == Function.UNKNOWN_STACK_DEPTH_CHANGE else purge
 
 
 def unpaired_names(
@@ -332,7 +310,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             for path in (orig, recomp)
         ]
         try:
-            imports = [_import_locations(program) for program in programs]
+            imports = [import_locations(program) for program in programs]
             for program, own, other in (
                 (programs[0], imports[0], imports[1]),
                 (programs[1], imports[1], imports[0]),
@@ -341,8 +319,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 try:
                     for key, location in own.items():
                         counterpart = other.get(key)
-                        purge = _known_purge(counterpart)
-                        if purge is None or _known_purge(location) is not None:
+                        purge = known_purge(counterpart)
+                        if purge is None or known_purge(location) is not None:
                             continue
                         # Before analysis an import is only a location; its
                         # function is what carries the purge.
@@ -682,6 +660,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         and to.isMemoryAddress()
                         and functions.getFunctionContaining(to) is None
                         and self._is_data(image_id, to.getOffset())
+                        and not register_operand(instruction, ref.getOperandIndex())
                     ):
                         bound = self._compared_end(
                             image_id, instruction, ref.getOperandIndex(), to
@@ -689,7 +668,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         access = access_size(instruction, to.getOffset())
                         if bound is not None:
                             self._name_end(program, instruction, ref, bound)
-                        elif access is None:
+                        else:
+                            bound = self._iterated_past_end(
+                                image_id, instruction, ref.getOperandIndex(), to
+                            )
+                        if bound is None and access is None:
                             to = self._string_start(program, image_id, to)
                         targets.setdefault(Use(to.getOffset(), bound, access), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
@@ -743,6 +726,35 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             return None
         orig_addr = ended.named.orig_addr
         return ObjectOffset(orig_addr, self._names[orig_addr], ended.offset)
+
+    def _iterated_past_end(
+        self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
+    ) -> ObjectOffset | None:
+        """The paired array a register-relative access runs past, when
+        Ghidra's constant propagation follows a loop over it one iteration
+        further than the loop bound allows.
+
+        The address lies past the array's end by less than the array's
+        size, in whatever the linker placed next, and differs between the
+        binaries. It is the array's, at that offset, with no contents."""
+        from ghidra.program.model.lang import OperandType
+        from ghidra.program.model.scalar import Scalar
+
+        if not OperandType.isDynamic(instruction.getOperandType(operand)):
+            return None
+        if any(
+            isinstance(part, Scalar) and part.getUnsignedValue() == to.getOffset()
+            for part in instruction.getOpObjects(operand)
+        ):
+            # The operand names the address itself: a table access.
+            return None
+        past = self._extents[image_id].bound_at(to.getOffset())
+        if past is None or past.named is None or past.size is None:
+            return None
+        if past.offset < past.size:
+            return None
+        orig_addr = past.named.orig_addr
+        return ObjectOffset(orig_addr, self._names[orig_addr], past.offset)
 
     def _name_end(
         self, program: "Program", instruction: Any, ref: Any, end: ObjectOffset
