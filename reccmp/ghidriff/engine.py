@@ -137,6 +137,9 @@ def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:
     }
 
 
+# Matches come from the manifest through `diff_pairs` only; Ghidriff's
+# unused matcher raises NotImplementedError, which pylint reads as abstract.
+# pylint: disable-next=abstract-method
 class ReccmpDiffEngine(GhidraDiffEngine):
     """A GhidraDiffEngine whose function matches come from a manifest."""
 
@@ -163,10 +166,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         """Neither program gets debug information: the comparison is of the
         binaries as Ghidra sees them, under reccmp's names only."""
         return None
-
-    def find_matches(self, p1: "Program", p2: "Program") -> list:
-        """Pairs come from the catalog only, through `diff_pairs`."""
-        raise NotImplementedError("reccmp supplies its pairs to diff_pairs")
 
     def function_matches(self) -> list[FunctionMatch]:
         """Every requested pair that has a function on both sides."""
