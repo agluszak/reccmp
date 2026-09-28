@@ -711,6 +711,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         )
                         if end is not None:
                             self._name_end(program, instruction, ref, end)
+                        else:
+                            to = self._string_start(program, image_id, to)
                         targets.setdefault((to.getOffset(), end), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
                 self._reference(program, image_id, to, end)
@@ -718,6 +720,26 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     targets.items(), key=lambda item: (item[0][0], item[0][1] is None)
                 )
             )
+
+    def _string_start(
+        self, program: "Program", image_id: ImageId, address: "Address"
+    ) -> "Address":
+        """The string an address inside a string belongs to.
+
+        Scanning a string, as an inlined strlen does, leaves Ghidra's
+        constant propagation with a reference a byte or so into it; the
+        function refers to the string, not to its tail."""
+        from ghidra.program.model.data import StringDataInstance
+
+        located = self._extents[image_id].containing(address.getOffset())
+        if located is not None:
+            if located.entity_type in _STRING_TYPES:
+                return address.subtract(located.offset)
+            return address
+        data = program.getListing().getDataContaining(address)
+        if data is not None and StringDataInstance.isString(data):
+            return data.getMinAddress()
+        return address
 
     def _compared_end(
         self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
