@@ -98,6 +98,16 @@ def match_symbols(
 _ELABORATED_ARGUMENT = re.compile(r"([<,])\s*(?:class|struct|union|enum)\s+")
 _ARGUMENT_SPACE = re.compile(r"\s*,\s*")
 _CLOSING_SPACE = re.compile(r">\s+(?=>)")
+_VALUE_ARGUMENT = re.compile(r"(?<=[<,])(true|false|0[xX][0-9a-fA-F]+)(?=[,>])")
+
+
+def _value_argument(match: re.Match[str]) -> str:
+    value = match.group(1)
+    if value == "true":
+        return "1"
+    if value == "false":
+        return "0"
+    return str(int(value, 16))
 
 
 def match_name(name: str) -> str:
@@ -107,12 +117,15 @@ def match_name(name: str) -> str:
     pointer or reference sigil (``T *>``), the elaborated keyword of a class
     argument (``<T, class U, 1>``), a space after each comma and between
     closing brackets (``> >``). Annotation-side names spell them tight
-    (``<T,U,1>``, ``T*>``, ``>>``). None of it carries identity, so names
-    match on the tight form."""
+    (``<T,U,1>``, ``T*>``, ``>>``). A non-type argument is mangled as its
+    value, so the demangler prints ``1`` and ``10496`` where an annotation
+    may write ``true`` and ``0x2900``. None of it carries identity, so names
+    match on the tight decimal form."""
     name = name.replace(" *", "*").replace(" &", "&")
     name = _ELABORATED_ARGUMENT.sub(r"\1", name)
     name = _ARGUMENT_SPACE.sub(",", name)
-    return _CLOSING_SPACE.sub(">", name)
+    name = _CLOSING_SPACE.sub(">", name)
+    return _VALUE_ARGUMENT.sub(_value_argument, name)
 
 
 def match_functions(
