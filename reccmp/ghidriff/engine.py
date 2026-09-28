@@ -624,7 +624,15 @@ class ReccmpDiffEngine(GhidraDiffEngine):
     def _rename_function(self, function: Any, name: str) -> None:
         from ghidra.program.model.symbol import SourceType
 
-        function.setName(self._ghidra_name(name), SourceType.USER_DEFINED)
+        ghidra_name = self._ghidra_name(name)
+        # The PE loader labels an export's entry with its decorated name; a
+        # function cannot take a name another symbol already holds there.
+        primary = function.getSymbol()
+        table = function.getProgram().getSymbolTable()
+        for symbol in table.getSymbols(function.getEntryPoint()):
+            if symbol != primary and symbol.getName() == ghidra_name:
+                symbol.delete()
+        function.setName(ghidra_name, SourceType.USER_DEFINED)
 
     def _label(self, program: "Program", address: "Address", name: str) -> None:
         from ghidra.program.model.symbol import SourceType
