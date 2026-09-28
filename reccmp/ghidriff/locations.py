@@ -181,3 +181,17 @@ def only_compared(instruction: Any, value: int) -> bool:
             continue
         return False
     return used
+
+
+def register_operand(instruction: Any, operand: int) -> bool:
+    """Whether a reference hangs on an operand that is only a register.
+
+    Ghidra's constant propagation attaches a reference to a register operand
+    whose value it can compute, when that value happens to be an address;
+    the instruction reads no memory there."""
+    from ghidra.program.model.lang import OperandType
+
+    if operand < 0:
+        return False
+    kind = instruction.getOperandType(operand)
+    return OperandType.isRegister(kind) and not OperandType.isDynamic(kind)

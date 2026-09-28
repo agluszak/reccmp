@@ -18,6 +18,7 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+from .imports import import_locations, known_purge
 from .locations import (
     STRING_TYPES,
     Extents,
@@ -25,6 +26,7 @@ from .locations import (
     Use,
     access_size,
     only_compared,
+    register_operand,
 )
 from .results import (
     AnalysisFailure,
@@ -49,6 +51,9 @@ if TYPE_CHECKING:
 # Ghidra names imports itself, the same way in both programs.
 _UNNAMED_TYPES = (EntityType.IMPORT, EntityType.IMPORT_THUNK)
 _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
+# Code the catalog knows starts a function. An import thunk is one too: left
+# alone, Ghidra reads a jump to it as part of the function that jumps.
+_ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 # Named by their contents in the catalog; shown by their contents instead.
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
@@ -56,7 +61,7 @@ _RAW_LIMIT = 64
 _PRISTINE_FOLDER = "pristine"
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
-ANALYSIS_REVISION = 2
+ANALYSIS_REVISION = 3
 
 
 @dataclass(frozen=True)
@@ -300,40 +305,27 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         only. An imported function pops the same arguments whichever binary
         calls it. Runs before analysis, which the purges shape, and again
         after the pristine-project reset, which can restore an unknown purge."""
-        from ghidra.program.model.listing import Function
-
         programs = [
             self.project.openProgram("/", self.gen_proj_bin_name_from_path(path), False)
             for path in (orig, recomp)
         ]
         try:
-            imports = [
-                {
-                    (
-                        function.getExternalLocation().getLibraryName().upper(),
-                        function.getExternalLocation().getOriginalImportedName()
-                        or function.getName(),
-                    ): function
-                    for function in program.getFunctionManager().getExternalFunctions()
-                }
-                for program in programs
-            ]
+            imports = [import_locations(program) for program in programs]
             for program, own, other in (
                 (programs[0], imports[0], imports[1]),
                 (programs[1], imports[1], imports[0]),
             ):
                 transaction = program.startTransaction("reccmp import purges")
                 try:
-                    for key, function in own.items():
+                    for key, location in own.items():
                         counterpart = other.get(key)
-                        if (
-                            counterpart is not None
-                            and function.getStackPurgeSize()
-                            == Function.UNKNOWN_STACK_DEPTH_CHANGE
-                            and counterpart.getStackPurgeSize()
-                            != Function.UNKNOWN_STACK_DEPTH_CHANGE
-                        ):
-                            function.setStackPurgeSize(counterpart.getStackPurgeSize())
+                        purge = known_purge(counterpart)
+                        if purge is None or known_purge(location) is not None:
+                            continue
+                        # Before analysis an import is only a location; its
+                        # function is what carries the purge.
+                        function = location.getFunction() or location.createFunction()
+                        function.setStackPurgeSize(purge)
                 finally:
                     program.endTransaction(transaction, True)
                 self.project.save(program)
@@ -437,12 +429,12 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             {
                 obj.addr(image_id)
                 for obj in self.manifest.objects
-                if obj.entity_type in _FUNCTION_TYPES
+                if obj.entity_type in _ENTRY_TYPES
             }
             | {
                 entity.addr
                 for entity in self.manifest.unpaired
-                if entity.image_id == image_id and entity.entity_type in _FUNCTION_TYPES
+                if entity.image_id == image_id and entity.entity_type in _ENTRY_TYPES
             }
             | {
                 alias.addr
@@ -530,10 +522,19 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         shows a literal on one side and a name on the other. Literals the
         catalog found in both binaries get the same data type on both
         sides; every other paired object loses such one-sided typing, so
-        both sides show its shared name. Pointers are left alone."""
+        both sides show its shared name. Pointers are left alone.
+
+        Ghidra may also type a run of bytes that holds two catalog objects
+        as one scalar, so a paired object reads as an offcut of the item
+        before it. That item is cleared: the catalog says they are two.
+        Arrays and structures Ghidra typed are left alone; their elements
+        are how the code indexes them. Undefined items of some width inside
+        a paired object are only guesses from single accesses, which differ
+        between the programs, and are cleared too."""
         from ghidra.program.model.data import (
             AbstractFloatDataType,
             StringDataInstance,
+            Undefined,
         )
         from ghidra.program.model.address import AddressSet
         from ghidra.program.model.util import CodeUnitInsertionException
@@ -546,6 +547,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             address = space.getAddress(obj.addr(image_id))
             size = obj.extent(image_id)
             data_type = _literal_data_type(obj.entity_type, size)
+            containing = listing.getDataContaining(address)
+            if (
+                containing is not None
+                and containing.isDefined()
+                and containing.getNumComponents() == 0
+                and containing.getMinAddress() != address
+            ):
+                listing.clearCodeUnits(
+                    containing.getMinAddress(), containing.getMaxAddress(), False
+                )
             existing = listing.getDataAt(address)
             if data_type is not None and size:
                 end = address.add(size - 1)
@@ -563,6 +574,21 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 or isinstance(existing.getDataType(), AbstractFloatDataType)
             ):
                 listing.clearCodeUnits(address, existing.getMaxAddress(), False)
+            if data_type is None and size:
+                # Undefined items of some width inside the object are
+                # guesses from single accesses, which differ between the
+                # programs.
+                guessed = [
+                    item
+                    for item in listing.getDefinedData(
+                        AddressSet(address, address.add(size - 1)), True
+                    )
+                    if Undefined.isUndefined(item.getDataType())
+                ]
+                for item in guessed:
+                    listing.clearCodeUnits(
+                        item.getMinAddress(), item.getMaxAddress(), False
+                    )
 
     def _apply_names(self, program: "Program", image_id: ImageId) -> None:
         functions = program.getFunctionManager()
@@ -634,6 +660,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         and to.isMemoryAddress()
                         and functions.getFunctionContaining(to) is None
                         and self._is_data(image_id, to.getOffset())
+                        and not register_operand(instruction, ref.getOperandIndex())
                     ):
                         bound = self._compared_end(
                             image_id, instruction, ref.getOperandIndex(), to
@@ -641,7 +668,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         access = access_size(instruction, to.getOffset())
                         if bound is not None:
                             self._name_end(program, instruction, ref, bound)
-                        elif access is None:
+                        else:
+                            bound = self._iterated_past_end(
+                                image_id, instruction, ref.getOperandIndex(), to
+                            )
+                        if bound is None and access is None:
                             to = self._string_start(program, image_id, to)
                         targets.setdefault(Use(to.getOffset(), bound, access), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
@@ -695,6 +726,35 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             return None
         orig_addr = ended.named.orig_addr
         return ObjectOffset(orig_addr, self._names[orig_addr], ended.offset)
+
+    def _iterated_past_end(
+        self, image_id: ImageId, instruction: Any, operand: int, to: "Address"
+    ) -> ObjectOffset | None:
+        """The paired array a register-relative access runs past, when
+        Ghidra's constant propagation follows a loop over it one iteration
+        further than the loop bound allows.
+
+        The address lies past the array's end by less than the array's
+        size, in whatever the linker placed next, and differs between the
+        binaries. It is the array's, at that offset, with no contents."""
+        from ghidra.program.model.lang import OperandType
+        from ghidra.program.model.scalar import Scalar
+
+        if not OperandType.isDynamic(instruction.getOperandType(operand)):
+            return None
+        if any(
+            isinstance(part, Scalar) and part.getUnsignedValue() == to.getOffset()
+            for part in instruction.getOpObjects(operand)
+        ):
+            # The operand names the address itself: a table access.
+            return None
+        past = self._extents[image_id].bound_at(to.getOffset())
+        if past is None or past.named is None or past.size is None:
+            return None
+        if past.offset < past.size:
+            return None
+        orig_addr = past.named.orig_addr
+        return ObjectOffset(orig_addr, self._names[orig_addr], past.offset)
 
     def _name_end(
         self, program: "Program", instruction: Any, ref: Any, end: ObjectOffset
