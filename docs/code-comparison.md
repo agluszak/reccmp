@@ -47,7 +47,14 @@ decompiler failed (`decompile-error`).
 
 ## What both programs receive
 
-Both programs are analyzed the same way, without debug information. Then:
+Both programs are analyzed the same way, without debug information. Before
+the analysis, an import whose mangled name makes it variadic or `__cdecl` gets
+a stack purge of zero. With the imported library beside the binary, Ghidra
+takes import purges from its own analysis of the library, which can count the
+arguments of a call that never returns (a failed assertion's exit) as the
+function's purge. The decompiler's stack pointer is then off after every call
+to that import, so it gives the callers parameters they do not have, and can
+crash. After the analysis:
 
 - the original's memory blocks get the write permission of the recompiled
   blocks with the same name. A packed or protected original can have writable
@@ -108,8 +115,8 @@ Each pair records why it exists (`basis` in the manifest and the summary):
 
 Ghidra's analysis of both binaries is kept in a Ghidra project
 (`--ghidra-projects`, default `.reccmp-cache/ghidra` beside the recompiled
-PDB), named by the original binary's digest and the Ghidra and Ghidriff
-versions. A new recompiled build replaces the previous one in that project;
+PDB), named by the original binary's digest, the Ghidra and Ghidriff
+versions, and a revision of what reccmp changes before the analysis. A new recompiled build replaces the previous one in that project;
 the original is analyzed once. The analyzed programs are kept pristine; each
 run starts from them and
 applies the current catalog, so a changed annotation never needs a new
