@@ -170,6 +170,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         engine.align_import_purges(orig, recomp)
         engine.analyze_project()
         engine.reset_programs()
+        engine.align_import_purges(orig, recomp)
         engine.align_memory_permissions(orig, recomp)
         engine.prepare_program(orig, ImageId.ORIG)
         engine.prepare_program(recomp, ImageId.RECOMP)

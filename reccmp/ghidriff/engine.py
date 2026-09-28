@@ -298,7 +298,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         does not. An unknown purge leaves the stack depth after every call
         unknown, so stack variables and parameters go missing on one side
         only. An imported function pops the same arguments whichever binary
-        calls it. Runs before analysis, which the purges shape."""
+        calls it. Runs before analysis, which the purges shape, and again
+        after the pristine-project reset, which can restore an unknown purge."""
         from ghidra.program.model.listing import Function
 
         programs = [
