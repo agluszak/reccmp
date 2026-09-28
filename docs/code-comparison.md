@@ -100,7 +100,8 @@ therefore compares the contents of the data each function refers to:
   catalog's extent for it (the recompiled PDB's size stands for the original
   when only it is known);
 - such a loop bound is identified by its array and offset, and has no
-  contents;
+  contents; a reference into the middle of a string, which scanning it
+  leaves in Ghidra's analysis, is a reference to the string;
 - the remaining references have no counterpart, so only their contents are
   compared, as a multiset. A string on one side and the same bytes, untyped,
   on the other are consistent; so are zero-filled regions of any length. A
