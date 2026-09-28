@@ -68,7 +68,7 @@ _RAW_LIMIT = 64
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 3
+PREPARATION_REVISION = 4
 
 
 @dataclass(frozen=True)
@@ -385,13 +385,18 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp names")
             try:
                 self._align_data_types(program, image_id)
-                paired = {
-                    addr
+                known_callees = {
+                    obj.addr(image_id)
                     for obj in self.manifest.objects
                     if obj.entity_type in _FUNCTION_TYPES
-                    and (addr := obj.addr(image_id)) is not None
                 }
-                infer_requested_callee_parameters(program, requested, paired)
+                known_callees.update(
+                    entity.addr
+                    for entity in self.manifest.unpaired
+                    if entity.image_id == image_id
+                    and entity.entity_type in _FUNCTION_TYPES
+                )
+                infer_requested_callee_parameters(program, requested, known_callees)
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
             finally:
