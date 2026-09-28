@@ -52,7 +52,7 @@ Both programs are analyzed the same way, without debug information. Then:
   commands;
 - every pair gets one name in both programs, its reccmp name (qualified with
   the original address when several pairs share a name). A duplicate the
-  catalog identifies with a pair (a `FOLDED` annotation) gets the pair's name;
+  catalog identifies with a pair gets the pair's name;
 - unpaired catalog entities keep their own image's name, qualified so it can
   never look like a correspondence;
 - string, wide string and float constants the catalog found get the same
@@ -99,8 +99,10 @@ Each pair records why it exists (`basis` in the manifest and the summary):
 
 Ghidra's analysis of both binaries is kept in a Ghidra project
 (`--ghidra-projects`, default `.reccmp-cache/ghidra` beside the recompiled
-PDB), named by the binaries' digests and the Ghidra and Ghidriff versions.
-The analyzed programs are kept pristine; each run starts from them and
+PDB), named by the original binary's digest and the Ghidra and Ghidriff
+versions. A new recompiled build replaces the previous one in that project;
+the original is analyzed once. The analyzed programs are kept pristine; each
+run starts from them and
 applies the current catalog, so a changed annotation never needs a new
 analysis and never leaves stale names behind.
 

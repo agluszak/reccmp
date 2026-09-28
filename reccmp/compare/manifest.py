@@ -83,7 +83,7 @@ class UnpairedEntity:
 
 @dataclass(frozen=True)
 class Alias:
-    """A side-local duplicate of a pair (a FOLDED annotation, an identical
+    """A side-local duplicate of a pair (an identical
     duplicate emission): it has the pair's identity, at another address."""
 
     image_id: ImageId

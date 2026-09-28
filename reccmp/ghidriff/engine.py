@@ -233,6 +233,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         return True
 
     def decompile_func(self, prog: "Program", func: Any, timeout: int = 15) -> Any:
+        # ghidriff returns (error, code); pylint misreads its annotation.
+        # pylint: disable-next=unpacking-non-sequence
         error, code = super().decompile_func(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
@@ -258,6 +260,19 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         addr = entry.orig_addr if image_id == ImageId.ORIG else entry.recomp_addr
         assert addr is not None
         return addr
+
+    def prune_programs(self, paths: list[Path]) -> None:
+        """Delete programs of binaries this run does not compare, such as an
+        earlier recompiled build, with their pristine copies."""
+        keep = {self.gen_proj_bin_name_from_path(path) for path in paths}
+        root = self.project.getRootFolder()
+        pristine = root.getFolder(_PRISTINE_FOLDER)
+        for folder in (root, pristine):
+            if folder is None:
+                continue
+            for domain_file in folder.getFiles():
+                if domain_file.getName() not in keep:
+                    domain_file.delete()
 
     def reset_programs(self) -> None:
         """Start from the analyzed programs, without names or functions a
