@@ -59,7 +59,7 @@ _RAW_LIMIT = 64
 _PRISTINE_FOLDER = "pristine"
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
-ANALYSIS_REVISION = 2
+ANALYSIS_REVISION = 3
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,30 @@ def _decode_string(raw: bytes, entity_type: EntityType | None) -> StringValue:
     wide = entity_type == EntityType.WIDECHAR
     text = raw.decode("utf-16-le" if wide else "latin1", errors="replace")
     return StringValue(text.split("\0", 1)[0])
+
+
+def _import_locations(program: "Program") -> dict[tuple[str, str], Any]:
+    """A program's imports by library and imported name."""
+    manager = program.getExternalManager()
+    locations = {}
+    for library in manager.getExternalLibraryNames():
+        iterator = manager.getExternalLocations(library)
+        while iterator.hasNext():
+            location = iterator.next()
+            name = location.getOriginalImportedName() or location.getLabel()
+            locations[(str(library).upper(), str(name))] = location
+    return locations
+
+
+def _known_purge(location: Any) -> int | None:
+    """An import's stack purge, if its function has a known one."""
+    from ghidra.program.model.listing import Function
+
+    function = location.getFunction() if location is not None else None
+    if function is None:
+        return None
+    purge = int(function.getStackPurgeSize())
+    return None if purge == Function.UNKNOWN_STACK_DEPTH_CHANGE else purge
 
 
 def unpaired_names(
@@ -303,40 +327,27 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         only. An imported function pops the same arguments whichever binary
         calls it. Runs before analysis, which the purges shape, and again
         after the pristine-project reset, which can restore an unknown purge."""
-        from ghidra.program.model.listing import Function
-
         programs = [
             self.project.openProgram("/", self.gen_proj_bin_name_from_path(path), False)
             for path in (orig, recomp)
         ]
         try:
-            imports = [
-                {
-                    (
-                        function.getExternalLocation().getLibraryName().upper(),
-                        function.getExternalLocation().getOriginalImportedName()
-                        or function.getName(),
-                    ): function
-                    for function in program.getFunctionManager().getExternalFunctions()
-                }
-                for program in programs
-            ]
+            imports = [_import_locations(program) for program in programs]
             for program, own, other in (
                 (programs[0], imports[0], imports[1]),
                 (programs[1], imports[1], imports[0]),
             ):
                 transaction = program.startTransaction("reccmp import purges")
                 try:
-                    for key, function in own.items():
+                    for key, location in own.items():
                         counterpart = other.get(key)
-                        if (
-                            counterpart is not None
-                            and function.getStackPurgeSize()
-                            == Function.UNKNOWN_STACK_DEPTH_CHANGE
-                            and counterpart.getStackPurgeSize()
-                            != Function.UNKNOWN_STACK_DEPTH_CHANGE
-                        ):
-                            function.setStackPurgeSize(counterpart.getStackPurgeSize())
+                        purge = _known_purge(counterpart)
+                        if purge is None or _known_purge(location) is not None:
+                            continue
+                        # Before analysis an import is only a location; its
+                        # function is what carries the purge.
+                        function = location.getFunction() or location.createFunction()
+                        function.setStackPurgeSize(purge)
                 finally:
                     program.endTransaction(transaction, True)
                 self.project.save(program)
@@ -536,11 +547,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         both sides show its shared name. Pointers are left alone.
 
         Ghidra may also type a run of bytes that holds two catalog objects
-        as one item, so a paired object reads as an offcut of the item
-        before it. That item is cleared: the catalog says they are two."""
+        as one scalar, so a paired object reads as an offcut of the item
+        before it. That item is cleared: the catalog says they are two.
+        Arrays and structures Ghidra typed are left alone; their elements
+        are how the code indexes them. Undefined items of some width inside
+        a paired object are only guesses from single accesses, which differ
+        between the programs, and are cleared too."""
         from ghidra.program.model.data import (
             AbstractFloatDataType,
             StringDataInstance,
+            Undefined,
         )
         from ghidra.program.model.address import AddressSet
         from ghidra.program.model.util import CodeUnitInsertionException
@@ -557,6 +573,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             if (
                 containing is not None
                 and containing.isDefined()
+                and containing.getNumComponents() == 0
                 and containing.getMinAddress() != address
             ):
                 listing.clearCodeUnits(
@@ -579,6 +596,21 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 or isinstance(existing.getDataType(), AbstractFloatDataType)
             ):
                 listing.clearCodeUnits(address, existing.getMaxAddress(), False)
+            if data_type is None and size:
+                # Undefined items of some width inside the object are
+                # guesses from single accesses, which differ between the
+                # programs.
+                guessed = [
+                    item
+                    for item in listing.getDefinedData(
+                        AddressSet(address, address.add(size - 1)), True
+                    )
+                    if Undefined.isUndefined(item.getDataType())
+                ]
+                for item in guessed:
+                    listing.clearCodeUnits(
+                        item.getMinAddress(), item.getMaxAddress(), False
+                    )
 
     def _apply_names(self, program: "Program", image_id: ImageId) -> None:
         functions = program.getFunctionManager()

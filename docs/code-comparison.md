@@ -55,7 +55,7 @@ arguments of a call that never returns (a failed assertion's exit) as the
 function's purge. The decompiler's stack pointer is then off after every call
 to that import, so it gives the callers parameters they do not have, and can
 crash. An import one program has no stack purge for gets the purge the other program
-has for the same import: without its library beside the binary, Ghidra leaves
+has for the same import, as a function if it was only an external location: without its library beside the binary, Ghidra leaves
 it unknown, and the stack depth after every call to it with it. After the
 analysis:
 
@@ -74,6 +74,10 @@ analysis:
   catalog identifies with a pair gets the pair's name;
 - unpaired catalog entities keep their own image's name, qualified so it can
   never look like a correspondence;
+- functions are created at import thunks the catalog knows as well;
+- an undefined item of some width Ghidra guessed inside a paired object, or a
+  scalar item that spans the start of a paired object, is cleared: the width
+  comes from one access and differs between the programs;
 - string, wide string and float constants the catalog found get the same
   data type on both sides; one-sided string or float typing Ghidra inferred
   for other paired objects is removed, so the decompiler shows the shared name
