@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ghidriff import GhidraDiffEngine
+from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
@@ -206,43 +206,27 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         return None
 
     def find_matches(self, p1: "Program", p2: "Program") -> list:
+        """Pairs come from the catalog only, through `diff_pairs`."""
+        raise NotImplementedError("reccmp supplies its pairs to diff_pairs")
+
+    def function_matches(self) -> list[FunctionMatch]:
         """Every requested pair that has a function on both sides."""
-        self._sides = {
-            self._program_key(p1): ImageId.ORIG,
-            self._program_key(p2): ImageId.RECOMP,
-        }
-        orig_functions = p1.getFunctionManager()
-        recomp_functions = p2.getFunctionManager()
-        orig_space = p1.getAddressFactory().getDefaultAddressSpace()
-        recomp_space = p2.getAddressFactory().getDefaultAddressSpace()
+        return [
+            FunctionMatch(entry.orig_addr, entry.recomp_addr, ("reccmp",))
+            for entry in self._comparable_entries()
+        ]
 
-        matched = []
-        for entry in self._comparable_entries():
-            assert entry.recomp_addr is not None
-            orig = orig_functions.getFunctionAt(orig_space.getAddress(entry.orig_addr))
-            recomp = recomp_functions.getFunctionAt(
-                recomp_space.getAddress(entry.recomp_addr)
-            )
-            if orig is not None and recomp is not None:
-                matched.append([orig.getSymbol(), recomp.getSymbol(), ["reccmp"]])
-        return [[], matched, []]
-
-    def syms_need_diff(self, *_: Any, **__: Any) -> bool:
-        """Decompile every requested pair. Equal size and reference counts
-        are exactly where subtle differences hide."""
-        return True
-
-    def decompile_func(self, prog: "Program", func: Any, timeout: int = 15) -> Any:
-        # ghidriff returns (error, code); pylint misreads its annotation.
-        # pylint: disable-next=unpacking-non-sequence
-        error, code = super().decompile_func(prog, func, timeout)
+    def decompile_func(
+        self, prog: "Program", func: Any, timeout: int = 15
+    ) -> DecompileResult:
+        result = super().decompile_func(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
             self._decompiled[(side, func.getEntryPoint().getOffset())] = _Decompiled(
-                code=str(code) if not error else None,
-                error=str(error) if error else None,
+                code=result.code if result.completed else None,
+                error=result.error,
             )
-        return error, code
+        return result
 
     # --- program preparation ----------------------------------------------
 
@@ -349,6 +333,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
+            self._require_functions(program, image_id)
 
             transaction = program.startTransaction("reccmp names")
             try:
@@ -357,6 +342,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 self._collect_references(program, image_id)
             finally:
                 program.endTransaction(transaction, True)
+            self._sides[self._program_key(program)] = image_id
             self.project.save(program)
         finally:
             self.project.close(program)
@@ -428,12 +414,18 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 program, TaskMonitor.DUMMY
             )
             CreateFunctionCmd(address).applyTo(program, TaskMonitor.DUMMY)
-            if functions.getFunctionAt(address) is None and addr in requested:
-                self._fail(
-                    requested[addr], AnalysisFailure(FailureKind.NO_FUNCTION, image_id)
-                )
         for function in split:
             CreateFunctionCmd.fixupFunctionBody(program, function, TaskMonitor.DUMMY)
+
+    def _require_functions(self, program: "Program", image_id: ImageId) -> None:
+        """Report requested entries still without a function once analysis
+        is done; ghidriff diffs supplied pairs only when both resolve."""
+        functions = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        for entry in self._comparable_entries():
+            address = space.getAddress(self._entry_addr(entry, image_id))
+            if functions.getFunctionAt(address) is None:
+                self._fail(entry, AnalysisFailure(FailureKind.NO_FUNCTION, image_id))
 
     @staticmethod
     def _clear_data(program: "Program", address: "Address") -> None:
