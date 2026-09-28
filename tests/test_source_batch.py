@@ -87,6 +87,12 @@ int g_pragma = 0;
 // GLOBAL: TEST 0x3030
 
 int g_spaced = 0;
+
+// STRING: TEST 0x4020
+#define GREETING "good " "day"
+// STRING: TEST 0x4030
+#define WIDE_GREETING L"hi"
+const char* Greet() { return GREETING; }
 """
 
 _MARKED_HEADER = """\
@@ -184,7 +190,13 @@ def test_markers_come_from_the_compiler(tmp_path: Path) -> None:
         0x1020,
     )
     strings = {s.offset: (s.name, s.is_widechar) for s in codebase.iter_strings()}
-    assert strings == {0x4000: ("hello\tworld", False), 0x4010: ("wide", True)}
+    assert strings == {
+        0x4000: ("hello\tworld", False),
+        0x4010: ("wide", True),
+        # Named by a #define directly below the marker.
+        0x4020: ("good day", False),
+        0x4030: ("hi", True),
+    }
     lines = [(s.offset, s.line_number) for s in codebase.iter_line_symbols()]
     assert lines == [(0x6000, 40)]
     assert {s.type for s in codebase.iter_name_functions()} == {MarkerType.SYNTHETIC}

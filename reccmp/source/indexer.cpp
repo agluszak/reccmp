@@ -873,6 +873,20 @@ class Indexer {
     return token;
   }
 
+  // The `#` of a `#define` directive that directly follows `offset`, past
+  // comments and whitespace only: a string written once under a name, which
+  // a STRING marker above it annotates.
+  bool definitionAfter(FileID file, unsigned offset, Token& hash) const {
+    llvm::StringRef buffer = sources_.getBufferData(file);
+    Lexer lexer(sources_.getLocForStartOfFile(file), context_.getLangOpts(), buffer.begin(),
+                buffer.begin() + offset, buffer.end());
+    lexer.LexFromRawLexer(hash);
+    if (!hash.is(tok::hash) || !hash.isAtStartOfLine()) return false;
+    Token keyword;
+    lexer.LexFromRawLexer(keyword);
+    return keyword.is(tok::raw_identifier) && keyword.getRawIdentifier() == "define";
+  }
+
   // The first string literal (with adjacent literals concatenated) on the
   // line that starts at `token`, as the bytes the compiler would emit.
   llvm::json::Value lineString(FileID file, const Token& first) const {
@@ -944,6 +958,19 @@ class Indexer {
         {"comments", std::move(comments)},
         {"anchor", nullptr},
     };
+    Token definition;
+    if (definitionAfter(file, group.back().endOffset, definition)) {
+      unsigned offset = sources_.getFileOffset(definition.getLocation());
+      record["anchor"] = llvm::json::Object{
+          {"line", sources_.getLineNumber(file, offset)},
+          {"column", sources_.getColumnNumber(file, offset)},
+          {"candidates", llvm::json::Array{}},
+          {"string", lineString(file, definition)},
+          {"blank_line", blankLineBetween(file, group.back(), offset)},
+      };
+      emit(std::move(record));
+      return;
+    }
     Token token = nextCodeToken(file, group.back().endOffset);
     if (!token.is(tok::eof)) {
       unsigned offset = sources_.getFileOffset(token.getLocation());
