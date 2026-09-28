@@ -36,7 +36,7 @@ from .results import (
 
 if TYPE_CHECKING:
     from ghidra.program.model.address import Address
-    from ghidra.program.model.listing import Program
+    from ghidra.program.model.listing import Function, Program
 
 # Ghidra names imports itself, the same way in both programs.
 _UNNAMED_TYPES = (EntityType.IMPORT, EntityType.IMPORT_THUNK)
@@ -233,6 +233,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         return True
 
     def decompile_func(self, prog: "Program", func: Any, timeout: int = 15) -> Any:
+        # ghidriff returns (error, code); pylint misreads its annotation.
+        # pylint: disable-next=unpacking-non-sequence
         error, code = super().decompile_func(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
@@ -259,6 +261,19 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         assert addr is not None
         return addr
 
+    def prune_programs(self, paths: list[Path]) -> None:
+        """Delete programs of binaries this run does not compare, such as an
+        earlier recompiled build, with their pristine copies."""
+        keep = {self.gen_proj_bin_name_from_path(path) for path in paths}
+        root = self.project.getRootFolder()
+        pristine = root.getFolder(_PRISTINE_FOLDER)
+        for folder in (root, pristine):
+            if folder is None:
+                continue
+            for domain_file in folder.getFiles():
+                if domain_file.getName() not in keep:
+                    domain_file.delete()
+
     def reset_programs(self) -> None:
         """Start from the analyzed programs, without names or functions a
         previous run added. The analysis itself is kept and reused."""
@@ -275,6 +290,42 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             else:
                 domain_file.delete()
                 saved.copyTo(root, TaskMonitor.DUMMY)
+
+    def align_memory_permissions(self, orig: Path, recomp: Path) -> None:
+        """Give the original's memory blocks the write permission of the
+        recompiled blocks with the same name.
+
+        A packer or copy protection may leave the original's read-only
+        sections writable. The decompiler folds a read of read-only memory
+        into its value, so the same instruction would show a constant in one
+        program and a name in the other. The recompiled image is the
+        linker's own output, so its permissions are the ones both get."""
+        recomp_program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(recomp), True
+        )
+        try:
+            writable = {
+                block.getName(): block.isWrite()
+                for block in recomp_program.getMemory().getBlocks()
+            }
+        finally:
+            self.project.close(recomp_program)
+
+        program = self.project.openProgram(
+            "/", self.gen_proj_bin_name_from_path(orig), False
+        )
+        try:
+            transaction = program.startTransaction("reccmp permissions")
+            try:
+                for block in program.getMemory().getBlocks():
+                    write = writable.get(block.getName())
+                    if write is not None and write != block.isWrite():
+                        block.setWrite(write)
+            finally:
+                program.endTransaction(transaction, True)
+            self.project.save(program)
+        finally:
+            self.project.close(program)
 
     def prepare_program(self, path: Path, image_id: ImageId) -> None:
         """Give one analyzed program reccmp's functions and names, and record
@@ -312,10 +363,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
     def _create_functions(self, program: "Program", image_id: ImageId) -> None:
         """Make functions at the entries the catalog knows, through Ghidra's
-        own commands. An entry inside another function is a conflict to
-        report, not a reason to compare the containing function."""
+        own commands.
+
+        Ghidra's analysis may absorb a tail-called function into its caller
+        as a separate piece of the caller's body. An entry at such a piece
+        is split off into its own function. An entry inside the piece that
+        holds the containing function's own entry is a conflict to report,
+        not a reason to compare the containing function."""
         from ghidra.app.cmd.disassemble import DisassembleCommand
         from ghidra.app.cmd.function import CreateFunctionCmd
+        from ghidra.util.task import TaskMonitor
 
         functions = program.getFunctionManager()
         space = program.getAddressFactory().getDefaultAddressSpace()
@@ -342,11 +399,18 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
             }
         )
+        split = []
         for addr in sorted(known | requested.keys()):
             address = space.getAddress(addr)
             if functions.getFunctionAt(address) is not None:
                 continue
-            containing = functions.getFunctionContaining(address)
+            # Ghidra returns null when no function contains the address.
+            containing: "Function | None" = functions.getFunctionContaining(address)
+            if containing is not None and self._split_absorbed_piece(
+                containing, address
+            ):
+                split.append(containing)
+                containing = None
             if containing is not None:
                 if addr in requested:
                     self._fail(
@@ -358,12 +422,44 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         ),
                     )
                 continue
-            DisassembleCommand(address, None, True).applyTo(program)
-            CreateFunctionCmd(address).applyTo(program)
+            self._clear_data(program, address)
+            # A null restricted set leaves disassembly unrestricted.
+            DisassembleCommand(address, None, True).applyTo(  # type: ignore[call-overload]
+                program, TaskMonitor.DUMMY
+            )
+            CreateFunctionCmd(address).applyTo(program, TaskMonitor.DUMMY)
             if functions.getFunctionAt(address) is None and addr in requested:
                 self._fail(
                     requested[addr], AnalysisFailure(FailureKind.NO_FUNCTION, image_id)
                 )
+        for function in split:
+            CreateFunctionCmd.fixupFunctionBody(program, function, TaskMonitor.DUMMY)
+
+    @staticmethod
+    def _clear_data(program: "Program", address: "Address") -> None:
+        """Remove data Ghidra's analysis defined over a known function entry,
+        such as a string it guessed in the instruction bytes; it would keep
+        the entry from being disassembled."""
+        listing = program.getListing()
+        data = listing.getDataContaining(address)
+        if data is not None and data.isDefined():
+            listing.clearCodeUnits(data.getMinAddress(), data.getMaxAddress(), False)
+
+    @staticmethod
+    def _split_absorbed_piece(function: Any, address: "Address") -> bool:
+        """Remove the piece of `function`'s body that starts at `address`,
+        when that piece does not hold the function's entry. Returns whether
+        it was removed."""
+        from ghidra.program.model.address import AddressSet
+
+        body = function.getBody()
+        piece = body.getRangeContaining(address)
+        if piece is None or piece.contains(function.getEntryPoint()):
+            return False
+        if piece.getMinAddress() != address:
+            return False
+        function.setBody(body.subtract(AddressSet(piece)))
+        return True
 
     def _fail(self, entry: FunctionEntry, failure: AnalysisFailure) -> None:
         self._failures.setdefault(entry.orig_addr, []).append(failure)

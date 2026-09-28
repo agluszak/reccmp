@@ -156,17 +156,19 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         decompiler_timeout=args.decompiler_timeout,
     )
     ghidra_version = str(engine.get_ghidra_version())
-    # The analyzed programs depend on the binaries and on the analyzer.
+    # One project per original binary and analyzer: the original's analysis
+    # is reused across recompiled builds, whose programs replace each other.
     project_name = (
         f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
-        f"-{manifest.recomp.sha256[:12]}-ghidra{ghidra_version}"
-        f"-ghidriff{ghidriff.__version__}"
+        f"-ghidra{ghidra_version}-ghidriff{ghidriff.__version__}"
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     try:
         engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
+        engine.prune_programs([orig, recomp])
         engine.analyze_project()
         engine.reset_programs()
+        engine.align_memory_permissions(orig, recomp)
         engine.prepare_program(orig, ImageId.ORIG)
         engine.prepare_program(recomp, ImageId.RECOMP)
         pdiff = engine.diff_bins(orig, recomp, force_diff=True)

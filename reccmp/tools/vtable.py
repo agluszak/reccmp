@@ -81,7 +81,7 @@ def show_vtable(comparison: VtableComparison, plain: bool):
         recomp = slot_text(slot.recomp, slot.recomp_raw)
         index = f"vtable0x{slot.offset:02x}"
         if slot.status == SlotStatus.UNPAIRED:
-            recomp += "  (not paired: a FOLDED annotation may be missing)"
+            recomp += "  (not paired)"
         if slot.matches:
             print(f"  {index}  {recomp}")
         elif plain:

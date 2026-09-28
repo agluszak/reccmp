@@ -20,8 +20,8 @@ class SlotStatus(enum.Enum):
     DIFFERENT = "different"
     # A slot names a function reccmp has not paired: the catalog cannot say
     # whether it is right. An original slot at a paired body next to an
-    # unpaired recompiled function usually means the original linker folded
-    # identical functions and the source lacks a FOLDED annotation.
+    # unpaired recompiled function is typical of identical-code folding in
+    # the original link: one retail body serves several source functions.
     UNPAIRED = "unpaired"
 
 
