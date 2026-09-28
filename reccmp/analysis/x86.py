@@ -2,7 +2,8 @@
 
 Instruction semantics belong to Ghidra. The catalog only asks whether bytes
 decode at all (vtable slot plausibility), where a ``jmp rel32`` goes (thunk
-chains) and which addresses a short CRT initializer mentions.
+chains), which addresses a short CRT initializer mentions, and whether two
+function bodies are the same code.
 """
 
 from functools import cache
@@ -85,3 +86,28 @@ def direct_call_target(insn: CsInsn) -> int | None:
     ):
         return insn.operands[0].imm & 0xFFFFFFFF
     return None
+
+
+def code_signature(code: bytes, address: int) -> tuple[bytes | tuple[str, int], ...]:
+    """What a function body is, independent of where it was placed.
+
+    Instruction bytes, except that a relative branch is described by its
+    target: an offset into the body when it stays inside, the absolute
+    address otherwise. Relocated operands are absolute already. Two bodies
+    with one signature are the same code, which identical-code folding would
+    have kept once."""
+    end = address + len(code)
+    signature: list[bytes | tuple[str, int]] = []
+    for insn in instructions(code, address):
+        relative = (
+            insn.group(x86_const.X86_GRP_JUMP) or insn.group(x86_const.X86_GRP_CALL)
+        ) and any(operand.type == x86_const.X86_OP_IMM for operand in insn.operands)
+        if not relative:
+            signature.append(bytes(insn.bytes))
+            continue
+        target = insn.operands[0].imm & 0xFFFFFFFF
+        if address <= target < end:
+            signature.append(("inside", target - address))
+        else:
+            signature.append(("at", target))
+    return tuple(signature)

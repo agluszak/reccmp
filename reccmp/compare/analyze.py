@@ -22,6 +22,7 @@ from reccmp.analysis import (
     is_likely_latin1,
     is_likely_widechar,
 )
+from reccmp.analysis.x86 import code_signature
 from reccmp.analysis.crt_startup import (
     detect_crt_startup_arrays,
     get_crt_function_name,
@@ -592,6 +593,75 @@ def match_inferred_vtables_by_slots(
         if len(equivalent) == 1:
             pairs.append((orig_addr, equivalent[0]))
     db.bulk_match(pairs, basis=PairBasis.DERIVED)
+
+
+def _function_signature(
+    binfile: PEImage, addr: int | None, size: int | None
+) -> tuple | None:
+    if addr is None or size is None or size <= 0:
+        return None
+    try:
+        code = bytes(binfile.read(addr, size))
+    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+        return None
+    return code_signature(code, addr)
+
+
+def classify_folded_function_aliases(
+    db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage
+) -> None:
+    """Record recompiled functions the original's identical-code folding kept
+    as one body.
+
+    The original links with ICF: functions whose code is the same are one
+    body at one address. The recompiled image links without it, so a
+    function the catalog cannot explain whose code is the same as exactly
+    one paired function's (ILLength and PLLength) was folded into that pair
+    in the original, and takes its identity. FOLDED annotations say the
+    same for the cases they name.
+
+    Folding covers only packaged functions: the original keeps several
+    empty bodies apart, for one. When another function of the original
+    starts with the pair's code, the folded copy could be either, so it
+    keeps no identity."""
+    canonical: dict[tuple, set[int]] = {}
+    for pair in db.get_matches_by_type(EntityType.FUNCTION):
+        signature = _function_signature(
+            recomp_bin, pair.recomp_addr, pair.size(ImageId.RECOMP)
+        )
+        if signature:
+            canonical.setdefault(signature, set()).add(pair.orig_addr)
+
+    folded: dict[int, list[tuple[int, int]]] = {}
+    for candidate in tuple(db.unexplained(ImageId.RECOMP)):
+        if candidate.get("type") != EntityType.FUNCTION:
+            continue
+        addr = candidate.addr(ImageId.RECOMP)
+        size = candidate.size(ImageId.RECOMP)
+        signature = _function_signature(recomp_bin, addr, size)
+        identities = canonical.get(signature, set()) if signature else set()
+        if addr is not None and size is not None and len(identities) == 1:
+            folded.setdefault(size, []).append((addr, next(iter(identities))))
+    if not folded:
+        return
+
+    originals = [
+        addr
+        for entity in db.get_all()
+        if entity.get("type") == EntityType.FUNCTION
+        and (addr := entity.addr(ImageId.ORIG)) is not None
+    ]
+    for size, candidates in folded.items():
+        # Original bodies at this length, compared within the original.
+        bodies: dict[tuple, int] = {}
+        for addr in originals:
+            signature = _function_signature(orig_bin, addr, size)
+            if signature:
+                bodies[signature] = bodies.get(signature, 0) + 1
+        for addr, orig_addr in candidates:
+            signature = _function_signature(orig_bin, orig_addr, size)
+            if signature and bodies.get(signature) == 1:
+                db.set_alias(ImageId.RECOMP, addr, orig_addr)
 
 
 def classify_exact_vtable_aliases(
