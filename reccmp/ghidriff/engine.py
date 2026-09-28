@@ -154,6 +154,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
     def __init__(self, manifest: Manifest, *args: Any, **kwargs: Any) -> None:
         self.manifest = manifest
+        # A focused comparison needs switch recovery only for its requested
+        # functions. Ghidra's whole-image switch pass dominates cold analysis.
+        self.focused_switch_analysis = len(manifest.functions) <= 32
         self._names = canonical_names(manifest.objects)
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
         self._pair_types = {obj.orig_addr: obj.entity_type for obj in manifest.objects}
@@ -213,6 +216,10 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp import purges")
             try:
                 self._correct_import_purges(program)
+                if self.focused_switch_analysis:
+                    self.set_analysis_option(
+                        program, "Decompiler Switch Analysis", False
+                    )
             finally:
                 program.endTransaction(transaction, True)
         return super().analyze_program(
@@ -394,6 +401,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             GhidraScriptUtil.acquireBundleHostReference()
             try:
                 FlatProgramAPI(program).analyzeChanges(program)
+                if self.focused_switch_analysis:
+                    self._recover_requested_switches(program, image_id)
+                    FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
             self._require_functions(program, image_id)
@@ -409,6 +419,42 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self.project.save(program)
         finally:
             self.project.close(program)
+
+    def _recover_requested_switches(
+        self, program: "Program", image_id: ImageId
+    ) -> None:
+        """Run Ghidra's switch command on the functions this run compares."""
+        from ghidra.app.cmd.function import DecompilerSwitchAnalysisCmd
+        from ghidra.app.decompiler import DecompInterface
+        from ghidra.app.plugin.core.analysis import SwitchAnalysisDecompileConfigurer
+        from ghidra.util.task import TaskMonitor
+
+        functions = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        decompiler = DecompInterface()
+        try:
+            SwitchAnalysisDecompileConfigurer(program).configure(decompiler)
+            if not decompiler.openProgram(program):
+                raise RuntimeError("Could not open program for switch analysis")
+            for entry in self._comparable_entries():
+                function = functions.getFunctionAt(
+                    space.getAddress(self._entry_addr(entry, image_id))
+                )
+                if function is None:
+                    continue
+                results = decompiler.decompileFunction(function, 60, TaskMonitor.DUMMY)
+                if not results.decompileCompleted():
+                    raise RuntimeError(
+                        f"Switch analysis failed at {function.getEntryPoint()}"
+                    )
+                if not DecompilerSwitchAnalysisCmd(results).applyTo(
+                    program, TaskMonitor.DUMMY
+                ):
+                    raise RuntimeError(
+                        f"Switch recovery failed at {function.getEntryPoint()}"
+                    )
+        finally:
+            decompiler.dispose()
 
     def _create_functions(self, program: "Program", image_id: ImageId) -> None:
         """Make functions at the entries the catalog knows, through Ghidra's

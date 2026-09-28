@@ -184,6 +184,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
         f"-ghidra{ghidra_version}-ghidriff{ghidriff.__version__}"
         f"-reccmp{ANALYSIS_REVISION}"
+        f"{'-switchfocus1' if engine.focused_switch_analysis else ''}"
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     prepared_stamp = projects / project_name / "prepared-key.txt"
