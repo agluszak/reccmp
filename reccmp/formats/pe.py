@@ -11,7 +11,7 @@ from functools import cached_property
 from uuid import UUID
 from pathlib import Path
 import struct
-from typing import Iterable, Iterator, cast
+from typing import Iterable, Iterator, Mapping, cast
 
 from .exceptions import (
     InvalidVirtualAddressError,
@@ -959,19 +959,30 @@ class PEImage(Image):
             ):
                 yield ImageRegion(sect.virtual_address, sect.view, sect.extent)
 
-    def get_const_regions(self) -> Iterator[ImageRegion]:
+    def get_const_regions(
+        self, write_permissions: Mapping[str, bool] | None = None
+    ) -> Iterator[ImageRegion]:
         for sect, header in zip(self.sections, self.section_headers):
             # Exclude special sections that have data but are handled separately.
             if header.name in (".idata", ".rsrc"):
                 continue
 
-            if header.test_flags(
+            writable = (write_permissions or {}).get(
+                header.name,
+                header.test_flags(include=PESectionFlags.IMAGE_SCN_MEM_WRITE),
+            )
+            if not writable and header.test_flags(
                 include=PESectionFlags.IMAGE_SCN_MEM_READ,
-                exclude=PESectionFlags.IMAGE_SCN_MEM_WRITE
-                | PESectionFlags.IMAGE_SCN_MEM_EXECUTE
+                exclude=PESectionFlags.IMAGE_SCN_MEM_EXECUTE
                 | PESectionFlags.IMAGE_SCN_MEM_DISCARDABLE,
             ):
                 yield ImageRegion(sect.virtual_address, sect.view, sect.extent)
+
+    def section_write_permissions(self) -> dict[str, bool]:
+        return {
+            header.name: header.test_flags(include=PESectionFlags.IMAGE_SCN_MEM_WRITE)
+            for header in self.section_headers
+        }
 
     @cached_property
     def uninitialized_ranges(self) -> list[range]:

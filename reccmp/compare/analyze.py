@@ -5,6 +5,7 @@ These functions update the entity database based on analysis of the binary files
 import logging
 import re
 import struct
+from typing import Mapping
 from reccmp.formats import Image, PEImage
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
@@ -144,12 +145,18 @@ def create_analysis_strings(
                 last_range = range(addr, addr + len(string) + 1)
 
 
-def create_analysis_floats(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_analysis_floats(
+    db: EntityDb,
+    img_id: ImageId,
+    binfile: PEImage,
+    write_permissions: Mapping[str, bool] | None = None,
+):
     """Add floating point constants in each binary to the database.
     We are not matching anything right now because these values are not
-    deduped like strings."""
+    deduped like strings. `write_permissions` overrides the binary's own
+    section permissions when deciding which data is constant."""
     with db.batch() as batch:
-        for addr, size, float_value in find_float_consts(binfile):
+        for addr, size, float_value in find_float_consts(binfile, write_permissions):
             if not db.intersects(img_id, addr):
                 batch.set(
                     img_id,
