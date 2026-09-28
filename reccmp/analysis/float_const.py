@@ -12,7 +12,7 @@ Then filter on pointers into read-only sections.
 
 import re
 import struct
-from typing import Iterator, NamedTuple
+from typing import Iterator, Mapping, NamedTuple
 from typing_extensions import Buffer
 from reccmp.formats import PEImage
 
@@ -85,7 +85,9 @@ class FloatConstant(NamedTuple):
     value: float
 
 
-def find_float_consts(image: PEImage) -> Iterator[FloatConstant]:
+def find_float_consts(
+    image: PEImage, write_permissions: Mapping[str, bool] | None = None
+) -> Iterator[FloatConstant]:
     """Floating point instructions that refer to a memory address can
     point to constant values. Search the code sections to find FP
     instructions and check whether the pointer address refers to
@@ -95,7 +97,7 @@ def find_float_consts(image: PEImage) -> Iterator[FloatConstant]:
     # Return each float only once from this function.
     seen = set()
 
-    const_regions = list(image.get_const_regions())
+    const_regions = list(image.get_const_regions(write_permissions))
 
     for region in image.get_code_regions():
         for inst in find_float_instructions_in_buffer(region.data, region.addr):

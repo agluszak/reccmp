@@ -298,3 +298,19 @@ def test_section_iter(binfile: PEImage):
 
     # .rdata only
     assert [s.addr for s in binfile.get_const_regions()] == [0x100D4000]
+
+
+def test_const_regions_follow_supplied_write_permissions(binfile: PEImage):
+    """A packed original can leave .rdata writable; the recompiled image's
+    permissions then decide which data is constant."""
+    permissions = binfile.section_write_permissions()
+    assert permissions[".rdata"] is False and permissions[".data"] is True
+
+    marked_writable = {".rdata": True}
+    assert not list(binfile.get_const_regions(marked_writable))
+
+    marked_read_only = {".data": False}
+    assert [s.addr for s in binfile.get_const_regions(marked_read_only)] == [
+        0x100D4000,
+        0x100F0000,
+    ]

@@ -1,7 +1,7 @@
 import enum
 import re
 import dataclasses
-from typing import Iterator
+from typing import Iterator, Mapping
 from pathlib import Path
 
 from reccmp.types import ConcreteBuffer
@@ -126,7 +126,15 @@ class Image:
     def get_data_regions(self) -> Iterator[ImageRegion]:
         raise NotImplementedError
 
-    def get_const_regions(self) -> Iterator[ImageRegion]:
+    def get_const_regions(
+        self, write_permissions: Mapping[str, bool] | None = None
+    ) -> Iterator[ImageRegion]:
+        """Regions of read-only data. `write_permissions` overrides the
+        write permission of the sections it names."""
+        raise NotImplementedError
+
+    def section_write_permissions(self) -> dict[str, bool]:
+        """Whether each named section is writable."""
         raise NotImplementedError
 
     def read_string(self, vaddr: int) -> bytes:
