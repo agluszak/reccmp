@@ -49,6 +49,9 @@ if TYPE_CHECKING:
 # Ghidra names imports itself, the same way in both programs.
 _UNNAMED_TYPES = (EntityType.IMPORT, EntityType.IMPORT_THUNK)
 _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
+# Code the catalog knows starts a function. An import thunk is one too: left
+# alone, Ghidra reads a jump to it as part of the function that jumps.
+_ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 # Named by their contents in the catalog; shown by their contents instead.
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 # Upper bound on the bytes shown for one referenced location.
@@ -437,12 +440,12 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             {
                 obj.addr(image_id)
                 for obj in self.manifest.objects
-                if obj.entity_type in _FUNCTION_TYPES
+                if obj.entity_type in _ENTRY_TYPES
             }
             | {
                 entity.addr
                 for entity in self.manifest.unpaired
-                if entity.image_id == image_id and entity.entity_type in _FUNCTION_TYPES
+                if entity.image_id == image_id and entity.entity_type in _ENTRY_TYPES
             }
             | {
                 alias.addr
@@ -530,7 +533,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         shows a literal on one side and a name on the other. Literals the
         catalog found in both binaries get the same data type on both
         sides; every other paired object loses such one-sided typing, so
-        both sides show its shared name. Pointers are left alone."""
+        both sides show its shared name. Pointers are left alone.
+
+        Ghidra may also type a run of bytes that holds two catalog objects
+        as one item, so a paired object reads as an offcut of the item
+        before it. That item is cleared: the catalog says they are two."""
         from ghidra.program.model.data import (
             AbstractFloatDataType,
             StringDataInstance,
@@ -546,6 +553,15 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             address = space.getAddress(obj.addr(image_id))
             size = obj.extent(image_id)
             data_type = _literal_data_type(obj.entity_type, size)
+            containing = listing.getDataContaining(address)
+            if (
+                containing is not None
+                and containing.isDefined()
+                and containing.getMinAddress() != address
+            ):
+                listing.clearCodeUnits(
+                    containing.getMinAddress(), containing.getMaxAddress(), False
+                )
             existing = listing.getDataAt(address)
             if data_type is not None and size:
                 end = address.add(size - 1)
