@@ -261,9 +261,9 @@ def load_markers(
             )
 
             if fun.name.startswith("?") or fun.name_is_symbol:
-                batch.set(ImageId.ORIG, fun.offset, symbol=fun.name)
+                batch.set(ImageId.ORIG, fun.offset, symbol=fun.name, name=None)
             else:
-                batch.set(ImageId.ORIG, fun.offset, name=fun.name)
+                batch.set(ImageId.ORIG, fun.offset, name=fun.name, symbol=None)
 
         for var in codebase.iter_variables():
             batch.set(

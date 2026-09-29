@@ -165,6 +165,44 @@ def test_load_code_cpp_symbol_function(
     assert entity.get("name") is None
 
 
+@pytest.mark.parametrize(
+    ("marker_name", "expected_name", "expected_symbol"),
+    [
+        ("??0srShader@@QAE@ABV0@@Z", None, "??0srShader@@QAE@ABV0@@Z"),
+        ("W8Vector<int>::Clear", "W8Vector<int>::Clear", None),
+    ],
+)
+def test_source_function_identity_replaces_data_source_label(
+    db: EntityDb,
+    lines_db: LinesDb,
+    marker_name: str,
+    expected_name: str | None,
+    expected_symbol: str | None,
+):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            0x10086240,
+            type=EntityType.FUNCTION,
+            symbol="Older Ghidra label",
+            name="Older Ghidra name",
+        )
+
+    orig_bin = Mock(spec=PEImage)
+    orig_bin.is_valid_vaddr.return_value = True
+    _load(
+        db,
+        lines_db,
+        orig_bin,
+        _nameref(0x10086240, marker_name, MarkerType.SYNTHETIC),
+    )
+
+    entity = db.get(ImageId.ORIG, 0x10086240)
+    assert entity is not None
+    assert entity.get("name") == expected_name
+    assert entity.get("symbol") == expected_symbol
+
+
 def test_load_code_c_symbol_implicit(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
     """Namerefs that begin with '_' are NOT assumed to be the symbol.
     This would cause problems for (e.g.) STL entities like '_Tree...'"""

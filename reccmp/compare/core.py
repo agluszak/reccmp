@@ -201,6 +201,9 @@ class Compare:
 
         match_entry(self._db, self.orig_bin, self.recomp_bin)
 
+        # Data-source labels supplement source markers; they must not replace
+        # a marker's established identity when the two disagree.
+        load_data_sources(self._db, self.data_sources)
         load_markers(
             self.code_files,
             self._lines_db,
@@ -211,7 +214,6 @@ class Compare:
             self.report,
         )
 
-        load_data_sources(self._db, self.data_sources)
         normalize_original_zero_size_data(self._db, self.orig_bin)
 
         # Match using PDB and annotation data
