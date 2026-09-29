@@ -200,6 +200,37 @@ def test_source_index_records_isle_style_base_vtables(tmp_path: Path) -> None:
     ] == [(0x2100, "Secondary")]
 
 
+def test_source_index_primary_vtable_can_name_first_base(tmp_path: Path) -> None:
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _class(
+            semantic_id="record:Widget",
+            qualified_name="Widget",
+            bases=["Primary", "Secondary"],
+            source_file="sample.cpp",
+            line=5,
+        ),
+        unit_id="sample.cpp",
+    )
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            3,
+            "// VTABLE: TEST 0x2000 Primary",
+            "// VTABLE: TEST 0x2100 Secondary",
+            candidates=(_class_candidate("Widget"),),
+        ),
+        unit_id="sample.cpp",
+    )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
+    widget = next(iter(index.classes.values()))
+    assert widget.vtable_address == 0x2000
+    assert [(item.address, item.base_class) for item in widget.base_vtables] == [
+        (0x2100, "Secondary")
+    ]
+
+
 def test_source_index_preserves_template_specialization_owner(tmp_path: Path) -> None:
     collector = SourceCollector(tmp_path)
     collector.collect_record(
