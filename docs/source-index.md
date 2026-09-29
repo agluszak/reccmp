@@ -60,6 +60,9 @@ index.write(repo / "build/source-index.json")
 owners = index.functions_by_address(target="GAME")
 ```
 
+The caller owns the final index output. Collection caches per-TU artifacts and
+its profile; it does not write another aggregate index into the cache directory.
+
 Set `RECCMP_SOURCE_INDEXER` (or put `reccmp-source-indexer` on `PATH`) to a
 collector built against LLVM 21. Without that, the first collection compiles
 `indexer.cpp` into the cache using the host's LLVM 21 development libraries.
@@ -90,7 +93,10 @@ serialization) plus records and bytes by kind.
 Most of a unit's records describe headers that many units include (on the
 Wizardry corpus a declaration line recurs 32 times on average, a class 56
 times). Units are loaded through a `RecordPool` that parses each distinct
-artifact line once and shares the record; derivation sees each record once.
+artifact line once and shares the record. Derivation skips shared external facts
+before constructing their namespace keys; TU-local declarations remain distinct
+in each including unit. Different observations and target namespaces retain
+their own consistency checks.
 
 The index also lists, per unit, the repository files it includes
 (`unit_dependencies`).

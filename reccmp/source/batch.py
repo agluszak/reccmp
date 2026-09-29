@@ -601,8 +601,6 @@ def collect_compile_database(
             },
             repository=repository,
         )
-    with profile.phase("write"):
-        result.write(cache / "source-index.json")
     digests.save()
     _publish(cache / "profile.json", json.dumps(profile.to_dict(), indent=1))
     logger.info("%s", profile.summary())

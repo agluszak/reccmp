@@ -41,17 +41,33 @@ def derive_namespace(
     declarations: dict[DeclarationKey, list[SourceDeclaration]] = {}
     variables: dict[DeclarationKey, list[SourceVariable]] = {}
     classes: dict[DeclarationKey, list[SourceClass]] = {}
+    shared_declarations: set[int] = set()
+    shared_variables: set[int] = set()
+    shared_classes: set[int] = set()
     for unit in selected:
         # Units share fact objects; each key keeps each object once.
         for declaration in unit.declarations:
+            if declaration.is_external:
+                identity = id(declaration)
+                if identity in shared_declarations:
+                    continue
+                shared_declarations.add(identity)
             _add_observation(
                 declarations, declaration.key(target, unit.unit_id), declaration
             )
         for variable in unit.variables:
+            identity = id(variable)
+            if identity in shared_variables:
+                continue
+            shared_variables.add(identity)
             _add_observation(
                 variables, DeclarationKey(target, variable.semantic_id), variable
             )
         for source_class in unit.classes:
+            identity = id(source_class)
+            if identity in shared_classes:
+                continue
+            shared_classes.add(identity)
             _add_observation(
                 classes, DeclarationKey(target, source_class.semantic_id), source_class
             )

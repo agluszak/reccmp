@@ -116,7 +116,7 @@ class TranslationUnitRecords:
         unit = cls(unit_id=unit_id)
         with path.open("rb") as handle:
             for line in handle:
-                if not line.strip():
+                if line.isspace():
                     continue
                 shared = pool.facts.get(line) if pool is not None else None
                 if shared is not None:
@@ -135,7 +135,7 @@ class TranslationUnitRecords:
 
     def extend_stream(self, handle: TextIO) -> None:
         for line in handle:
-            if line.strip():
+            if not line.isspace():
                 self.add(json.loads(line))
 
 

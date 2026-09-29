@@ -16,6 +16,7 @@ from reccmp.source import (
 )
 from reccmp.source.index import source_digest
 from reccmp.source.records import SourceDeclaration
+from reccmp.source.observations import RecordPool, TranslationUnitRecords
 
 
 def _declaration(**fields) -> dict:
@@ -618,6 +619,47 @@ def test_internal_functions_are_distinct_per_translation_unit(tmp_path: Path) ->
     namespace = collector.derive(target="GAME", unit_ids={"a.cpp", "b.cpp"})
     assert len(namespace.declarations) == 2
     assert not namespace.conflicts
+
+
+def test_shared_header_facts_preserve_local_keys_targets_and_conflicts(
+    tmp_path: Path,
+) -> None:
+    external = _declaration(
+        semantic_id="_shared", qualified_name="shared", source_file="common.h", line=1
+    )
+    local = _declaration(
+        semantic_id="_helper",
+        qualified_name="helper",
+        source_file="common.h",
+        line=2,
+        linkage="internal",
+        storage_class="static",
+    )
+    pool = RecordPool()
+    units = []
+    for name, records in (
+        ("a.cpp", [external, local]),
+        ("b.cpp", [external, local]),
+        ("c.cpp", [{**external, "return_type": "long"}]),
+    ):
+        path = tmp_path / name
+        path.write_text(
+            " \t\n" + "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        units.append(TranslationUnitRecords.load(path, name, pool))
+    index = SourceIndex.from_units(
+        units, {"GAME": {"a.cpp", "b.cpp", "c.cpp"}, "EDITOR": {"a.cpp"}}
+    )
+    assert {key for key in index.declarations if key.semantic_id == "_helper"} == {
+        DeclarationKey("GAME", "_helper", "a.cpp"),
+        DeclarationKey("GAME", "_helper", "b.cpp"),
+        DeclarationKey("EDITOR", "_helper", "a.cpp"),
+    }
+    assert DeclarationKey("GAME", "_shared") in index.declarations
+    assert DeclarationKey("EDITOR", "_shared") in index.declarations
+    [conflict] = index.conflicts
+    assert conflict.target == "GAME"
+    assert {variant.signature[2] for variant in conflict.variants} == {"void", "long"}
 
 
 def test_tu_local_functions_with_one_mangled_name_bind_by_location(
