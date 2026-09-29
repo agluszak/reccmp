@@ -24,13 +24,14 @@ from reccmp.analysis import (
     is_likely_latin1,
     is_likely_widechar,
 )
-from reccmp.analysis.x86 import code_signature
+from reccmp.analysis.x86 import code_signature, direct_call_target, instructions
 from reccmp.analysis.crt_startup import (
     detect_crt_startup_arrays,
     get_crt_function_name,
 )
 from .db import EntityDb, PairBasis, ReccmpEntity, entity_name_from_string
 from .queries import get_floats_without_data, get_strings_without_data
+from .thunk_resolve import is_plausible_vtable_target
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +697,88 @@ def classify_synthetic_jump_aliases(
         paired = db.get_one_match(target)
         if paired is not None and paired.get("type") == EntityType.FUNCTION:
             db.set_alias(ImageId.ORIG, addr, target)
+
+
+def _direct_calls(binfile: PEImage, addr: int, size: int | None) -> tuple[int, ...] | None:
+    if size is None or size <= 0 or size > 10000:
+        return None
+    try:
+        code = bytes(binfile.read(addr, size))
+    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+        return None
+    return tuple(
+        target
+        for insn in instructions(code, addr)
+        if (target := direct_call_target(insn)) is not None
+    )
+
+
+def match_unpaired_direct_callees(
+    db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage
+) -> None:
+    """Derive an unnamed callee from the same calls in independent paired bodies.
+
+    Require whole direct-call sequences to align, including already paired
+    callees. Two distinct paired callers must agree on one original/rebuild
+    target and neither target may have another candidate. This recovers
+    private library helpers absent from the rebuild PDB without pairing on
+    a common short body or a rendered function name.
+    """
+    candidates = {
+        entity.orig_addr
+        for entity in db.unexplained(ImageId.ORIG)
+        if entity.get("type") == EntityType.FUNCTION
+        and entity.orig_addr is not None
+        and entity.best_name() is not None
+    }
+    observations: dict[int, dict[int, set[int]]] = {}
+    for parent in db.get_matches_by_type(EntityType.FUNCTION):
+        if db.pair_basis(parent.orig_addr) != PairBasis.ANNOTATION:
+            continue
+        orig_calls = _direct_calls(
+            orig_bin,
+            parent.orig_addr,
+            parent.size(ImageId.ORIG) or parent.fact(ImageId.ORIG, "orig_max_size"),
+        )
+        if not orig_calls or not candidates.intersection(orig_calls):
+            continue
+        recomp_calls = _direct_calls(
+            recomp_bin, parent.recomp_addr, parent.size(ImageId.RECOMP)
+        )
+        if recomp_calls is None or len(orig_calls) != len(recomp_calls):
+            continue
+        proposed: set[tuple[int, int]] = set()
+        for orig_target, recomp_target in zip(orig_calls, recomp_calls):
+            orig_identity = db.alias_canonical_orig(ImageId.ORIG, orig_target)
+            recomp_identity = db.alias_canonical_orig(ImageId.RECOMP, recomp_target)
+            if orig_identity is not None or recomp_identity is not None:
+                if orig_identity != recomp_identity:
+                    break
+            elif (
+                orig_target in candidates
+                and db.get(ImageId.RECOMP, recomp_target) is None
+                and is_plausible_vtable_target(recomp_bin, recomp_target)
+            ):
+                proposed.add((orig_target, recomp_target))
+            else:
+                break
+        else:
+            for orig_target, recomp_target in proposed:
+                observations.setdefault(orig_target, {}).setdefault(
+                    recomp_target, set()
+                ).add(parent.orig_addr)
+
+    reverse: dict[int, set[int]] = {}
+    for orig_target, targets in observations.items():
+        for recomp_target in targets:
+            reverse.setdefault(recomp_target, set()).add(orig_target)
+    with db.batch() as batch:
+        for orig_target, targets in observations.items():
+            if len(targets) != 1:
+                continue
+            recomp_target, parents = next(iter(targets.items()))
+            if len(parents) >= 2 and reverse[recomp_target] == {orig_target}:
+                batch.match(orig_target, recomp_target, basis=PairBasis.DERIVED)
 
 
 def classify_exact_vtable_aliases(

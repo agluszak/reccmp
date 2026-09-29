@@ -61,6 +61,7 @@ from .analyze import (
     classify_exact_vtable_aliases,
     classify_folded_function_aliases,
     classify_synthetic_jump_aliases,
+    match_unpaired_direct_callees,
     classify_folded_vtable_aliases,
     match_inferred_vtables_by_slots,
 )
@@ -261,6 +262,7 @@ class Compare:
         classify_exact_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         classify_folded_function_aliases(self._db, self.orig_bin, self.recomp_bin)
         classify_synthetic_jump_aliases(self._db, self.orig_bin, self.codebase)
+        match_unpaired_direct_callees(self._db, self.orig_bin, self.recomp_bin)
         classify_folded_vtable_aliases(self._db, self.orig_bin, self.recomp_bin)
         unique_names_for_overloaded_functions(self._db)
         name_thunks(self._db)

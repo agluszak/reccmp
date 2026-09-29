@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import struct
 import pytest
 from reccmp.compare.db import EntityDb, PairBasis
-from reccmp.formats.image import ImageImport, ImageRegion
+from reccmp.formats.image import (
+    ImageImport,
+    ImageRegion,
+    ImageSection,
+    ImageSectionFlags,
+)
 from reccmp.formats import PEImage
 from reccmp.types import EntityType, ImageId
 from reccmp.parser.marker import MarkerType
@@ -25,6 +30,7 @@ from reccmp.compare.analyze import (
     normalize_original_zero_size_data,
     classify_exact_vtable_aliases,
     classify_synthetic_jump_aliases,
+    match_unpaired_direct_callees,
     classify_folded_vtable_aliases,
     match_inferred_vtables_by_slots,
 )
@@ -33,6 +39,7 @@ from reccmp.analysis.funcinfo import (
     FuncInfo,
     UnwindMapEntry,
 )
+from .raw_image import RawImage
 
 
 @pytest.fixture(name="db")
@@ -236,6 +243,60 @@ def test_synthetic_jump_alias_requires_marker_jump_and_pair(
     classify_synthetic_jump_aliases(db, binfile, codebase)
 
     assert db.alias_canonical_orig(ImageId.ORIG, 100) == expected
+
+
+def _call_image(base: int, targets: tuple[int, ...], known: int) -> RawImage:
+    raw = bytearray(b"\xcc" * 0x140)
+    for index, target in enumerate(targets):
+        addr = base + index * 0x20
+        offset = index * 0x20
+        raw[offset : offset + 5] = b"\xe8" + struct.pack("<i", target - addr - 5)
+        raw[offset + 5 : offset + 10] = b"\xe8" + struct.pack(
+            "<i", known - addr - 10
+        )
+        raw[offset + 10] = 0xC3
+    for target in (*targets, known):
+        raw[target - base] = 0xC3
+    image = RawImage.from_memory(bytes(raw), base_addr=base)
+    image.sections = (
+        ImageSection(
+            virtual_range=range(base, base + len(raw)),
+            physical_range=range(len(raw)),
+            view=image.view,
+            flags=ImageSectionFlags.EXECUTE,
+        ),
+    )
+    return image
+
+
+@pytest.mark.parametrize(
+    ("recomp_targets", "expected"),
+    [((0x20100, 0x20100), 0x20100), ((0x20100,), None), ((0x20100, 0x20120), None)],
+)
+def test_unpaired_direct_callee_needs_two_consistent_callers(
+    db: EntityDb, recomp_targets: tuple[int, ...], expected: int | None
+):
+    orig_targets = (0x10100,) * len(recomp_targets)
+    orig_bin = _call_image(0x10000, orig_targets, 0x10110)
+    recomp_bin = _call_image(0x20000, recomp_targets, 0x20110)
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x10100, type=EntityType.FUNCTION, name="helper")
+        batch.set(ImageId.ORIG, 0x10110, type=EntityType.FUNCTION)
+        batch.set(ImageId.RECOMP, 0x20110, type=EntityType.FUNCTION)
+        batch.match(0x10110, 0x20110, basis=PairBasis.ANNOTATION)
+        for index in range(len(recomp_targets)):
+            orig_parent = 0x10000 + index * 0x20
+            recomp_parent = 0x20000 + index * 0x20
+            batch.set(ImageId.ORIG, orig_parent, type=EntityType.FUNCTION, size=11)
+            batch.set(ImageId.RECOMP, recomp_parent, type=EntityType.FUNCTION, size=11)
+            batch.match(orig_parent, recomp_parent, basis=PairBasis.ANNOTATION)
+
+    match_unpaired_direct_callees(db, orig_bin, recomp_bin)
+
+    pair = db.get_one_match(0x10100)
+    assert (pair.recomp_addr if pair is not None else None) == expected
+    if expected is not None:
+        assert db.pair_basis(0x10100) == PairBasis.DERIVED
 
 
 def test_create_analysis_floats(db: EntityDb):
