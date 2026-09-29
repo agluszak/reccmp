@@ -6,7 +6,8 @@ pydemumble==0.0.1
 pyghidra==3.1.0
 # The agluszak/ghidriff fork: the same-basename decompiler-pool fix,
 # normalization of default and address-bearing labels, PE export-comment
-# RVAs and warning addresses, simple equalities, supplied function pairs, bounded decompiler
+# RVAs and warning addresses, simple equalities and independent local updates,
+# supplied function pairs, bounded decompiler
 # pools, buffered Markdown reports, reports for rebuilt images without version
 # info, and Ghidra 12.1.4.
-ghidriff @ https://github.com/agluszak/ghidriff/archive/4024b72eb6378c47257b557d856c46ecb7abe7f8.tar.gz
+ghidriff @ https://github.com/agluszak/ghidriff/archive/0f10c1485a60ba3106b69aad7151709e3e5bebaa.tar.gz
