@@ -15,59 +15,95 @@ from reccmp.analysis.x86 import decode_one, direct_call_target
 from reccmp.types import ImageId
 
 
+def _body_calls(program, image, address, identities, names):
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    function = program.getFunctionManager().getFunctionAt(space.getAddress(address))
+    if function is None:
+        return {"calls": None, "error": "no-function-at-entry"}
+    body = function.getBody()
+    calls = []
+    for instruction in program.getListing().getInstructions(body, True):
+        if not instruction.getFlowType().isCall():
+            continue
+        # A Ghidra reference resolving an indirect call is not a direct call.
+        site = int(instruction.getAddress().getOffset())
+        decoded = decode_one(bytes(int(b) & 255 for b in instruction.getBytes()), site)
+        target = direct_call_target(decoded) if decoded is not None else None
+        if target is None:
+            continue
+        obj = identities.get(target)
+        calls.append(
+            {
+                "site": f"{site:#x}",
+                "target": f"{target:#x}",
+                "identity": f"pair:{obj.orig_addr:#x}"
+                if obj
+                else f"{image.name.lower()}:{target:#x}",
+                "paired": obj is not None,
+                "name": obj.name if obj else names.get(target),
+            }
+        )
+    return {
+        "body_ranges": [
+            [str(r.getMinAddress()), str(r.getMaxAddress())] for r in body.getAddressRanges()
+        ],
+        "calls": calls,
+    }
+
+
 def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict:
     """Read Ghidra-owned function bodies using catalog-owned identities."""
     functions = []
     identities = {image: {obj.addr(image): obj for obj in manifest.objects} for image in ImageId}
+    names = {
+        image: {obj.addr: obj.name for obj in manifest.unpaired if obj.image_id == image}
+        for image in ImageId
+    }
     pairs = {obj.orig_addr: obj for obj in manifest.objects}
     for alias in manifest.aliases:
         if alias.canonical_orig in pairs:
             identities[alias.image_id][alias.addr] = pairs[alias.canonical_orig]
+    bodies: dict[ImageId, dict[int, dict[str, Any]]] = {image: {} for image in programs}
     for entry in manifest.functions:
         if entry.recomp_addr is None:
             continue
-        sides: dict[str, Any] = {}
+        sides = {}
         for image, program in programs.items():
             address = entry.orig_addr if image == ImageId.ORIG else entry.recomp_addr
-            space = program.getAddressFactory().getDefaultAddressSpace()
-            function = program.getFunctionManager().getFunctionAt(space.getAddress(address))
-            side: dict[str, Any] = {"calls": None}
-            sides[image.name.lower()] = side
-            if function is None:
-                side["error"] = "no-function-at-entry"
-                continue
-            body = function.getBody()
-            side["body_ranges"] = [
-                [str(r.getMinAddress()), str(r.getMaxAddress())] for r in body.getAddressRanges()
-            ]
-            calls = []
-            for instruction in program.getListing().getInstructions(body, True):
-                if not instruction.getFlowType().isCall():
-                    continue
-                # Ghidra may resolve an indirect call as a reference; exclude
-                # it from the direct-call sequence nonetheless.
-                site = int(instruction.getAddress().getOffset())
-                decoded = decode_one(bytes(int(b) & 255 for b in instruction.getBytes()), site)
-                target = direct_call_target(decoded) if decoded is not None else None
-                if target is None:
-                    continue
-                obj = identities[image].get(target)
-                calls.append(
-                    {
-                        "site": f"{site:#x}",
-                        "target": f"{target:#x}",
-                        "identity": f"pair:{obj.orig_addr:#x}"
-                        if obj
-                        else f"{image.name.lower()}:{target:#x}",
-                        "paired": obj is not None,
-                        "name": obj.name if obj else None,
-                    }
-                )
-            side["calls"] = calls
+            observation = _body_calls(program, image, address, identities[image], names[image])
+            bodies[image][address] = observation
+            sides[image.name.lower()] = observation
         functions.append({"address": f"{entry.orig_addr:#x}", **sides})
+    # Read only targets already observed in these callers, not a second whole-
+    # binary function inventory. Unpaired template emissions can still have
+    # known retail bodies; no counterpart or equivalence is inferred for them.
+    targets = []
+    for image, program in programs.items():
+        addresses = {
+            int(call["target"], 16)
+            for body in bodies[image].values()
+            for call in body["calls"] or []
+        }
+        for address in sorted(addresses):
+            body = bodies[image].get(address)
+            if body is None:
+                body = _body_calls(program, image, address, identities[image], names[image])
+            obj = identities[image].get(address)
+            targets.append(
+                {
+                    "image": image.name.lower(),
+                    "address": f"{address:#x}",
+                    "identity": f"pair:{obj.orig_addr:#x}"
+                    if obj
+                    else f"{image.name.lower()}:{address:#x}",
+                    "name": obj.name if obj else names[image].get(address),
+                    **body,
+                }
+            )
     return {
         "manifest_sha256": manifest.digest(),
         "functions": functions,
+        "targets": targets,
         "scope": "direct calls in Ghidra function bodies, in address order; excludes indirect calls and tail jumps",
     }
 
