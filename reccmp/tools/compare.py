@@ -155,10 +155,10 @@ def _stage(name: str):
 
 def _reviewed_signatures(
     args: argparse.Namespace, manifest: Manifest
-) -> tuple[dict[int, int], set[int]]:
+) -> tuple[dict[int, int], dict[int, str]]:
     """Read established original cdecl facts that agree with PDB decoration."""
     if not args.orig_ghidra_project and not args.orig_ghidra_program:
-        return {}, set()
+        return {}, {}
     if not args.orig_ghidra_project or not args.orig_ghidra_program:
         raise ValueError("both reviewed Ghidra project and program are required")
     import pyghidra
@@ -179,7 +179,18 @@ def _reviewed_signatures(
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
             signatures: dict[int, int] = {}
-            bool_returns: set[int] = set()
+            scalar_returns: dict[int, str] = {}
+            scalar_spellings = {
+                "bool": "bool",
+                "int": "int",
+                "uint": "unsigned int",
+                "short": "short",
+                "ushort": "unsigned short",
+                "long": "long",
+                "ulong": "unsigned long",
+                "float": "float",
+                "double": "double",
+            }
             for obj in manifest.objects:
                 if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:
                     continue
@@ -192,11 +203,9 @@ def _reviewed_signatures(
                 demangled = DemanglerUtil.demangle(obj.recomp_symbol)
                 if not isinstance(demangled, DemangledFunction):
                     continue
-                if (
-                    function.getReturnType().getName() == "bool"
-                    and str(demangled.getReturnType()) == "bool"
-                ):
-                    bool_returns.add(obj.orig_addr)
+                return_name = str(function.getReturnType().getName())
+                if scalar_spellings.get(return_name) == str(demangled.getReturnType()):
+                    scalar_returns[obj.orig_addr] = return_name
                 if function.getCallingConventionName() != "__cdecl":
                     continue
                 if demangled.getCallingConvention() != "__cdecl":
@@ -211,7 +220,7 @@ def _reviewed_signatures(
                 )
                 if function.getParameterCount() == count:
                     signatures[obj.orig_addr] = count
-            return signatures, bool_returns
+            return signatures, scalar_returns
     finally:
         project.close()
 
@@ -252,13 +261,13 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     )
     (
         engine.reviewed_cdecl_signatures,
-        engine.reviewed_bool_returns,
+        engine.reviewed_scalar_returns,
     ) = _reviewed_signatures(args, manifest)
     reviewed_digest = hashlib.sha256(
         json.dumps(
             [
                 sorted(engine.reviewed_cdecl_signatures.items()),
-                sorted(engine.reviewed_bool_returns),
+                sorted(engine.reviewed_scalar_returns.items()),
             ]
         ).encode()
     ).hexdigest()

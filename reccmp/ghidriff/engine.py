@@ -32,7 +32,7 @@ from .locations import (
     register_operand,
 )
 from .preparation import (
-    apply_reviewed_bool_returns,
+    apply_reviewed_scalar_returns,
     apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
     correct_recompiled_signatures,
@@ -79,7 +79,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 20
+PREPARATION_REVISION = 21
 
 
 @dataclass(frozen=True)
@@ -283,7 +283,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._sides: dict[Any, ImageId] = {}
         self._retail_signatures: dict[int, tuple[int, str]] = {}
         self.reviewed_cdecl_signatures: dict[int, int] = {}
-        self.reviewed_bool_returns: set[int] = set()
+        self.reviewed_scalar_returns: dict[int, str] = {}
         super().__init__(*args, **kwargs)
 
     # --- ghidriff hooks ---------------------------------------------------
@@ -483,7 +483,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     )
                 )
             }
-            apply_reviewed_bool_returns(program, self.reviewed_bool_returns)
+            apply_reviewed_scalar_returns(program, self.reviewed_scalar_returns)
         else:
             correct_recompiled_signatures(
                 program,
@@ -498,11 +498,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     and obj.recomp_symbol
                 },
             )
-            apply_reviewed_bool_returns(
+            apply_reviewed_scalar_returns(
                 program,
                 {
-                    recomp_addr
-                    for orig_addr in self.reviewed_bool_returns
+                    recomp_addr: return_name
+                    for orig_addr, return_name in self.reviewed_scalar_returns.items()
                     if (recomp_addr := self._recomp_entries.get(orig_addr)) is not None
                 },
             )

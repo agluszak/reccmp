@@ -57,17 +57,38 @@ def apply_reviewed_cdecl_signatures(
         function.setSignatureSource(SourceType.USER_DEFINED)
 
 
-def apply_reviewed_bool_returns(program: "Program", addresses: set[int]) -> None:
-    """Use a return type independently established by retail and PDB."""
-    from ghidra.program.model.data import BooleanDataType
+def apply_reviewed_scalar_returns(program: "Program", returns: dict[int, str]) -> None:
+    """Use scalar return types independently established by retail and PDB."""
+    from ghidra.program.model.data import (
+        BooleanDataType,
+        DoubleDataType,
+        FloatDataType,
+        IntegerDataType,
+        LongDataType,
+        ShortDataType,
+        UnsignedIntegerDataType,
+        UnsignedLongDataType,
+        UnsignedShortDataType,
+    )
     from ghidra.program.model.symbol import SourceType
 
+    data_types = {
+        "bool": BooleanDataType.dataType,
+        "int": IntegerDataType.dataType,
+        "uint": UnsignedIntegerDataType.dataType,
+        "short": ShortDataType.dataType,
+        "ushort": UnsignedShortDataType.dataType,
+        "long": LongDataType.dataType,
+        "ulong": UnsignedLongDataType.dataType,
+        "float": FloatDataType.dataType,
+        "double": DoubleDataType.dataType,
+    }
     functions = program.getFunctionManager()
     space = program.getAddressFactory().getDefaultAddressSpace()
-    for address in addresses:
+    for address, return_name in returns.items():
         function = functions.getFunctionAt(space.getAddress(address))
-        if function is not None and function.getReturnType().getName() != "bool":
-            function.setReturnType(BooleanDataType.dataType, SourceType.USER_DEFINED)
+        if function is not None and function.getReturnType().getName() != return_name:
+            function.setReturnType(data_types[return_name], SourceType.USER_DEFINED)
 
 
 def correct_recompiled_signatures(
