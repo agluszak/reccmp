@@ -10,4 +10,4 @@ pyghidra==3.1.0
 # supplied function pairs, bounded decompiler
 # pools, buffered Markdown reports, reports for rebuilt images without version
 # info, and Ghidra 12.1.4.
-ghidriff @ https://github.com/agluszak/ghidriff/archive/4de23b4a4c9d9d359608429043f579a448751db8.tar.gz
+ghidriff @ https://github.com/agluszak/ghidriff/archive/78704f4a3f6524d1b43d247bee6ea79293f6e0bd.tar.gz

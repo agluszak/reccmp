@@ -1007,7 +1007,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         if decompiled is None or decompiled.code is None:
             return None
         lines = decompiled.code.splitlines(True)
-        self.normalize_ghidra_decomp(lines)
+        stack_setup = (
+            "replaced with injection: alloca_probe" in decompiled.code
+            or "ExceptionList" in decompiled.code
+        )
+        self.normalize_ghidra_decomp(lines, addr, stack_setup)
         return lines
 
     def results(self) -> list[FunctionResult]:
