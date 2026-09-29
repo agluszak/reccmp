@@ -50,9 +50,7 @@ def _manifest(tmp_path: Path, catalog: Compare, **kwargs):
     recomp = tmp_path / "recomp.exe"
     orig.write_bytes(b"orig")
     recomp.write_bytes(b"recomp")
-    return build_manifest(
-        catalog, target_id="TEST", orig_path=orig, recomp_path=recomp, **kwargs
-    )
+    return build_manifest(catalog, target_id="TEST", orig_path=orig, recomp_path=recomp, **kwargs)
 
 
 def test_every_original_function_is_requested_paired_or_not(tmp_path: Path):
@@ -140,3 +138,20 @@ def test_extent_prefers_the_own_image():
     )
     assert obj.extent(ImageId.ORIG) == 4
     assert obj.extent(ImageId.RECOMP) == 8
+
+
+def test_unpaired_import_slot_is_not_compared_as_literal_data(tmp_path: Path):
+    from reccmp.ghidriff.engine import ReccmpDiffEngine
+    from reccmp.ghidriff.locations import Extents
+
+    catalog = _catalog()
+    with catalog.db.batch() as batch:
+        batch.set(
+            ImageId.ORIG, 0x90, type=EntityType.IMPORT, name="SR.dll::RetailOnlyExport", size=4
+        )
+        batch.set(ImageId.ORIG, 0x94, type=EntityType.DATA, name="adjacent_literal", size=4)
+    manifest = _manifest(tmp_path, catalog)
+    engine = object.__new__(ReccmpDiffEngine)
+    engine._extents = {ImageId.ORIG: Extents(manifest, ImageId.ORIG)}
+    assert not engine._is_data(ImageId.ORIG, 0x90)
+    assert engine._is_data(ImageId.ORIG, 0x94)

@@ -38,9 +38,7 @@ def comparison_run(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(engine, "ReccmpDiffEngine", Engine)
-    monkeypatch.setattr(
-        compare, "_reviewed_signatures", lambda *_: ({}, state["reviewed"])
-    )
+    monkeypatch.setattr(compare, "_reviewed_signatures", lambda *_: ({}, state["reviewed"]))
 
     def analyze(_engine, _args, **_options):
         state["runs"] += 1
@@ -52,7 +50,7 @@ def comparison_run(tmp_path, monkeypatch):
             orig_refs=(),
             recomp_refs=(),
         )
-        return {"functions": {"modified": []}}, [result]
+        return {"functions": {"modified": []}}, [result], {"functions": []}
 
     monkeypatch.setattr(compare, "_compare_programs", analyze)
     args = SimpleNamespace(
@@ -107,9 +105,7 @@ def test_changed_comparison_inputs_invalidate_completed_result(comparison_run, c
     if change == "binary":
         manifest = replace(manifest, recomp=replace(manifest.recomp, sha256="c" * 64))
     elif change == "identity":
-        manifest = replace(
-            manifest, functions=(replace(manifest.functions[0], name="another"),)
-        )
+        manifest = replace(manifest, functions=(replace(manifest.functions[0], name="another"),))
     elif change == "timeout":
         args.decompiler_timeout = 120
     elif change == "reviewed":
