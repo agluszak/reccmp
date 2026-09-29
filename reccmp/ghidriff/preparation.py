@@ -57,6 +57,19 @@ def apply_reviewed_cdecl_signatures(
         function.setSignatureSource(SourceType.USER_DEFINED)
 
 
+def apply_reviewed_bool_returns(program: "Program", addresses: set[int]) -> None:
+    """Use a return type independently established by retail and PDB."""
+    from ghidra.program.model.data import BooleanDataType
+    from ghidra.program.model.symbol import SourceType
+
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for address in addresses:
+        function = functions.getFunctionAt(space.getAddress(address))
+        if function is not None and function.getReturnType().getName() != "bool":
+            function.setReturnType(BooleanDataType.dataType, SourceType.USER_DEFINED)
+
+
 def correct_recompiled_signatures(
     program: "Program", symbols: dict[int, tuple[str, int, str]]
 ) -> None:

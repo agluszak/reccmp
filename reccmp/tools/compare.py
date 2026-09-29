@@ -153,12 +153,12 @@ def _stage(name: str):
     )
 
 
-def _reviewed_cdecl_signatures(
+def _reviewed_signatures(
     args: argparse.Namespace, manifest: Manifest
-) -> dict[int, int]:
+) -> tuple[dict[int, int], set[int]]:
     """Read established original cdecl facts that agree with PDB decoration."""
     if not args.orig_ghidra_project and not args.orig_ghidra_program:
-        return {}
+        return {}, set()
     if not args.orig_ghidra_project or not args.orig_ghidra_program:
         raise ValueError("both reviewed Ghidra project and program are required")
     import pyghidra
@@ -179,6 +179,7 @@ def _reviewed_cdecl_signatures(
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
             signatures: dict[int, int] = {}
+            bool_returns: set[int] = set()
             for obj in manifest.objects:
                 if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:
                     continue
@@ -186,11 +187,17 @@ def _reviewed_cdecl_signatures(
                 if (
                     function is None
                     or function.getSignatureSource() == SourceType.DEFAULT
-                    or function.getCallingConventionName() != "__cdecl"
                 ):
                     continue
                 demangled = DemanglerUtil.demangle(obj.recomp_symbol)
                 if not isinstance(demangled, DemangledFunction):
+                    continue
+                if (
+                    function.getReturnType().getName() == "bool"
+                    and str(demangled.getReturnType()) == "bool"
+                ):
+                    bool_returns.add(obj.orig_addr)
+                if function.getCallingConventionName() != "__cdecl":
                     continue
                 if demangled.getCallingConvention() != "__cdecl":
                     continue
@@ -204,7 +211,7 @@ def _reviewed_cdecl_signatures(
                 )
                 if function.getParameterCount() == count:
                     signatures[obj.orig_addr] = count
-            return signatures
+            return signatures, bool_returns
     finally:
         project.close()
 
@@ -243,9 +250,17 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         bsim=False,
         decompiler_timeout=args.decompiler_timeout,
     )
-    engine.reviewed_cdecl_signatures = _reviewed_cdecl_signatures(args, manifest)
+    (
+        engine.reviewed_cdecl_signatures,
+        engine.reviewed_bool_returns,
+    ) = _reviewed_signatures(args, manifest)
     reviewed_digest = hashlib.sha256(
-        json.dumps(sorted(engine.reviewed_cdecl_signatures.items())).encode()
+        json.dumps(
+            [
+                sorted(engine.reviewed_cdecl_signatures.items()),
+                sorted(engine.reviewed_bool_returns),
+            ]
+        ).encode()
     ).hexdigest()
     ghidra_version = str(engine.get_ghidra_version())
     # One project per original binary and analyzer: the original's analysis
