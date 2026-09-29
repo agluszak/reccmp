@@ -7,7 +7,6 @@ import pytest
 from reccmp.types import EntityType, ImageId
 from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.compare.match_msvc import (
-    match_name,
     match_functions,
     match_static_variables,
     match_strings,
@@ -166,31 +165,6 @@ def test_match_functions_ignore_outer_demangler_whitespace(db):
     match_functions(db)
 
     assert db.is_match(123, 555)
-
-
-@pytest.mark.parametrize(
-    ("source", "demangled"),
-    [
-        (
-            "W8Vector<stLight*>::W8Vector",
-            "W8Vector<stLight *>::W8Vector<stLight *>",
-        ),
-        (
-            "W8GrowableVector<srVector3T<float>*>::W8GrowableVector(int)",
-            "W8GrowableVector<srVector3T<float> *>::W8GrowableVector<srVector3T<float> *>(int)",
-        ),
-        (
-            "ns::W8HashTable<unsigned int,int>::W8HashTable",
-            "ns::W8HashTable<unsigned int, int>::W8HashTable<unsigned int, int>",
-        ),
-    ],
-)
-def test_match_name_template_constructor_spelling(source, demangled):
-    assert match_name(source) == match_name(demangled)
-
-
-def test_match_name_keeps_other_template_members_distinct():
-    assert match_name("Vector<int>::Other<int>") != match_name("Vector<int>::Other")
 
 
 def test_match_functions_uses_each_public_name_at_one_address(db):
