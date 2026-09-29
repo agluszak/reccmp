@@ -32,6 +32,7 @@ from .locations import (
     register_operand,
 )
 from .preparation import (
+    apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
     correct_recompiled_signatures,
     correct_import_purges,
@@ -77,7 +78,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 13
+PREPARATION_REVISION = 17
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 self._function_entries[(side, address)] = entry.orig_addr
         self._sides: dict[Any, ImageId] = {}
         self._retail_signatures: dict[int, tuple[int, str]] = {}
+        self.reviewed_cdecl_signatures: dict[int, int] = {}
         super().__init__(*args, **kwargs)
 
     # --- ghidriff hooks ---------------------------------------------------
@@ -452,6 +454,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         ]
         infer_requested_callee_parameters(program, requested, known_callees)
         if image_id == ImageId.ORIG:
+            apply_reviewed_cdecl_signatures(program, self.reviewed_cdecl_signatures)
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
             self._retail_signatures = {
@@ -465,7 +468,13 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     function := functions.getFunctionAt(space.getAddress(obj.orig_addr))
                 )
                 is not None
-                and function.getSignatureSource() == SourceType.ANALYSIS
+                and (
+                    function.getSignatureSource() == SourceType.ANALYSIS
+                    or (
+                        obj.orig_addr in self.reviewed_cdecl_signatures
+                        and function.getSignatureSource() == SourceType.USER_DEFINED
+                    )
+                )
             }
         else:
             correct_recompiled_signatures(

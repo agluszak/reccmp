@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import sys
@@ -23,7 +24,7 @@ from reccmp.project.detect import (
 )
 from reccmp.project.logging import argparse_add_logging_args, argparse_parse_logging
 from reccmp.source.index import SourceIndexError
-from reccmp.types import ImageId
+from reccmp.types import EntityType, ImageId
 
 logger = logging.getLogger(__name__)
 colorama.just_fix_windows_console()
@@ -74,6 +75,15 @@ def parse_args() -> argparse.Namespace:
             "Where analyzed Ghidra projects are kept between runs "
             "(default: .reccmp-cache/ghidra next to the recompiled PDB)"
         ),
+    )
+    parser.add_argument(
+        "--orig-ghidra-project",
+        type=Path,
+        help="Existing reviewed Ghidra project (.gpr) for original signatures",
+    )
+    parser.add_argument(
+        "--orig-ghidra-program",
+        help="Program path in --orig-ghidra-project",
     )
     parser.add_argument(
         "--sxs",
@@ -143,6 +153,62 @@ def _stage(name: str):
     )
 
 
+def _reviewed_cdecl_signatures(
+    args: argparse.Namespace, manifest: Manifest
+) -> dict[int, int]:
+    """Read established original cdecl facts that agree with PDB decoration."""
+    if not args.orig_ghidra_project and not args.orig_ghidra_program:
+        return {}
+    if not args.orig_ghidra_project or not args.orig_ghidra_program:
+        raise ValueError("both reviewed Ghidra project and program are required")
+    import pyghidra
+    from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+    from ghidra.program.model.symbol import SourceType
+
+    project_file = args.orig_ghidra_project
+    if not project_file.is_file():
+        raise FileNotFoundError(project_file)
+    project = pyghidra.open_project(
+        project_file.parent, project_file.stem, create=False
+    )
+    try:
+        with pyghidra.program_context(project, args.orig_ghidra_program) as program:
+            original_md5 = hashlib.md5(manifest.orig.path.read_bytes()).hexdigest()
+            if program.getExecutableMD5().lower() != original_md5:
+                raise ValueError("reviewed Ghidra program is not the original binary")
+            functions = program.getFunctionManager()
+            space = program.getAddressFactory().getDefaultAddressSpace()
+            signatures: dict[int, int] = {}
+            for obj in manifest.objects:
+                if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:
+                    continue
+                function = functions.getFunctionAt(space.getAddress(obj.orig_addr))
+                if (
+                    function is None
+                    or function.getSignatureSource() == SourceType.DEFAULT
+                    or function.getCallingConventionName() != "__cdecl"
+                ):
+                    continue
+                demangled = DemanglerUtil.demangle(obj.recomp_symbol)
+                if not isinstance(demangled, DemangledFunction):
+                    continue
+                if demangled.getCallingConvention() != "__cdecl":
+                    continue
+                parameters = list(demangled.getParameters())
+                if any(parameter.getType().isVarArgs() for parameter in parameters):
+                    continue
+                count = (
+                    0
+                    if len(parameters) == 1 and str(parameters[0]) == "void"
+                    else len(parameters)
+                )
+                if function.getParameterCount() == count:
+                    signatures[obj.orig_addr] = count
+            return signatures
+    finally:
+        project.close()
+
+
 def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manifest):
     # pylint: disable=import-outside-toplevel
     # Importing the engine does not start the JVM, but it does need ghidriff.
@@ -177,6 +243,10 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         bsim=False,
         decompiler_timeout=args.decompiler_timeout,
     )
+    engine.reviewed_cdecl_signatures = _reviewed_cdecl_signatures(args, manifest)
+    reviewed_digest = hashlib.sha256(
+        json.dumps(sorted(engine.reviewed_cdecl_signatures.items())).encode()
+    ).hexdigest()
     ghidra_version = str(engine.get_ghidra_version())
     # One project per original binary and analyzer: the original's analysis
     # is reused across recompiled builds, whose programs replace each other.
@@ -188,7 +258,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     prepared_stamp = projects / project_name / "prepared-key.txt"
-    prepared_key = f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}"
+    prepared_key = (
+        f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
+    )
     try:
         with _stage("set up project"):
             engine.setup_project(

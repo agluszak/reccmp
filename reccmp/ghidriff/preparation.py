@@ -27,6 +27,36 @@ def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> No
             function.setCallFixup("alloca_probe")
 
 
+def apply_reviewed_cdecl_signatures(
+    program: "Program", signatures: dict[int, int]
+) -> None:
+    """Constrain private retail analysis with independently reviewed signatures."""
+    from ghidra.program.model.data import Undefined4DataType
+    from ghidra.program.model.listing import ParameterImpl
+    from ghidra.program.model.symbol import SourceType
+
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for address, count in signatures.items():
+        function = functions.getFunctionAt(space.getAddress(address))
+        if function is None:
+            continue
+        existing = function.getParameterCount()
+        # An inferred extra argument may be an auto-parameter. The reviewed
+        # arity alone does not establish which private parameter to discard.
+        if existing >= count:
+            continue
+        function.setCallingConvention("__cdecl")
+        if function.getParameterCount() > count:
+            continue
+        for index in range(function.getParameterCount(), count):
+            function.addParameter(
+                ParameterImpl(f"param{index}", Undefined4DataType.dataType, program),
+                SourceType.USER_DEFINED,
+            )
+        function.setSignatureSource(SourceType.USER_DEFINED)
+
+
 def correct_recompiled_signatures(
     program: "Program", symbols: dict[int, tuple[str, int, str]]
 ) -> None:
