@@ -188,7 +188,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     )
     orig, recomp = manifest.orig.path, manifest.recomp.path
     prepared_stamp = projects / project_name / "prepared-key.txt"
-    prepared_key = f"v{PREPARATION_REVISION}:{manifest.digest()}"
+    prepared_key = f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}"
     try:
         with _stage("set up project"):
             engine.setup_project(

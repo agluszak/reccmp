@@ -139,6 +139,8 @@ class Manifest:
                     "recomp": f"{obj.recomp_addr:#x}",
                     "name": obj.name,
                     "type": obj.entity_type.name if obj.entity_type else None,
+                    "orig_size": obj.orig_size,
+                    "recomp_size": obj.recomp_size,
                     "basis": obj.basis.value,
                     **({"recomp_symbol": obj.recomp_symbol} if obj.recomp_symbol else {}),
                 }
@@ -167,6 +169,19 @@ class Manifest:
     def digest(self) -> str:
         """Identity of the metadata a comparison ran with."""
         text = json.dumps(self.to_json(), sort_keys=True)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def preparation_digest(self) -> str:
+        """Identity of metadata that changes the prepared Ghidra programs.
+
+        Source locations explain the report but do not enter program
+        preparation. A line-number-only source edit can reuse the prepared
+        programs when the binaries and catalog facts are otherwise unchanged.
+        """
+        document = self.to_json()
+        for entry in document["functions"]:
+            del entry["source"]
+        text = json.dumps(document, sort_keys=True)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 

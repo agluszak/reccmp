@@ -1,11 +1,17 @@
 """The pairs and names reccmp hands to the code differ."""
 
-from pathlib import Path
+from dataclasses import replace
+from pathlib import Path, PurePath
 from unittest.mock import Mock
 
 from reccmp.compare import Compare
 from reccmp.compare.db import PairBasis
-from reccmp.compare.manifest import NamedObject, build_manifest, select_addresses
+from reccmp.compare.manifest import (
+    NamedObject,
+    SourceLocation,
+    build_manifest,
+    select_addresses,
+)
 from reccmp.cvdump import CvdumpAnalysis
 from reccmp.types import EntityType, ImageId
 from .raw_image import RawImage
@@ -99,6 +105,27 @@ def test_manifest_records_its_inputs(tmp_path: Path):
     assert document["functions"][0]["basis"] == "annotation"
     assert document["objects"][0]["recomp_symbol"] == "?Paired@@YAXXZ"
     assert manifest.digest() == _manifest(tmp_path, _catalog()).digest()
+
+
+def test_prepared_identity_tracks_extent_but_not_source_location(tmp_path: Path):
+    manifest = _manifest(tmp_path, _catalog())
+    relocated = replace(
+        manifest,
+        functions=(
+            replace(
+                manifest.functions[0],
+                source=SourceLocation(PurePath("file.cpp"), 42),
+            ),
+            *manifest.functions[1:],
+        ),
+    )
+    assert relocated.digest() != manifest.digest()
+    assert relocated.preparation_digest() == manifest.preparation_digest()
+
+    object_with_new_extent = replace(manifest.objects[0], recomp_size=16)
+    resized = replace(manifest, objects=(object_with_new_extent, *manifest.objects[1:]))
+    assert resized.digest() != manifest.digest()
+    assert resized.preparation_digest() != manifest.preparation_digest()
 
 
 def test_extent_prefers_the_own_image():
