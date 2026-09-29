@@ -125,7 +125,35 @@ def match_name(name: str) -> str:
     name = _ELABORATED_ARGUMENT.sub(r"\1", name)
     name = _ARGUMENT_SPACE.sub(",", name)
     name = _CLOSING_SPACE.sub(">", name)
-    return _VALUE_ARGUMENT.sub(_value_argument, name)
+    name = _VALUE_ARGUMENT.sub(_value_argument, name)
+
+    # MSVC's demangler may repeat a class template's arguments on the
+    # constructor name (Vector<T>::Vector<T>), while source annotations use
+    # the C++ spelling Vector<T>::Vector. Remove only an exact repetition of
+    # the enclosing class component, retaining any overload signature.
+    depth = 0
+    qualifiers: list[int] = []
+    method_end = len(name)
+    for index, char in enumerate(name):
+        if char == "<":
+            depth += 1
+        elif char == ">":
+            depth -= 1
+        elif char == "(" and depth == 0:
+            method_end = index
+            break
+        elif char == ":" and depth == 0 and name[index : index + 2] == "::":
+            qualifiers.append(index)
+    if not qualifiers:
+        return name
+    last = qualifiers[-1]
+    previous = qualifiers[-2] + 2 if len(qualifiers) > 1 else 0
+    owner = name[previous:last]
+    if "<" not in owner or not owner.endswith(">"):
+        return name
+    if name[last + 2 : method_end] != owner:
+        return name
+    return name[: last + 2] + owner.split("<", 1)[0] + name[method_end:]
 
 
 def match_functions(
