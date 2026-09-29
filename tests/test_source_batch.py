@@ -11,6 +11,7 @@ from reccmp.parser import DecompCodebase
 from reccmp.parser.error import AlertCode
 from reccmp.parser.marker import MarkerType
 from reccmp.source import SourceIndex, SourceIndexError
+from reccmp.source.batch import resolve_indexer
 from reccmp.tools.decomplint import DecomplintTarget, lint_all_targets
 
 
@@ -22,6 +23,18 @@ def _require_collector() -> None:
         pytest.skip(
             "run inside the pinned analysis image (LLVM 21 + reccmp-source-indexer)"
         )
+
+
+@pytest.fixture(scope="session")
+def native_indexer(tmp_path_factory) -> Path:
+    """Compile the real collector once; each test still has its own TU cache."""
+    _require_collector()
+    return resolve_indexer(tmp_path_factory.mktemp("native-indexer"))
+
+
+@pytest.fixture(autouse=True)
+def use_native_indexer(native_indexer: Path, monkeypatch) -> None:
+    monkeypatch.setenv("RECCMP_SOURCE_INDEXER", str(native_indexer))
 
 
 def _clang_cl(repository: Path) -> str:

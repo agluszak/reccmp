@@ -9,10 +9,12 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import colorama
 
 import reccmp
+from reccmp.analysis_cache import AnalysisCache, fingerprint_files
 from reccmp.compare import Compare
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.manifest import Manifest, build_manifest
@@ -117,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-cache",
         action="store_true",
-        help="Do not reuse cached PDB and catalog preparation",
+        help="Do not reuse cached catalog, prepared programs or completed comparisons",
     )
     argparse_add_logging_args(parser)
     args = parser.parse_args()
@@ -161,6 +163,8 @@ def _reviewed_signatures(
         return {}, {}
     if not args.orig_ghidra_project or not args.orig_ghidra_program:
         raise ValueError("both reviewed Ghidra project and program are required")
+    # Ghidra imports require the engine-started JVM.
+    # pylint: disable=import-outside-toplevel
     import pyghidra
     from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
     from ghidra.program.model.symbol import SourceType
@@ -227,11 +231,6 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         PREPARATION_REVISION,
         ReccmpDiffEngine,
     )
-    from reccmp.ghidriff.project_cache import (
-        reset_programs,
-        restore_prepared,
-        save_prepared,
-    )
     from reccmp.ghidriff.report import RunInputs, print_summary, summary_json
     from reccmp.ghidriff.results import Outcome
 
@@ -273,11 +272,104 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         f"-reccmp{ANALYSIS_REVISION}"
         f"{'-switchfocus1' if engine.focused_switch_analysis else ''}"
     )
-    orig, recomp = manifest.orig.path, manifest.recomp.path
-    prepared_stamp = projects / project_name / "prepared-key.txt"
     prepared_key = (
         f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
     )
+    # Hash the installed Python implementations as well as version strings:
+    # local edits in either fork must invalidate completed results too.
+    completed_key = fingerprint_files(
+        [
+            *Path(reccmp.__file__).parent.rglob("*.py"),
+            *Path(ghidriff.__file__).parent.rglob("*.py"),
+        ],
+        context=json.dumps(
+            [
+                manifest.digest(),
+                prepared_key,
+                project_name,
+                args.decompiler_timeout,
+                args.threaded,
+                args.max_ram_percent,
+                reccmp.VERSION,
+                ghidriff.__version__,
+            ]
+        ),
+    )
+    cache = AnalysisCache(projects / "completed", enabled=not args.no_cache)
+    cached: tuple[Any, Any] | None = cache.load(
+        "comparison-" + completed_key, completed_key
+    )
+    if cached is not None:
+        pdiff, results = cached
+        print("[CACHE] Reusing completed comparison", file=sys.stderr)
+    else:
+        pdiff, results = _compare_programs(
+            engine,
+            args,
+            project_name=project_name,
+            prepared_key=prepared_key,
+        )
+        if all(result.outcome != Outcome.ANALYSIS_FAILED for result in results):
+            cache.store("comparison-" + completed_key, completed_key, (pdiff, results))
+
+    # The report covers the requested functions only; Ghidriff's global
+    # symbol and string inventories describe whole binaries.
+    differing = {
+        result.entry.orig_addr
+        for result in results
+        if result.outcome == Outcome.DIFFERENCES
+    }
+    pdiff["symbols"] = {"added": [], "deleted": []}
+    pdiff["strings"] = {"added": [], "deleted": []}
+    pdiff["functions"]["modified"] = [
+        func
+        for func in pdiff["functions"]["modified"]
+        if int(func["old"]["address"], 16) in differing
+    ]
+    with _stage("write Ghidriff report"):
+        engine.dump_pdiff_to_path(
+            f"{manifest.target_id}.ghidriff",
+            pdiff,
+            output,
+            side_by_side=args.side_by_side,
+            max_section_funcs=len(differing) or 1,
+            md_title=f"{manifest.target_id}: reconstructed functions with differences",
+        )
+
+    inputs = RunInputs(
+        manifest_sha256=manifest.digest(),
+        reccmp_version=reccmp.VERSION,
+        ghidra_version=ghidra_version,
+        ghidriff_version=ghidriff.__version__,
+        ghidra_project=str(projects / project_name),
+    )
+    summary = summary_json(manifest, inputs, results)
+    summary["inputs"]["comparison_key"] = completed_key
+    summary["cache"] = {"reused": cached is not None}
+    summary_path = output / "summary.json"
+    summary_path.write_text(
+        json.dumps(summary, indent=1) + "\n",
+        encoding="utf-8",
+    )
+    print_summary(results, details=args.details or bool(args.orig_address))
+    print(f"Report: {summary_path}")
+
+
+def _compare_programs(engine, args, *, project_name, prepared_key):
+    """Analyze and compare only on a completed-result cache miss."""
+    # pylint: disable=import-outside-toplevel
+    from reccmp.ghidriff.project_cache import (
+        reset_programs,
+        restore_prepared,
+        save_prepared,
+    )
+
+    output = args.output
+    projects = args.ghidra_projects or (
+        engine.manifest.recomp.path.parent / ".reccmp-cache" / "ghidra"
+    )
+    prepared_stamp = projects / project_name / "prepared-key.txt"
+    orig, recomp = engine.manifest.orig.path, engine.manifest.recomp.path
     try:
         with _stage("set up project"):
             engine.setup_project(
@@ -315,45 +407,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
             results = engine.results()
     finally:
         engine.project.close()
-
-    # The report covers the requested functions only; Ghidriff's global
-    # symbol and string inventories describe whole binaries.
-    differing = {
-        result.entry.orig_addr
-        for result in results
-        if result.outcome == Outcome.DIFFERENCES
-    }
-    pdiff["symbols"] = {"added": [], "deleted": []}
-    pdiff["strings"] = {"added": [], "deleted": []}
-    pdiff["functions"]["modified"] = [
-        func
-        for func in pdiff["functions"]["modified"]
-        if int(func["old"]["address"], 16) in differing
-    ]
-    with _stage("write Ghidriff report"):
-        engine.dump_pdiff_to_path(
-            f"{manifest.target_id}.ghidriff",
-            pdiff,
-            output,
-            side_by_side=args.side_by_side,
-            max_section_funcs=len(differing) or 1,
-            md_title=f"{manifest.target_id}: reconstructed functions with differences",
-        )
-
-    inputs = RunInputs(
-        manifest_sha256=manifest.digest(),
-        reccmp_version=reccmp.VERSION,
-        ghidra_version=ghidra_version,
-        ghidriff_version=ghidriff.__version__,
-        ghidra_project=str(projects / project_name),
-    )
-    summary_path = output / "summary.json"
-    summary_path.write_text(
-        json.dumps(summary_json(manifest, inputs, results), indent=1) + "\n",
-        encoding="utf-8",
-    )
-    print_summary(results, details=args.details or bool(args.orig_address))
-    print(f"Report: {summary_path}")
+    return pdiff, results
 
 
 def main() -> int:

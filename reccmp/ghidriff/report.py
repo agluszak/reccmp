@@ -163,6 +163,44 @@ def summary_json(
     }
 
 
+def comparison_changes(
+    current: dict[str, Any], previous: dict[str, Any]
+) -> dict[int, str]:
+    """Changes at original-address identities; absent selections are not fixes."""
+    if current["target"] != previous["target"]:
+        raise ValueError("comparison reports have different targets")
+    before = {int(row["orig"], 16): row for row in previous["functions"]}
+    after = {int(row["orig"], 16): row for row in current["functions"]}
+    changes: dict[int, str] = {}
+    for address in sorted(before.keys() | after.keys()):
+        old, new = before.get(address), after.get(address)
+        if old is None:
+            changes[address] = "only-current"
+        elif new is None:
+            changes[address] = "only-previous"
+        elif any(
+            old[key] != new[key]
+            for key in (
+                "outcome",
+                "code_diff",
+                "data",
+                "failures",
+                "unidentified_references",
+                "name",
+                "basis",
+            )
+        ):
+            if new["outcome"] == "no-differences" and old["outcome"] == "differences":
+                changes[address] = "resolved"
+            elif new["outcome"] == "differences" and old["outcome"] != "differences":
+                changes[address] = "newly-different"
+            elif new["outcome"] in ("analysis-failed", "unpaired"):
+                changes[address] = new["outcome"]
+            else:
+                changes[address] = "changed"
+    return changes
+
+
 def _location(entry: FunctionEntry) -> str:
     if entry.source is None:
         return ""

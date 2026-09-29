@@ -20,7 +20,7 @@ def test_vtable_command_requires_a_selected_table(
     monkeypatch.setattr(vtable, "argparse_parse_project_target", lambda _: object())
     monkeypatch.setattr(vtable.Compare, "from_target", lambda _: catalog)
     monkeypatch.setattr(
-        vtable, "compare_vtable", lambda *_: SimpleNamespace(matches=True)
+        vtable, "compare_vtable", lambda *_: SimpleNamespace(matches=True, slots=())
     )
 
     assert vtable.main() == expected

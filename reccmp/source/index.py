@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import copy
+from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -511,10 +513,20 @@ class SourceIndex(SourceLayoutQueries):
     def read(cls, path: Path) -> "SourceIndex":
         try:
             content = path.read_bytes()
-            index = cls.from_dict(
-                json.loads(content),
-                document_digest=hashlib.sha256(content).hexdigest(),
+            parsed = (
+                _parsed_document(content)
+                if cls is SourceIndex
+                else cls.from_dict(
+                    json.loads(content),
+                    document_digest=hashlib.sha256(content).hexdigest(),
+                )
             )
+            # Records are immutable; give each reader independent lookup maps
+            # so a caller cannot alter another reader's cached projection.
+            index = copy(parsed)
+            for name, value in vars(parsed).items():
+                if isinstance(value, dict):
+                    setattr(index, name, value.copy())
         except (OSError, ValueError, KeyError, TypeError) as exc:
             if isinstance(exc, SourceIndexError):
                 raise
@@ -529,3 +541,11 @@ class SourceIndex(SourceLayoutQueries):
         encoded = content.encode("utf-8")
         if not path.is_file() or path.read_bytes() != encoded:
             path.write_bytes(encoded)
+
+
+@lru_cache(maxsize=2)
+def _parsed_document(content: bytes) -> SourceIndex:
+    """Reuse parsing for identical bytes; every read still observes the file."""
+    return SourceIndex.from_dict(
+        json.loads(content), document_digest=hashlib.sha256(content).hexdigest()
+    )

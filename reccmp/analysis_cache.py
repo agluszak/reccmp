@@ -1,8 +1,9 @@
 """Validated local cache for expensive, deterministic analysis inputs.
 
 A cache hit reuses parsed PDB or source-marker data, or a prepared entity
-catalog whose every input is fingerprinted. Code comparison results are never
-cached.
+catalog whose every input is fingerprinted. Completed code comparisons also
+reuse this cache when binaries, metadata, analysis configuration and tool
+implementations agree; failed analyses are not retained.
 """
 
 from __future__ import annotations

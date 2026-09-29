@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -769,3 +770,35 @@ def test_identity_changes_with_what_clang_reported(tmp_path: Path) -> None:
     moved.write(path)
     assert SourceIndex.read(path).identity() != first.identity()
     assert moved.identity() != index.identity()
+
+
+def test_cached_read_observes_replacement_with_preserved_metadata(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-index.json"
+    index = SourceIndex(
+        declarations={}, classes={}, markers=(), source_digests={"a.cpp": "aaa"}
+    )
+    index.write(path)
+    first = SourceIndex.read(path)
+    stat = path.stat()
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(path.read_bytes().replace(b"aaa", b"bbb"))
+    os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    replacement.replace(path)
+    second = SourceIndex.read(path)
+    assert second.source_digests == {"a.cpp": "bbb"}
+    assert second.identity() != first.identity()
+
+
+def test_cached_read_keeps_reader_maps_independent(tmp_path: Path) -> None:
+    path = tmp_path / "source-index.json"
+    SourceIndex(
+        declarations={}, classes={}, markers=(), source_digests={"a.cpp": "aaa"}
+    ).write(path)
+    first = SourceIndex.read(path)
+    first.source_digests["a.cpp"] = "mutated"
+    first.unit_dependencies["a.cpp"] = ("invented.h",)
+    second = SourceIndex.read(path)
+    assert second.source_digests == {"a.cpp": "aaa"}
+    assert second.unit_dependencies == {}
