@@ -79,7 +79,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 19
+PREPARATION_REVISION = 20
 
 
 @dataclass(frozen=True)
@@ -265,11 +265,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._function_entries: dict[tuple[ImageId, int], int] = {}
-        self._recomp_entries: dict[int, int] = {}
+        # Return-type preparation also covers callees of selected functions.
+        # Keep their addresses even when the focused comparison omits their bodies.
+        self._recomp_entries: dict[int, int] = {
+            obj.orig_addr: obj.recomp_addr
+            for obj in manifest.objects
+            if obj.entity_type == EntityType.FUNCTION and obj.recomp_addr is not None
+        }
         for entry in manifest.functions:
             if entry.recomp_addr is None:
                 continue
-            self._recomp_entries[entry.orig_addr] = entry.recomp_addr
             for side, address in (
                 (ImageId.ORIG, entry.orig_addr),
                 (ImageId.RECOMP, entry.recomp_addr),
