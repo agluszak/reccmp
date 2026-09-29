@@ -145,12 +145,11 @@ def compare_references(
 ) -> tuple[DataFinding, ...]:
     """Compare the contents of the data both sides refer to.
 
-    A paired object both sides refer to is compared by identity. Everything
-    else has no counterpart on the other side, so only the contents are
-    compared, as a multiset: this flags a different literal without claiming
-    which location corresponds to which. A reference to a different object
-    with the same contents is already visible in the code as a different
-    name; it is not a contents difference.
+    A paired object both sides refer to is compared by identity. References
+    to different paired objects are visible by name in the code; their contents
+    do not describe corresponding data. Only unidentified references are
+    compared as a multiset, to flag different literals without claiming which
+    location corresponds to which.
     """
     findings: list[DataFinding] = []
 
@@ -171,7 +170,7 @@ def compare_references(
         return Counter(
             ref.contents
             for ref in refs
-            if ref.object not in shared and contents_comparable(ref.contents)
+            if ref.object is None and contents_comparable(ref.contents)
         )
 
     orig_rest = rest(orig)

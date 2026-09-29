@@ -162,6 +162,15 @@ def test_same_contents_through_different_objects_is_not_a_data_difference():
     assert not findings
 
 
+def test_different_paired_objects_are_not_compared_by_contents():
+    """Different table references already have distinct identities in code."""
+    findings = compare_references(
+        (_ref(RawBytes(b"\x01", False, True), ObjectOffset(0x5000, "g_a", 0)),),
+        (_ref(RawBytes(b"\x02", False, True), ObjectOffset(0x6000, "g_b", 0)),),
+    )
+    assert not findings
+
+
 def test_an_array_end_is_not_the_object_the_linker_placed_after_it():
     """A loop bound names the end of its array on both sides, whatever
     follows the array in either binary."""
