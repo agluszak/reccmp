@@ -224,7 +224,11 @@ def test_create_thunks_do_not_replace(db: EntityDb):
     ],
 )
 def test_synthetic_jump_alias_requires_marker_jump_and_pair(
-    db: EntityDb, marker_type: MarkerType, opcode: int, paired_target: bool, expected: int | None
+    db: EntityDb,
+    marker_type: MarkerType,
+    opcode: int,
+    paired_target: bool,
+    expected: int | None,
 ):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION)
@@ -251,9 +255,7 @@ def _call_image(base: int, targets: tuple[int, ...], known: int) -> RawImage:
         addr = base + index * 0x20
         offset = index * 0x20
         raw[offset : offset + 5] = b"\xe8" + struct.pack("<i", target - addr - 5)
-        raw[offset + 5 : offset + 10] = b"\xe8" + struct.pack(
-            "<i", known - addr - 10
-        )
+        raw[offset + 5 : offset + 10] = b"\xe8" + struct.pack("<i", known - addr - 10)
         raw[offset + 10] = 0xC3
     for target in (*targets, known):
         raw[target - base] = 0xC3
@@ -297,6 +299,43 @@ def test_unpaired_direct_callee_needs_two_consistent_callers(
     assert (pair.recomp_addr if pair is not None else None) == expected
     if expected is not None:
         assert db.pair_basis(0x10100) == PairBasis.DERIVED
+
+
+def test_marked_trailing_funclet_pairs_from_one_parent(db: EntityDb):
+    orig = bytearray(b"\xcc" * 0x120)
+    orig[0:5] = b"\xe8" + struct.pack("<i", 0x10100 - 0x10005)
+    orig[5] = 0xC3
+    orig[0x100] = 0xC3
+    recomp = bytearray(b"\xcc" * 0x120)
+    recomp[0:5] = b"\xe8\x01\x00\x00\x00"  # local funclet at +6
+    recomp[5] = 0xC3
+    recomp[6:11] = b"\xe8" + struct.pack("<i", 0x20100 - 0x2000B)
+    recomp[11] = 0xC3
+    recomp[0x100] = 0xC3
+    orig_bin = RawImage.from_memory(bytes(orig), base_addr=0x10000)
+    recomp_bin = RawImage.from_memory(bytes(recomp), base_addr=0x20000)
+    recomp_bin.sections = (
+        ImageSection(
+            virtual_range=range(0x20000, 0x20120),
+            physical_range=range(0x120),
+            view=recomp_bin.view,
+            flags=ImageSectionFlags.EXECUTE,
+        ),
+    )
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 0x10000, type=EntityType.FUNCTION, size=6)
+        batch.set(ImageId.RECOMP, 0x20000, type=EntityType.FUNCTION, size=12)
+        batch.match(0x10000, 0x20000, basis=PairBasis.ANNOTATION)
+        batch.set(ImageId.ORIG, 0x10100, type=EntityType.FUNCTION, name="unwind")
+    codebase = Mock()
+    codebase.iter_name_functions.return_value = [
+        SimpleNamespace(type=MarkerType.SYNTHETIC, offset=0x10100)
+    ]
+
+    match_unpaired_direct_callees(db, orig_bin, recomp_bin, codebase)
+
+    pair = db.get_one_match(0x10100)
+    assert pair is not None and pair.recomp_addr == 0x20006
 
 
 def test_create_analysis_floats(db: EntityDb):

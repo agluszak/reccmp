@@ -699,7 +699,9 @@ def classify_synthetic_jump_aliases(
             db.set_alias(ImageId.ORIG, addr, target)
 
 
-def _direct_calls(binfile: PEImage, addr: int, size: int | None) -> tuple[int, ...] | None:
+def _direct_calls(
+    binfile: PEImage, addr: int, size: int | None
+) -> tuple[int, ...] | None:
     if size is None or size <= 0 or size > 10000:
         return None
     try:
@@ -713,17 +715,60 @@ def _direct_calls(binfile: PEImage, addr: int, size: int | None) -> tuple[int, .
     )
 
 
+def _trailing_called_funclet(
+    binfile: PEImage, addr: int, size: int | None
+) -> tuple[tuple[int, ...], int] | None:
+    """Find a local call target immediately following the parent's return.
+
+    VC6 PDB function extents can include an adjacent unwind funclet. Its own
+    calls belong to the funclet, not the enclosing source function.
+    """
+    if size is None or size <= 0 or size > 10000:
+        return None
+    try:
+        code = bytes(binfile.read(addr, size))
+    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+        return None
+    calls: list[int] = []
+    previous = None
+    for insn in instructions(code, addr):
+        if (
+            insn.address in calls
+            and previous is not None
+            and previous.mnemonic.startswith("ret")
+        ):
+            return tuple(calls), insn.address
+        if (target := direct_call_target(insn)) is not None:
+            calls.append(target)
+        previous = insn
+    return None
+
+
 def match_unpaired_direct_callees(
-    db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage
+    db: EntityDb,
+    orig_bin: PEImage,
+    recomp_bin: PEImage,
+    codebase: DecompCodebase | None = None,
 ) -> None:
     """Derive an unnamed callee from the same calls in independent paired bodies.
 
     Require whole direct-call sequences to align, including already paired
     callees. Two distinct paired callers must agree on one original/rebuild
-    target and neither target may have another candidate. This recovers
+    target and neither target may have another candidate. A marked synthetic
+    funclet may instead use one parent when the rebuild PDB folds its body
+    into that parent's extent immediately after a return. This recovers
     private library helpers absent from the rebuild PDB without pairing on
     a common short body or a rendered function name.
     """
+    synthetic = (
+        {
+            marker.offset
+            for marker in codebase.iter_name_functions()
+            if marker.type == MarkerType.SYNTHETIC
+        }
+        if codebase is not None
+        else set()
+    )
     candidates = {
         entity.orig_addr
         for entity in db.unexplained(ImageId.ORIG)
@@ -732,6 +777,7 @@ def match_unpaired_direct_callees(
         and entity.best_name() is not None
     }
     observations: dict[int, dict[int, set[int]]] = {}
+    trailing_funclets: set[tuple[int, int]] = set()
     for parent in db.get_matches_by_type(EntityType.FUNCTION):
         if db.pair_basis(parent.orig_addr) != PairBasis.ANNOTATION:
             continue
@@ -745,8 +791,21 @@ def match_unpaired_direct_callees(
         recomp_calls = _direct_calls(
             recomp_bin, parent.recomp_addr, parent.size(ImageId.RECOMP)
         )
-        if recomp_calls is None or len(orig_calls) != len(recomp_calls):
+        if recomp_calls is None:
             continue
+        if len(orig_calls) != len(recomp_calls):
+            # A single marked retail funclet may be included in its rebuild
+            # parent's PDB extent. Require the local target to begin directly
+            # after a return and every parent call before it to align.
+            if len(orig_calls) != 1 or orig_calls[0] not in synthetic:
+                continue
+            trailing = _trailing_called_funclet(
+                recomp_bin, parent.recomp_addr, parent.size(ImageId.RECOMP)
+            )
+            if trailing is None or trailing[0] != (trailing[1],):
+                continue
+            recomp_calls = trailing[0]
+            trailing_funclets.add((orig_calls[0], recomp_calls[0]))
         proposed: set[tuple[int, int]] = set()
         for orig_target, recomp_target in zip(orig_calls, recomp_calls):
             orig_identity = db.alias_canonical_orig(ImageId.ORIG, orig_target)
@@ -777,7 +836,9 @@ def match_unpaired_direct_callees(
             if len(targets) != 1:
                 continue
             recomp_target, parents = next(iter(targets.items()))
-            if len(parents) >= 2 and reverse[recomp_target] == {orig_target}:
+            if (
+                len(parents) >= 2 or (orig_target, recomp_target) in trailing_funclets
+            ) and reverse[recomp_target] == {orig_target}:
                 batch.match(orig_target, recomp_target, basis=PairBasis.DERIVED)
 
 
