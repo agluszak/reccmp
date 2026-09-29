@@ -12,6 +12,7 @@ an inferred no-argument signature when retail independently agrees.
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Any
 
 from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
@@ -71,6 +72,7 @@ _STACK_PROBE_NAMES = frozenset(
 )
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
+_RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
@@ -156,6 +158,51 @@ def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:
     }
 
 
+def paired_reference_tokens(
+    orig_refs: tuple[DataReference, ...], recomp_refs: tuple[DataReference, ...]
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Name only addresses both sides reference as the same paired object location."""
+    by_side = []
+    for refs in (orig_refs, recomp_refs):
+        locations: dict[ObjectOffset, set[int]] = {}
+        for ref in refs:
+            if ref.object is not None:
+                locations.setdefault(ref.object, set()).add(ref.address)
+        by_side.append(locations)
+    orig, recomp = by_side
+    orig_tokens: dict[int, str] = {}
+    recomp_tokens: dict[int, str] = {}
+    for obj in orig.keys() & recomp.keys():
+        if len(orig[obj]) != 1 or len(recomp[obj]) != 1:
+            continue
+        orig_addr = next(iter(orig[obj]))
+        recomp_addr = next(iter(recomp[obj]))
+        if orig_addr == recomp_addr:
+            continue
+        token = f"PAIRED_DATA_{obj.orig_addr:x}_{obj.offset:x}"
+        orig_tokens[orig_addr] = token
+        recomp_tokens[recomp_addr] = token
+    return orig_tokens, recomp_tokens
+
+
+def replace_paired_raw_addresses(code: list[str], tokens: dict[int, str]) -> None:
+    """Replace referenced raw addresses, leaving literals and comments intact."""
+    if not tokens:
+        return
+
+    def rename(match: re.Match[str]) -> str:
+        return tokens.get(int(match.group(), 16), match.group())
+
+    for index, line in enumerate(code):
+        if line.lstrip().startswith(("/*", "//", "*")):
+            continue
+        parts = GhidraDiffEngine.QUOTED_LITERAL.split(line)
+        code[index] = "".join(
+            part if part_index % 2 else _RAW_ADDRESS.sub(rename, part)
+            for part_index, part in enumerate(parts)
+        )
+
+
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
@@ -179,6 +226,22 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._failures: dict[int, list[AnalysisFailure]] = {}
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
+        self._function_entries: dict[int, tuple[ImageId, int] | None] = {}
+        for entry in manifest.functions:
+            if entry.recomp_addr is None:
+                continue
+            for side, address in (
+                (ImageId.ORIG, entry.orig_addr),
+                (ImageId.RECOMP, entry.recomp_addr),
+            ):
+                identity = (side, entry.orig_addr)
+                if (
+                    address in self._function_entries
+                    and self._function_entries[address] != identity
+                ):
+                    self._function_entries[address] = None
+                else:
+                    self._function_entries[address] = identity
         self._sides: dict[Any, ImageId] = {}
         self._retail_zero_arg: set[int] = set()
         super().__init__(*args, **kwargs)
@@ -196,6 +259,27 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             FunctionMatch(entry.orig_addr, entry.recomp_addr, ("reccmp",))
             for entry in self._comparable_entries()
         ]
+
+    def normalize_ghidra_decomp(
+        self,
+        code: list[str],
+        entry_address: int | None = None,
+        stack_setup: bool = False,
+    ) -> None:
+        super().normalize_ghidra_decomp(code, entry_address, stack_setup)
+        if (
+            entry_address is None
+            or (entry := self._function_entries.get(entry_address)) is None
+        ):
+            return
+        side, orig_addr = entry
+        orig_tokens, recomp_tokens = paired_reference_tokens(
+            self._references.get((ImageId.ORIG, orig_addr), ()),
+            self._references.get((ImageId.RECOMP, orig_addr), ()),
+        )
+        replace_paired_raw_addresses(
+            code, orig_tokens if side == ImageId.ORIG else recomp_tokens
+        )
 
     def diff_nf_symbols(self, p1: Any, p2: Any) -> list[list[Any]]:
         """Skip Ghidriff's unused whole-image symbol inventory."""

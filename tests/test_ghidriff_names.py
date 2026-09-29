@@ -9,8 +9,14 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.engine import canonical_names, unpaired_names
+from reccmp.ghidriff.engine import (
+    canonical_names,
+    paired_reference_tokens,
+    replace_paired_raw_addresses,
+    unpaired_names,
+)
 from reccmp.ghidriff.locations import Extents
+from reccmp.ghidriff.results import DataReference, ObjectOffset, UnknownExtent
 from reccmp.types import EntityType, ImageId
 
 
@@ -54,6 +60,34 @@ def test_unpaired_names_never_look_like_a_correspondence():
         (ImageId.ORIG, 0x300): "Dup@0x300",
         (ImageId.ORIG, 0x400): "Dup@0x400",
     }
+
+
+def test_only_shared_paired_data_references_normalize_raw_addresses():
+    shared = ObjectOffset(0x617584, "g_format_s_space_s", 0)
+    orig_only = ObjectOffset(0x605880, "g_other", 0)
+    original = (
+        DataReference(0x617584, shared, UnknownExtent()),
+        DataReference(0x605880, orig_only, UnknownExtent()),
+    )
+    recomp = (DataReference(0x627C04, shared, UnknownExtent()),)
+    orig_tokens, recomp_tokens = paired_reference_tokens(original, recomp)
+    assert orig_tokens == {0x617584: "PAIRED_DATA_617584_0"}
+    assert recomp_tokens == {0x627C04: "PAIRED_DATA_617584_0"}
+
+    old_code = [
+        '  swprintf(buffer,0x617584,"0x617584");\n',
+        "  use(0x605880);\n",
+        "/* 0x617584 */\n",
+    ]
+    new_code = ['  swprintf(buffer,0x627c04,"0x627c04");\n']
+    replace_paired_raw_addresses(old_code, orig_tokens)
+    replace_paired_raw_addresses(new_code, recomp_tokens)
+    assert old_code == [
+        '  swprintf(buffer,PAIRED_DATA_617584_0,"0x617584");\n',
+        "  use(0x605880);\n",
+        "/* 0x617584 */\n",
+    ]
+    assert new_code == ['  swprintf(buffer,PAIRED_DATA_617584_0,"0x627c04");\n']
 
 
 def _data(orig_addr: int, name: str, size: int, entity_type=EntityType.DATA):
