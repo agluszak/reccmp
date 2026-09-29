@@ -16,7 +16,17 @@ def test_call_census_excludes_indirect_calls_and_uses_native_body():
         binary,
         binary,
         (FunctionEntry(0x1000, 0x2000, "caller", PairBasis.ANNOTATION, None, False),),
-        (NamedObject(0x1100, 0x2100, "helper", EntityType.FUNCTION, 1, 1, PairBasis.ANNOTATION),),
+        (
+            NamedObject(
+                0x1100,
+                0x2100,
+                "helper",
+                EntityType.FUNCTION,
+                1,
+                1,
+                PairBasis.ANNOTATION,
+            ),
+        ),
         (),
     )
     body = NS(getAddressRanges=lambda: [])
@@ -27,6 +37,7 @@ def test_call_census_excludes_indirect_calls_and_uses_native_body():
                 getFlowType=lambda: NS(isCall=lambda: True),
                 getAddress=lambda: NS(getOffset=lambda: site),
                 getBytes=lambda: data,
+                getFallThrough=lambda: None,
             )
 
         def instructions(actual_body, forward):
@@ -45,11 +56,19 @@ def test_call_census_excludes_indirect_calls_and_uses_native_body():
         )
 
     census = direct_call_census(
-        manifest, {ImageId.ORIG: program(0x1000, 0x1100), ImageId.RECOMP: program(0x2000, 0x2100)}
+        manifest,
+        {
+            ImageId.ORIG: program(0x1000, 0x1100),
+            ImageId.RECOMP: program(0x2000, 0x2100),
+        },
     )
     row = census["functions"][0]
     delta = call_delta(row["orig"]["calls"], row["recomp"]["calls"])
-    assert delta == {"category": "identical-canonical-sequence", "deltas": [], "unresolved": False}
+    assert delta == {
+        "category": "identical-canonical-sequence",
+        "deltas": [],
+        "unresolved": False,
+    }
     assert len(row["orig"]["calls"]) == 1
 
 
@@ -70,7 +89,17 @@ def test_unpaired_helper_body_keeps_its_calls_without_inventing_a_pair():
         binary,
         binary,
         (FunctionEntry(0x1000, 0x2000, "caller", PairBasis.ANNOTATION, None, False),),
-        (NamedObject(0x1200, 0x2200, "delete", EntityType.FUNCTION, 1, 1, PairBasis.ANNOTATION),),
+        (
+            NamedObject(
+                0x1200,
+                0x2200,
+                "delete",
+                EntityType.FUNCTION,
+                1,
+                1,
+                PairBasis.ANNOTATION,
+            ),
+        ),
         (UnpairedEntity(ImageId.ORIG, 0x1100, 6, EntityType.FUNCTION, "destructor"),),
     )
 
@@ -87,13 +116,14 @@ def test_unpaired_helper_body_keeps_its_calls_without_inventing_a_pair():
                         getFlowType=lambda: NS(isCall=lambda: True),
                         getAddress=lambda site=site: NS(getOffset=lambda: site),
                         getBytes=lambda data=data: data,
+                        getFallThrough=lambda: None,
                     )
                 )
             instructions[id(bodies[entry])] = code
         return NS(
             getAddressFactory=lambda: NS(getDefaultAddressSpace=lambda: NS(getAddress=lambda a: a)),
             getFunctionManager=lambda: NS(
-                getFunctionAt=lambda a: NS(getBody=lambda: bodies[a]) if a in bodies else None
+                getFunctionAt=lambda a: (NS(getBody=lambda: bodies[a]) if a in bodies else None)
             ),
             getListing=lambda: NS(getInstructions=lambda body, forward: instructions[id(body)]),
         )
@@ -110,3 +140,24 @@ def test_unpaired_helper_body_keeps_its_calls_without_inventing_a_pair():
     assert [call["identity"] for call in helper["calls"]] == ["pair:0x1200"]
     caller = census["functions"][0]
     assert caller["orig"]["calls"][0]["paired"] is False
+
+
+def test_split_body_prefix_is_not_a_complete_empty_call_sequence():
+    from reccmp.compare.call_census import _body_calls
+
+    body = NS(getAddressRanges=lambda: [], contains=lambda address: address < 0x1002)
+    instruction = NS(
+        getAddress=lambda: 0x1000,
+        getFallThrough=lambda: 0x1002,
+        getFlowType=lambda: NS(isCall=lambda: False),
+    )
+    program = NS(
+        getAddressFactory=lambda: NS(getDefaultAddressSpace=lambda: NS(getAddress=lambda a: a)),
+        getFunctionManager=lambda: NS(getFunctionAt=lambda a: NS(getBody=lambda: body)),
+        getListing=lambda: NS(getInstructions=lambda actual, forward: [instruction]),
+    )
+    observation = _body_calls(program, ImageId.ORIG, 0x1000, {}, {})
+    assert observation["calls"] is None
+    assert observation["partial_calls"] == []
+    assert observation["error"] == "function-body-has-outside-fallthrough"
+    assert observation["outside_fallthroughs"] == [{"site": "4096", "target": "4098"}]

@@ -22,7 +22,13 @@ def _body_calls(program, image, address, identities, names):
         return {"calls": None, "error": "no-function-at-entry"}
     body = function.getBody()
     calls = []
+    outside_fallthroughs = []
     for instruction in program.getListing().getInstructions(body, True):
+        fallthrough = instruction.getFallThrough()
+        if fallthrough is not None and not body.contains(fallthrough):
+            outside_fallthroughs.append(
+                {"site": str(instruction.getAddress()), "target": str(fallthrough)}
+            )
         if not instruction.getFlowType().isCall():
             continue
         # A Ghidra reference resolving an indirect call is not a direct call.
@@ -36,19 +42,29 @@ def _body_calls(program, image, address, identities, names):
             {
                 "site": f"{site:#x}",
                 "target": f"{target:#x}",
-                "identity": f"pair:{obj.orig_addr:#x}"
-                if obj
-                else f"{image.name.lower()}:{target:#x}",
+                "identity": (
+                    f"pair:{obj.orig_addr:#x}" if obj else f"{image.name.lower()}:{target:#x}"
+                ),
                 "paired": obj is not None,
                 "name": obj.name if obj else names.get(target),
             }
         )
-    return {
+    observation: dict[str, Any] = {
         "body_ranges": [
             [str(r.getMinAddress()), str(r.getMaxAddress())] for r in body.getAddressRanges()
         ],
         "calls": calls,
     }
+    if outside_fallthroughs:
+        # A shared/mid-body entry may have split the native FunctionDB body.
+        # The observed prefix is not a complete authored-function sequence.
+        observation.update(
+            calls=None,
+            partial_calls=calls,
+            error="function-body-has-outside-fallthrough",
+            outside_fallthroughs=outside_fallthroughs,
+        )
+    return observation
 
 
 def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict:
@@ -93,9 +109,9 @@ def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict
                 {
                     "image": image.name.lower(),
                     "address": f"{address:#x}",
-                    "identity": f"pair:{obj.orig_addr:#x}"
-                    if obj
-                    else f"{image.name.lower()}:{address:#x}",
+                    "identity": (
+                        f"pair:{obj.orig_addr:#x}" if obj else f"{image.name.lower()}:{address:#x}"
+                    ),
                     "name": obj.name if obj else names[image].get(address),
                     **body,
                 }
