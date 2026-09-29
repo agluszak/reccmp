@@ -121,7 +121,7 @@ def match_name(name: str) -> str:
     value, so the demangler prints ``1`` and ``10496`` where an annotation
     may write ``true`` and ``0x2900``. None of it carries identity, so names
     match on the tight decimal form."""
-    name = name.replace(" *", "*").replace(" &", "&")
+    name = name.strip().replace(" *", "*").replace(" &", "&")
     name = _ELABORATED_ARGUMENT.sub(r"\1", name)
     name = _ARGUMENT_SPACE.sub(",", name)
     name = _CLOSING_SPACE.sub(">", name)

@@ -147,6 +147,26 @@ def test_match_functions(db):
     assert db.count() == 1
 
 
+def test_match_functions_ignore_outer_demangler_whitespace(db):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            123,
+            name="W8Missile::`vector deleting destructor'`adjustor{24}'",
+            type=EntityType.FUNCTION,
+        )
+        batch.set(
+            ImageId.RECOMP,
+            555,
+            name="W8Missile::`vector deleting destructor'`adjustor{24}' ",
+            type=EntityType.FUNCTION,
+        )
+
+    match_functions(db)
+
+    assert db.is_match(123, 555)
+
+
 def test_match_functions_uses_each_public_name_at_one_address(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 123, name="__alloca_probe", type=EntityType.FUNCTION)
