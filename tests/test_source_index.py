@@ -262,6 +262,39 @@ def test_source_index_first_base_after_primary_is_secondary(tmp_path: Path) -> N
     ]
 
 
+def test_source_index_first_base_before_explicit_primary_is_secondary(
+    tmp_path: Path,
+) -> None:
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _class(
+            semantic_id="record:Widget",
+            qualified_name="Widget",
+            bases=["Primary"],
+            source_file="sample.cpp",
+            line=5,
+        ),
+        unit_id="sample.cpp",
+    )
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            3,
+            "// VTABLE: TEST 0x2100 Primary",
+            "// VTABLE: TEST 0x2000 Widget",
+            candidates=(_class_candidate("Widget"),),
+        ),
+        unit_id="sample.cpp",
+    )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
+    widget = next(iter(index.classes.values()))
+    assert widget.vtable_address == 0x2000
+    assert [(item.address, item.base_class) for item in widget.base_vtables] == [
+        (0x2100, "Primary")
+    ]
+
+
 def test_source_index_preserves_template_specialization_owner(tmp_path: Path) -> None:
     collector = SourceCollector(tmp_path)
     collector.collect_record(

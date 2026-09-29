@@ -128,6 +128,16 @@ def _join_markers(
 
     classes = dict(source_classes)
     class_by_name = {item.qualified_name: key for key, item in classes.items()}
+    explicitly_primary = {
+        symbol.name
+        for symbol in symbols
+        if isinstance(symbol, ParserVtable)
+        and (
+            symbol.base_class is None
+            or _compact_pointer_spacing(symbol.base_class)
+            == _compact_pointer_spacing(symbol.name)
+        )
+    }
     for vtable_symbol in symbols:
         if not isinstance(vtable_symbol, ParserVtable):
             continue
@@ -160,7 +170,10 @@ def _join_markers(
         # MSVC may name the primary table for the first direct base. The
         # marker may spell that base explicitly.
         primary_names = class_names
-        if source_class.vtable_address is None:
+        if (
+            source_class.vtable_address is None
+            and source_class.qualified_name not in explicitly_primary
+        ):
             primary_names |= set(source_class.bases[:1])
         if base_class is not None and _compact_pointer_spacing(base_class) not in {
             _compact_pointer_spacing(name) for name in primary_names
