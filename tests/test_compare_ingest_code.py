@@ -166,16 +166,23 @@ def test_load_code_cpp_symbol_function(
 
 
 @pytest.mark.parametrize(
-    ("marker_name", "expected_name", "expected_symbol"),
+    ("marker_name", "csv_symbol", "expected_name", "expected_symbol"),
     [
-        ("??0srShader@@QAE@ABV0@@Z", None, "??0srShader@@QAE@ABV0@@Z"),
-        ("W8Vector<int>::Clear", "W8Vector<int>::Clear", None),
+        (
+            "??0srShader@@QAE@ABV0@@Z",
+            "Older Ghidra label",
+            None,
+            "??0srShader@@QAE@ABV0@@Z",
+        ),
+        ("W8Vector<int>::Clear", "Older Ghidra label", "W8Vector<int>::Clear", None),
+        ("_inflateEnd", "_inflateEnd", "_inflateEnd", "_inflateEnd"),
     ],
 )
 def test_source_function_identity_replaces_data_source_label(
     db: EntityDb,
     lines_db: LinesDb,
     marker_name: str,
+    csv_symbol: str,
     expected_name: str | None,
     expected_symbol: str | None,
 ):
@@ -184,7 +191,7 @@ def test_source_function_identity_replaces_data_source_label(
             ImageId.ORIG,
             0x10086240,
             type=EntityType.FUNCTION,
-            symbol="Older Ghidra label",
+            symbol=csv_symbol,
             name="Older Ghidra name",
         )
 

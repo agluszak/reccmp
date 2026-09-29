@@ -263,7 +263,17 @@ def load_markers(
             if fun.name.startswith("?") or fun.name_is_symbol:
                 batch.set(ImageId.ORIG, fun.offset, symbol=fun.name, name=None)
             else:
-                batch.set(ImageId.ORIG, fun.offset, name=fun.name, symbol=None)
+                prior = db.get(ImageId.ORIG, fun.offset)
+                # A CSV may supply the exact C linker spelling of this
+                # source name. Keep that corroborating symbol, but reject a
+                # different (possibly stale) identity at the same address.
+                symbol = (
+                    fun.name
+                    if prior is not None
+                    and prior.fact(ImageId.ORIG, "symbol") == fun.name
+                    else None
+                )
+                batch.set(ImageId.ORIG, fun.offset, name=fun.name, symbol=symbol)
 
         for var in codebase.iter_variables():
             batch.set(
