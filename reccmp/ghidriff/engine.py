@@ -301,6 +301,12 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             for entity in self.manifest.unpaired
             if entity.image_id == image_id and entity.entity_type in _FUNCTION_TYPES
         )
+        known_callees.update(
+            alias.addr
+            for alias in self.manifest.aliases
+            if alias.image_id == image_id
+            and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
+        )
         requested = [
             self._entry_addr(entry, image_id) for entry in self._comparable_entries()
         ]
