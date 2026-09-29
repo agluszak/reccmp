@@ -27,10 +27,10 @@ def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> No
             function.setCallFixup("alloca_probe")
 
 
-def correct_recompiled_cdecl_arity(
-    program: "Program", symbols: dict[int, tuple[str, int]]
+def correct_recompiled_signatures(
+    program: "Program", symbols: dict[int, tuple[str, int, str]]
 ) -> None:
-    """Correct inferred cdecl arity when retail and the recomp PDB agree.
+    """Correct inferred ABI when retail and the recomp PDB agree.
 
     Parameter ID can mistake live registers for arguments, or miss a trailing
     argument unused by the callee. Retail must independently infer the same
@@ -44,7 +44,7 @@ def correct_recompiled_cdecl_arity(
 
     functions = program.getFunctionManager()
     space = program.getAddressFactory().getDefaultAddressSpace()
-    for address, (symbol, retail_count) in symbols.items():
+    for address, (symbol, retail_count, retail_convention) in symbols.items():
         function = functions.getFunctionAt(space.getAddress(address))
         if function is None or function.getParameterCount() == retail_count:
             continue
@@ -59,6 +59,15 @@ def correct_recompiled_cdecl_arity(
         parameters = list(demangled.getParameters())
         if len(parameters) == 1 and str(parameters[0]) == "void":
             parameters = []
+        if (
+            demangled.getCallingConvention() == "__thiscall"
+            and retail_convention == "__thiscall"
+            and retail_count == len(parameters) + 1
+            and function.getParameterCount() == len(parameters)
+        ):
+            function.setCallingConvention("__thiscall")
+            function.setSignatureSource(SourceType.USER_DEFINED)
+            continue
         if (
             demangled.getCallingConvention() != "__cdecl"
             or any(parameter.getType().isVarArgs() for parameter in parameters)

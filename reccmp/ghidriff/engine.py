@@ -33,7 +33,7 @@ from .locations import (
 )
 from .preparation import (
     apply_stack_probe_call_fixups,
-    correct_recompiled_cdecl_arity,
+    correct_recompiled_signatures,
     correct_import_purges,
     infer_requested_callee_parameters,
     recover_requested_switches,
@@ -77,7 +77,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 9
+PREPARATION_REVISION = 13
 
 
 @dataclass(frozen=True)
@@ -274,7 +274,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             ):
                 self._function_entries[(side, address)] = entry.orig_addr
         self._sides: dict[Any, ImageId] = {}
-        self._retail_arity: dict[int, int] = {}
+        self._retail_signatures: dict[int, tuple[int, str]] = {}
         super().__init__(*args, **kwargs)
 
     # --- ghidriff hooks ---------------------------------------------------
@@ -454,8 +454,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         if image_id == ImageId.ORIG:
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
-            self._retail_arity = {
-                obj.orig_addr: function.getParameterCount()
+            self._retail_signatures = {
+                obj.orig_addr: (
+                    function.getParameterCount(),
+                    function.getCallingConventionName(),
+                )
                 for obj in self.manifest.objects
                 if obj.entity_type == EntityType.FUNCTION
                 and (
@@ -465,16 +468,16 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 and function.getSignatureSource() == SourceType.ANALYSIS
             }
         else:
-            correct_recompiled_cdecl_arity(
+            correct_recompiled_signatures(
                 program,
                 {
                     obj.recomp_addr: (
                         obj.recomp_symbol,
-                        self._retail_arity[obj.orig_addr],
+                        *self._retail_signatures[obj.orig_addr],
                     )
                     for obj in self.manifest.objects
                     if obj.entity_type == EntityType.FUNCTION
-                    and obj.orig_addr in self._retail_arity
+                    and obj.orig_addr in self._retail_signatures
                     and obj.recomp_symbol
                 },
             )
