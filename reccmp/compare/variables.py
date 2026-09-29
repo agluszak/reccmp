@@ -1,10 +1,8 @@
-import re
 import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
 from struct import unpack, error as StructError
-from typing_extensions import Self
 from reccmp.formats import Image
 from reccmp.analysis.string_const import is_likely_latin1, is_likely_widechar
 from reccmp.formats.exceptions import (
@@ -27,108 +25,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-#
-# A note about initialized and uninitialized data:
-#
-# The binary's section header contains the physical and virtual size for each section.
-# The physical size corresponds to physical bytes in the file on disk (i.e. the image).
-# The virtual size is the actual size of the section in memory. If virtual size is greater than physical
-# size, the difference is considered to be uninitialized data. Windows allocates a buffer for the
-# virtual size of the section, copies physical data to the start, and sets the remaining bytes to zero.
-#
-# Reference (PE format):
-#     https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#section-table-section-headers
-#
-# Since the virtual memory for a particular section is made up of both initialized and uninitialized
-# data, we can divide it into these regions:
-#
-# ┌───────────────────────────────────────────────┬─────────────────────────────────┐
-# │ Initialized data                              │ Uninitialized data              │
-# │ (zero and non-zero bytes)                     │ (Set to zero during image load) │
-# └───────────────────────────────────────────────┴─────────────────────────────────┘
-#
-# Keep in mind: physical size can be zero, meaning the section is entirely uninitialized.
-# Physical size can also match or exceed virtual size, meaning the section is fully initialized.
-# (The virtual size sets the memory footprint even if physical size is larger.)
-#
-# Due to the requirement that physical data be aligned to a particular offset, there may be zero bytes
-# in the physical data to pad the end of a section where this would otherwise not be necessary.
-#
-# This means we can subdivide the section further:
-#
-# ┌───────────────────────────┬───────────────────┬─────────────────────────────────┐
-# │ Initialized data          │ Initialized data  │ Uninitialized data              │
-# │ (zero and non-zero bytes) │ (only zero bytes) │ (Set to zero during image load) │
-# └───────────────────────────┴───────────────────┴─────────────────────────────────┘
-#
-# Call these memory regions 1, 2, and 3.
-#
-# A global variable is initialized if its declaration includes an initial value.
-#
-#     Initialized:   int g_hello = 5;
-#   Uninitialized:   int g_hello;
-#
-# While there is no requirement for a variable to be in a particular spot, we have observed that:
-# - Region 1 contains only initialized variables.
-# - Region 3 contains only uninitialized variables.
-#
-# Datacmp will report a diff if a variable resides in region 1 in ORIG and region 3 in RECOMP, or vice versa.
-# The user can correct this by providing an initial value or removing it, depending on what ORIG does.
-# We cannot make this determination if the variable resides in region 2 in either ORIG or RECOMP.
-#
-
-
-class BssState(Enum):
-    """Determination of whether this variable is uninitialized.
-    These values correspond to memory regions 1, 2, and 3 in the block comment above.
-    BSS refers to a section of memory that is entirely uninitialized.
-    - NO:    At least one byte between the variable's start and the
-             end of the section is non-zero.
-    - MAYBE: The variable is fully initialized to zero. All remaining
-             initialized bytes in the section are zero.
-    - YES:   All or part of the variable is uninitialized.
-    """
-
-    NO = 0
-    MAYBE = 1
-    YES = 2
-
-
 class CompareResult(Enum):
     MATCH = 1
     DIFF = 2
     ERROR = 3
     WARN = 4
-
-
-class DataBlock(NamedTuple):
-    addr: int
-    data: bytes
-    bss: BssState
-
-    @classmethod
-    def read(cls, addr: int, size: int, image: Image) -> Self:
-        data = image.read(addr, size)
-        # Per the seek() API, phys_data is a memoryview of the remaining
-        # physical bytes in this section.
-        phys_data, _ = image.seek(addr)
-
-        # If we find any non-zero bytes then this variable must be initialized
-        # even if all of the variable's values are zero.
-        init_bytes_remain = re.search(b"[^\x00]", phys_data) is not None
-
-        if init_bytes_remain:
-            bss = BssState.NO
-        elif len(phys_data) < size:
-            # If there are not enough physical bytes to cover
-            # the entire variable, it is definitely uninitialized.
-            bss = BssState.YES
-        else:
-            # Due to section alignment, there may be enough physical
-            # zero bytes to cover this entire variable.
-            bss = BssState.MAYBE
-
-        return cls(addr, data, bss)
 
 
 class DataOffset(NamedTuple):
@@ -502,13 +403,13 @@ class VariableComparator:
         source_type_name = self._source_type_name(var)
 
         try:
-            orig_block = DataBlock.read(var.orig_addr, data_size, self.orig_bin)
+            orig_bytes = self.orig_bin.read(var.orig_addr, data_size)
         except InvalidVirtualReadError as ex:
             # Reading from orig can fail if the recomp variable is too large
             return create_comparison_item(var, error=repr(ex))
 
         # Reading from recomp should never fail, so if it does, raising an exception is correct
-        recomp_block = DataBlock.read(var.recomp_addr, data_size, self.recomp_bin)
+        recomp_bytes = self.recomp_bin.read(var.recomp_addr, data_size)
 
         used_source_layout = False
         if raw_only:
@@ -523,11 +424,9 @@ class VariableComparator:
                 used_source_layout = True
                 compare_items = [item for item, _size in source_members]
                 try:
-                    orig_data = self._unpack_layout_members(
-                        orig_block.data, source_members
-                    )
+                    orig_data = self._unpack_layout_members(orig_bytes, source_members)
                     recomp_data = self._unpack_layout_members(
-                        recomp_block.data, source_members
+                        recomp_bytes, source_members
                     )
                 except StructError as e:
                     return create_comparison_item(
@@ -541,8 +440,8 @@ class VariableComparator:
                     DataOffset(offset=i, name="", pointer=False)
                     for i in range(data_size)
                 ]
-                orig_data = tuple(orig_block.data)
-                recomp_data = tuple(recomp_block.data)
+                orig_data = tuple(orig_bytes)
+                recomp_data = tuple(recomp_bytes)
         else:
             assert type_key is not None
             compare_items = [
@@ -552,8 +451,8 @@ class VariableComparator:
             format_str = self.types.get_format_string(type_key)
 
             try:
-                orig_data = unpack(format_str, orig_block.data)
-                recomp_data = unpack(format_str, recomp_block.data)
+                orig_data = unpack(format_str, orig_bytes)
+                recomp_data = unpack(format_str, recomp_bytes)
             except StructError as e:
                 return create_comparison_item(var, error=f"Failed to unpack data: {e}")
 
@@ -573,19 +472,6 @@ class VariableComparator:
                 match = orig_val == recomp_val
                 value_a = str(orig_val)
                 value_b = str(recomp_val)
-
-            # Invalidate the match if there is a definite conflict between
-            # the initialized state in orig and recomp.
-            if (orig_block.bss == BssState.NO and recomp_block.bss == BssState.YES) or (
-                recomp_block.bss == BssState.NO and orig_block.bss == BssState.YES
-            ):
-                match = False
-
-            if orig_block.bss == BssState.YES:
-                value_a = "(uninitialized)"
-
-            if recomp_block.bss == BssState.YES:
-                value_b = "(uninitialized)"
 
             compared.append(
                 ComparedOffset(

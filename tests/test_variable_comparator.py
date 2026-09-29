@@ -225,8 +225,7 @@ def test_compare_scalar_bss_diff(db: EntityDb, types: CvdumpTypesParser):
 
 
 def test_compare_scalar_bss_effective_match(db: EntityDb, types: CvdumpTypesParser):
-    """Scalar variable, one initialized to zero, one uninitialized.
-    The initialized zero byte is in the BssState.MAYBE region."""
+    """A stored zero and a loader-filled zero have the same value."""
     create_matched_variable(db, 0, data_type=CVInfoTypeEnum.T_CHAR)
 
     orig = RawImage.from_memory(bss=1)
@@ -239,9 +238,10 @@ def test_compare_scalar_bss_effective_match(db: EntityDb, types: CvdumpTypesPars
     assert c.result == CompareResult.MATCH
 
 
-def test_compare_scalar_bss_true_diff(db: EntityDb, types: CvdumpTypesParser):
-    """Scalar variable, one initialized to zero, one uninitialized.
-    The initialized zero byte is in the BssState.NO region."""
+def test_compare_scalar_bss_with_later_nonzero_byte(
+    db: EntityDb, types: CvdumpTypesParser
+):
+    """Later nonzero data does not change the compared zero byte."""
     create_matched_variable(db, 0, data_type=CVInfoTypeEnum.T_CHAR)
 
     orig = RawImage.from_memory(bss=1)
@@ -251,7 +251,7 @@ def test_compare_scalar_bss_true_diff(db: EntityDb, types: CvdumpTypesParser):
     c = comparator.compare_variable(get_match(db, 0))
 
     assert c is not None
-    assert c.result == CompareResult.DIFF
+    assert c.result == CompareResult.MATCH
 
 
 def test_compare_complex_partial_diff(db: EntityDb):
