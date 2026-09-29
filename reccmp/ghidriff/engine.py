@@ -270,7 +270,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     domain_file.delete()
 
     def collect_prepared_references(self, path: Path, image_id: ImageId) -> None:
-        """Recreate per-run reference results from an already prepared image."""
+        """Refresh selection-dependent signatures and references in a cached image."""
         program = self.project.openProgram(
             "/", self.gen_proj_bin_name_from_path(path), False
         )
@@ -278,12 +278,56 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self._require_functions(program, image_id)
             transaction = program.startTransaction("reccmp references")
             try:
+                self._infer_requested_prototypes(program, image_id)
                 self._collect_references(program, image_id)
             finally:
                 program.endTransaction(transaction, True)
             self._sides[self._program_key(program)] = image_id
+            self.project.save(program)
         finally:
             self.project.close(program)
+
+    def _infer_requested_prototypes(self, program: "Program", image_id: ImageId) -> None:
+        """Infer callees for this selection, including after a prepared-cache hit."""
+        from ghidra.program.model.symbol import SourceType
+
+        known_callees = {
+            obj.addr(image_id)
+            for obj in self.manifest.objects
+            if obj.entity_type in _FUNCTION_TYPES
+        }
+        known_callees.update(
+            entity.addr
+            for entity in self.manifest.unpaired
+            if entity.image_id == image_id and entity.entity_type in _FUNCTION_TYPES
+        )
+        requested = [
+            self._entry_addr(entry, image_id) for entry in self._comparable_entries()
+        ]
+        infer_requested_callee_parameters(program, requested, known_callees)
+        if image_id == ImageId.ORIG:
+            functions = program.getFunctionManager()
+            space = program.getAddressFactory().getDefaultAddressSpace()
+            self._retail_zero_arg = {
+                obj.orig_addr
+                for obj in self.manifest.objects
+                if obj.entity_type == EntityType.FUNCTION
+                and (function := functions.getFunctionAt(space.getAddress(obj.orig_addr)))
+                is not None
+                and function.getParameterCount() == 0
+                and function.getSignatureSource() == SourceType.ANALYSIS
+            }
+        else:
+            correct_recompiled_zero_arg_signatures(
+                program,
+                {
+                    obj.recomp_addr: obj.recomp_symbol
+                    for obj in self.manifest.objects
+                    if obj.entity_type == EntityType.FUNCTION
+                    and obj.orig_addr in self._retail_zero_arg
+                    and obj.recomp_symbol
+                },
+            )
 
     def align_import_purges(self, orig: Path, recomp: Path) -> None:
         """Give an import whose stack purge one program does not know the
@@ -365,7 +409,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         the data each requested function refers to."""
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.program.flatapi import FlatProgramAPI
-        from ghidra.program.model.symbol import SourceType
 
         program = self.project.openProgram(
             "/", self.gen_proj_bin_name_from_path(path), False
@@ -394,17 +437,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             transaction = program.startTransaction("reccmp names")
             try:
                 self._align_data_types(program, image_id)
-                known_callees = {
-                    obj.addr(image_id)
-                    for obj in self.manifest.objects
-                    if obj.entity_type in _FUNCTION_TYPES
-                }
-                known_callees.update(
-                    entity.addr
-                    for entity in self.manifest.unpaired
-                    if entity.image_id == image_id
-                    and entity.entity_type in _FUNCTION_TYPES
-                )
                 probes = {
                     obj.addr(image_id)
                     for obj in self.manifest.objects
@@ -418,30 +450,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     and entity.entity_type in _FUNCTION_TYPES
                 )
                 apply_stack_probe_call_fixups(program, probes)
-                infer_requested_callee_parameters(program, requested, known_callees)
-                if image_id == ImageId.ORIG:
-                    functions = program.getFunctionManager()
-                    space = program.getAddressFactory().getDefaultAddressSpace()
-                    self._retail_zero_arg = {
-                        obj.orig_addr
-                        for obj in self.manifest.objects
-                        if obj.entity_type == EntityType.FUNCTION
-                        and (function := functions.getFunctionAt(space.getAddress(obj.orig_addr)))
-                        is not None
-                        and function.getParameterCount() == 0
-                        and function.getSignatureSource() == SourceType.ANALYSIS
-                    }
-                else:
-                    correct_recompiled_zero_arg_signatures(
-                        program,
-                        {
-                            obj.recomp_addr: obj.recomp_symbol
-                            for obj in self.manifest.objects
-                            if obj.entity_type == EntityType.FUNCTION
-                            and obj.orig_addr in self._retail_zero_arg
-                            and obj.recomp_symbol
-                        },
-                    )
+                self._infer_requested_prototypes(program, image_id)
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
             finally:
