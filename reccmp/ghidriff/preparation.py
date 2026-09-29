@@ -57,8 +57,10 @@ def apply_reviewed_cdecl_signatures(
         function.setSignatureSource(SourceType.USER_DEFINED)
 
 
-def apply_reviewed_scalar_returns(program: "Program", returns: dict[int, str]) -> None:
-    """Use scalar return types independently established by retail and PDB."""
+def apply_reviewed_scalar_returns(
+    program: "Program", returns: dict[int, str], *, recomp: bool = False
+) -> None:
+    """Restore lost returns without retyping already inferred integer calls."""
     from ghidra.program.model.data import (
         BooleanDataType,
         UnsignedIntegerDataType,
@@ -73,7 +75,12 @@ def apply_reviewed_scalar_returns(program: "Program", returns: dict[int, str]) -
     space = program.getAddressFactory().getDefaultAddressSpace()
     for address, return_name in returns.items():
         function = functions.getFunctionAt(space.getAddress(address))
-        if function is not None and function.getReturnType().getName() != return_name:
+        if function is None:
+            continue
+        current = function.getReturnType().getName()
+        if return_name == "uint" and (not recomp or current != "void"):
+            continue
+        if current != return_name:
             function.setReturnType(data_types[return_name], SourceType.USER_DEFINED)
 
 
