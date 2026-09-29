@@ -13,6 +13,8 @@ from reccmp.formats.exceptions import (
     InvalidStringError,
 )
 from reccmp.types import EntityType, ImageId
+from reccmp.parser import DecompCodebase
+from reccmp.parser.marker import MarkerType
 from reccmp.analysis import (
     find_float_consts,
     find_import_thunks,
@@ -662,6 +664,38 @@ def classify_folded_function_aliases(
             signature = _function_signature(orig_bin, orig_addr, size)
             if signature and bodies.get(signature) == 1:
                 db.set_alias(ImageId.RECOMP, addr, orig_addr)
+
+
+def classify_synthetic_jump_aliases(
+    db: EntityDb, orig_bin: PEImage, codebase: DecompCodebase
+) -> None:
+    """Give annotated retail jump thunks the identity of their paired target.
+
+    A SYNTHETIC marker identifies compiler/linker emission, not a second
+    authored function. Require the entire meaningful instruction to be a
+    direct near jump; an ordinary source forwarding function is not an alias.
+    """
+    for marker in codebase.iter_name_functions():
+        if marker.type != MarkerType.SYNTHETIC:
+            continue
+        addr = marker.offset
+        candidate = db.get(ImageId.ORIG, addr)
+        if (
+            candidate is None
+            or candidate.get("type") != EntityType.FUNCTION
+            or candidate.recomp_addr is not None
+        ):
+            continue
+        try:
+            code = bytes(orig_bin.read(addr, 5))
+        except (InvalidVirtualAddressError, InvalidVirtualReadError):
+            continue
+        if len(code) != 5 or code[0] != 0xE9:
+            continue
+        target = addr + 5 + struct.unpack("<i", code[1:])[0]
+        paired = db.get_one_match(target)
+        if paired is not None and paired.get("type") == EntityType.FUNCTION:
+            db.set_alias(ImageId.ORIG, addr, target)
 
 
 def classify_exact_vtable_aliases(

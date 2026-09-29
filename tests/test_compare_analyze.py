@@ -1,10 +1,12 @@
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 import struct
 import pytest
 from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.formats.image import ImageImport, ImageRegion
 from reccmp.formats import PEImage
 from reccmp.types import EntityType, ImageId
+from reccmp.parser.marker import MarkerType
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
     InvalidVirtualReadError,
@@ -22,6 +24,7 @@ from reccmp.compare.analyze import (
     create_seh_entities,
     normalize_original_zero_size_data,
     classify_exact_vtable_aliases,
+    classify_synthetic_jump_aliases,
     classify_folded_vtable_aliases,
     match_inferred_vtables_by_slots,
 )
@@ -202,6 +205,37 @@ def test_create_thunks_do_not_replace(db: EntityDb):
     assert e.get("type") == EntityType.FUNCTION
     assert e.any_size() != 5
     assert e.get("ref_orig") is None
+
+
+@pytest.mark.parametrize(
+    ("marker_type", "opcode", "paired_target", "expected"),
+    [
+        (MarkerType.SYNTHETIC, 0xE9, True, 200),
+        (MarkerType.FUNCTION, 0xE9, True, None),
+        (MarkerType.SYNTHETIC, 0xE8, True, None),
+        (MarkerType.SYNTHETIC, 0xE9, False, None),
+    ],
+)
+def test_synthetic_jump_alias_requires_marker_jump_and_pair(
+    db: EntityDb, marker_type: MarkerType, opcode: int, paired_target: bool, expected: int | None
+):
+    with db.batch() as batch:
+        batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION)
+        batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
+        if paired_target:
+            batch.set(ImageId.RECOMP, 300, type=EntityType.FUNCTION)
+            batch.match(200, 300, basis=PairBasis.ANNOTATION)
+
+    binfile = Mock(spec=[])
+    binfile.read = Mock(return_value=bytes([opcode]) + struct.pack("<i", 95))
+    codebase = Mock(spec=[])
+    codebase.iter_name_functions = Mock(
+        return_value=[SimpleNamespace(type=marker_type, offset=100)]
+    )
+
+    classify_synthetic_jump_aliases(db, binfile, codebase)
+
+    assert db.alias_canonical_orig(ImageId.ORIG, 100) == expected
 
 
 def test_create_analysis_floats(db: EntityDb):
