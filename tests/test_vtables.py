@@ -227,6 +227,78 @@ def test_slot_at_an_unpaired_function_is_unpaired_not_different():
     assert [slot.status for slot in result.slots] == [SlotStatus.UNPAIRED]
 
 
+def test_unpaired_return_only_slot_is_code_equivalent():
+    base = 0x1000
+    ret4 = b"\xc2\x04\x00"
+    orig_bin = RawImage.from_memory(
+        ret4 + b"\x90" + base.to_bytes(4, "little"), base_addr=base
+    )
+    recomp_bin = RawImage.from_memory(
+        ret4 + b"\x90" + ret4 + b"\x90" + (base + 4).to_bytes(4, "little"),
+        base_addr=base,
+    )
+
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP, base, type=EntityType.FUNCTION, name="Base::f", size=3
+        )
+        batch.set(
+            ImageId.RECOMP,
+            base + 4,
+            type=EntityType.FUNCTION,
+            name="Derived::f",
+            size=3,
+        )
+        batch.set(
+            ImageId.ORIG, base + 4, type=EntityType.VTABLE, name="Derived", size=4
+        )
+        batch.set(
+            ImageId.RECOMP, base + 8, type=EntityType.VTABLE, name="Derived", size=4
+        )
+        batch.match(base, base, basis=PairBasis.ANNOTATION)
+        batch.match(base + 4, base + 8, basis=PairBasis.ANNOTATION)
+
+    result = compare_vtable(db, orig_bin, recomp_bin, _vtable(db, base + 4))
+    assert [slot.status for slot in result.slots] == [SlotStatus.CODE_EQUIVALENT]
+    assert result.matches
+
+
+def test_unpaired_return_only_slot_requires_same_stack_cleanup():
+    base = 0x1000
+    orig_bin = RawImage.from_memory(
+        b"\xc2\x04\x00\x90" + base.to_bytes(4, "little"), base_addr=base
+    )
+    recomp_bin = RawImage.from_memory(
+        b"\xc2\x04\x00\x90\xc2\x08\x00\x90" + (base + 4).to_bytes(4, "little"),
+        base_addr=base,
+    )
+
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP, base, type=EntityType.FUNCTION, name="Base::f", size=3
+        )
+        batch.set(
+            ImageId.RECOMP,
+            base + 4,
+            type=EntityType.FUNCTION,
+            name="Derived::f",
+            size=3,
+        )
+        batch.set(
+            ImageId.ORIG, base + 4, type=EntityType.VTABLE, name="Derived", size=4
+        )
+        batch.set(
+            ImageId.RECOMP, base + 8, type=EntityType.VTABLE, name="Derived", size=4
+        )
+        batch.match(base, base, basis=PairBasis.ANNOTATION)
+        batch.match(base + 4, base + 8, basis=PairBasis.ANNOTATION)
+
+    result = compare_vtable(db, orig_bin, recomp_bin, _vtable(db, base + 4))
+    assert [slot.status for slot in result.slots] == [SlotStatus.UNPAIRED]
+
+
 def test_slots_at_different_pairs_are_different():
     base = 0x1000
     ret = b"\xc3\x00\x00\x00"

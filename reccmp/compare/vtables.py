@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from itertools import zip_longest
 
 from reccmp.formats import Image
-from reccmp.types import ImageId
+from reccmp.formats.exceptions import (
+    InvalidVirtualAddressError,
+    InvalidVirtualReadError,
+)
+from reccmp.types import EntityType, ImageId
 from .db import EntityDb, ReccmpEntity, ReccmpMatch
 from .thunk_resolve import effective_orig_vtable_size, resolve_vtable_slot
 
@@ -16,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 class SlotStatus(enum.Enum):
     MATCH = "match"
+    # Both targets have the same complete return-only body. Their source
+    # identities remain unresolved when retail folded several functions.
+    CODE_EQUIVALENT = "code-equivalent"
     # Both slots name paired functions, and not the same pair.
     DIFFERENT = "different"
     # A slot names a function reccmp has not paired: the catalog cannot say
@@ -38,7 +45,7 @@ class VtableSlot:
 
     @property
     def matches(self) -> bool:
-        return self.status == SlotStatus.MATCH
+        return self.status in (SlotStatus.MATCH, SlotStatus.CODE_EQUIVALENT)
 
 
 @dataclass(frozen=True)
@@ -89,6 +96,8 @@ def _table_sizes(db: EntityDb, orig_bin: Image, match: ReccmpMatch) -> tuple[int
 
 def _slot_status(
     db: EntityDb,
+    orig_bin: Image,
+    recomp_bin: Image,
     raw: tuple[int | None, int | None],
     orig: ReccmpEntity | None,
     recomp: ReccmpEntity | None,
@@ -106,8 +115,40 @@ def _slot_status(
         ):
             return SlotStatus.MATCH
     if orig is None or recomp is None or not orig.matched or not recomp.matched:
+        if _same_return_only_body(orig_bin, recomp_bin, orig, recomp):
+            return SlotStatus.CODE_EQUIVALENT
         return SlotStatus.UNPAIRED
     return SlotStatus.DIFFERENT
+
+
+def _same_return_only_body(
+    orig_bin: Image,
+    recomp_bin: Image,
+    orig: ReccmpEntity | None,
+    recomp: ReccmpEntity | None,
+) -> bool:
+    if (
+        orig is None
+        or recomp is None
+        or orig.get("type") != EntityType.FUNCTION
+        or recomp.get("type") != EntityType.FUNCTION
+    ):
+        return False
+    size = recomp.size(ImageId.RECOMP)
+    if size not in (1, 3):
+        return False
+    orig_addr = orig.addr(ImageId.ORIG)
+    recomp_addr = recomp.addr(ImageId.RECOMP)
+    if orig_addr is None or recomp_addr is None:
+        return False
+    try:
+        code = bytes(recomp_bin.read(recomp_addr, size))
+        orig_code = bytes(orig_bin.read(orig_addr, size))
+    except (InvalidVirtualAddressError, InvalidVirtualReadError):
+        return False
+    if code != b"\xc3" and (size != 3 or code[:1] != b"\xc2"):
+        return False
+    return orig_code == code
 
 
 def compare_vtable(
@@ -159,7 +200,9 @@ def compare_vtable(
                 raw_recomp,
                 orig,
                 recomp,
-                _slot_status(db, (raw_orig, raw_recomp), orig, recomp),
+                _slot_status(
+                    db, orig_bin, recomp_bin, (raw_orig, raw_recomp), orig, recomp
+                ),
             )
         )
 

@@ -92,14 +92,23 @@ def show_vtable(comparison: VtableComparison, plain: bool):
             print(f"{colorama.Fore.GREEN}+ {index}  {recomp}{colorama.Style.RESET_ALL}")
 
 
-def print_summary(vtable_count: int, different: int, unpaired: int):
+def print_summary(
+    vtable_count: int, different: int, unpaired: int, code_equivalent: int
+):
     if different == 0 and unpaired == 0:
-        print(f"Vtables found: {vtable_count}.\n100% match.")
+        print(f"Vtables found: {vtable_count}.")
+        if code_equivalent:
+            print("No differing or unpaired slots.")
+            print(f"Vtables with return-only code-equivalent slots: {code_equivalent}.")
+        else:
+            print("100% match.")
         return
 
     print(f"Vtables found: {vtable_count}.")
     print(f"Vtables with a different slot: {different}.")
     print(f"Vtables with only unpaired slots otherwise matching: {unpaired}.")
+    if code_equivalent:
+        print(f"Vtables with return-only code-equivalent slots: {code_equivalent}.")
 
 
 def main():
@@ -107,6 +116,7 @@ def main():
     vtable_count = 0
     different = 0
     unpaired = 0
+    code_equivalent = 0
 
     try:
         target = argparse_parse_project_target(args)
@@ -129,6 +139,8 @@ def main():
         comparison = compare_vtable(
             catalog.db, catalog.orig_bin, catalog.recomp_bin, tbl_match
         )
+        if any(slot.status == SlotStatus.CODE_EQUIVALENT for slot in comparison.slots):
+            code_equivalent += 1
         if comparison.matches:
             continue
         if any(slot.status == SlotStatus.DIFFERENT for slot in comparison.slots):
@@ -149,7 +161,7 @@ def main():
             logger.error("No vtables found")
         return 1
 
-    print_summary(vtable_count, different, unpaired)
+    print_summary(vtable_count, different, unpaired, code_equivalent)
     return 1 if different or unpaired else 0
 
 
