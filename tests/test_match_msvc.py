@@ -400,6 +400,27 @@ def test_match_vtables_base_class_same_as_derived(db):
     assert db.get(ImageId.ORIG, 100).recomp_addr == 200
 
 
+def test_match_vtables_base_class_pointer_spacing_is_same_class(db):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            100,
+            name="Pizza<Item *>",
+            type=EntityType.VTABLE,
+            base_class="Pizza<Item*>",
+        )
+        batch.set(
+            ImageId.RECOMP,
+            200,
+            name="Pizza<Item *>::`vftable'",
+            type=EntityType.VTABLE,
+        )
+
+    match_vtables(db)
+
+    assert db.get(ImageId.ORIG, 100).recomp_addr == 200
+
+
 def test_match_vtables_base_class_same_as_derived_orig_none(db):
     """If orig does not have the base_class attribute set, we can still match if
     the recomp vtable has the same base and derived class."""

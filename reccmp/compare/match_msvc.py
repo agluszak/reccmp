@@ -215,7 +215,7 @@ def _find_vtable_match(
 
     # Most classes will not use multiple inheritance, so try the regular vtable
     # first, unless a base class is provided.
-    if base_class is None or base_class == class_name:
+    if base_class is None or match_name(base_class) == match_name(class_name):
         bare_vftable = match_name(f"{class_name}::`vftable'")
 
         if bare_vftable in vtable_name_index:
