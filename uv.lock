@@ -214,12 +214,12 @@ wheels = [
 [[package]]
 name = "ghidriff"
 version = "1.0.0"
-source = { url = "https://github.com/agluszak/ghidriff/archive/7f1dd1c9da78265f3cff0ac8efd42aaa36ac80c9.tar.gz" }
+source = { url = "https://github.com/agluszak/ghidriff/archive/e1040dc.tar.gz" }
 dependencies = [
     { name = "mdutils" },
     { name = "pyghidra" },
 ]
-sdist = { hash = "sha256:3088677286ae52c32fcb4dd2494aef1718ffd29c7b201a07537e72019997dab9" }
+sdist = { hash = "sha256:30a47a1e0d276e3f6007b25b3708ef2493d6d14887be6863029fd88c80956ff1" }
 
 [package.metadata]
 requires-dist = [
@@ -883,7 +883,7 @@ dev = [
 requires-dist = [
     { name = "capstone", specifier = "==5.0.9" },
     { name = "colorama", specifier = ">=0.4.6" },
-    { name = "ghidriff", url = "https://github.com/agluszak/ghidriff/archive/7f1dd1c9da78265f3cff0ac8efd42aaa36ac80c9.tar.gz" },
+    { name = "ghidriff", url = "https://github.com/agluszak/ghidriff/archive/e1040dc.tar.gz" },
     { name = "pydantic", specifier = "==2.13.5" },
     { name = "pydemumble", specifier = "==0.0.1" },
     { name = "pyghidra", specifier = "==3.1.0" },
