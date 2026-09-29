@@ -182,14 +182,7 @@ def _reviewed_signatures(
             scalar_returns: dict[int, str] = {}
             scalar_spellings = {
                 "bool": "bool",
-                "int": "int",
                 "uint": "unsigned int",
-                "short": "short",
-                "ushort": "unsigned short",
-                "long": "long",
-                "ulong": "unsigned long",
-                "float": "float",
-                "double": "double",
             }
             for obj in manifest.objects:
                 if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:

@@ -61,27 +61,13 @@ def apply_reviewed_scalar_returns(program: "Program", returns: dict[int, str]) -
     """Use scalar return types independently established by retail and PDB."""
     from ghidra.program.model.data import (
         BooleanDataType,
-        DoubleDataType,
-        FloatDataType,
-        IntegerDataType,
-        LongDataType,
-        ShortDataType,
         UnsignedIntegerDataType,
-        UnsignedLongDataType,
-        UnsignedShortDataType,
     )
     from ghidra.program.model.symbol import SourceType
 
     data_types = {
         "bool": BooleanDataType.dataType,
-        "int": IntegerDataType.dataType,
         "uint": UnsignedIntegerDataType.dataType,
-        "short": ShortDataType.dataType,
-        "ushort": UnsignedShortDataType.dataType,
-        "long": LongDataType.dataType,
-        "ulong": UnsignedLongDataType.dataType,
-        "float": FloatDataType.dataType,
-        "double": DoubleDataType.dataType,
     }
     functions = program.getFunctionManager()
     space = program.getAddressFactory().getDefaultAddressSpace()
