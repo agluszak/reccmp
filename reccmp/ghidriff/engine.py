@@ -30,6 +30,7 @@ from .locations import (
     Located,
     Use,
     access_size,
+    bitwise_scalar_operand,
     only_compared,
     register_operand,
 )
@@ -664,26 +665,28 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             ):
                 for ref in references.getReferencesFrom(instruction.getAddress()):
                     to = ref.getToAddress()
-                    if (
-                        not ref.getReferenceType().isFlow()
-                        and to.isMemoryAddress()
-                        and functions.getFunctionContaining(to) is None
-                        and self._is_data(image_id, to.getOffset())
-                        and not register_operand(instruction, ref.getOperandIndex())
+                    if ref.getReferenceType().isFlow() or not to.isMemoryAddress():
+                        continue
+                    if functions.getFunctionContaining(
+                        to
+                    ) is not None or not self._is_data(image_id, to.getOffset()):
+                        continue
+                    operand = ref.getOperandIndex()
+                    if register_operand(instruction, operand) or bitwise_scalar_operand(
+                        instruction, operand, to.getOffset()
                     ):
-                        bound = self._compared_end(
-                            image_id, instruction, ref.getOperandIndex(), to
+                        continue
+                    bound = self._compared_end(image_id, instruction, operand, to)
+                    access = access_size(instruction, to.getOffset())
+                    if bound is not None:
+                        self._name_end(program, instruction, ref, bound)
+                    else:
+                        bound = self._iterated_past_end(
+                            image_id, instruction, operand, to
                         )
-                        access = access_size(instruction, to.getOffset())
-                        if bound is not None:
-                            self._name_end(program, instruction, ref, bound)
-                        else:
-                            bound = self._iterated_past_end(
-                                image_id, instruction, ref.getOperandIndex(), to
-                            )
-                        if bound is None and access is None:
-                            to = self._string_start(program, image_id, to)
-                        targets.setdefault(Use(to.getOffset(), bound, access), to)
+                    if bound is None and access is None:
+                        to = self._string_start(program, image_id, to)
+                    targets.setdefault(Use(to.getOffset(), bound, access), to)
             self._references[(image_id, entry.orig_addr)] = tuple(
                 self._reference(program, image_id, to, use)
                 for use, to in sorted(

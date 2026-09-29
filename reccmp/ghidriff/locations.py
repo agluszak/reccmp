@@ -195,3 +195,21 @@ def register_operand(instruction: Any, operand: int) -> bool:
         return False
     kind = instruction.getOperandType(operand)
     return OperandType.isRegister(kind) and not OperandType.isDynamic(kind)
+
+
+def bitwise_scalar_operand(instruction: Any, operand: int, value: int) -> bool:
+    """A scalar bit mask is not an address even if Ghidra resolves its value
+    to a data location in the loaded image."""
+    from ghidra.program.model.lang import OperandType
+
+    if operand < 0 or instruction.getMnemonicString().upper() not in {
+        "TEST",
+        "AND",
+        "OR",
+        "XOR",
+    }:
+        return False
+    if OperandType.isDynamic(instruction.getOperandType(operand)):
+        return False
+    scalar = instruction.getScalar(operand)
+    return scalar is not None and scalar.getUnsignedValue() == value
