@@ -290,6 +290,28 @@ def test_source_index_joins_standalone_template_vtable_by_name(tmp_path: Path) -
     assert list(index.classes.values())[0].vtable_address == 0x2000
 
 
+def test_source_index_pointer_template_vtable_is_primary(tmp_path: Path) -> None:
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _class(
+            semantic_id="record:Vec<Item *>",
+            qualified_name="Vec<Item *>",
+            source_file="vector.cpp",
+            line=1,
+        ),
+        unit_id="vector.cpp",
+    )
+    collector.collect_record(
+        _marker_block("vector.cpp", 2, "// VTABLE: TEST 0x2000", "// class Vec<Item*>"),
+        unit_id="vector.cpp",
+    )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"vector.cpp"})
+    record = next(iter(index.classes.values()))
+    assert record.vtable_address == 0x2000
+    assert record.base_vtables == ()
+
+
 def test_source_index_preserves_standalone_template_vtable_without_compiler_record(
     tmp_path: Path,
 ) -> None:

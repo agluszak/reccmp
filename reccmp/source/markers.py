@@ -46,6 +46,10 @@ def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
     }
 
 
+def _compact_pointer_spacing(name: str) -> str:
+    return name.replace(" *", "*").replace(" &", "&")
+
+
 def _join_markers(
     target: str,
     declarations: Mapping[DeclarationKey, SourceDeclaration],
@@ -151,7 +155,11 @@ def _join_markers(
             source_class.qualified_name,
             source_class.qualified_name.rsplit("::", 1)[-1],
         }
-        if base_class is not None and base_class not in class_names:
+        # Clang spells a pointer template argument as ``T *`` while a marker
+        # may spell the same class as ``T*``. That whitespace is not a base.
+        if base_class is not None and _compact_pointer_spacing(base_class) not in {
+            _compact_pointer_spacing(name) for name in class_names
+        }:
             base_vtable = SourceBaseVtable(vtable_symbol.offset, base_class)
             if base_vtable in source_class.base_vtables:
                 raise SourceIndexError(
