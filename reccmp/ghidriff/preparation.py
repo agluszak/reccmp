@@ -9,6 +9,24 @@ if TYPE_CHECKING:
     from ghidra.program.model.listing import Program
 
 
+def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> None:
+    """Apply Ghidra's compiler fixup to catalogued stack-probe functions.
+
+    The probe changes ESP by the requested allocation size. Without its
+    call fixup, Ghidra loses the caller's stack frame and parameters after
+    a large local allocation, including parameters of calls in that frame.
+    """
+    fixups = program.getCompilerSpec().getPcodeInjectLibrary().getCallFixupNames()
+    if "alloca_probe" not in fixups:
+        return
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for address in addresses:
+        function = functions.getFunctionAt(space.getAddress(address))
+        if function is not None and function.getCallFixup() is None:
+            function.setCallFixup("alloca_probe")
+
+
 def correct_import_purges(program: "Program") -> None:
     """Give cdecl and variadic imports a stack purge of zero.
 

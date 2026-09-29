@@ -18,12 +18,8 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+
 from .imports import import_locations, known_purge
-from .preparation import (
-    correct_import_purges,
-    infer_requested_callee_parameters,
-    recover_requested_switches,
-)
 from .locations import (
     STRING_TYPES,
     Extents,
@@ -33,6 +29,12 @@ from .locations import (
     bitwise_scalar_operand,
     only_compared,
     register_operand,
+)
+from .preparation import (
+    apply_stack_probe_call_fixups,
+    correct_import_purges,
+    infer_requested_callee_parameters,
+    recover_requested_switches,
 )
 from .project_cache import _PRISTINE_FOLDER
 from .results import (
@@ -63,13 +65,16 @@ _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 _ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 # Named by their contents in the catalog; shown by their contents instead.
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
+_STACK_PROBE_NAMES = frozenset(
+    {"__chkstk", "__alloca_probe", "__alloca_probe_8", "__alloca_probe_16"}
+)
 # Upper bound on the bytes shown for one referenced location.
 _RAW_LIMIT = 64
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 4
+PREPARATION_REVISION = 5
 
 
 @dataclass(frozen=True)
@@ -397,6 +402,19 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     if entity.image_id == image_id
                     and entity.entity_type in _FUNCTION_TYPES
                 )
+                probes = {
+                    obj.addr(image_id)
+                    for obj in self.manifest.objects
+                    if obj.name in _STACK_PROBE_NAMES and obj.entity_type in _FUNCTION_TYPES
+                }
+                probes.update(
+                    entity.addr
+                    for entity in self.manifest.unpaired
+                    if entity.image_id == image_id
+                    and entity.name in _STACK_PROBE_NAMES
+                    and entity.entity_type in _FUNCTION_TYPES
+                )
+                apply_stack_probe_call_fixups(program, probes)
                 infer_requested_callee_parameters(program, requested, known_callees)
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
