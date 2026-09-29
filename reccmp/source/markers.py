@@ -159,7 +159,9 @@ def _join_markers(
         # may spell the same class as ``T*``. That whitespace is not a base.
         # MSVC may name the primary table for the first direct base. The
         # marker may spell that base explicitly.
-        primary_names = class_names | set(source_class.bases[:1])
+        primary_names = class_names
+        if source_class.vtable_address is None:
+            primary_names |= set(source_class.bases[:1])
         if base_class is not None and _compact_pointer_spacing(base_class) not in {
             _compact_pointer_spacing(name) for name in primary_names
         }:
