@@ -167,14 +167,25 @@ def _join_markers(
         }
         # Clang spells a pointer template argument as ``T *`` while a marker
         # may spell the same class as ``T*``. That whitespace is not a base.
-        # MSVC may name the primary table for the first direct base. The
-        # marker may spell that base explicitly.
+        # MSVC may name the primary table for an inherited first-base vtable.
+        # Follow only the first-base chain; other bases own secondary tables.
         primary_names = class_names
         if (
             source_class.vtable_address is None
             and source_class.qualified_name not in explicitly_primary
         ):
-            primary_names |= set(source_class.bases[:1])
+            ancestor = source_class
+            seen_bases: set[str] = set()
+            while ancestor.bases:
+                first_base = ancestor.bases[0]
+                if first_base in seen_bases:
+                    break
+                seen_bases.add(first_base)
+                primary_names.add(first_base)
+                parent_key = class_by_name.get(first_base)
+                if parent_key is None:
+                    break
+                ancestor = classes[parent_key]
         if base_class is not None and _compact_pointer_spacing(base_class) not in {
             _compact_pointer_spacing(name) for name in primary_names
         }:

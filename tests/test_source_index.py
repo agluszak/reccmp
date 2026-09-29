@@ -231,6 +231,44 @@ def test_source_index_primary_vtable_can_name_first_base(tmp_path: Path) -> None
     ]
 
 
+def test_source_index_primary_vtable_can_name_first_base_ancestor(
+    tmp_path: Path,
+) -> None:
+    collector = SourceCollector(tmp_path)
+    for name, bases in (
+        ("Widget", ["Middle", "Secondary"]),
+        ("Middle", ["Root"]),
+        ("Root", []),
+    ):
+        collector.collect_record(
+            _class(
+                semantic_id=f"record:{name}",
+                qualified_name=name,
+                bases=bases,
+                source_file="sample.cpp",
+                line=5,
+            ),
+            unit_id="sample.cpp",
+        )
+    collector.collect_record(
+        _marker_block(
+            "sample.cpp",
+            3,
+            "// VTABLE: TEST 0x2000 Root",
+            "// VTABLE: TEST 0x2100 Secondary",
+            candidates=(_class_candidate("Widget"),),
+        ),
+        unit_id="sample.cpp",
+    )
+
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"sample.cpp"})
+    widget = index.class_named("Widget", target="TEST")
+    assert widget is not None and widget.vtable_address == 0x2000
+    assert [(item.address, item.base_class) for item in widget.base_vtables] == [
+        (0x2100, "Secondary")
+    ]
+
+
 def test_source_index_first_base_after_primary_is_secondary(tmp_path: Path) -> None:
     collector = SourceCollector(tmp_path)
     collector.collect_record(
