@@ -27,24 +27,26 @@ def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> No
             function.setCallFixup("alloca_probe")
 
 
-def correct_recompiled_zero_arg_signatures(
-    program: "Program", symbols: dict[int, str]
+def correct_recompiled_cdecl_arity(
+    program: "Program", symbols: dict[int, tuple[str, int]]
 ) -> None:
-    """Remove inferred arguments contradicted by this image's own PDB symbol.
+    """Correct inferred cdecl arity when retail and the recomp PDB agree.
 
-    Parameter ID sometimes mistakes live ECX/EDX values or a return register
-    for arguments of a source-declared ``__cdecl f(void)``. Apply this narrow
-    correction only to the recompilation after retail independently inferred
-    zero arguments; retail remains inferred from its own binary.
+    Parameter ID can mistake live registers for arguments, or miss a trailing
+    argument unused by the callee. Retail must independently infer the same
+    count as the recompilation's decorated symbol. Neither side imports the
+    other image's parameter types.
     """
     from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+    from ghidra.program.model.data import Undefined4DataType
+    from ghidra.program.model.listing import ParameterImpl
     from ghidra.program.model.symbol import SourceType
 
     functions = program.getFunctionManager()
     space = program.getAddressFactory().getDefaultAddressSpace()
-    for address, symbol in symbols.items():
+    for address, (symbol, retail_count) in symbols.items():
         function = functions.getFunctionAt(space.getAddress(address))
-        if function is None or function.getParameterCount() == 0:
+        if function is None or function.getParameterCount() == retail_count:
             continue
         if function.getSignatureSource() not in (
             SourceType.DEFAULT,
@@ -55,13 +57,35 @@ def correct_recompiled_zero_arg_signatures(
         if not isinstance(demangled, DemangledFunction):
             continue
         parameters = list(demangled.getParameters())
-        if demangled.getCallingConvention() != "__cdecl" or (
-            parameters and (len(parameters) != 1 or str(parameters[0]) != "void")
+        if len(parameters) == 1 and str(parameters[0]) == "void":
+            parameters = []
+        if (
+            demangled.getCallingConvention() != "__cdecl"
+            or any(parameter.getType().isVarArgs() for parameter in parameters)
+            or len(parameters) != retail_count
+        ):
+            continue
+        missing_types = [
+            parameter.getType().getDataType(program.getDataTypeManager())
+            for parameter in parameters[function.getParameterCount() :]
+        ]
+        if any(
+            data_type is None or not 0 < data_type.getLength() <= 4
+            for data_type in missing_types
         ):
             continue
         function.setCallingConvention("__cdecl")
-        while function.getParameterCount():
+        while function.getParameterCount() > retail_count:
             function.removeParameter(function.getParameterCount() - 1)
+        for index in range(function.getParameterCount(), retail_count):
+            function.addParameter(
+                ParameterImpl(
+                    f"param{index}",
+                    Undefined4DataType.dataType,
+                    program,
+                ),
+                SourceType.USER_DEFINED,
+            )
         function.setSignatureSource(SourceType.USER_DEFINED)
 
 

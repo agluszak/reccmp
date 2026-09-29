@@ -4,7 +4,7 @@ Ghidra analyzes and decompiles both programs; ghidriff diffs and reports.
 reccmp contributes what only the reconstruction knows: which functions
 correspond, under which names, and where their source is. Both programs are
 analyzed without imported debug types. A recompiled PDB symbol may correct
-an inferred no-argument signature when retail independently agrees.
+an inferred cdecl arity when retail independently agrees.
 """
 
 # pylint: disable=import-outside-toplevel,import-error
@@ -33,7 +33,7 @@ from .locations import (
 )
 from .preparation import (
     apply_stack_probe_call_fixups,
-    correct_recompiled_zero_arg_signatures,
+    correct_recompiled_cdecl_arity,
     correct_import_purges,
     infer_requested_callee_parameters,
     recover_requested_switches,
@@ -77,7 +77,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 7
+PREPARATION_REVISION = 9
 
 
 @dataclass(frozen=True)
@@ -159,9 +159,15 @@ def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:
 
 
 def paired_reference_tokens(
-    orig_refs: tuple[DataReference, ...], recomp_refs: tuple[DataReference, ...]
+    orig_refs: tuple[DataReference, ...],
+    recomp_refs: tuple[DataReference, ...],
+    paired_recomp_addrs: dict[int, int] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
-    """Name only addresses both sides reference as the same paired object location."""
+    """Name paired addresses confirmed by at least one side's reference.
+
+    Ghidra sometimes prints the counterpart as a raw constant without making
+    a reference. The manifest still supplies its exact paired address.
+    """
     by_side = []
     for refs in (orig_refs, recomp_refs):
         locations: dict[ObjectOffset, set[int]] = {}
@@ -172,11 +178,19 @@ def paired_reference_tokens(
     orig, recomp = by_side
     orig_tokens: dict[int, str] = {}
     recomp_tokens: dict[int, str] = {}
-    for obj in orig.keys() & recomp.keys():
-        if len(orig[obj]) != 1 or len(recomp[obj]) != 1:
+    for obj in orig.keys() | recomp.keys():
+        canonical_recomp = (paired_recomp_addrs or {}).get(obj.orig_addr)
+        if canonical_recomp is not None and (
+            obj.orig_addr + obj.offset in orig.get(obj, ())
+            or canonical_recomp + obj.offset in recomp.get(obj, ())
+        ):
+            orig_addr = obj.orig_addr + obj.offset
+            recomp_addr = canonical_recomp + obj.offset
+        elif obj in orig and obj in recomp and len(orig[obj]) == len(recomp[obj]) == 1:
+            orig_addr = next(iter(orig[obj]))
+            recomp_addr = next(iter(recomp[obj]))
+        else:
             continue
-        orig_addr = next(iter(orig[obj]))
-        recomp_addr = next(iter(recomp[obj]))
         if orig_addr == recomp_addr:
             continue
         token = f"PAIRED_DATA_{obj.orig_addr:x}_{obj.offset:x}"
@@ -203,6 +217,20 @@ def replace_paired_raw_addresses(code: list[str], tokens: dict[int, str]) -> Non
         )
 
 
+def unquoted_raw_addresses(code: str) -> set[int]:
+    """Collect displayed addresses without treating strings/comments as code."""
+    found: set[int] = set()
+    for line in code.splitlines():
+        if line.lstrip().startswith(("/*", "//", "*")):
+            continue
+        for index, part in enumerate(GhidraDiffEngine.QUOTED_LITERAL.split(line)):
+            if index % 2 == 0:
+                found.update(
+                    int(match.group(), 16) for match in _RAW_ADDRESS.finditer(part)
+                )
+    return found
+
+
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
@@ -219,6 +247,14 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._names = canonical_names(manifest.objects)
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
         self._pair_types = {obj.orig_addr: obj.entity_type for obj in manifest.objects}
+        self._paired_recomp_addrs = {
+            obj.orig_addr: obj.recomp_addr for obj in manifest.objects
+        }
+        self._paired_data_addrs = {
+            obj.orig_addr: obj.recomp_addr
+            for obj in manifest.objects
+            if obj.entity_type not in (*_FUNCTION_TYPES, *_UNNAMED_TYPES)
+        }
         self._extents = {
             image_id: Extents(manifest, image_id)
             for image_id in (ImageId.ORIG, ImageId.RECOMP)
@@ -226,24 +262,19 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._failures: dict[int, list[AnalysisFailure]] = {}
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
-        self._function_entries: dict[int, tuple[ImageId, int] | None] = {}
+        self._function_entries: dict[tuple[ImageId, int], int] = {}
+        self._recomp_entries: dict[int, int] = {}
         for entry in manifest.functions:
             if entry.recomp_addr is None:
                 continue
+            self._recomp_entries[entry.orig_addr] = entry.recomp_addr
             for side, address in (
                 (ImageId.ORIG, entry.orig_addr),
                 (ImageId.RECOMP, entry.recomp_addr),
             ):
-                identity = (side, entry.orig_addr)
-                if (
-                    address in self._function_entries
-                    and self._function_entries[address] != identity
-                ):
-                    self._function_entries[address] = None
-                else:
-                    self._function_entries[address] = identity
+                self._function_entries[(side, address)] = entry.orig_addr
         self._sides: dict[Any, ImageId] = {}
-        self._retail_zero_arg: set[int] = set()
+        self._retail_arity: dict[int, int] = {}
         super().__init__(*args, **kwargs)
 
     # --- ghidriff hooks ---------------------------------------------------
@@ -260,23 +291,46 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             for entry in self._comparable_entries()
         ]
 
-    def normalize_ghidra_decomp(
+    def normalize_ghidra_decomp_for_side(
         self,
         code: list[str],
+        is_old: bool,
         entry_address: int | None = None,
         stack_setup: bool = False,
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
+        side = ImageId.ORIG if is_old else ImageId.RECOMP
         if (
             entry_address is None
-            or (entry := self._function_entries.get(entry_address)) is None
+            or (orig_addr := self._function_entries.get((side, entry_address))) is None
         ):
             return
-        side, orig_addr = entry
         orig_tokens, recomp_tokens = paired_reference_tokens(
             self._references.get((ImageId.ORIG, orig_addr), ()),
             self._references.get((ImageId.RECOMP, orig_addr), ()),
+            self._paired_recomp_addrs,
         )
+        original = self._decompiled.get((ImageId.ORIG, orig_addr))
+        recomp_addr = self._recomp_entries.get(orig_addr)
+        recompiled = (
+            self._decompiled.get((ImageId.RECOMP, recomp_addr))
+            if recomp_addr is not None
+            else None
+        )
+        if (
+            original is not None
+            and recompiled is not None
+            and original.code
+            and recompiled.code
+        ):
+            orig_raw = unquoted_raw_addresses(original.code)
+            recomp_raw = unquoted_raw_addresses(recompiled.code)
+            for address in orig_raw & self._paired_data_addrs.keys():
+                paired = self._paired_data_addrs[address]
+                if paired in recomp_raw and address != paired:
+                    token = f"PAIRED_DATA_{address:x}_0"
+                    orig_tokens[address] = token
+                    recomp_tokens[paired] = token
         replace_paired_raw_addresses(
             code, orig_tokens if side == ImageId.ORIG else recomp_tokens
         )
@@ -400,25 +454,27 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         if image_id == ImageId.ORIG:
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
-            self._retail_zero_arg = {
-                obj.orig_addr
+            self._retail_arity = {
+                obj.orig_addr: function.getParameterCount()
                 for obj in self.manifest.objects
                 if obj.entity_type == EntityType.FUNCTION
                 and (
                     function := functions.getFunctionAt(space.getAddress(obj.orig_addr))
                 )
                 is not None
-                and function.getParameterCount() == 0
                 and function.getSignatureSource() == SourceType.ANALYSIS
             }
         else:
-            correct_recompiled_zero_arg_signatures(
+            correct_recompiled_cdecl_arity(
                 program,
                 {
-                    obj.recomp_addr: obj.recomp_symbol
+                    obj.recomp_addr: (
+                        obj.recomp_symbol,
+                        self._retail_arity[obj.orig_addr],
+                    )
                     for obj in self.manifest.objects
                     if obj.entity_type == EntityType.FUNCTION
-                    and obj.orig_addr in self._retail_zero_arg
+                    and obj.orig_addr in self._retail_arity
                     and obj.recomp_symbol
                 },
             )
@@ -1115,7 +1171,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             "replaced with injection: alloca_probe" in decompiled.code
             or "ExceptionList" in decompiled.code
         )
-        self.normalize_ghidra_decomp(lines, addr, stack_setup)
+        self.normalize_ghidra_decomp_for_side(
+            lines, image_id == ImageId.ORIG, addr, stack_setup
+        )
         return lines
 
     def results(self) -> list[FunctionResult]:

@@ -13,6 +13,7 @@ from reccmp.ghidriff.engine import (
     canonical_names,
     paired_reference_tokens,
     replace_paired_raw_addresses,
+    unquoted_raw_addresses,
     unpaired_names,
 )
 from reccmp.ghidriff.locations import Extents
@@ -88,6 +89,27 @@ def test_only_shared_paired_data_references_normalize_raw_addresses():
         "/* 0x617584 */\n",
     ]
     assert new_code == ['  swprintf(buffer,PAIRED_DATA_617584_0,"0x627c04");\n']
+
+
+def test_paired_address_normalizes_when_ghidra_misses_one_reference():
+    shared = ObjectOffset(0x689B34, "g_empty_wide_string", 0)
+    original = (DataReference(0x689B34, shared, UnknownExtent()),)
+    recomp = (
+        DataReference(0x6550A0, shared, UnknownExtent()),
+        DataReference(0x6550A2, shared, UnknownExtent()),
+    )
+    orig_tokens, recomp_tokens = paired_reference_tokens(
+        original, recomp, {0x689B34: 0x6550A0}
+    )
+    assert orig_tokens == {0x689B34: "PAIRED_DATA_689b34_0"}
+    code = ["  swprintf(buffer,0x6550a0,text);\n"]
+    replace_paired_raw_addresses(code, recomp_tokens)
+    assert code == ["  swprintf(buffer,PAIRED_DATA_689b34_0,text);\n"]
+
+
+def test_raw_address_candidates_ignore_strings_and_comments():
+    code = '  swprintf(buffer,0x6550a0,"0x689b34");\n/* 0x689b34 */\n'
+    assert unquoted_raw_addresses(code) == {0x6550A0}
 
 
 def _data(orig_addr: int, name: str, size: int, entity_type=EntityType.DATA):
