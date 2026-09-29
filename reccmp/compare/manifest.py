@@ -142,7 +142,11 @@ class Manifest:
                     "orig_size": obj.orig_size,
                     "recomp_size": obj.recomp_size,
                     "basis": obj.basis.value,
-                    **({"recomp_symbol": obj.recomp_symbol} if obj.recomp_symbol else {}),
+                    **(
+                        {"recomp_symbol": obj.recomp_symbol}
+                        if obj.recomp_symbol
+                        else {}
+                    ),
                 }
                 for obj in self.objects
             ],

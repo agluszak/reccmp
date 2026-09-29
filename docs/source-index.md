@@ -134,6 +134,6 @@ docker run --rm -v "$PWD:/work" -w /work reccmp-source-test bash -lc '
   clang++ -O1 -std=c++17 -fno-rtti -fno-exceptions -I/usr/lib/llvm-21/include \
     reccmp/source/indexer.cpp -o /tmp/indexer \
     /usr/lib/llvm-21/lib/libclang-cpp.so.21.1 /usr/lib/llvm-21/lib/libLLVM.so.21.1 &&
-  uv venv -q /tmp/venv && uv pip install -q --python /tmp/venv -e . -r requirements-tests.txt &&
-  RECCMP_SOURCE_INDEXER=/tmp/indexer /tmp/venv/bin/python -m pytest tests/test_source_batch.py'
+  uv sync --locked --group dev --no-managed-python &&
+  RECCMP_SOURCE_INDEXER=/tmp/indexer uv run --locked --group dev --no-managed-python pytest tests/test_source_batch.py'
 ```

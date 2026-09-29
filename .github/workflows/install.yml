@@ -9,6 +9,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
     - uses: actions/setup-python@v7
       with:
@@ -17,4 +18,4 @@ jobs:
     - name: Install reccmp
       shell: bash
       run: |
-        pip install .
+        uv sync --locked && uv run --locked reccmp-reccmp --help

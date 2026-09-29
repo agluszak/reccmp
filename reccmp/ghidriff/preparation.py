@@ -46,7 +46,10 @@ def correct_recompiled_zero_arg_signatures(
         function = functions.getFunctionAt(space.getAddress(address))
         if function is None or function.getParameterCount() == 0:
             continue
-        if function.getSignatureSource() not in (SourceType.DEFAULT, SourceType.ANALYSIS):
+        if function.getSignatureSource() not in (
+            SourceType.DEFAULT,
+            SourceType.ANALYSIS,
+        ):
             continue
         demangled = DemanglerUtil.demangle(symbol)
         if not isinstance(demangled, DemangledFunction):

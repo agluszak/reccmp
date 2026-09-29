@@ -22,11 +22,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
     - uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
-        cache: 'pip'
 
     - name: Restore sample binaries
       id: cache
@@ -39,9 +39,9 @@ jobs:
     - name: Install python libraries
       shell: bash
       run: |
-        pip install -r requirements.txt -r requirements-tests.txt
+        uv sync --locked --python "${{ matrix.python-version }}" --group dev
 
     - name: Run unit tests
       shell: bash
       run: |
-        pytest . --binfiles=binfiles --require-binfiles
+        uv run --locked --python "${{ matrix.python-version }}" --group dev pytest . --binfiles=binfiles --require-binfiles

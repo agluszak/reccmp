@@ -1,10 +1,67 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "reccmp"
 description = "Collection of decompilation tools."
-license-files = ["COPYING", "reccmp/bin/LICENSE*.txt"]
 readme = "docs/intro.md"
-dynamic = ["classifiers", "dependencies", "license", "optional-dependencies", "scripts", "version"]
+license = "AGPL-3.0-or-later"
+license-files = ["COPYING", "reccmp/bin/LICENSE*.txt"]
+dynamic = ["version"]
 requires-python = ">= 3.10"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Disassemblers",
+  "Topic :: Utilities",
+  "Typing :: Typed",
+]
+dependencies = [
+  "capstone==5.0.9",
+  "colorama>=0.4.6",
+  "pydantic==2.13.5",
+  "ruamel.yaml==0.19.1",
+  "pydemumble==0.0.1",
+  "pyghidra==3.1.0",
+  "ghidriff @ https://github.com/agluszak/ghidriff/archive/7f1dd1c9da78265f3cff0ac8efd42aaa36ac80c9.tar.gz",
+]
+
+[project.scripts]
+reccmp-cvdump = "reccmp.tools.cvdump:main"
+reccmp-datacmp = "reccmp.tools.datacmp:main"
+reccmp-decomplint = "reccmp.tools.decomplint:main"
+reccmp-project = "reccmp.tools.project:main"
+reccmp-reccmp = "reccmp.tools.compare:main"
+reccmp-roadmap = "reccmp.tools.roadmap:main"
+reccmp-verexp = "reccmp.tools.verexp:main"
+reccmp-vtable = "reccmp.tools.vtable:main"
+reccmp-ghidra-import = "reccmp.ghidra.ghidra_import:main"
+
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+  "black==26.5.1",
+  "codespell==2.4.3",
+  "pylint==4.0.8",
+  "mypy==2.3.1",
+  "types-colorama>=0.4.15.20260508",
+  "ghidra-stubs==12.1.4",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "reccmp.VERSION" }
+
+[tool.setuptools.packages.find]
+include = ["reccmp*"]
 
 [flake8]
 max-line-length = 120

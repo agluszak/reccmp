@@ -287,7 +287,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         finally:
             self.project.close(program)
 
-    def _infer_requested_prototypes(self, program: "Program", image_id: ImageId) -> None:
+    def _infer_requested_prototypes(
+        self, program: "Program", image_id: ImageId
+    ) -> None:
         """Infer callees for this selection, including after a prepared-cache hit."""
         from ghidra.program.model.symbol import SourceType
 
@@ -318,7 +320,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 obj.orig_addr
                 for obj in self.manifest.objects
                 if obj.entity_type == EntityType.FUNCTION
-                and (function := functions.getFunctionAt(space.getAddress(obj.orig_addr)))
+                and (
+                    function := functions.getFunctionAt(space.getAddress(obj.orig_addr))
+                )
                 is not None
                 and function.getParameterCount() == 0
                 and function.getSignatureSource() == SourceType.ANALYSIS
@@ -446,7 +450,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 probes = {
                     obj.addr(image_id)
                     for obj in self.manifest.objects
-                    if obj.name in _STACK_PROBE_NAMES and obj.entity_type in _FUNCTION_TYPES
+                    if obj.name in _STACK_PROBE_NAMES
+                    and obj.entity_type in _FUNCTION_TYPES
                 }
                 probes.update(
                     entity.addr

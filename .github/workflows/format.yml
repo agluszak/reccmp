@@ -9,6 +9,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
     - uses: actions/setup-python@v7
       with:
@@ -18,28 +19,28 @@ jobs:
       shell: bash
       id: install
       run: |
-        pip install -r requirements.txt -r requirements-tests.txt
+        uv sync --locked --group dev
 
     - name: Run black
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: black --check .
+      run: uv run --locked --group dev black --check .
 
     - name: Run pylint
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: pylint reccmp tests
+      run: uv run --locked --group dev pylint reccmp tests
 
     - name: Run mypy
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
-      run: mypy ./reccmp ./tests
+      run: uv run --locked --group dev mypy ./reccmp ./tests
 
     - name: Run codespell
       if: ${{ always() && steps.install.outcome == 'success' }}
       shell: bash
       run: |
-        codespell \
+        uv run --locked --group dev codespell \
           --ignore-multiline-regex \
             '# codespell:ignore-begin.*?codespell:ignore-end *\n' \
           --ignore-regex remote-checkin-comment \
