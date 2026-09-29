@@ -195,7 +195,6 @@ _COMPARED_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP)
 _UNPAIRED_TYPES = (
     # Unpaired loader slots are still imports, not anonymous literal data.
     EntityType.IMPORT,
-    EntityType.IMPORT_THUNK,
     EntityType.FUNCTION,
     EntityType.VTORDISP,
     EntityType.DATA,
