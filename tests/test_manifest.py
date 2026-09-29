@@ -20,7 +20,13 @@ def _catalog() -> Compare:
     )
     with catalog.db.batch() as batch:
         batch.set(ImageId.ORIG, 0x10, type=EntityType.FUNCTION, name="Paired")
-        batch.set(ImageId.RECOMP, 0x20, type=EntityType.FUNCTION, name="Paired")
+        batch.set(
+            ImageId.RECOMP,
+            0x20,
+            type=EntityType.FUNCTION,
+            name="Paired",
+            symbol="?Paired@@YAXXZ",
+        )
         batch.match(0x10, 0x20, basis=PairBasis.ANNOTATION)
         batch.set(ImageId.ORIG, 0x30, type=EntityType.FUNCTION, name="Unpaired")
         batch.set(ImageId.ORIG, 0x40, type=EntityType.FUNCTION, name="Stub", stub=True)
@@ -91,6 +97,7 @@ def test_manifest_records_its_inputs(tmp_path: Path):
 
     assert document["orig"]["sha256"] == manifest.orig.sha256
     assert document["functions"][0]["basis"] == "annotation"
+    assert document["objects"][0]["recomp_symbol"] == "?Paired@@YAXXZ"
     assert manifest.digest() == _manifest(tmp_path, _catalog()).digest()
 
 

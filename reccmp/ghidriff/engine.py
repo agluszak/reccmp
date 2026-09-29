@@ -3,8 +3,8 @@
 Ghidra analyzes and decompiles both programs; ghidriff diffs and reports.
 reccmp contributes what only the reconstruction knows: which functions
 correspond, under which names, and where their source is. Both programs are
-analyzed the same way, without debug information, so neither decompilation
-is shaped by the reconstruction's own types.
+analyzed without imported debug types. A recompiled PDB symbol may correct
+an inferred no-argument signature when retail independently agrees.
 """
 
 # pylint: disable=import-outside-toplevel,import-error
@@ -32,6 +32,7 @@ from .locations import (
 )
 from .preparation import (
     apply_stack_probe_call_fixups,
+    correct_recompiled_zero_arg_signatures,
     correct_import_purges,
     infer_requested_callee_parameters,
     recover_requested_switches,
@@ -74,7 +75,7 @@ _RAW_LIMIT = 64
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 5
+PREPARATION_REVISION = 7
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._sides: dict[Any, ImageId] = {}
+        self._retail_zero_arg: set[int] = set()
         super().__init__(*args, **kwargs)
 
     # --- ghidriff hooks ---------------------------------------------------
@@ -363,6 +365,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         the data each requested function refers to."""
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.program.flatapi import FlatProgramAPI
+        from ghidra.program.model.symbol import SourceType
 
         program = self.project.openProgram(
             "/", self.gen_proj_bin_name_from_path(path), False
@@ -416,6 +419,29 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 )
                 apply_stack_probe_call_fixups(program, probes)
                 infer_requested_callee_parameters(program, requested, known_callees)
+                if image_id == ImageId.ORIG:
+                    functions = program.getFunctionManager()
+                    space = program.getAddressFactory().getDefaultAddressSpace()
+                    self._retail_zero_arg = {
+                        obj.orig_addr
+                        for obj in self.manifest.objects
+                        if obj.entity_type == EntityType.FUNCTION
+                        and (function := functions.getFunctionAt(space.getAddress(obj.orig_addr)))
+                        is not None
+                        and function.getParameterCount() == 0
+                        and function.getSignatureSource() == SourceType.ANALYSIS
+                    }
+                else:
+                    correct_recompiled_zero_arg_signatures(
+                        program,
+                        {
+                            obj.recomp_addr: obj.recomp_symbol
+                            for obj in self.manifest.objects
+                            if obj.entity_type == EntityType.FUNCTION
+                            and obj.orig_addr in self._retail_zero_arg
+                            and obj.recomp_symbol
+                        },
+                    )
                 self._apply_names(program, image_id)
                 self._collect_references(program, image_id)
             finally:

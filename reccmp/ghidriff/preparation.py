@@ -27,6 +27,41 @@ def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> No
             function.setCallFixup("alloca_probe")
 
 
+def correct_recompiled_zero_arg_signatures(
+    program: "Program", symbols: dict[int, str]
+) -> None:
+    """Remove inferred arguments contradicted by this image's own PDB symbol.
+
+    Parameter ID sometimes mistakes live ECX/EDX values or a return register
+    for arguments of a source-declared ``__cdecl f(void)``. Apply this narrow
+    correction only to the recompilation after retail independently inferred
+    zero arguments; retail remains inferred from its own binary.
+    """
+    from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+    from ghidra.program.model.symbol import SourceType
+
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for address, symbol in symbols.items():
+        function = functions.getFunctionAt(space.getAddress(address))
+        if function is None or function.getParameterCount() == 0:
+            continue
+        if function.getSignatureSource() not in (SourceType.DEFAULT, SourceType.ANALYSIS):
+            continue
+        demangled = DemanglerUtil.demangle(symbol)
+        if not isinstance(demangled, DemangledFunction):
+            continue
+        parameters = list(demangled.getParameters())
+        if demangled.getCallingConvention() != "__cdecl" or (
+            parameters and (len(parameters) != 1 or str(parameters[0]) != "void")
+        ):
+            continue
+        function.setCallingConvention("__cdecl")
+        while function.getParameterCount():
+            function.removeParameter(function.getParameterCount() - 1)
+        function.setSignatureSource(SourceType.USER_DEFINED)
+
+
 def correct_import_purges(program: "Program") -> None:
     """Give cdecl and variadic imports a stack purge of zero.
 

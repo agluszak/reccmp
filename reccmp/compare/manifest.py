@@ -50,6 +50,7 @@ class NamedObject:
     orig_size: int | None
     recomp_size: int | None
     basis: PairBasis
+    recomp_symbol: str | None = None
 
     def addr(self, image_id: ImageId) -> int:
         return self.orig_addr if image_id == ImageId.ORIG else self.recomp_addr
@@ -139,6 +140,7 @@ class Manifest:
                     "name": obj.name,
                     "type": obj.entity_type.name if obj.entity_type else None,
                     "basis": obj.basis.value,
+                    **({"recomp_symbol": obj.recomp_symbol} if obj.recomp_symbol else {}),
                 }
                 for obj in self.objects
             ],
@@ -240,6 +242,11 @@ def build_manifest(
                     orig_size=entity.size(ImageId.ORIG),
                     recomp_size=entity.size(ImageId.RECOMP),
                     basis=basis,
+                    recomp_symbol=(
+                        entity.fact(ImageId.RECOMP, "symbol")
+                        if entity_type == EntityType.FUNCTION
+                        else None
+                    ),
                 )
             )
 
