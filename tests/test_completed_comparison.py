@@ -2,28 +2,38 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+
 
 import ghidriff
 import pytest
 
 import reccmp
+from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest
 from reccmp.ghidriff import engine
 from reccmp.ghidriff.report import comparison_changes
 from reccmp.ghidriff.results import classify
 from reccmp.tools import compare
+from reccmp.tools.compare import _run_engine
 
 
-@pytest.fixture
-def comparison_run(tmp_path, monkeypatch):
+@pytest.fixture(name="prepared_comparison")
+def fixture_prepared_comparison(tmp_path, monkeypatch):
     implementation = tmp_path / "implementation"
     implementation.mkdir()
     module = implementation / "__init__.py"
     module.write_text("# initial implementation")
     monkeypatch.setattr(reccmp, "__file__", str(module))
     monkeypatch.setattr(ghidriff, "__file__", str(module))
-    state = {"version": "12.1.4", "reviewed": {}, "runs": 0, "failed": False}
+    state: dict[str, Any] = {
+        "version": "12.1.4",
+        "reviewed": {},
+        "runs": 0,
+        "failed": False,
+    }
 
     class Engine:
         focused_switch_analysis = False
@@ -38,7 +48,9 @@ def comparison_run(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(engine, "ReccmpDiffEngine", Engine)
-    monkeypatch.setattr(compare, "_reviewed_signatures", lambda *_: ({}, state["reviewed"]))
+    monkeypatch.setattr(
+        compare, "_reviewed_signatures", lambda *_: ({}, state["reviewed"])
+    )
 
     def analyze(_engine, _args, **_options):
         state["runs"] += 1
@@ -76,12 +88,14 @@ def comparison_run(tmp_path, monkeypatch):
     return args, manifest, state, module
 
 
-def test_completed_comparison_reuses_results_and_regenerates_report(comparison_run):
-    args, manifest, state, _ = comparison_run
-    compare._run_engine(args, None, manifest)
+def test_completed_comparison_reuses_results_and_regenerates_report(
+    prepared_comparison,
+):
+    args, manifest, state, _ = prepared_comparison
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     first = (args.output / "summary.json").read_text()
     (args.output / "summary.json").unlink()
-    compare._run_engine(args, None, manifest)
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     assert state["runs"] == 1
     assert '"reused": false' in first
     assert '"reused": true' in (args.output / "summary.json").read_text()
@@ -99,13 +113,17 @@ def test_completed_comparison_reuses_results_and_regenerates_report(comparison_r
         "no-cache",
     ],
 )
-def test_changed_comparison_inputs_invalidate_completed_result(comparison_run, change):
-    args, manifest, state, module = comparison_run
-    compare._run_engine(args, None, manifest)
+def test_changed_comparison_inputs_invalidate_completed_result(
+    prepared_comparison, change
+):
+    args, manifest, state, module = prepared_comparison
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     if change == "binary":
         manifest = replace(manifest, recomp=replace(manifest.recomp, sha256="c" * 64))
     elif change == "identity":
-        manifest = replace(manifest, functions=(replace(manifest.functions[0], name="another"),))
+        manifest = replace(
+            manifest, functions=(replace(manifest.functions[0], name="another"),)
+        )
     elif change == "timeout":
         args.decompiler_timeout = 120
     elif change == "reviewed":
@@ -116,50 +134,50 @@ def test_changed_comparison_inputs_invalidate_completed_result(comparison_run, c
         module.write_text("# changed implementation")
     elif change == "no-cache":
         args.no_cache = True
-    compare._run_engine(args, None, manifest)
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     assert state["runs"] == 2
 
 
-def test_analysis_failure_is_retried(comparison_run):
-    args, manifest, state, _ = comparison_run
+def test_analysis_failure_is_retried(prepared_comparison):
+    args, manifest, state, _ = prepared_comparison
     state["failed"] = True
-    compare._run_engine(args, None, manifest)
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     state["failed"] = False
-    compare._run_engine(args, None, manifest)
+    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
     assert state["runs"] == 2
 
 
 def test_report_delta_distinguishes_resolved_and_unselected_functions():
     def row(address, outcome, diff=()):
-        return dict(
-            orig=hex(address),
-            outcome=outcome,
-            code_diff=list(diff),
-            data=[],
-            failures=[],
-            unidentified_references=0,
-            name="f",
-            basis="annotation",
-        )
+        return {
+            "orig": hex(address),
+            "outcome": outcome,
+            "code_diff": list(diff),
+            "data": [],
+            "failures": [],
+            "unidentified_references": 0,
+            "name": "f",
+            "basis": "annotation",
+        }
 
-    before = dict(
-        target="TEST",
-        functions=[
+    before = {
+        "target": "TEST",
+        "functions": [
             row(1, "differences"),
             row(2, "differences"),
             row(3, "no-differences"),
             row(4, "differences"),
         ],
-    )
-    after = dict(
-        target="TEST",
-        functions=[
+    }
+    after = {
+        "target": "TEST",
+        "functions": [
             row(1, "no-differences"),
             row(3, "differences"),
             row(4, "differences", ["+ different"]),
             row(5, "unpaired"),
         ],
-    )
+    }
     assert comparison_changes(after, before) == {
         1: "resolved",
         2: "only-previous",

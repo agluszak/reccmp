@@ -58,10 +58,13 @@ def _join_markers(
     *,
     aliases: ProjectAliases | None,
 ) -> tuple[dict[DeclarationKey, SourceClass], list[SourceMarker]]:
-    identity = {block.source_file: PurePath(block.source_file) for block in blocks}
     symbols = [
         symbol
-        for result in read_marker_blocks(blocks, identity, aliases=aliases)
+        for result in read_marker_blocks(
+            blocks,
+            {block.source_file: PurePath(block.source_file) for block in blocks},
+            aliases=aliases,
+        )
         for symbol in result.tokens
         if symbol.module == target.upper()
     ]

@@ -3,9 +3,10 @@
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ghidra.program.model.address import Address
     from ghidra.program.model.listing import Program
 
 
@@ -265,3 +266,29 @@ def recover_requested_switches(program: "Program", requested: list[int]) -> None
                 )
     finally:
         decompiler.dispose()
+
+
+def clear_data(program: "Program", address: "Address") -> None:
+    """Remove data Ghidra's analysis defined over a known function entry,
+    such as a string it guessed in the instruction bytes; it would keep
+    the entry from being disassembled."""
+    listing = program.getListing()
+    data = listing.getDataContaining(address)
+    if data is not None and data.isDefined():
+        listing.clearCodeUnits(data.getMinAddress(), data.getMaxAddress(), False)
+
+
+def split_absorbed_piece(function: Any, address: "Address") -> bool:
+    """Remove the piece of `function`'s body that starts at `address`,
+    when that piece does not hold the function's entry. Returns whether
+    it was removed."""
+    from ghidra.program.model.address import AddressSet
+
+    body = function.getBody()
+    piece = body.getRangeContaining(address)
+    if piece is None or piece.contains(function.getEntryPoint()):
+        return False
+    if piece.getMinAddress() != address:
+        return False
+    function.setBody(body.subtract(AddressSet(piece)))
+    return True

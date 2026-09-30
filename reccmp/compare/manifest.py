@@ -118,7 +118,9 @@ class Manifest:
                 {
                     "orig": f"{entry.orig_addr:#x}",
                     "recomp": (
-                        f"{entry.recomp_addr:#x}" if entry.recomp_addr is not None else None
+                        f"{entry.recomp_addr:#x}"
+                        if entry.recomp_addr is not None
+                        else None
                     ),
                     "name": entry.name,
                     "basis": entry.basis.value if entry.basis is not None else None,
@@ -140,7 +142,11 @@ class Manifest:
                     "orig_size": obj.orig_size,
                     "recomp_size": obj.recomp_size,
                     "basis": obj.basis.value,
-                    **({"recomp_symbol": obj.recomp_symbol} if obj.recomp_symbol else {}),
+                    **(
+                        {"recomp_symbol": obj.recomp_symbol}
+                        if obj.recomp_symbol
+                        else {}
+                    ),
                 }
                 for obj in self.objects
             ],

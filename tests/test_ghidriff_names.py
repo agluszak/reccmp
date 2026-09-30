@@ -9,7 +9,7 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.engine import (
+from reccmp.ghidriff.names import (
     canonical_names,
     paired_reference_tokens,
     replace_paired_raw_addresses,
