@@ -32,19 +32,32 @@ def record_signature_origin(program, function, origin: str) -> None:
     )
 
 
-def independently_reviewed_signature(program, function) -> bool:
+def _reviewed_origin(program, function) -> str | None:
     stamps = program.getUsrPropertyManager().getStringPropertyMap(PROPERTY)
     if stamps is None:
-        return False
+        return None
     value = stamps.getString(function.getEntryPoint())
     if value is None:
-        return False
+        return None
     try:
         stamp = json.loads(str(value))
     except (ValueError, TypeError):
-        return False
+        return None
     if not isinstance(stamp, dict):
-        return False
-    return stamp.get("origin") == "retail-reviewed" and stamp.get("signature") == _signature(
-        function
-    )
+        return None
+    if stamp.get("signature") != _signature(function):
+        return None
+    origin = stamp.get("origin")
+    return origin if isinstance(origin, str) else None
+
+
+def independently_reviewed_signature(program, function) -> bool:
+    return _reviewed_origin(program, function) == "retail-reviewed"
+
+
+def independently_reviewed_return(program, function) -> bool:
+    """A return-only binary review does not establish parameter count or types."""
+    return _reviewed_origin(program, function) in {
+        "retail-reviewed",
+        "retail-return-reviewed",
+    }

@@ -63,12 +63,16 @@ def apply_reviewed_scalar_returns(
     """Restore lost returns without retyping already inferred integer calls."""
     from ghidra.program.model.data import (
         BooleanDataType,
+        Undefined1DataType,
+        Undefined4DataType,
         UnsignedIntegerDataType,
     )
     from ghidra.program.model.symbol import SourceType
 
     data_types = {
         "bool": BooleanDataType.dataType,
+        "undefined1": Undefined1DataType.dataType,
+        "undefined4": Undefined4DataType.dataType,
         "uint": UnsignedIntegerDataType.dataType,
     }
     functions = program.getFunctionManager()
@@ -79,6 +83,16 @@ def apply_reviewed_scalar_returns(
             continue
         current = function.getReturnType().getName()
         if return_name == "uint" and (not recomp or current != "void"):
+            continue
+        if return_name == "undefined4" and (
+            recomp
+            or function.getReturnType().getLength()
+            >= Undefined4DataType.dataType.getLength()
+        ):
+            continue
+        if return_name == "undefined1" and (
+            recomp or function.getReturnType().getLength() not in (0, 2, 4)
+        ):
             continue
         if current != return_name:
             function.setReturnType(data_types[return_name], SourceType.USER_DEFINED)

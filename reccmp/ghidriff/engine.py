@@ -79,7 +79,7 @@ _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 23
+PREPARATION_REVISION = 24
 
 
 @dataclass(frozen=True)
