@@ -43,7 +43,9 @@ def parse_args() -> argparse.Namespace:
             "its original with Ghidra and report the differences."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {reccmp.VERSION}")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {reccmp.VERSION}"
+    )
     argparse_add_project_target_args(parser)
     parser.add_argument(
         "--orig-address",
@@ -58,7 +60,9 @@ def parse_args() -> argparse.Namespace:
         metavar="<substring>",
         help="Compare only functions whose name contains this substring",
     )
-    parser.add_argument("--nolib", action="store_true", help="Do not compare library functions")
+    parser.add_argument(
+        "--nolib", action="store_true", help="Do not compare library functions"
+    )
     parser.add_argument(
         "--output",
         metavar="<dir>",
@@ -146,7 +150,9 @@ def _stage(name: str):
     """Report how long a pipeline stage took; the whole run is minutes long."""
     start = time.monotonic()
     yield
-    print(f"[STAGE] {name}: {time.monotonic() - start:.0f}s", file=sys.stderr, flush=True)
+    print(
+        f"[STAGE] {name}: {time.monotonic() - start:.0f}s", file=sys.stderr, flush=True
+    )
 
 
 def _reviewed_signatures(
@@ -161,12 +167,17 @@ def _reviewed_signatures(
     # pylint: disable=import-outside-toplevel
     import pyghidra
     from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
-    from reccmp.ghidra.signature_provenance import independently_reviewed_signature
+    from reccmp.ghidra.signature_provenance import (
+        independently_reviewed_return,
+        independently_reviewed_signature,
+    )
 
     project_file = args.orig_ghidra_project
     if not project_file.is_file():
         raise FileNotFoundError(project_file)
-    project = pyghidra.open_project(project_file.parent, project_file.stem, create=False)
+    project = pyghidra.open_project(
+        project_file.parent, project_file.stem, create=False
+    )
     try:
         with pyghidra.program_context(project, args.orig_ghidra_program) as program:
             original_md5 = hashlib.md5(manifest.orig.path.read_bytes()).hexdigest()
@@ -177,21 +188,29 @@ def _reviewed_signatures(
             signatures: dict[int, int] = {}
             scalar_returns: dict[int, str] = {}
             scalar_spellings = {
-                "bool": "bool",
-                "uint": "unsigned int",
+                "bool": ("bool",),
+                "undefined1": ("bool", "char", "signed char", "unsigned char"),
+                "undefined4": ("int", "unsigned int"),
+                "uint": ("unsigned int",),
             }
             for obj in manifest.objects:
                 if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:
                     continue
                 function = functions.getFunctionAt(space.getAddress(obj.orig_addr))
-                if function is None or not independently_reviewed_signature(program, function):
+                if function is None or not independently_reviewed_return(
+                    program, function
+                ):
                     continue
                 demangled = DemanglerUtil.demangle(obj.recomp_symbol)
                 if not isinstance(demangled, DemangledFunction):
                     continue
                 return_name = str(function.getReturnType().getName())
-                if scalar_spellings.get(return_name) == str(demangled.getReturnType()):
+                if str(demangled.getReturnType()) in scalar_spellings.get(
+                    return_name, ()
+                ):
                     scalar_returns[obj.orig_addr] = return_name
+                if not independently_reviewed_signature(program, function):
+                    continue
                 if function.getCallingConventionName() != "__cdecl":
                     continue
                 if demangled.getCallingConvention() != "__cdecl":
@@ -200,7 +219,9 @@ def _reviewed_signatures(
                 if any(parameter.getType().isVarArgs() for parameter in parameters):
                     continue
                 count = (
-                    0 if len(parameters) == 1 and str(parameters[0]) == "void" else len(parameters)
+                    0
+                    if len(parameters) == 1 and str(parameters[0]) == "void"
+                    else len(parameters)
                 )
                 if function.getParameterCount() == count:
                     signatures[obj.orig_addr] = count
@@ -222,7 +243,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     from reccmp.ghidriff.results import Outcome
 
     output: Path = args.output
-    projects = args.ghidra_projects or (target.recompiled_pdb.parent / ".reccmp-cache" / "ghidra")
+    projects = args.ghidra_projects or (
+        target.recompiled_pdb.parent / ".reccmp-cache" / "ghidra"
+    )
     engine = ReccmpDiffEngine(
         manifest,
         args=args,
@@ -257,7 +280,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         f"-reccmp{ANALYSIS_REVISION}"
         f"{'-switchfocus1' if engine.focused_switch_analysis else ''}"
     )
-    prepared_key = f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
+    prepared_key = (
+        f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
+    )
     # Hash the installed Python implementations as well as version strings:
     # local edits in either fork must invalidate completed results too.
     completed_key = fingerprint_files(
@@ -279,7 +304,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         ),
     )
     cache = AnalysisCache(projects / "completed", enabled=not args.no_cache)
-    cached: tuple[Any, Any, Any] | None = cache.load("comparison-" + completed_key, completed_key)
+    cached: tuple[Any, Any, Any] | None = cache.load(
+        "comparison-" + completed_key, completed_key
+    )
     if cached is not None:
         pdiff, results, calls = cached
         print("[CACHE] Reusing completed comparison", file=sys.stderr)
@@ -291,13 +318,19 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
             prepared_key=prepared_key,
         )
         if all(result.outcome != Outcome.ANALYSIS_FAILED for result in results):
-            cache.store("comparison-" + completed_key, completed_key, (pdiff, results, calls))
+            cache.store(
+                "comparison-" + completed_key, completed_key, (pdiff, results, calls)
+            )
 
-    (output / "direct-calls.json").write_text(json.dumps(calls, indent=1) + "\n", encoding="utf-8")
+    (output / "direct-calls.json").write_text(
+        json.dumps(calls, indent=1) + "\n", encoding="utf-8"
+    )
     # The report covers the requested functions only; Ghidriff's global
     # symbol and string inventories describe whole binaries.
     differing = {
-        result.entry.orig_addr for result in results if result.outcome == Outcome.DIFFERENCES
+        result.entry.orig_addr
+        for result in results
+        if result.outcome == Outcome.DIFFERENCES
     }
     pdiff["symbols"] = {"added": [], "deleted": []}
     pdiff["strings"] = {"added": [], "deleted": []}
@@ -352,7 +385,9 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
     orig, recomp = engine.manifest.orig.path, engine.manifest.recomp.path
     try:
         with _stage("set up project"):
-            engine.setup_project([orig, recomp], projects, project_name, output / "symbols")
+            engine.setup_project(
+                [orig, recomp], projects, project_name, output / "symbols"
+            )
             engine.prune_programs([orig, recomp])
             engine.align_import_purges(orig, recomp)
         with _stage("analyze programs"):
@@ -378,7 +413,9 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
                 with _stage("save prepared programs"):
                     save_prepared(engine.project, prepared_stamp, prepared_key)
         with _stage("decompile and diff"):
-            pdiff = engine.diff_pairs(orig, recomp, engine.function_matches(), force_diff=True)
+            pdiff = engine.diff_pairs(
+                orig, recomp, engine.function_matches(), force_diff=True
+            )
         with _stage("collect results"):
             results = engine.results()
         from reccmp.compare.call_census import direct_call_census

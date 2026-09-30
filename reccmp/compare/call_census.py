@@ -22,7 +22,13 @@ def _body_calls(program, image, address, identities, names):
         return {"calls": None, "error": "no-function-at-entry"}
     body = function.getBody()
     calls = []
+    outside_fallthroughs = []
     for instruction in program.getListing().getInstructions(body, True):
+        fallthrough = instruction.getFallThrough()
+        if fallthrough is not None and not body.contains(fallthrough):
+            outside_fallthroughs.append(
+                {"site": str(instruction.getAddress()), "target": str(fallthrough)}
+            )
         if not instruction.getFlowType().isCall():
             continue
         # A Ghidra reference resolving an indirect call is not a direct call.
@@ -36,27 +42,44 @@ def _body_calls(program, image, address, identities, names):
             {
                 "site": f"{site:#x}",
                 "target": f"{target:#x}",
-                "identity": f"pair:{obj.orig_addr:#x}"
-                if obj
-                else f"{image.name.lower()}:{target:#x}",
+                "identity": (
+                    f"pair:{obj.orig_addr:#x}"
+                    if obj
+                    else f"{image.name.lower()}:{target:#x}"
+                ),
                 "paired": obj is not None,
                 "name": obj.name if obj else names.get(target),
             }
         )
-    return {
+    observation: dict[str, Any] = {
         "body_ranges": [
-            [str(r.getMinAddress()), str(r.getMaxAddress())] for r in body.getAddressRanges()
+            [str(r.getMinAddress()), str(r.getMaxAddress())]
+            for r in body.getAddressRanges()
         ],
         "calls": calls,
     }
+    if outside_fallthroughs:
+        # A shared/mid-body entry may have split the native FunctionDB body.
+        # The observed prefix is not a complete authored-function sequence.
+        observation.update(
+            calls=None,
+            partial_calls=calls,
+            error="function-body-has-outside-fallthrough",
+            outside_fallthroughs=outside_fallthroughs,
+        )
+    return observation
 
 
 def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict:
     """Read Ghidra-owned function bodies using catalog-owned identities."""
     functions = []
-    identities = {image: {obj.addr(image): obj for obj in manifest.objects} for image in ImageId}
+    identities = {
+        image: {obj.addr(image): obj for obj in manifest.objects} for image in ImageId
+    }
     names = {
-        image: {obj.addr: obj.name for obj in manifest.unpaired if obj.image_id == image}
+        image: {
+            obj.addr: obj.name for obj in manifest.unpaired if obj.image_id == image
+        }
         for image in ImageId
     }
     pairs = {obj.orig_addr: obj for obj in manifest.objects}
@@ -70,7 +93,9 @@ def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict
         sides = {}
         for image, program in programs.items():
             address = entry.orig_addr if image == ImageId.ORIG else entry.recomp_addr
-            observation = _body_calls(program, image, address, identities[image], names[image])
+            observation = _body_calls(
+                program, image, address, identities[image], names[image]
+            )
             bodies[image][address] = observation
             sides[image.name.lower()] = observation
         functions.append({"address": f"{entry.orig_addr:#x}", **sides})
@@ -87,15 +112,19 @@ def direct_call_census(manifest: Manifest, programs: dict[ImageId, Any]) -> dict
         for address in sorted(addresses):
             body = bodies[image].get(address)
             if body is None:
-                body = _body_calls(program, image, address, identities[image], names[image])
+                body = _body_calls(
+                    program, image, address, identities[image], names[image]
+                )
             obj = identities[image].get(address)
             targets.append(
                 {
                     "image": image.name.lower(),
                     "address": f"{address:#x}",
-                    "identity": f"pair:{obj.orig_addr:#x}"
-                    if obj
-                    else f"{image.name.lower()}:{address:#x}",
+                    "identity": (
+                        f"pair:{obj.orig_addr:#x}"
+                        if obj
+                        else f"{image.name.lower()}:{address:#x}"
+                    ),
                     "name": obj.name if obj else names[image].get(address),
                     **body,
                 }
@@ -114,7 +143,9 @@ def call_delta(original: list[dict], rebuilt: list[dict]) -> dict:
     unresolved = any(not call["paired"] for call in original + rebuilt)
     deltas = [
         {"retail": old[i:j], "rebuild": new[k:l]}
-        for tag, i, j, k, l in SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        for tag, i, j, k, l in SequenceMatcher(
+            None, old, new, autojunk=False
+        ).get_opcodes()
         if tag != "equal"
     ]
     removed = sum(len(delta["retail"]) for delta in deltas)

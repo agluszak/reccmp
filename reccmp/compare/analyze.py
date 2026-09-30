@@ -700,7 +700,7 @@ def classify_synthetic_jump_aliases(
 
 
 def _direct_calls(
-    binfile: PEImage, addr: int, size: int | None
+    binfile: Image, addr: int, size: int | None
 ) -> tuple[int, ...] | None:
     if size is None or size <= 0 or size > 10000:
         return None
@@ -716,7 +716,7 @@ def _direct_calls(
 
 
 def _trailing_called_funclet(
-    binfile: PEImage, addr: int, size: int | None
+    binfile: Image, addr: int, size: int | None
 ) -> tuple[tuple[int, ...], int] | None:
     """Find a local call target immediately following the parent's return.
 
@@ -746,8 +746,8 @@ def _trailing_called_funclet(
 
 def match_unpaired_direct_callees(
     db: EntityDb,
-    orig_bin: PEImage,
-    recomp_bin: PEImage,
+    orig_bin: Image,
+    recomp_bin: Image,
     codebase: DecompCodebase | None = None,
 ) -> None:
     """Derive an unnamed callee from the same calls in independent paired bodies.

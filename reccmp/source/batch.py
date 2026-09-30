@@ -601,6 +601,14 @@ def collect_compile_database(
             },
             repository=repository,
         )
+        # Repository-local compiler dependencies can live outside the target's
+        # marked source roots (for example analysis compatibility headers).
+        # Their bounds/types are still inputs to these declarations.
+        for dependency in {
+            path for paths in result.unit_dependencies.values() for path in paths
+        }:
+            if (digest := digests.digest(repository / dependency)) is not None:
+                result.source_digests[dependency] = digest
     digests.save()
     _publish(cache / "profile.json", json.dumps(profile.to_dict(), indent=1))
     logger.info("%s", profile.summary())

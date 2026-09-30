@@ -12,14 +12,30 @@ an inferred cdecl arity when retail independently agrees.
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING, Any
 
 from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
-from reccmp.compare.manifest import FunctionEntry, Manifest, NamedObject
+from reccmp.compare.manifest import FunctionEntry, Manifest
 from reccmp.types import EntityType, ImageId
 
+from .contents import (
+    literal_data_type,
+    decode_string,
+    ghidra_string,
+    relocation_at,
+    read_contents,
+)
+from .names import (
+    name_end,
+    rename_function,
+    label,
+    unpaired_names,
+    canonical_names,
+    paired_reference_tokens,
+    replace_paired_raw_addresses,
+    unquoted_raw_addresses,
+)
 from .imports import import_locations, known_purge
 from .locations import (
     STRING_TYPES,
@@ -32,6 +48,8 @@ from .locations import (
     register_operand,
 )
 from .preparation import (
+    clear_data,
+    split_absorbed_piece,
     apply_reviewed_scalar_returns,
     apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
@@ -68,169 +86,20 @@ _FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 # alone, Ghidra reads a jump to it as part of the function that jumps.
 _ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
 # Named by their contents in the catalog; shown by their contents instead.
-_LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 _STACK_PROBE_NAMES = frozenset(
     {"__chkstk", "__alloca_probe", "__alloca_probe_8", "__alloca_probe_16"}
 )
-# Upper bound on the bytes shown for one referenced location.
-_RAW_LIMIT = 64
-_RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 # Changes whenever what reccmp does to a program before Ghidra's analysis
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 23
+PREPARATION_REVISION = 24
 
 
 @dataclass(frozen=True)
 class _Decompiled:
     code: str | None
     error: str | None
-
-
-def _literal_data_type(entity_type: EntityType | None, size: int | None) -> Any:
-    """The Ghidra data type for a literal the catalog found, if any."""
-    from ghidra.program.model.data import (
-        DoubleDataType,
-        FloatDataType,
-        TerminatedStringDataType,
-        TerminatedUnicodeDataType,
-    )
-
-    match entity_type, size:
-        case EntityType.STRING, _:
-            return TerminatedStringDataType.dataType
-        case EntityType.WIDECHAR, _:
-            return TerminatedUnicodeDataType.dataType
-        case EntityType.FLOAT, 4:
-            return FloatDataType.dataType
-        case EntityType.FLOAT, 8:
-            return DoubleDataType.dataType
-    return None
-
-
-def _decode_string(raw: bytes, entity_type: EntityType | None) -> StringValue:
-    """A catalog string entity's text, up to its terminator."""
-    wide = entity_type == EntityType.WIDECHAR
-    text = raw.decode("utf-16-le" if wide else "latin1", errors="replace")
-    return StringValue(text.split("\0", 1)[0])
-
-
-def unpaired_names(
-    manifest: Manifest, shared: set[str]
-) -> dict[tuple[ImageId, int], str]:
-    """Own-image names for unpaired entities. A name that is also a shared
-    name, or that several unpaired entities of one image carry, is
-    qualified with the address, so it cannot suggest a correspondence."""
-    named = [
-        entity
-        for entity in manifest.unpaired
-        if entity.name is not None and entity.entity_type not in _LITERAL_TYPES
-    ]
-    counts: dict[tuple[ImageId, str], int] = {}
-    for entity in named:
-        assert entity.name is not None
-        key = (entity.image_id, entity.name)
-        counts[key] = counts.get(key, 0) + 1
-    result = {}
-    for entity in named:
-        assert entity.name is not None
-        unique = counts[(entity.image_id, entity.name)] == 1
-        result[(entity.image_id, entity.addr)] = (
-            entity.name
-            if unique and entity.name not in shared
-            else f"{entity.name}@{entity.addr:#x}"
-        )
-    return result
-
-
-def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:
-    """One Ghidra name per paired object, keyed by original address.
-
-    A name shared by distinct objects is qualified with the original
-    address, which identifies the pair on both sides."""
-    counts: dict[str, int] = {}
-    for obj in objects:
-        counts[obj.name] = counts.get(obj.name, 0) + 1
-    return {
-        obj.orig_addr: (
-            obj.name if counts[obj.name] == 1 else f"{obj.name}@{obj.orig_addr:#x}"
-        )
-        for obj in objects
-    }
-
-
-def paired_reference_tokens(
-    orig_refs: tuple[DataReference, ...],
-    recomp_refs: tuple[DataReference, ...],
-    paired_recomp_addrs: dict[int, int] | None = None,
-) -> tuple[dict[int, str], dict[int, str]]:
-    """Name paired addresses confirmed by at least one side's reference.
-
-    Ghidra sometimes prints the counterpart as a raw constant without making
-    a reference. The manifest still supplies its exact paired address.
-    """
-    by_side = []
-    for refs in (orig_refs, recomp_refs):
-        locations: dict[ObjectOffset, set[int]] = {}
-        for ref in refs:
-            if ref.object is not None:
-                locations.setdefault(ref.object, set()).add(ref.address)
-        by_side.append(locations)
-    orig, recomp = by_side
-    orig_tokens: dict[int, str] = {}
-    recomp_tokens: dict[int, str] = {}
-    for obj in orig.keys() | recomp.keys():
-        canonical_recomp = (paired_recomp_addrs or {}).get(obj.orig_addr)
-        if canonical_recomp is not None and (
-            obj.orig_addr + obj.offset in orig.get(obj, ())
-            or canonical_recomp + obj.offset in recomp.get(obj, ())
-        ):
-            orig_addr = obj.orig_addr + obj.offset
-            recomp_addr = canonical_recomp + obj.offset
-        elif obj in orig and obj in recomp and len(orig[obj]) == len(recomp[obj]) == 1:
-            orig_addr = next(iter(orig[obj]))
-            recomp_addr = next(iter(recomp[obj]))
-        else:
-            continue
-        if orig_addr == recomp_addr:
-            continue
-        token = f"PAIRED_DATA_{obj.orig_addr:x}_{obj.offset:x}"
-        orig_tokens[orig_addr] = token
-        recomp_tokens[recomp_addr] = token
-    return orig_tokens, recomp_tokens
-
-
-def replace_paired_raw_addresses(code: list[str], tokens: dict[int, str]) -> None:
-    """Replace referenced raw addresses, leaving literals and comments intact."""
-    if not tokens:
-        return
-
-    def rename(match: re.Match[str]) -> str:
-        return tokens.get(int(match.group(), 16), match.group())
-
-    for index, line in enumerate(code):
-        if line.lstrip().startswith(("/*", "//", "*")):
-            continue
-        parts = GhidraDiffEngine.QUOTED_LITERAL.split(line)
-        code[index] = "".join(
-            part if part_index % 2 else _RAW_ADDRESS.sub(rename, part)
-            for part_index, part in enumerate(parts)
-        )
-
-
-def unquoted_raw_addresses(code: str) -> set[int]:
-    """Collect displayed addresses without treating strings/comments as code."""
-    found: set[int] = set()
-    for line in code.splitlines():
-        if line.lstrip().startswith(("/*", "//", "*")):
-            continue
-        for index, part in enumerate(GhidraDiffEngine.QUOTED_LITERAL.split(line)):
-            if index % 2 == 0:
-                found.update(
-                    int(match.group(), 16) for match in _RAW_ADDRESS.finditer(part)
-                )
-    return found
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -685,9 +554,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 continue
             # Ghidra returns null when no function contains the address.
             containing: "Function | None" = functions.getFunctionContaining(address)
-            if containing is not None and self._split_absorbed_piece(
-                containing, address
-            ):
+            if containing is not None and split_absorbed_piece(containing, address):
                 split.append(containing)
                 containing = None
             if containing is not None:
@@ -701,7 +568,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         ),
                     )
                 continue
-            self._clear_data(program, address)
+            clear_data(program, address)
             # A null restricted set leaves disassembly unrestricted.
             DisassembleCommand(address, None, True).applyTo(  # type: ignore[call-overload]
                 program, TaskMonitor.DUMMY
@@ -719,32 +586,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             address = space.getAddress(self._entry_addr(entry, image_id))
             if functions.getFunctionAt(address) is None:
                 self._fail(entry, AnalysisFailure(FailureKind.NO_FUNCTION, image_id))
-
-    @staticmethod
-    def _clear_data(program: "Program", address: "Address") -> None:
-        """Remove data Ghidra's analysis defined over a known function entry,
-        such as a string it guessed in the instruction bytes; it would keep
-        the entry from being disassembled."""
-        listing = program.getListing()
-        data = listing.getDataContaining(address)
-        if data is not None and data.isDefined():
-            listing.clearCodeUnits(data.getMinAddress(), data.getMaxAddress(), False)
-
-    @staticmethod
-    def _split_absorbed_piece(function: Any, address: "Address") -> bool:
-        """Remove the piece of `function`'s body that starts at `address`,
-        when that piece does not hold the function's entry. Returns whether
-        it was removed."""
-        from ghidra.program.model.address import AddressSet
-
-        body = function.getBody()
-        piece = body.getRangeContaining(address)
-        if piece is None or piece.contains(function.getEntryPoint()):
-            return False
-        if piece.getMinAddress() != address:
-            return False
-        function.setBody(body.subtract(AddressSet(piece)))
-        return True
 
     def _fail(self, entry: FunctionEntry, failure: AnalysisFailure) -> None:
         self._failures.setdefault(entry.orig_addr, []).append(failure)
@@ -781,7 +622,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                 continue
             address = space.getAddress(obj.addr(image_id))
             size = obj.extent(image_id)
-            data_type = _literal_data_type(obj.entity_type, size)
+            data_type = literal_data_type(obj.entity_type, size)
             containing = listing.getDataContaining(address)
             if (
                 containing is not None
@@ -850,35 +691,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             address = space.getAddress(addr)
             function = functions.getFunctionAt(address)
             if function is not None:
-                self._rename_function(function, name)
+                rename_function(function, name)
             else:
-                self._label(program, address, name)
-
-    @staticmethod
-    def _ghidra_name(name: str) -> str:
-        from ghidra.program.model.symbol import SymbolUtilities
-
-        return SymbolUtilities.replaceInvalidChars(name, True)
-
-    def _rename_function(self, function: Any, name: str) -> None:
-        from ghidra.program.model.symbol import SourceType
-
-        ghidra_name = self._ghidra_name(name)
-        # The PE loader labels an export's entry with its decorated name; a
-        # function cannot take a name another symbol already holds there.
-        primary = function.getSymbol()
-        table = function.getProgram().getSymbolTable()
-        for symbol in table.getSymbols(function.getEntryPoint()):
-            if symbol != primary and symbol.getName() == ghidra_name:
-                symbol.delete()
-        function.setName(ghidra_name, SourceType.USER_DEFINED)
-
-    def _label(self, program: "Program", address: "Address", name: str) -> None:
-        from ghidra.program.model.symbol import SourceType
-
-        program.getSymbolTable().createLabel(
-            address, self._ghidra_name(name), SourceType.USER_DEFINED
-        ).setPrimary()
+                label(program, address, name)
 
     # --- referenced data --------------------------------------------------
 
@@ -902,7 +717,9 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                         continue
                     if functions.getFunctionContaining(
                         to
-                    ) is not None or not self._is_data(image_id, to.getOffset()):
+                    ) is not None or not self._extents[image_id].is_data(
+                        to.getOffset()
+                    ):
                         continue
                     operand = ref.getOperandIndex()
                     if register_operand(instruction, operand) or bitwise_scalar_operand(
@@ -912,7 +729,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
                     bound = self._compared_end(image_id, instruction, operand, to)
                     access = access_size(instruction, to.getOffset())
                     if bound is not None:
-                        self._name_end(program, instruction, ref, bound)
+                        name_end(program, instruction, ref, bound)
                     else:
                         bound = self._iterated_past_end(
                             image_id, instruction, operand, to
@@ -1001,28 +818,6 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         orig_addr = past.named.orig_addr
         return ObjectOffset(orig_addr, self._names[orig_addr], past.offset)
 
-    def _name_end(
-        self, program: "Program", instruction: Any, ref: Any, end: ObjectOffset
-    ) -> None:
-        """Show the compared constant as its offset from its array. The
-        decompiler shows an equate for the constant, also when it adjusts
-        the constant by one to rewrite the comparison."""
-        name = self._ghidra_name(f"{end.name}+{end.offset:#x}")
-        value = ref.getToAddress().getOffset()
-        equates = program.getEquateTable()
-        equate = equates.getEquate(name) or equates.createEquate(name, value)
-        if equate.getValue() == value:
-            equate.addReference(instruction.getAddress(), ref.getOperandIndex())
-
-    def _is_data(self, image_id: ImageId, addr: int) -> bool:
-        """Import slots are compared by the import name Ghidra shows in the
-        code; jump tables inside a function's extent are part of its code."""
-        located = self._extents[image_id].containing(addr)
-        return located is None or (
-            located.entity_type not in _UNNAMED_TYPES
-            and located.entity_type not in _FUNCTION_TYPES
-        )
-
     def _reference(
         self,
         program: "Program",
@@ -1050,7 +845,7 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             if located.offset:
                 # Name a location inside a paired object by the object and
                 # offset, so `array + 4` cannot read as `array`.
-                self._label(program, address, f"{obj.name}+{obj.offset:#x}")
+                label(program, address, f"{obj.name}+{obj.offset:#x}")
         return DataReference(
             address.getOffset(),
             obj,
@@ -1068,14 +863,14 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         in both images, whatever Ghidra's data typing on either side."""
         if located.size is None:
             return UnknownExtent()
-        read = self._read(program, address, located.size - located.offset)
+        read = read_contents(program, address, located.size - located.offset)
         if read is None:
             return Uninitialized()
         raw, relocated = read
-        if relocated and self._relocation_at(program, address) and len(raw) >= 4:
+        if relocated and relocation_at(program, address) and len(raw) >= 4:
             return self._pointer(program, image_id, raw)
         if located.entity_type in STRING_TYPES and not relocated:
-            return _decode_string(raw, located.entity_type)
+            return decode_string(raw, located.entity_type)
         return RawBytes(raw, relocated, extent_known=True)
 
     def _accessed_contents(
@@ -1084,11 +879,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         """The bytes an instruction loads or stores at a location the
         catalog does not know: what the function uses, whatever Ghidra's
         data typing there (two float constants typed as one string)."""
-        read = self._read(program, address, size)
+        read = read_contents(program, address, size)
         if read is None:
             return Uninitialized()
         raw, relocated = read
-        if relocated and self._relocation_at(program, address) and len(raw) >= 4:
+        if relocated and relocation_at(program, address) and len(raw) >= 4:
             return self._pointer(program, image_id, raw)
         return RawBytes(raw, relocated, extent_known=True)
 
@@ -1100,59 +895,17 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         data = program.getListing().getDataContaining(address)
         if data is None or not data.isDefined():
             return UnknownExtent()
-        string = self._ghidra_string(program, address)
+        string = ghidra_string(program, address)
         if string is not None:
             return string
         offset = address.subtract(data.getMinAddress())
-        read = self._read(program, address, data.getLength() - offset)
+        read = read_contents(program, address, data.getLength() - offset)
         if read is None:
             return Uninitialized()
         raw, relocated = read
-        if relocated and self._relocation_at(program, address) and len(raw) >= 4:
+        if relocated and relocation_at(program, address) and len(raw) >= 4:
             return self._pointer(program, image_id, raw)
         return RawBytes(raw, relocated, extent_known=False)
-
-    @staticmethod
-    def _ghidra_string(program: "Program", address: "Address") -> StringValue | None:
-        """The string Ghidra's analysis defined at (or around) an address."""
-        from ghidra.program.model.data import StringDataInstance
-
-        data = program.getListing().getDataContaining(address)
-        if data is None or not StringDataInstance.isString(data):
-            return None
-        string = StringDataInstance.getStringDataInstance(data)
-        offset = address.subtract(data.getMinAddress())
-        if offset:
-            string = string.getByteOffcut(offset)
-        value = string.getStringValue()
-        return StringValue(str(value)) if value is not None else None
-
-    @staticmethod
-    def _relocation_at(program: "Program", address: "Address") -> bool:
-        return bool(program.getRelocationTable().hasRelocation(address))
-
-    @staticmethod
-    def _read(
-        program: "Program", address: "Address", length: int
-    ) -> tuple[bytes, bool] | None:
-        """Up to ``length`` initialized bytes and whether any is relocated."""
-        import jpype
-        from ghidra.program.model.address import AddressSet
-
-        block = program.getMemory().getBlock(address)
-        if block is None or not block.isInitialized():
-            return None
-        length = min(length, _RAW_LIMIT, block.getEnd().subtract(address) + 1)
-        if length <= 0:
-            return b"", False
-        buffer = jpype.JArray(jpype.JByte)(length)
-        program.getMemory().getBytes(address, buffer)
-        relocated = (
-            program.getRelocationTable()
-            .getRelocations(AddressSet(address, address.add(length - 1)))
-            .hasNext()
-        )
-        return bytes(b & 0xFF for b in buffer), relocated
 
     def _pointer(self, program: "Program", image_id: ImageId, raw: bytes) -> Contents:
         space = program.getAddressFactory().getDefaultAddressSpace()
@@ -1184,10 +937,10 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             and located.entity_type in STRING_TYPES
             and located.size is not None
         ):
-            read = self._read(program, target, located.size - located.offset)
+            read = read_contents(program, target, located.size - located.offset)
             if read is not None and not read[1]:
-                return _decode_string(read[0], located.entity_type)
-        return self._ghidra_string(program, target)
+                return decode_string(read[0], located.entity_type)
+        return ghidra_string(program, target)
 
     # --- results ----------------------------------------------------------
 

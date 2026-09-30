@@ -68,7 +68,9 @@ class PdbFunctionImporter(ABC):
         for pattern, substitution in name_substitutions:
             new_name = pattern.sub(substitution, self.name)
             if new_name != self.name:
-                logger.debug("Substituting function name: %s -> %s", self.name, new_name)
+                logger.debug(
+                    "Substituting function name: %s -> %s", self.name, new_name
+                )
                 self.name = new_name
 
     def get_full_name(self) -> str:
@@ -134,7 +136,9 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
             # Import the base class so the namespace exists
             self.type_importer.import_pdb_type_into_ghidra(self.signature.class_type)
 
-        self.return_type = type_importer.import_pdb_type_into_ghidra(self.signature.return_type)
+        self.return_type = type_importer.import_pdb_type_into_ghidra(
+            self.signature.return_type
+        )
 
         arg_keys = list(self.signature.arglist)
         self.varargs = False
@@ -168,14 +172,19 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
         if (
             (not return_type_match)
             and (self.return_type.getLength() > 4)
-            and (get_or_add_pointer_type(self.api, self.return_type) == ghidra_return_type)
+            and (
+                get_or_add_pointer_type(self.api, self.return_type)
+                == ghidra_return_type
+            )
             and any(
                 param
                 for param in ghidra_function.getParameters()
                 if param.getName() == "__return_storage_ptr__"
             )
         ):
-            logger.debug("%s has a return type larger than 4 bytes", self.get_full_name())
+            logger.debug(
+                "%s has a return type larger than 4 bytes", self.get_full_name()
+            )
             return_type_match = True
 
         # match arguments: decide if thiscall or not, and whether the `this` type matches
@@ -237,7 +246,9 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
         # Remove return storage pointer from comparison if present.
         # This is relevant to returning values larger than 4 bytes, and is not mentioned in the PDB
         ghidra_params = [
-            param for param in ghidra_params if param.getName() != "__return_storage_ptr__"
+            param
+            for param in ghidra_params
+            if param.getName() != "__return_storage_ptr__"
         ]
 
         if len(self.arguments) != len(ghidra_params):
@@ -289,7 +300,9 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
         """Replace the function declaration in Ghidra by the one derived from C++."""
 
         # Invalidate any previous independent review before replacing ABI facts.
-        record_signature_origin(self.api.getCurrentProgram(), ghidra_function, "pdb-projection")
+        record_signature_origin(
+            self.api.getCurrentProgram(), ghidra_function, "pdb-projection"
+        )
         if ghidra_function.hasCustomVariableStorage():
             # Unfortunately, calling `ghidra_function.setCustomVariableStorage(False)`
             # leads to two `this` parameters. Therefore, we first need to remove all `this` parameters
@@ -298,7 +311,11 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
                 Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,  # this implicitly sets custom variable storage to False
                 True,
                 SourceType.USER_DEFINED,
-                *[param for param in ghidra_function.getParameters() if param.getName() != "this"],
+                *[
+                    param
+                    for param in ghidra_function.getParameters()
+                    if param.getName() != "this"
+                ],
             )
 
         if ghidra_function.hasCustomVariableStorage():
@@ -310,7 +327,9 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
         ghidra_function.setCallingConvention(self.signature.call_type)
 
         if self.is_stub:
-            logger.debug("%s is a stub, skipping parameter import", self.get_full_name())
+            logger.debug(
+                "%s is a stub, skipping parameter import", self.get_full_name()
+            )
         else:
             ghidra_function.replaceParameters(
                 Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
@@ -360,8 +379,12 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
             logger.warning("Skipping stack parameter of type NOTYPE")
             return
 
-        if param.getDataType() != self.type_importer.import_pdb_type_into_ghidra(match.data_type):
-            logger.error("Type mismatch for parameter: %s in Ghidra, %s in PDB", param, match)
+        if param.getDataType() != self.type_importer.import_pdb_type_into_ghidra(
+            match.data_type
+        ):
+            logger.error(
+                "Type mismatch for parameter: %s in Ghidra, %s in PDB", param, match
+            )
             return
 
         name = match.name
@@ -376,7 +399,8 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
             (
                 symbol
                 for symbol in self.signature.symbols
-                if isinstance(symbol, CppStackSymbol) and symbol.stack_offset == stack_offset
+                if isinstance(symbol, CppStackSymbol)
+                and symbol.stack_offset == stack_offset
             ),
             None,
         )
@@ -386,7 +410,8 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
             (
                 symbol
                 for symbol in self.signature.symbols
-                if isinstance(symbol, CppRegisterSymbol) and symbol.register == register.lower()
+                if isinstance(symbol, CppRegisterSymbol)
+                and symbol.register == register.lower()
             ),
             None,
         )
@@ -432,6 +457,8 @@ class PdbFunctionImporterFull(PdbFunctionImporter):
             ComponentOffsetSettingsDefinition.DEF.setValue(
                 typedef_ghidra_type.getDefaultSettings(), self.signature.this_adjust
             )
-            typedef_ghidra_type = add_data_type_or_reuse_existing(self.api, typedef_ghidra_type)
+            typedef_ghidra_type = add_data_type_or_reuse_existing(
+                self.api, typedef_ghidra_type
+            )
 
             this_parameter.setDataType(typedef_ghidra_type, SourceType.USER_DEFINED)

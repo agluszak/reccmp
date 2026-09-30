@@ -184,6 +184,7 @@ def test_source_function_identity_replaces_data_source_label(
     marker_name: str,
     csv_symbol: str,
     expected_name: str | None,
+    *,
     expected_symbol: str | None,
 ):
     with db.batch() as batch:

@@ -1,6 +1,7 @@
 """Exercise the actual collector inside the pinned LLVM 21 analysis environment."""
 
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -25,16 +26,16 @@ def _require_collector() -> None:
         )
 
 
-@pytest.fixture(scope="session")
-def native_indexer(tmp_path_factory) -> Path:
+@pytest.fixture(scope="session", name="compiled_indexer")
+def fixture_compiled_indexer(tmp_path_factory) -> Path:
     """Compile the real collector once; each test still has its own TU cache."""
     _require_collector()
     return resolve_indexer(tmp_path_factory.mktemp("native-indexer"))
 
 
 @pytest.fixture(autouse=True)
-def use_native_indexer(native_indexer: Path, monkeypatch) -> None:
-    monkeypatch.setenv("RECCMP_SOURCE_INDEXER", str(native_indexer))
+def use_native_indexer(compiled_indexer: Path, monkeypatch) -> None:
+    monkeypatch.setenv("RECCMP_SOURCE_INDEXER", str(compiled_indexer))
 
 
 def _clang_cl(repository: Path) -> str:
@@ -246,7 +247,10 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
     repository = tmp_path / "source with spaces"
     repository.mkdir()
     header = repository / "owner.h"
+    support = repository / "analysis-support.h"
+    support.write_text("#define ARRAY_BOUND 7\n", encoding="utf-8")
     header.write_text(
+        '#include "analysis-support.h"\n'
         "struct Owner {\n"
         "  int **pointers;\n"
         "  int (*callback)(int);\n"
@@ -349,6 +353,11 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert profile["records"]["declaration"] > 0
         assert profile["indexer_totals_ms"]["frontend_ms"] > 0
         assert "owner.h" in index.unit_dependencies["first.cpp"]
+        assert "analysis-support.h" in index.unit_dependencies["first.cpp"]
+        assert (
+            index.source_digests["analysis-support.h"]
+            == sha256(support.read_bytes()).hexdigest()
+        )
         owner_keys = {
             key: item
             for key, item in index.classes.items()

@@ -37,6 +37,17 @@ class Located:
 class Extents:
     """Catalog entities of one image, by the address range they occupy."""
 
+    def is_data(self, address: int) -> bool:
+        """Import slots and code extents contribute identity, not literal bytes."""
+        located = self.containing(address)
+        return located is None or located.entity_type not in (
+            EntityType.IMPORT,
+            EntityType.IMPORT_THUNK,
+            EntityType.FUNCTION,
+            EntityType.VTORDISP,
+            EntityType.THUNK,
+        )
+
     def __init__(self, manifest: Manifest, image_id: ImageId):
         spans = [
             Located(obj.addr(image_id), 0, obj.extent(image_id), obj.entity_type, obj)

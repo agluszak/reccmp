@@ -98,6 +98,7 @@ def _slot_status(
     db: EntityDb,
     orig_bin: Image,
     recomp_bin: Image,
+    *,
     raw: tuple[int | None, int | None],
     orig: ReccmpEntity | None,
     recomp: ReccmpEntity | None,
@@ -201,7 +202,12 @@ def compare_vtable(
                 orig,
                 recomp,
                 _slot_status(
-                    db, orig_bin, recomp_bin, (raw_orig, raw_recomp), orig, recomp
+                    db,
+                    orig_bin,
+                    recomp_bin,
+                    raw=(raw_orig, raw_recomp),
+                    orig=orig,
+                    recomp=recomp,
                 ),
             )
         )
