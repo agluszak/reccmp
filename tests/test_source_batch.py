@@ -1,6 +1,7 @@
 """Exercise the actual collector inside the pinned LLVM 21 analysis environment."""
 
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -246,7 +247,10 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
     repository = tmp_path / "source with spaces"
     repository.mkdir()
     header = repository / "owner.h"
+    support = repository / "analysis-support.h"
+    support.write_text("#define ARRAY_BOUND 7\n", encoding="utf-8")
     header.write_text(
+        '#include "analysis-support.h"\n'
         "struct Owner {\n"
         "  int **pointers;\n"
         "  int (*callback)(int);\n"
@@ -349,6 +353,11 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert profile["records"]["declaration"] > 0
         assert profile["indexer_totals_ms"]["frontend_ms"] > 0
         assert "owner.h" in index.unit_dependencies["first.cpp"]
+        assert "analysis-support.h" in index.unit_dependencies["first.cpp"]
+        assert (
+            index.source_digests["analysis-support.h"]
+            == sha256(support.read_bytes()).hexdigest()
+        )
         owner_keys = {
             key: item
             for key, item in index.classes.items()
