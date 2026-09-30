@@ -241,6 +241,53 @@ def _write(index: SourceIndex, directory: Path) -> Path:
     return path
 
 
+def test_out_of_line_records_keep_semantic_owner_and_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "nested.cpp"
+    source.write_text(
+        "namespace N { struct Owner { struct Part; }; }\n"
+        "struct N::Owner::Part {\n"
+        "  struct Inner { int count; };\n"
+        '  static_assert(sizeof(Part::Inner) == 4, "inner size");\n'
+        "  Inner item; int value; int get() const;\n"
+        "};\n"
+        "int N::Owner::Part::get() const { return item.count + value; }\n"
+        'static_assert(sizeof(N::Owner::Part) == 8, "size");\n',
+        encoding="utf-8",
+    )
+    database = tmp_path / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(source),
+                    "arguments": [
+                        _clang_cl(tmp_path),
+                        "--target=i686-pc-windows-msvc",
+                        "/c",
+                        str(source),
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RECCMP_SOURCE_ROOT", str(tmp_path))
+    index = SourceIndex.from_compile_database(
+        tmp_path, database, {"TEST": [source]}, cache_dir=tmp_path / "cache", jobs=1
+    )
+    part = index.class_named("N::Owner::Part", target="TEST")
+    inner = index.class_named("N::Owner::Part::Inner", target="TEST")
+    assert part is not None and part.asserted_size == 8
+    assert inner is not None and inner.asserted_size == 4
+    assert part.semantic_id == "record:N::Owner::Part"
+    assert inner.semantic_id == "record:N::Owner::Part::Inner"
+    assert part.fields[0].record_semantic_id == inner.semantic_id
+    assert index.class_named("Part", target="TEST") is None
+
+
 def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
     # pylint: disable=too-many-statements,too-many-locals
     _require_collector()
