@@ -739,7 +739,7 @@ class Indexer {
   // written `static_assert((sizeof(T) == N), ...)`, and reading the comparison
   // through the AST-JSON shape missed every one of them, because the parentheses
   // put a node between the assertion and its comparison.
-  void emitSizeAssertion(const StaticAssertDecl* assertion, llvm::StringRef scope) {
+  void emitSizeAssertion(const StaticAssertDecl* assertion) {
     const auto* comparison = dyn_cast<BinaryOperator>(assertion->getAssertExpr()->IgnoreParens());
     if (!comparison || comparison->getOpcode() != BO_EQ) return;
     const Stmt* sizeOf = findDescendant(comparison, [](const Stmt* node) {
@@ -750,8 +750,10 @@ class Indexer {
         comparison, [](const Stmt* node) { return isa<IntegerLiteral>(node); });
     if (!sizeOf || !literal) return;
 
-    std::string name = cast<UnaryExprOrTypeTraitExpr>(sizeOf)->getArgumentType().getAsString(policy_);
-    if (name.find("::") == std::string::npos && !scope.empty()) name = qualify(scope, name);
+    const CXXRecordDecl* record =
+        cast<UnaryExprOrTypeTraitExpr>(sizeOf)->getArgumentType()->getAsCXXRecordDecl();
+    if (!record) return;
+    std::string name = qualify(scopeOf(record->getDeclContext()), component(record));
     emit(llvm::json::Object{
         {"record", "size-assertion"},
         {"qualified_name", name},
@@ -1041,7 +1043,7 @@ class Indexer {
 
     std::string childScope = scope;
     std::string part = component(declaration);
-    if (!part.empty()) childScope = qualify(scope, part);
+    if (!part.empty()) childScope = qualify(scopeOf(declaration->getDeclContext()), part);
 
     SourceLocation beginLoc =
         sources_.getExpansionLoc(declaration->getSourceRange().getBegin());
@@ -1076,7 +1078,7 @@ class Indexer {
         emitVariable(variable, location);
       }
     } else if (const auto* assertion = dyn_cast<StaticAssertDecl>(declaration)) {
-      if (indexed) emitSizeAssertion(assertion, scope);
+      if (indexed) emitSizeAssertion(assertion);
     }
 
     // A template's specializations are reached through the template, exactly as
