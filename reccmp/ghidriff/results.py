@@ -8,7 +8,7 @@ analyzed output shows a difference, and whether the analysis happened.
 import difflib
 import enum
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from reccmp.compare.manifest import FunctionEntry
 from reccmp.types import ImageId
@@ -244,15 +244,40 @@ def consistent(left: Contents, right: Contents) -> bool:
 
 
 @dataclass(frozen=True)
+class InlineCode:
+    orig: list[str] | None
+    recomp: list[str] | None
+    callees: tuple[int, ...]
+    failures: tuple[AnalysisFailure, ...] = ()
+
+
+@dataclass(frozen=True)
+class InlineDiff:
+    diff: tuple[str, ...] | None
+    callees: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class FunctionResult:
     entry: FunctionEntry
     outcome: Outcome
-    # Unified diff of the normalized decompilations; empty when equal.
-    code_diff: tuple[str, ...] = ()
+    normal_diff: tuple[str, ...] = ()
     data_findings: tuple[DataFinding, ...] = ()
     failures: tuple[AnalysisFailure, ...] = ()
-    # Referenced locations without a paired object, compared by contents only.
     unidentified_references: int = 0
+    inline: InlineDiff | None = None
+
+    @property
+    def code_diff(self) -> tuple[str, ...]:
+        return (self.inline.diff or ()) if self.inline is not None else self.normal_diff
+
+    @property
+    def inline_normalized_diff(self) -> tuple[str, ...] | None:
+        return self.inline.diff if self.inline is not None else None
+
+    @property
+    def inline_callees(self) -> tuple[int, ...]:
+        return self.inline.callees if self.inline is not None else ()
 
 
 def code_diff(orig: list[str], recomp: list[str], name: str) -> tuple[str, ...]:
@@ -298,7 +323,31 @@ def classify(
     return FunctionResult(
         entry,
         Outcome.DIFFERENCES if diff or findings else Outcome.NO_DIFFERENCES,
-        code_diff=diff,
+        normal_diff=diff,
         data_findings=findings,
         unidentified_references=unidentified,
+    )
+
+
+def classify_inline(
+    normal: FunctionResult,
+    code: InlineCode,
+    orig_refs: tuple[DataReference, ...],
+    recomp_refs: tuple[DataReference, ...],
+) -> FunctionResult:
+    """Use the retry without score selection, retaining the ordinary diff."""
+    retry = classify(
+        normal.entry,
+        failures=code.failures,
+        orig_code=code.orig,
+        recomp_code=code.recomp,
+        orig_refs=orig_refs,
+        recomp_refs=recomp_refs,
+    )
+    return replace(
+        retry,
+        normal_diff=normal.normal_diff,
+        inline=InlineDiff(
+            retry.normal_diff if not retry.failures else None, code.callees
+        ),
     )

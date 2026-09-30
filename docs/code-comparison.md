@@ -45,6 +45,28 @@ starts elsewhere (`entry-conflict`, with that function's address; the entry is
 inside the piece of that function holding its own entry); the
 decompiler failed (`decompile-error`).
 
+## Compiler inlining
+
+After ordinary decompilation, an asymmetric direct-call set triggers one retry.
+Only reccmp-paired internal callees with fewer than 100 native instructions on
+both sides and no recursive direct-call SCC are eligible. For this caller pair
+only, Ghidra temporarily marks the paired callees inline and decompiles again.
+Retries run serially, roll back program transactions, and flush decompiler
+caches before and after each pair. No inline hints are saved to either program.
+
+Each summary result retains `normal_diff` and `inline_normalized_diff`, with
+`inline_callees` recording the canonical retail addresses used. A null normalized
+diff means no successful retry; an empty list means the retry found no code
+difference. `code_diff` and the mismatch outcome use the retry whenever requested,
+without score selection. A failed retry is `analysis-failed`. Referenced data
+from callees actually called on each side remains part of the contents check.
+Ghidra's expansion notice is omitted from compared text; other warnings remain.
+
+The Ghidriff Markdown/HTML report retains the ordinary decompilations for
+debugging; `summary.json` supplies both diffs and the normalized outcome.
+Ghidra may refuse an expansion or produce different variables/control flow, so
+this normalization does not promise to erase every compiler-inline difference.
+
 ## What both programs receive
 
 Both programs are analyzed the same way, without debug information. Before
