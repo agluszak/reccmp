@@ -416,8 +416,6 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
             pdiff = engine.diff_pairs(
                 orig, recomp, engine.function_matches(), force_diff=True
             )
-        with _stage("collect results"):
-            results = engine.results()
         from reccmp.compare.call_census import direct_call_census
 
         programs = {}
@@ -427,6 +425,10 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
                     "/", engine.gen_proj_bin_name_from_path(path), False
                 )
             calls = direct_call_census(engine.manifest, programs)
+            with _stage("inline-normalized retry"):
+                engine.normalize_inlining(programs)
+            with _stage("collect results"):
+                results = engine.results()
         finally:
             for program in programs.values():
                 engine.project.close(program)

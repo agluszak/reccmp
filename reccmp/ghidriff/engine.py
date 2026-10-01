@@ -10,7 +10,6 @@ an inferred cdecl arity when retail independently agrees.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +17,8 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 
 from reccmp.compare.manifest import FunctionEntry, Manifest
 from reccmp.types import EntityType, ImageId
+
+from .inlining import Decompiled as _Decompiled, InlineNormalizationMixin
 
 from .contents import (
     literal_data_type,
@@ -64,7 +65,6 @@ from .results import (
     Contents,
     DataReference,
     FailureKind,
-    FunctionResult,
     ObjectOffset,
     PastEnd,
     PointerValue,
@@ -72,7 +72,6 @@ from .results import (
     StringValue,
     Uninitialized,
     UnknownExtent,
-    classify,
 )
 
 if TYPE_CHECKING:
@@ -96,16 +95,10 @@ ANALYSIS_REVISION = 3
 PREPARATION_REVISION = 24
 
 
-@dataclass(frozen=True)
-class _Decompiled:
-    code: str | None
-    error: str | None
-
-
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
-class ReccmpDiffEngine(GhidraDiffEngine):
+class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
     """A GhidraDiffEngine whose function matches come from a manifest."""
 
     # pylint: disable=too-many-instance-attributes
@@ -133,6 +126,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         self._failures: dict[int, list[AnalysisFailure]] = {}
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
+        self._inline_decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
+        self._inline_callees: dict[int, tuple[int, ...]] = {}
         self._function_entries: dict[tuple[ImageId, int], int] = {}
         # Return-type preparation also covers callees of selected functions.
         # Keep their addresses even when the focused comparison omits their bodies.
@@ -175,6 +170,8 @@ class ReccmpDiffEngine(GhidraDiffEngine):
         is_old: bool,
         entry_address: int | None = None,
         stack_setup: bool = False,
+        *,
+        inline: bool = False,
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
         side = ImageId.ORIG if is_old else ImageId.RECOMP
@@ -188,10 +185,11 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             self._references.get((ImageId.RECOMP, orig_addr), ()),
             self._paired_recomp_addrs,
         )
-        original = self._decompiled.get((ImageId.ORIG, orig_addr))
+        decompiled = self._inline_decompiled if inline else self._decompiled
+        original = decompiled.get((ImageId.ORIG, orig_addr))
         recomp_addr = self._recomp_entries.get(orig_addr)
         recompiled = (
-            self._decompiled.get((ImageId.RECOMP, recomp_addr))
+            decompiled.get((ImageId.RECOMP, recomp_addr))
             if recomp_addr is not None
             else None
         )
@@ -697,20 +695,35 @@ class ReccmpDiffEngine(GhidraDiffEngine):
 
     # --- referenced data --------------------------------------------------
 
-    def _collect_references(self, program: "Program", image_id: ImageId) -> None:
+    def _collect_references(
+        self,
+        program: "Program",
+        image_id: ImageId,
+        bodies: dict[int, list[Any]] | None = None,
+    ) -> None:
         functions = program.getFunctionManager()
         references = program.getReferenceManager()
         space = program.getAddressFactory().getDefaultAddressSpace()
         for entry in self._comparable_entries():
+            if bodies is not None and entry.orig_addr not in bodies:
+                continue
             function = functions.getFunctionAt(
                 space.getAddress(self._entry_addr(entry, image_id))
             )
             if function is None:
                 continue
             targets: dict[Use, "Address"] = {}
-            for instruction in program.getListing().getInstructions(
-                function.getBody(), True
-            ):
+            body_functions = (
+                bodies[entry.orig_addr] if bodies is not None else [function]
+            )
+            instructions = (
+                instruction
+                for body_function in body_functions
+                for instruction in program.getListing().getInstructions(
+                    body_function.getBody(), True
+                )
+            )
+            for instruction in instructions:
                 for ref in references.getReferencesFrom(instruction.getAddress()):
                     to = ref.getToAddress()
                     if ref.getReferenceType().isFlow() or not to.isMemoryAddress():
@@ -941,59 +954,3 @@ class ReccmpDiffEngine(GhidraDiffEngine):
             if read is not None and not read[1]:
                 return decode_string(read[0], located.entity_type)
         return ghidra_string(program, target)
-
-    # --- results ----------------------------------------------------------
-
-    def _normalized(self, image_id: ImageId, addr: int) -> list[str] | None:
-        decompiled = self._decompiled.get((image_id, addr))
-        if decompiled is None or decompiled.code is None:
-            return None
-        lines = decompiled.code.splitlines(True)
-        stack_setup = (
-            "replaced with injection: alloca_probe" in decompiled.code
-            or "ExceptionList" in decompiled.code
-        )
-        self.normalize_ghidra_decomp_for_side(
-            lines, image_id == ImageId.ORIG, addr, stack_setup
-        )
-        return lines
-
-    def results(self) -> list[FunctionResult]:
-        """One result for every function the manifest requested."""
-        results = []
-        for entry in self.manifest.functions:
-            failures = list(self._failures.get(entry.orig_addr, ()))
-            if entry.recomp_addr is not None and not failures:
-                for image_id in (ImageId.ORIG, ImageId.RECOMP):
-                    decompiled = self._decompiled.get(
-                        (image_id, self._entry_addr(entry, image_id))
-                    )
-                    if decompiled is not None and decompiled.error is not None:
-                        failures.append(
-                            AnalysisFailure(
-                                FailureKind.DECOMPILE_ERROR,
-                                image_id,
-                                message=decompiled.error,
-                            )
-                        )
-            results.append(
-                classify(
-                    entry,
-                    failures=tuple(failures),
-                    orig_code=(
-                        self._normalized(ImageId.ORIG, entry.orig_addr)
-                        if entry.recomp_addr is not None
-                        else None
-                    ),
-                    recomp_code=(
-                        self._normalized(ImageId.RECOMP, entry.recomp_addr)
-                        if entry.recomp_addr is not None
-                        else None
-                    ),
-                    orig_refs=self._references.get((ImageId.ORIG, entry.orig_addr), ()),
-                    recomp_refs=self._references.get(
-                        (ImageId.RECOMP, entry.orig_addr), ()
-                    ),
-                )
-            )
-        return results

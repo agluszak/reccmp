@@ -129,6 +129,13 @@ def result_json(result: FunctionResult) -> dict[str, Any]:
         **_entry_json(result.entry),
         "outcome": result.outcome.value,
         "code_diff": list(result.code_diff),
+        "normal_diff": list(result.normal_diff),
+        "inline_normalized_diff": (
+            list(result.inline_normalized_diff)
+            if result.inline_normalized_diff is not None
+            else None
+        ),
+        "inline_callees": [_address(addr) for addr in result.inline_callees],
         "data": [_finding_json(f) for f in result.data_findings],
         "failures": [_failure_json(f) for f in result.failures],
         "unidentified_references": result.unidentified_references,

@@ -1,0 +1,199 @@
+"""Inline retries use catalog identity and preserve ordinary comparison evidence."""
+
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+import pytest
+
+from reccmp.compare.db import PairBasis
+from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest, NamedObject
+from reccmp.ghidriff.inlining import (
+    InlineCandidates,
+    decompiled_lines,
+    temporary_inline,
+)
+from reccmp.ghidriff.report import result_json
+from reccmp.ghidriff.results import InlineCode, Outcome, classify, classify_inline
+from reccmp.types import EntityType, ImageId
+
+
+def fixture_model(size=3, entity_type=EntityType.FUNCTION):
+    obj = NamedObject(0x1100, 0x2100, "helper", entity_type, 1, 1, PairBasis.ANNOTATION)
+    entry = FunctionEntry(0x1000, 0x2000, "caller", PairBasis.ANNOTATION, None, False)
+    binary = BinaryInput(Path("unused"), "a")
+    manifest = Manifest("T", binary, binary, (entry,), (obj,), ())
+    functions = {}
+    programs = {}
+    for image in ImageId:
+        fn = NS(
+            getBody=lambda: None,
+            isExternal=lambda: False,
+            isThunk=lambda: False,
+            inline=False,
+        )
+        fn.setInline = lambda value, fn=fn: setattr(fn, "inline", value)
+        functions[image] = fn
+        fn.saved = []
+
+        def start(_name, fn=fn):
+            fn.saved.append(fn.inline)
+            return len(fn.saved) - 1
+
+        def end(transaction, commit, fn=fn):
+            assert not commit
+            fn.inline = fn.saved[transaction]
+
+        programs[image] = NS(
+            getAddressFactory=lambda: NS(
+                getDefaultAddressSpace=lambda: NS(getAddress=lambda a: a)
+            ),
+            getFunctionManager=lambda fn=fn: NS(getFunctionAt=lambda _a: fn),
+            getListing=lambda: NS(getInstructions=lambda _body, _forward: range(size)),
+            startTransaction=start,
+            endTransaction=end,
+        )
+    candidates = InlineCandidates(manifest, programs)
+    candidates.calls = {
+        (ImageId.ORIG, 0x1000): [],
+        (ImageId.RECOMP, 0x2000): [
+            {"identity": "pair:0x1100", "paired": True, "target": "0x2100"}
+        ],
+        (ImageId.ORIG, 0x1100): [],
+        (ImageId.RECOMP, 0x2100): [],
+    }
+    return entry, obj, candidates, functions
+
+
+def test_small_asymmetric_internal_pair_is_candidate():
+    entry, obj, candidates, _ = fixture_model()
+    assert candidates.for_pair(entry) == (obj,)
+
+
+def test_common_callee_is_not_candidate():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1000] = candidates.calls[ImageId.RECOMP, 0x2000]
+    assert not candidates.for_pair(entry)
+
+
+@pytest.mark.parametrize("orig_count,recomp_count", [(1, 2), (2, 1), (2, 3)])
+def test_partial_inlining_of_repeated_calls_is_candidate(orig_count, recomp_count):
+    entry, obj, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1000] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x1100"}
+    ] * orig_count
+    candidates.calls[ImageId.RECOMP, 0x2000] *= recomp_count
+    assert candidates.for_pair(entry) == (obj,)
+
+
+def test_equal_repeated_call_counts_are_not_candidates():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1000] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x1100"}
+    ] * 2
+    candidates.calls[ImageId.RECOMP, 0x2000] *= 2
+    assert not candidates.for_pair(entry)
+
+
+@pytest.mark.parametrize("size", [100, 101])
+def test_large_callee_is_rejected(size):
+    entry, _, candidates, _ = fixture_model(size)
+    assert not candidates.for_pair(entry)
+
+
+def test_99_instructions_is_allowed():
+    entry, obj, candidates, _ = fixture_model(99)
+    assert candidates.for_pair(entry) == (obj,)
+
+
+@pytest.mark.parametrize("entity_type", [EntityType.IMPORT, EntityType.IMPORT_THUNK])
+def test_imports_are_never_candidates(entity_type):
+    entry, _, candidates, _ = fixture_model(entity_type=entity_type)
+    # The census does not classify imports as paired internal call identities.
+    candidates.calls[ImageId.RECOMP, 0x2000][0]["paired"] = False
+    assert not candidates.for_pair(entry)
+
+
+def test_recursive_cycle_through_unpaired_large_function_is_rejected():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x3000"}]
+    candidates.calls[ImageId.RECOMP, 0x3000] = [{"target": "0x2100"}]
+    assert not candidates.for_pair(entry)
+
+
+def test_incomplete_body_is_not_assumed_nonrecursive():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1100] = None
+    assert not candidates.for_pair(entry)
+
+
+def test_inline_flags_restore_original_values_after_exception():
+    _, obj, candidates, functions = fixture_model()
+    functions[ImageId.ORIG].inline = True
+    with pytest.raises(ValueError), temporary_inline(candidates.programs, [obj]):
+        assert all(fn.inline for fn in functions.values())
+        raise ValueError("retry failed")
+    assert functions[ImageId.ORIG].inline
+    assert not functions[ImageId.RECOMP].inline
+
+
+def result(entry, inline_code=None):
+    normal = classify(
+        entry,
+        failures=(),
+        orig_code=["return a->foo + 1;\n"],
+        recomp_code=["return GetFoo(a) + 1;\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    return (
+        classify_inline(
+            normal, InlineCode(inline_code[0], inline_code[1], (0x1100,)), (), ()
+        )
+        if inline_code is not None
+        else normal
+    )
+
+
+def test_retry_controls_outcome_and_both_diffs_are_reported():
+    entry, _, _, _ = fixture_model()
+    code = ["return a->foo + 1;\n"]
+    normalized = result(entry, (code, code))
+    assert normalized.outcome == Outcome.NO_DIFFERENCES
+    assert normalized.normal_diff
+    assert normalized.inline_normalized_diff == normalized.code_diff == ()
+    row = result_json(normalized)
+    assert row["normal_diff"] and row["inline_normalized_diff"] == []
+    assert row["inline_callees"] == ["0x1100"]
+
+
+def test_changed_value_survives_retry():
+    entry, _, _, _ = fixture_model()
+    normalized = result(entry, (["return a->foo + 1;\n"], ["return a->foo + 2;\n"]))
+    assert normalized.outcome == Outcome.DIFFERENCES
+    assert normalized.code_diff == normalized.inline_normalized_diff
+
+
+def test_failed_retry_is_analysis_failure_with_normal_diff_retained():
+    entry, _, _, _ = fixture_model()
+    normalized = result(entry, (["return 1;\n"], None))
+    assert normalized.outcome == Outcome.ANALYSIS_FAILED
+    assert normalized.normal_diff and normalized.failures
+
+
+def test_no_retry_is_distinct_from_empty_retry_diff():
+    entry, _, _, _ = fixture_model()
+    assert result(entry).inline_normalized_diff is None
+
+
+def test_only_successful_inline_notice_is_removed():
+    code = "\n/* WARNING: Inlined function: Foo */\n\n/* WARNING: Could not inline here */\nreturn 1;\n"
+    assert decompiled_lines(code) == [
+        "/* WARNING: Could not inline here */\n",
+        "return 1;\n",
+    ]
+
+
+def test_self_recursion_is_rejected():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x2100"}]
+    assert not candidates.for_pair(entry)
