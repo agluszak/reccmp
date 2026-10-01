@@ -61,6 +61,15 @@ def fixture_model(size=3, entity_type=EntityType.FUNCTION):
         (ImageId.ORIG, 0x1100): [],
         (ImageId.RECOMP, 0x2100): [],
     }
+    candidates.tails = {
+        (image, address): []
+        for image, address in (
+            (ImageId.ORIG, 0x1000),
+            (ImageId.RECOMP, 0x2000),
+            (ImageId.ORIG, 0x1100),
+            (ImageId.RECOMP, 0x2100),
+        )
+    }
     return entry, obj, candidates, functions
 
 
@@ -123,6 +132,62 @@ def test_recursive_cycle_through_unpaired_large_function_is_rejected():
 def test_incomplete_body_is_not_assumed_nonrecursive():
     entry, _, candidates, _ = fixture_model()
     candidates.calls[ImageId.ORIG, 0x1100] = None
+    assert not candidates.for_pair(entry)
+
+
+def nested_model():
+    """Caller -> helper, which tail-jumps to nested; retail expands both."""
+    entry, obj, candidates, _ = fixture_model()
+    nested = NamedObject(
+        0x1200, 0x2200, "nested", EntityType.FUNCTION, 1, 1, PairBasis.ANNOTATION
+    )
+    candidates.pairs[0x1200] = nested
+    for image in ImageId:
+        candidates.identities[image][nested.addr(image)] = nested
+    candidates.tails[ImageId.RECOMP, 0x2100] = [
+        {"identity": "pair:0x1200", "paired": True, "target": "0x2200"}
+    ]
+    for image, address in (
+        (ImageId.ORIG, 0x1100),
+        (ImageId.ORIG, 0x1200),
+        (ImageId.RECOMP, 0x2200),
+    ):
+        candidates.tails[image, address] = []
+    candidates.calls[ImageId.ORIG, 0x1200] = []
+    candidates.calls[ImageId.RECOMP, 0x2200] = []
+    return entry, obj, nested, candidates
+
+
+def test_tail_call_continuation_of_candidate_is_candidate():
+    entry, obj, nested, candidates = nested_model()
+    assert candidates.for_pair(entry) == (obj, nested)
+    assert candidates.reached(ImageId.RECOMP, 0x2000, (obj, nested)) == {
+        0x1100,
+        0x1200,
+    }
+    assert not candidates.reached(ImageId.ORIG, 0x1000, (obj, nested))
+
+
+def test_entry_tail_call_is_candidate():
+    entry, obj, candidates, _ = fixture_model()
+    candidates.tails[ImageId.RECOMP, 0x2000] = candidates.calls[ImageId.RECOMP, 0x2000]
+    candidates.calls[ImageId.RECOMP, 0x2000] = []
+    assert candidates.for_pair(entry) == (obj,)
+    assert candidates.reached(ImageId.RECOMP, 0x2000, (obj,)) == {0x1100}
+
+
+def test_nested_direct_call_of_candidate_is_not_candidate():
+    entry, obj, _, candidates = nested_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = candidates.tails[ImageId.RECOMP, 0x2100]
+    candidates.tails[ImageId.RECOMP, 0x2100] = []
+    assert candidates.for_pair(entry) == (obj,)
+
+
+def test_unpaired_or_non_function_identity_is_not_candidate():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2000] = [
+        {"identity": "pair:0x9999", "paired": True, "target": "0x2999"}
+    ]
     assert not candidates.for_pair(entry)
 
 
