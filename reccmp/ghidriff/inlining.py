@@ -1,11 +1,13 @@
 """Per-pair Ghidra inline hints, never source or decompiled-text substitution."""
 
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
 from reccmp.compare.call_census import _body_calls
 from reccmp.types import EntityType, ImageId
+
 from .results import (
     AnalysisFailure,
     FailureKind,
@@ -109,10 +111,13 @@ class InlineCandidates:
         if any(calls is None for calls in sides):
             return ()
         identities = [
-            {call["identity"] for call in calls if call["paired"]} for calls in sides
+            Counter(call["identity"] for call in calls if call["paired"])
+            for calls in sides
         ]
         result = []
-        for identity in sorted(identities[0] ^ identities[1]):
+        for identity in sorted(identities[0].keys() | identities[1].keys()):
+            if identities[0][identity] == identities[1][identity]:
+                continue
             obj = self.pairs[int(identity.removeprefix("pair:"), 16)]
             functions = [
                 self.function(image, obj.addr(image)) for image in self.programs

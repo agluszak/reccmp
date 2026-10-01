@@ -9,11 +9,11 @@ from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest, NamedObject
 from reccmp.ghidriff.inlining import (
     InlineCandidates,
-    temporary_inline,
     decompiled_lines,
+    temporary_inline,
 )
 from reccmp.ghidriff.report import result_json
-from reccmp.ghidriff.results import classify, classify_inline, InlineCode, Outcome
+from reccmp.ghidriff.results import InlineCode, Outcome, classify, classify_inline
 from reccmp.types import EntityType, ImageId
 
 
@@ -75,6 +75,25 @@ def test_common_callee_is_not_candidate():
     assert not candidates.for_pair(entry)
 
 
+@pytest.mark.parametrize("orig_count,recomp_count", [(1, 2), (2, 1), (2, 3)])
+def test_partial_inlining_of_repeated_calls_is_candidate(orig_count, recomp_count):
+    entry, obj, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1000] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x1100"}
+    ] * orig_count
+    candidates.calls[ImageId.RECOMP, 0x2000] *= recomp_count
+    assert candidates.for_pair(entry) == (obj,)
+
+
+def test_equal_repeated_call_counts_are_not_candidates():
+    entry, _, candidates, _ = fixture_model()
+    candidates.calls[ImageId.ORIG, 0x1000] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x1100"}
+    ] * 2
+    candidates.calls[ImageId.RECOMP, 0x2000] *= 2
+    assert not candidates.for_pair(entry)
+
+
 @pytest.mark.parametrize("size", [100, 101])
 def test_large_callee_is_rejected(size):
     entry, _, candidates, _ = fixture_model(size)
@@ -110,10 +129,9 @@ def test_incomplete_body_is_not_assumed_nonrecursive():
 def test_inline_flags_restore_original_values_after_exception():
     _, obj, candidates, functions = fixture_model()
     functions[ImageId.ORIG].inline = True
-    with pytest.raises(ValueError):
-        with temporary_inline(candidates.programs, [obj]):
-            assert all(fn.inline for fn in functions.values())
-            raise ValueError("retry failed")
+    with pytest.raises(ValueError), temporary_inline(candidates.programs, [obj]):
+        assert all(fn.inline for fn in functions.values())
+        raise ValueError("retry failed")
     assert functions[ImageId.ORIG].inline
     assert not functions[ImageId.RECOMP].inline
 
