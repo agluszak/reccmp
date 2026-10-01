@@ -1,5 +1,6 @@
 """Inline retries use catalog identity and preserve ordinary comparison evidence."""
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -262,3 +263,37 @@ def test_self_recursion_is_rejected():
     entry, _, candidates, _ = fixture_model()
     candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x2100"}]
     assert not candidates.for_pair(entry)
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (
+            lambda c: c.calls.__setitem__((ImageId.ORIG, 0x1100), None),
+            "incomplete-census",
+        ),
+        (
+            lambda c: c.calls.__setitem__(
+                (ImageId.RECOMP, 0x2100), [{"target": "0x2100"}]
+            ),
+            "recursive",
+        ),
+    ],
+)
+def test_rejected_asymmetric_callee_reports_reason(mutate, reason):
+    entry, _, candidates, _ = fixture_model()
+    mutate(candidates)
+    assert not candidates.for_pair(entry)
+    assert candidates.rejections[entry.orig_addr] == {0x1100: reason}
+
+
+def test_large_callee_reports_reason():
+    entry, _, candidates, _ = fixture_model(100)
+    assert not candidates.for_pair(entry)
+    assert candidates.rejections[entry.orig_addr] == {0x1100: "large"}
+
+
+def test_rejections_are_reported_in_json():
+    entry, _, _, _ = fixture_model()
+    row = result_json(replace(result(entry), inline_rejections=((0x1100, "large"),)))
+    assert row["inline_rejections"] == [{"callee": "0x1100", "reason": "large"}]

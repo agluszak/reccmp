@@ -136,6 +136,10 @@ def result_json(result: FunctionResult) -> dict[str, Any]:
             else None
         ),
         "inline_callees": [_address(addr) for addr in result.inline_callees],
+        "inline_rejections": [
+            {"callee": _address(addr), "reason": reason}
+            for addr, reason in result.inline_rejections
+        ],
         "data": [_finding_json(f) for f in result.data_findings],
         "failures": [_failure_json(f) for f in result.failures],
         "unidentified_references": result.unidentified_references,

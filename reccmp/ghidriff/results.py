@@ -259,6 +259,7 @@ class InlineDiff:
 
 @dataclass(frozen=True)
 class FunctionResult:
+    # pylint: disable=too-many-instance-attributes
     entry: FunctionEntry
     outcome: Outcome
     normal_diff: tuple[str, ...] = ()
@@ -266,6 +267,7 @@ class FunctionResult:
     failures: tuple[AnalysisFailure, ...] = ()
     unidentified_references: int = 0
     inline: InlineDiff | None = None
+    inline_rejections: tuple[tuple[int, str], ...] = ()
 
     @property
     def code_diff(self) -> tuple[str, ...]:

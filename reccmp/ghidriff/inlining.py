@@ -2,7 +2,7 @@
 
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from capstone import x86_const  # type: ignore
@@ -59,6 +59,7 @@ class InlineCandidates:
         self.calls = {}
         self.recursive = {}
         self.tails = {}
+        self.rejections: dict[int, dict[int, str]] = {}
 
     def function(self, image, address):
         program = self.programs[image]
@@ -124,14 +125,15 @@ class InlineCandidates:
         self.tails[key] = result
         return result
 
-    def is_recursive(self, image, address):
+    def recursion(self, image, address):
+        """ "recursive", "incomplete-census", or None when provably nonrecursive."""
         # Reachability back to the entry is precisely membership in a recursive
         # direct-call SCC. Walk through large and unpaired functions too.
         key = image, address
         if key not in self.recursive:
             pending = [address]
             seen = set()
-            recursive = False
+            status = None
             while pending:
                 current = pending.pop()
                 if current in seen:
@@ -140,11 +142,11 @@ class InlineCandidates:
                 calls = self.observation(image, current)
                 if calls is None:
                     # Incomplete body evidence cannot establish nonrecursion.
-                    recursive = True
+                    status = "incomplete-census"
                     break
                 targets = {int(call["target"], 16) for call in calls}
                 if address in targets:
-                    recursive = True
+                    status = "recursive"
                     break
                 pending.extend(
                     target
@@ -153,16 +155,20 @@ class InlineCandidates:
                     and self.function(image, target) is not None
                     and not self.function(image, target).isExternal()
                 )
-            self.recursive[key] = recursive
+            self.recursive[key] = status
         return self.recursive[key]
 
-    def eligible(self, obj):
+    def is_recursive(self, image, address):
+        return self.recursion(image, address) is not None
+
+    def rejection(self, obj):
+        """Why a paired callee cannot be retried inline, or None if it can."""
         functions = [self.function(image, obj.addr(image)) for image in self.programs]
         if any(
             function is None or function.isExternal() or function.isThunk()
             for function in functions
         ):
-            return False
+            return "external-or-thunk"
         if any(
             sum(
                 1
@@ -173,12 +179,18 @@ class InlineCandidates:
             >= 100
             for image, function in zip(self.programs, functions)
         ):
-            return False
-        return not any(
-            self.observation(image, obj.addr(image)) is None
-            or self.is_recursive(image, obj.addr(image))
-            for image in self.programs
-        )
+            return "large"
+        for image in self.programs:
+            if self.observation(image, obj.addr(image)) is None:
+                return "incomplete-census"
+        for image in self.programs:
+            status = self.recursion(image, obj.addr(image))
+            if status is not None:
+                return status
+        return None
+
+    def eligible(self, obj):
+        return self.rejection(obj) is None
 
     def for_pair(self, entry):
         """Asymmetric callees, closed over their tail-call continuations.
@@ -198,12 +210,19 @@ class InlineCandidates:
             for calls in sides
         ]
         selected: dict[str, Any] = {}
+        rejected: dict[int, str] = {}
+        self.rejections[entry.orig_addr] = rejected
         for identity in sorted(identities[0].keys() | identities[1].keys()):
             if identities[0][identity] == identities[1][identity]:
                 continue
             obj = self.pairs.get(int(identity.removeprefix("pair:"), 16))
-            if obj is not None and self.eligible(obj):
+            if obj is None:
+                continue
+            reason = self.rejection(obj)
+            if reason is None:
                 selected[identity] = obj
+            else:
+                rejected[obj.orig_addr] = reason
         pending = list(selected.values())
         while pending:
             obj = pending.pop()
@@ -289,6 +308,10 @@ class InlineNormalizationMixin:
                 ):
                     continue
                 callees = candidates.for_pair(entry)
+                if candidates.rejections.get(entry.orig_addr):
+                    self._inline_rejections[entry.orig_addr] = tuple(
+                        sorted(candidates.rejections[entry.orig_addr].items())
+                    )
                 if not callees:
                     continue
                 self._inline_callees[entry.orig_addr] = tuple(
@@ -404,6 +427,10 @@ class InlineNormalizationMixin:
                     ),
                     orig_refs,
                     recomp_refs,
+                )
+            if entry.orig_addr in self._inline_rejections:
+                result = replace(
+                    result, inline_rejections=self._inline_rejections[entry.orig_addr]
                 )
             results.append(result)
         return results

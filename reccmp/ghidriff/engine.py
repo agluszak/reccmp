@@ -128,6 +128,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._inline_decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._inline_callees: dict[int, tuple[int, ...]] = {}
+        self._inline_rejections: dict[int, tuple[tuple[int, str], ...]] = {}
         self._function_entries: dict[tuple[ImageId, int], int] = {}
         # Return-type preparation also covers callees of selected functions.
         # Keep their addresses even when the focused comparison omits their bodies.
