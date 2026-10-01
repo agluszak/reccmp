@@ -5,6 +5,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
+from capstone import x86_const  # type: ignore
+
+from reccmp.analysis.x86 import decode_one
 from reccmp.compare.call_census import _body_calls
 from reccmp.types import EntityType, ImageId
 
@@ -35,7 +38,7 @@ def decompiled_lines(code):
 
 
 class InlineCandidates:
-    """Canonical direct-call asymmetry with small, nonrecursive internal callees."""
+    """Canonical call and tail-call asymmetry with small, nonrecursive callees."""
 
     def __init__(self, manifest, programs):
         self.programs = programs
@@ -55,6 +58,7 @@ class InlineCandidates:
                 ]
         self.calls = {}
         self.recursive = {}
+        self.tails = {}
 
     def function(self, image, address):
         program = self.programs[image]
@@ -68,6 +72,57 @@ class InlineCandidates:
                 self.programs[image], image, address, self.identities[image], {}
             )["calls"]
         return self.calls[key]
+
+    def continued(self, image, address):
+        """Direct calls and tail-call continuations, or None without evidence."""
+        calls = self.observation(image, address)
+        return None if calls is None else calls + self.tail_calls(image, address)
+
+    def tail_calls(self, image, address):
+        """``jmp rel32`` from the body to another function's entry."""
+        key = image, address
+        if key in self.tails:
+            return self.tails[key]
+        self.tails[key] = []
+        function = self.function(image, address)
+        if function is None:
+            return []
+        program = self.programs[image]
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        body = function.getBody()
+        result = []
+        for instruction in program.getListing().getInstructions(body, True):
+            site = int(instruction.getAddress().getOffset())
+            decoded = decode_one(
+                bytes(int(b) & 255 for b in instruction.getBytes()), site
+            )
+            if (
+                decoded is None
+                or decoded.mnemonic != "jmp"
+                or len(decoded.operands) != 1
+                or decoded.operands[0].type != x86_const.X86_OP_IMM
+            ):
+                continue
+            target = decoded.operands[0].imm & 0xFFFFFFFF
+            if body.contains(space.getAddress(target)) or (
+                self.function(image, target) is None
+            ):
+                continue
+            obj = self.identities[image].get(target)
+            result.append(
+                {
+                    "site": f"{site:#x}",
+                    "target": f"{target:#x}",
+                    "identity": (
+                        f"pair:{obj.orig_addr:#x}"
+                        if obj
+                        else f"{image.name.lower()}:{target:#x}"
+                    ),
+                    "paired": obj is not None,
+                }
+            )
+        self.tails[key] = result
+        return result
 
     def is_recursive(self, image, address):
         # Reachability back to the entry is precisely membership in a recursive
@@ -101,9 +156,37 @@ class InlineCandidates:
             self.recursive[key] = recursive
         return self.recursive[key]
 
+    def eligible(self, obj):
+        functions = [self.function(image, obj.addr(image)) for image in self.programs]
+        if any(
+            function is None or function.isExternal() or function.isThunk()
+            for function in functions
+        ):
+            return False
+        if any(
+            sum(
+                1
+                for _ in self.programs[image]
+                .getListing()
+                .getInstructions(function.getBody(), True)
+            )
+            >= 100
+            for image, function in zip(self.programs, functions)
+        ):
+            return False
+        return not any(
+            self.observation(image, obj.addr(image)) is None
+            or self.is_recursive(image, obj.addr(image))
+            for image in self.programs
+        )
+
     def for_pair(self, entry):
+        """Asymmetric callees, closed over their tail-call continuations.
+
+        A tail jump continues the callee's body in another function, so
+        substituting the callee alone leaves that continuation as a call."""
         sides = [
-            self.observation(
+            self.continued(
                 image, entry.orig_addr if image == ImageId.ORIG else entry.recomp_addr
             )
             for image in (ImageId.ORIG, ImageId.RECOMP)
@@ -114,36 +197,47 @@ class InlineCandidates:
             Counter(call["identity"] for call in calls if call["paired"])
             for calls in sides
         ]
-        result = []
+        selected: dict[str, Any] = {}
         for identity in sorted(identities[0].keys() | identities[1].keys()):
             if identities[0][identity] == identities[1][identity]:
                 continue
-            obj = self.pairs[int(identity.removeprefix("pair:"), 16)]
-            functions = [
-                self.function(image, obj.addr(image)) for image in self.programs
-            ]
-            if any(
-                function is None or function.isExternal() or function.isThunk()
-                for function in functions
-            ):
+            obj = self.pairs.get(int(identity.removeprefix("pair:"), 16))
+            if obj is not None and self.eligible(obj):
+                selected[identity] = obj
+        pending = list(selected.values())
+        while pending:
+            obj = pending.pop()
+            for image in self.programs:
+                for tail in self.tail_calls(image, obj.addr(image)):
+                    identity = tail["identity"]
+                    if not tail["paired"] or identity in selected:
+                        continue
+                    target = self.pairs.get(int(identity.removeprefix("pair:"), 16))
+                    if target is not None and self.eligible(target):
+                        selected[identity] = target
+                        pending.append(target)
+        return tuple(selected.values())
+
+    def reached(self, image, address, callees):
+        """Selected callees whose bodies this side's substitution includes."""
+        selected = {f"pair:{obj.orig_addr:#x}": obj for obj in callees}
+        reached: set[int] = set()
+        pending = [
+            call["identity"]
+            for call in self.continued(image, address) or ()
+            if call["identity"] in selected
+        ]
+        while pending:
+            obj = selected[pending.pop()]
+            if obj.orig_addr in reached:
                 continue
-            if any(
-                sum(
-                    1
-                    for _ in self.programs[image]
-                    .getListing()
-                    .getInstructions(function.getBody(), True)
-                )
-                >= 100
-                for image, function in zip(self.programs, functions)
-            ):
-                continue
-            if any(
-                self.is_recursive(image, obj.addr(image)) for image in self.programs
-            ):
-                continue
-            result.append(obj)
-        return tuple(result)
+            reached.add(obj.orig_addr)
+            pending.extend(
+                tail["identity"]
+                for tail in self.tail_calls(image, obj.addr(image))
+                if tail["identity"] in selected
+            )
+        return reached
 
 
 @contextmanager
@@ -215,13 +309,8 @@ class InlineNormalizationMixin:
                                     + [
                                         candidates.function(image, obj.addr(image))
                                         for obj in callees
-                                        if any(
-                                            call["identity"]
-                                            == f"pair:{obj.orig_addr:#x}"
-                                            for call in candidates.observation(
-                                                image, address
-                                            )
-                                        )
+                                        if obj.orig_addr
+                                        in candidates.reached(image, address, callees)
                                     ]
                                 },
                             )
