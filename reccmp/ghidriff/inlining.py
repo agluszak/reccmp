@@ -141,9 +141,12 @@ class InlineCandidates:
                 seen.add(current)
                 calls = self.observation(image, current)
                 if calls is None:
-                    # Incomplete body evidence cannot establish nonrecursion.
-                    status = "incomplete-census"
-                    break
+                    if current == address:
+                        status = "incomplete-census"
+                        break
+                    # A descendant without body evidence cannot be expanded by
+                    # the retry, so it only bounds what this walk can see.
+                    continue
                 targets = {int(call["target"], 16) for call in calls}
                 if address in targets:
                     status = "recursive"

@@ -297,3 +297,10 @@ def test_rejections_are_reported_in_json():
     entry, _, _, _ = fixture_model()
     row = result_json(replace(result(entry), inline_rejections=((0x1100, "large"),)))
     assert row["inline_rejections"] == [{"callee": "0x1100", "reason": "large"}]
+
+
+def test_descendant_without_census_does_not_reject_candidate():
+    entry, obj, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x3000"}]
+    candidates.calls[ImageId.RECOMP, 0x3000] = None
+    assert candidates.for_pair(entry) == (obj,)
