@@ -122,17 +122,47 @@ def test_imports_are_never_candidates(entity_type):
     assert not candidates.for_pair(entry)
 
 
-def test_recursive_cycle_through_unpaired_large_function_is_rejected():
+def test_cycle_through_a_function_left_as_a_call_is_candidate():
+    # Only inline-marked functions expand, so the cycle stays one call deep.
+    entry, obj, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = [
+        {"identity": "recomp:0x3000", "paired": False, "target": "0x3000"}
+    ]
+    candidates.calls[ImageId.RECOMP, 0x3000] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x2100"}
+    ]
+    assert candidates.for_pair(entry) == (obj,)
+
+
+def test_self_recursive_candidate_is_rejected():
     entry, _, candidates, _ = fixture_model()
-    candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x3000"}]
-    candidates.calls[ImageId.RECOMP, 0x3000] = [{"target": "0x2100"}]
+    candidates.calls[ImageId.ORIG, 0x1100] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x1100"}
+    ]
     assert not candidates.for_pair(entry)
 
 
-def test_incomplete_body_is_not_assumed_nonrecursive():
+def test_cycle_among_selected_candidates_is_rejected():
+    entry, _, _, candidates = nested_model()
+    candidates.calls[ImageId.RECOMP, 0x2200] = [
+        {"identity": "pair:0x1100", "paired": True, "target": "0x2100"}
+    ]
+    assert not candidates.for_pair(entry)
+
+
+def test_incomplete_candidate_body_is_rejected():
     entry, _, candidates, _ = fixture_model()
     candidates.calls[ImageId.ORIG, 0x1100] = None
     assert not candidates.for_pair(entry)
+
+
+def test_incomplete_body_beyond_the_candidate_is_irrelevant():
+    entry, obj, candidates, _ = fixture_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = [
+        {"identity": "recomp:0x3000", "paired": False, "target": "0x3000"}
+    ]
+    candidates.calls[ImageId.RECOMP, 0x3000] = None
+    assert candidates.for_pair(entry) == (obj,)
 
 
 def nested_model():
@@ -256,9 +286,3 @@ def test_only_successful_inline_notice_is_removed():
         "/* WARNING: Could not inline here */\n",
         "return 1;\n",
     ]
-
-
-def test_self_recursion_is_rejected():
-    entry, _, candidates, _ = fixture_model()
-    candidates.calls[ImageId.RECOMP, 0x2100] = [{"target": "0x2100"}]
-    assert not candidates.for_pair(entry)
