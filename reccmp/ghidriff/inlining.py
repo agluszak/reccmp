@@ -31,7 +31,7 @@ def decompiled_lines(code):
                 line.startswith("/* WARNING: Inlined function: ")
                 and line.rstrip().endswith(" */")
             )
-            and not (line.startswith("/* RVA ") and line.rstrip().endswith(" */"))
+            and not (line.lstrip().startswith("/* RVA ") and line.rstrip().endswith(" */"))
         )
         .lstrip("\n")
         .splitlines(True)

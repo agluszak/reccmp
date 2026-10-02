@@ -317,6 +317,7 @@ def test_only_successful_inline_notice_is_removed():
     code = (
         "\n/* WARNING: Inlined function: Foo */\n"
         "/* RVA 1335: Ghidra metadata */\n"
+        "                    /* RVA  1335  ?getWorldSpaceMatrix@srNode@@ */\n"
         "\n/* WARNING: Could not inline here */\nreturn 1;\n"
     )
     assert decompiled_lines(code) == [
