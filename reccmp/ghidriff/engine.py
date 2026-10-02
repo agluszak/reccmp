@@ -10,6 +10,7 @@ an inferred cdecl arity when retail independently agrees.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -95,6 +96,32 @@ ANALYSIS_REVISION = 3
 PREPARATION_REVISION = 24
 
 
+_DEFAULT_PARAMETER = re.compile(r"\bparam_(\d+)\b")
+_QUOTED = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""")
+
+
+def _canonical_parameter_names(code: list[str]) -> None:
+    """Spell Ghidra's default ``param_N`` as ``param{N-1}``.
+
+    Ghidra numbers an unnamed parameter from one; the parameters reccmp adds
+    when it corrects an inferred signature are named from zero. Only the
+    spelling differs, so one side's correction would otherwise show as a
+    difference in every use of the parameter.
+    """
+    for i, line in enumerate(code):
+        parts = _QUOTED.split(line)
+        code[i] = "".join(
+            (
+                part
+                if j % 2
+                else _DEFAULT_PARAMETER.sub(
+                    lambda m: f"param{int(m.group(1)) - 1}", part
+                )
+            )
+            for j, part in enumerate(parts)
+        )
+
+
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
@@ -174,6 +201,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         inline: bool = False,
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
+        _canonical_parameter_names(code)
         side = ImageId.ORIG if is_old else ImageId.RECOMP
         if (
             entry_address is None
