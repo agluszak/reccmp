@@ -22,7 +22,7 @@ from .results import (
 
 
 def decompiled_lines(code):
-    """Discard only Ghidra's inline-expansion notice, not analysis warnings."""
+    """Discard Ghidra metadata, not code or analysis warnings."""
     return (
         "".join(
             line
@@ -31,6 +31,7 @@ def decompiled_lines(code):
                 line.startswith("/* WARNING: Inlined function: ")
                 and line.rstrip().endswith(" */")
             )
+            and not (line.startswith("/* RVA ") and line.rstrip().endswith(" */"))
         )
         .lstrip("\n")
         .splitlines(True)

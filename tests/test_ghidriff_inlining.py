@@ -314,7 +314,11 @@ def test_no_retry_is_distinct_from_empty_retry_diff():
 
 
 def test_only_successful_inline_notice_is_removed():
-    code = "\n/* WARNING: Inlined function: Foo */\n\n/* WARNING: Could not inline here */\nreturn 1;\n"
+    code = (
+        "\n/* WARNING: Inlined function: Foo */\n"
+        "/* RVA 1335: Ghidra metadata */\n"
+        "\n/* WARNING: Could not inline here */\nreturn 1;\n"
+    )
     assert decompiled_lines(code) == [
         "/* WARNING: Could not inline here */\n",
         "return 1;\n",
