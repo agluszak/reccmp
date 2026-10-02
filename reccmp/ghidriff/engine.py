@@ -219,7 +219,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         """Skip Ghidriff's unused whole-image symbol inventory."""
         return [[], []]
 
-    def decompile_func(
+    def _decompile_native(
         self, prog: "Program", func: "Function", timeout: int = 15
     ) -> DecompileResult:
         result = super().decompile_func(prog, func, timeout)
@@ -233,6 +233,12 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 decompile_fresh(prog, func, timeout, self._read_decompile_results)
                 or result
             )
+        return result
+
+    def decompile_func(
+        self, prog: "Program", func: "Function", timeout: int = 15
+    ) -> DecompileResult:
+        result = self._decompile_native(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
             self._decompiled[(side, func.getEntryPoint().getOffset())] = _Decompiled(
