@@ -300,7 +300,7 @@ class _FileReader:
                 if pending.markers and not is_ignorable_marker_adjacent_comment(
                     comment.text
                 ):
-                    self._complete_by_name(pending, comment)
+                    self._complete_by_name(pending, comment, block.anchor)
                     pending = _Pending()
                 continue
             if not is_marker_exact(comment.text):
@@ -335,19 +335,31 @@ class _FileReader:
 
     # -- completion by a name comment ---------------------------------------
 
-    def _complete_by_name(self, pending: _Pending, comment: MarkerComment) -> None:
+    def _complete_by_name(
+        self, pending: _Pending, comment: MarkerComment, anchor: MarkerAnchor | None
+    ) -> None:
         name = get_synthetic_name(comment.text) or ""
         selector = name.removeprefix("RECOMP: ").strip()
         display_name = pending.display_name or selector
         for marker in pending.markers.values():
             if marker.type in (MarkerType.FUNCTION, MarkerType.STUB, *_NAMEREF_TYPES):
+                definitions = (
+                    [item for item in anchor.of_kind("function") if item.is_definition]
+                    if marker.type in (MarkerType.FUNCTION, MarkerType.STUB)
+                    and name.startswith("RECOMP: ")
+                    and anchor is not None
+                    else []
+                )
+                first = definitions[0] if definitions else None
                 self._function(
                     marker,
-                    line=comment.line,
+                    line=first.line if first is not None else comment.line,
+                    end_line=first.end_line if first is not None else None,
                     name=display_name,
                     lookup_by_name=True,
                     name_is_symbol=_extra_is(marker, "symbol"),
                     recomp_selector=selector,
+                    definitions=tuple(item.semantic_id for item in definitions),
                 )
             elif marker.type == MarkerType.GLOBAL:
                 self._variable(marker, comment.line, name)

@@ -85,14 +85,11 @@ def _join_markers(
             continue
         relative = method_symbol.filename.as_posix()
         marker_key: DeclarationKey | None = None
-        # Name-reference markers (TEMPLATE/SYNTHETIC/LIBRARY, and FUNCTION with a
-        # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
-        # name their entity instead of annotating a definition.
-        if (
-            method_symbol.type
-            in {MarkerType.FUNCTION, MarkerType.STUB, MarkerType.TEMPLATE}
-            and not method_symbol.is_nameref()
-        ):
+        if method_symbol.type in {
+            MarkerType.FUNCTION,
+            MarkerType.STUB,
+            MarkerType.TEMPLATE,
+        } and (not method_symbol.is_nameref() or method_symbol.definitions):
             # One per definition. A TU-local function defined in a header
             # has an identical copy in each including unit, and nothing here
             # says which copy the marker's address is: it binds the first
