@@ -177,6 +177,9 @@ class SourceMarker:
     folded: bool = False
     target: str | None = None
     declaration_key: DeclarationKey | None = None
+    # Pairing-only recovered-source selector; not an original symbol/prototype.
+    recomp_selector: str | None = None
+    selector_is_symbol: bool = False
 
     @property
     def name(self) -> str:

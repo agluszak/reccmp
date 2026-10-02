@@ -36,6 +36,8 @@ def _marker_projection(marker: SourceMarker) -> dict[str, Any]:
         "source_file": marker.source_file,
         "line": marker.line,
         "marker_name": marker.marker_name,
+        "recomp_selector": marker.recomp_selector,
+        "selector_is_symbol": marker.selector_is_symbol,
         "folded": marker.folded,
         "target": marker.target,
         "declaration_key": (
@@ -87,7 +89,8 @@ def _join_markers(
         # name comment e.g. `FUNCTION: X 0x... SYMBOL` + `// ??0foo@@QAE@XZ`)
         # name their entity instead of annotating a definition.
         if (
-            method_symbol.type in {MarkerType.FUNCTION, MarkerType.STUB}
+            method_symbol.type
+            in {MarkerType.FUNCTION, MarkerType.STUB, MarkerType.TEMPLATE}
             and not method_symbol.is_nameref()
         ):
             # One per definition. A TU-local function defined in a header
@@ -126,6 +129,10 @@ def _join_markers(
                     method_symbol.name if marker_declaration is None else None
                 ),
                 declaration_key=marker_key,
+                recomp_selector=(
+                    method_symbol.selector if method_symbol.is_nameref() else None
+                ),
+                selector_is_symbol=method_symbol.selector_is_symbol,
             )
         )
 

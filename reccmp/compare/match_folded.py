@@ -28,12 +28,17 @@ def match_folded_function_aliases(
     """
 
     recomp_by_name: dict[str, list[int]] = {}
+    recomp_by_symbol: dict[str, list[int]] = {}
     for ent in db.get_all():
         if ent.recomp_addr is None:
             continue
         if ent.get("type") not in (EntityType.FUNCTION, None):
             continue
-        name = ent.get("name")
+        linker_symbol = ent.fact(ImageId.RECOMP, "symbol")
+        if linker_symbol:
+            key = linker_symbol[:255] if truncate else linker_symbol
+            recomp_by_symbol.setdefault(key, []).append(ent.recomp_addr)
+        name = ent.fact(ImageId.RECOMP, "name")
         if not isinstance(name, str) or not name:
             continue
         key = match_name(name[:255] if truncate else name)
@@ -61,10 +66,13 @@ def match_folded_function_aliases(
 
         recomp_addr: int | None = None
         if symbol.is_nameref():
-            key = match_name(symbol.name[:255] if truncate else symbol.name)
+            key = symbol.selector[:255] if truncate else symbol.selector
+            index = recomp_by_symbol if symbol.selector_is_symbol else recomp_by_name
+            if not symbol.selector_is_symbol:
+                key = match_name(key)
             candidates = [
                 addr
-                for addr in recomp_by_name.get(key, [])
+                for addr in index.get(key, [])
                 if db.alias_canonical_orig(ImageId.RECOMP, addr) is None
             ]
             if len(candidates) == 1:

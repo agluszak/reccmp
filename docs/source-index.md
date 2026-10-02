@@ -38,6 +38,12 @@ function definition (one per template instantiation), `GLOBAL` to a variable
 `STRING` to the string literal; a name comment after the markers completes
 them by name instead. `LINE` markers stand alone.
 
+Name-reference markers retain `marker_name` for display, `recomp_selector` for
+recomp lookup, and `selector_is_symbol` for the lookup namespace. These fields
+do not assert an original symbol or prototype. `NAME:`/`RECOMP:` comments can
+separate a generic display name from a concrete recomp spelling. `TEMPLATE`
+markers on definitions retain declaration keys rather than becoming name references.
+
 Markers the compiler never saw — in files no translation unit includes, or in
 code the preprocessor skipped — are reported by `reccmp-decomplint` as
 `marker_not_compiled`. The index records the sha256 of every target source file

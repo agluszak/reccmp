@@ -260,6 +260,7 @@ class _Pending:
         default_factory=dict
     )
     last_line: int = 0
+    display_name: str | None = None
 
     def types(self) -> set[MarkerType]:
         return {marker.type for marker in self.markers.values()}
@@ -292,6 +293,10 @@ class _FileReader:
         for comment in block.comments:
             marker = match_marker(comment.text, aliases=self.aliases)
             if marker is None:
+                text = get_synthetic_name(comment.text) or ""
+                if pending.markers and text.startswith("NAME: "):
+                    pending.display_name = text.removeprefix("NAME: ").strip()
+                    continue
                 if pending.markers and not is_ignorable_marker_adjacent_comment(
                     comment.text
                 ):
@@ -332,14 +337,17 @@ class _FileReader:
 
     def _complete_by_name(self, pending: _Pending, comment: MarkerComment) -> None:
         name = get_synthetic_name(comment.text) or ""
+        selector = name.removeprefix("RECOMP: ").strip()
+        display_name = pending.display_name or selector
         for marker in pending.markers.values():
             if marker.type in (MarkerType.FUNCTION, MarkerType.STUB, *_NAMEREF_TYPES):
                 self._function(
                     marker,
                     line=comment.line,
-                    name=name,
+                    name=display_name,
                     lookup_by_name=True,
                     name_is_symbol=_extra_is(marker, "symbol"),
+                    recomp_selector=selector,
                 )
             elif marker.type == MarkerType.GLOBAL:
                 self._variable(marker, comment.line, name)
@@ -365,9 +373,13 @@ class _FileReader:
         if anchor is not None and anchor.blank_line is not None:
             self.alert(AlertCode.UNEXPECTED_BLANK_LINE, anchor.blank_line)
         for marker in pending.markers.values():
-            if marker.type in _NAMEREF_TYPES:
+            if marker.type in (MarkerType.SYNTHETIC, MarkerType.LIBRARY):
                 self.alert(AlertCode.BAD_NAMEREF, pending.last_line)
-            elif marker.type in (MarkerType.FUNCTION, MarkerType.STUB):
+            elif marker.type in (
+                MarkerType.FUNCTION,
+                MarkerType.STUB,
+                MarkerType.TEMPLATE,
+            ):
                 self._anchored_function(marker, anchor, pending.last_line)
             elif marker.type == MarkerType.GLOBAL:
                 self._anchored_variable(marker, anchor, pending.last_line)
@@ -451,6 +463,7 @@ class _FileReader:
         end_line: int | None = None,
         lookup_by_name: bool = False,
         name_is_symbol: bool = False,
+        recomp_selector: str | None = None,
         definitions: tuple[str, ...] = (),
     ) -> None:
         self.symbols.append(
@@ -464,6 +477,7 @@ class _FileReader:
                 end_line=end_line if end_line is not None else line,
                 lookup_by_name=lookup_by_name,
                 name_is_symbol=name_is_symbol,
+                recomp_selector=recomp_selector,
                 is_folded=_extra_is(marker, "folded"),
                 definitions=definitions,
             )

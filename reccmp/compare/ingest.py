@@ -260,20 +260,16 @@ def load_markers(
                 library=fun.is_library(),
             )
 
-            if fun.name.startswith("?") or fun.name_is_symbol:
-                batch.set(ImageId.ORIG, fun.offset, symbol=fun.name, name=None)
-            else:
-                prior = db.get(ImageId.ORIG, fun.offset)
-                # A CSV may supply the exact C linker spelling of this
-                # source name. Keep that corroborating symbol, but reject a
-                # different (possibly stale) identity at the same address.
-                symbol = (
-                    fun.name
-                    if prior is not None
-                    and prior.fact(ImageId.ORIG, "symbol") == fun.name
-                    else None
-                )
-                batch.set(ImageId.ORIG, fun.offset, name=fun.name, symbol=symbol)
+            # Annotation selectors are recovered-source hypotheses about the
+            # recomp candidate. Do not replace independent ORIG symbol facts
+            # (including PE exports) with a projected PDB spelling.
+            batch.set(
+                ImageId.ORIG,
+                fun.offset,
+                recomp_selector=fun.selector,
+                selector_is_symbol=fun.selector_is_symbol,
+                source_name=fun.name,
+            )
 
         for var in codebase.iter_variables():
             batch.set(

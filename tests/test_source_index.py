@@ -844,3 +844,26 @@ def test_cached_read_keeps_reader_maps_independent(tmp_path: Path) -> None:
     second = SourceIndex.read(path)
     assert second.source_digests == {"a.cpp": "aaa"}
     assert second.unit_dependencies == {}
+
+
+def test_source_marker_keeps_display_and_recomp_selector_separate(tmp_path: Path):
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _marker_block(
+            "a.cpp",
+            1,
+            "// TEMPLATE: TEST 0x1000",
+            "// NAME: Vec<T>::Grow",
+            "// RECOMP: ?Grow@?$Vec@H@@QAEXH@Z",
+        ),
+        unit_id="a.cpp",
+    )
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"a.cpp"})
+    marker = index.markers[0]
+    assert marker.marker_name == "Vec<T>::Grow"
+    assert marker.recomp_selector == "?Grow@?$Vec@H@@QAEXH@Z"
+    assert marker.selector_is_symbol
+    assert marker.declaration is None
+    path = tmp_path / "index.json"
+    index.write(path)
+    assert SourceIndex.read(path).markers == index.markers

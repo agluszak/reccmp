@@ -148,44 +148,41 @@ def test_load_code_duplicate_addr(db: EntityDb, lines_db: LinesDb, binfile: PEIm
 
     entity = db.get(ImageId.ORIG, 0x1001DDE0)
     assert entity is not None
-    assert entity.get("name") == "_Lockit::~_Lockit"
+    assert entity.get("recomp_selector") == "_Lockit::~_Lockit"
 
 
 def test_load_code_cpp_symbol_function(
     db: EntityDb, lines_db: LinesDb, binfile: PEImage
 ):
-    """Function namerefs that begin with '?' are assumed to refer to the entity symbol."""
+    """A decorated annotation selects a recomp symbol, not a retail symbol."""
     _load(
         db, lines_db, binfile, _nameref(0x10086240, "??2@YAPAXI@Z", MarkerType.LIBRARY)
     )
 
     entity = db.get(ImageId.ORIG, 0x10086240)
     assert entity is not None
-    assert entity.get("symbol") == "??2@YAPAXI@Z"
+    assert entity.get("symbol") is None
+    assert entity.get("recomp_selector") == "??2@YAPAXI@Z"
+    assert entity.get("selector_is_symbol") is True
     assert entity.get("name") is None
 
 
 @pytest.mark.parametrize(
-    ("marker_name", "csv_symbol", "expected_name", "expected_symbol"),
+    ("marker_name", "csv_symbol"),
     [
         (
             "??0srShader@@QAE@ABV0@@Z",
             "Older Ghidra label",
-            None,
-            "??0srShader@@QAE@ABV0@@Z",
         ),
-        ("W8Vector<int>::Clear", "Older Ghidra label", "W8Vector<int>::Clear", None),
-        ("_inflateEnd", "_inflateEnd", "_inflateEnd", "_inflateEnd"),
+        ("W8Vector<int>::Clear", "Older Ghidra label"),
+        ("_inflateEnd", "_inflateEnd"),
     ],
 )
-def test_source_function_identity_replaces_data_source_label(
+def test_source_selector_does_not_replace_original_facts(
     db: EntityDb,
     lines_db: LinesDb,
     marker_name: str,
     csv_symbol: str,
-    expected_name: str | None,
-    *,
-    expected_symbol: str | None,
 ):
     with db.batch() as batch:
         batch.set(
@@ -207,8 +204,9 @@ def test_source_function_identity_replaces_data_source_label(
 
     entity = db.get(ImageId.ORIG, 0x10086240)
     assert entity is not None
-    assert entity.get("name") == expected_name
-    assert entity.get("symbol") == expected_symbol
+    assert entity.fact(ImageId.ORIG, "name") == "Older Ghidra name"
+    assert entity.fact(ImageId.ORIG, "symbol") == csv_symbol
+    assert entity.fact(ImageId.ORIG, "recomp_selector") == marker_name
 
 
 def test_load_code_c_symbol_implicit(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
@@ -219,11 +217,12 @@ def test_load_code_c_symbol_implicit(db: EntityDb, lines_db: LinesDb, binfile: P
     entity = db.get(ImageId.ORIG, 0x1008C410)
     assert entity is not None
     assert entity.get("symbol") is None
-    assert entity.get("name") == "_strlwr"
+    assert entity.get("recomp_selector") == "_strlwr"
+    assert entity.get("selector_is_symbol") is False
 
 
 def test_load_code_c_symbol_explicit(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
-    """If the SYMBOL annotation modifier is used, set the entity symbol instead of the name."""
+    """SYMBOL selects a C linker name without creating an original-symbol fact."""
     _load(
         db,
         lines_db,
@@ -233,7 +232,9 @@ def test_load_code_c_symbol_explicit(db: EntityDb, lines_db: LinesDb, binfile: P
 
     entity = db.get(ImageId.ORIG, 0x1008C410)
     assert entity is not None
-    assert entity.get("symbol") == "_strlwr"
+    assert entity.get("symbol") is None
+    assert entity.get("recomp_selector") == "_strlwr"
+    assert entity.get("selector_is_symbol") is True
     assert entity.get("name") is None
 
 
@@ -267,7 +268,7 @@ def test_load_code_function_nameref_variants(
     assert entity.get("type") == EntityType.FUNCTION
     assert entity.get("library") is False
     assert entity.get("stub") is False
-    assert entity.get("name") == "_Lockit::~_Lockit"
+    assert entity.get("recomp_selector") == "_Lockit::~_Lockit"
 
     # TEMPLATE
     entity = db.get(ImageId.ORIG, 0x1001C050)
@@ -275,7 +276,10 @@ def test_load_code_function_nameref_variants(
     assert entity.get("type") == EntityType.FUNCTION
     assert entity.get("library") is False
     assert entity.get("stub") is False
-    assert entity.get("name") == "Vector<unsigned char *>::~Vector<unsigned char *>"
+    assert (
+        entity.get("recomp_selector")
+        == "Vector<unsigned char *>::~Vector<unsigned char *>"
+    )
 
     # LIBRARY
     entity = db.get(ImageId.ORIG, 0x1008B400)
@@ -283,7 +287,7 @@ def test_load_code_function_nameref_variants(
     assert entity.get("type") == EntityType.FUNCTION
     assert entity.get("library") is True
     assert entity.get("stub") is False
-    assert entity.get("name") == "_atol"
+    assert entity.get("recomp_selector") == "_atol"
 
     # STUB
     entity = db.get(ImageId.ORIG, 0x1008B4B0)
@@ -298,7 +302,7 @@ def test_load_code_function_nameref_variants(
     assert entity.get("type") == EntityType.FUNCTION
     assert entity.get("library") is False
     assert entity.get("stub") is False
-    assert entity.get("name") == "Pizza::`scalar deleting destructor'"
+    assert entity.get("recomp_selector") == "Pizza::`scalar deleting destructor'"
 
 
 def test_load_code_lineref(db: EntityDb, lines_db: LinesDb, binfile: PEImage):
