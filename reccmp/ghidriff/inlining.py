@@ -38,7 +38,7 @@ def decompiled_lines(code):
 
 
 class InlineCandidates:
-    """Canonical call and tail-call asymmetry with small, nonrecursive callees."""
+    """Canonical call and tail-call asymmetry with small, acyclic callees."""
 
     def __init__(self, manifest, programs):
         self.programs = programs
@@ -57,7 +57,6 @@ class InlineCandidates:
                     alias.canonical_orig
                 ]
         self.calls = {}
-        self.recursive = {}
         self.tails = {}
 
     def function(self, image, address):
@@ -124,37 +123,35 @@ class InlineCandidates:
         self.tails[key] = result
         return result
 
-    def is_recursive(self, image, address):
-        # Reachability back to the entry is precisely membership in a recursive
-        # direct-call SCC. Walk through large and unpaired functions too.
-        key = image, address
-        if key not in self.recursive:
-            pending = [address]
-            seen = set()
-            recursive = False
-            while pending:
-                current = pending.pop()
-                if current in seen:
-                    continue
-                seen.add(current)
-                calls = self.observation(image, current)
-                if calls is None:
-                    # Incomplete body evidence cannot establish nonrecursion.
-                    recursive = True
-                    break
-                targets = {int(call["target"], 16) for call in calls}
-                if address in targets:
-                    recursive = True
-                    break
-                pending.extend(
-                    target
-                    for target in targets
-                    if target not in seen
-                    and self.function(image, target) is not None
-                    and not self.function(image, target).isExternal()
-                )
-            self.recursive[key] = recursive
-        return self.recursive[key]
+    def recursive(self, selected):
+        """Selected identities on a cycle of selected callees in either image.
+
+        Ghidra expands only the functions this retry marks inline, so only a
+        cycle made entirely of selected callees can expand without end. A
+        cycle through any other function stays an ordinary call, and that
+        function's body evidence is irrelevant to the substitution."""
+        result = set()
+        for image in self.programs:
+            edges = {
+                identity: {
+                    call["identity"]
+                    for call in self.continued(image, obj.addr(image)) or ()
+                    if call["identity"] in selected
+                }
+                for identity, obj in selected.items()
+            }
+            for identity in selected:
+                pending = list(edges[identity])
+                seen = set()
+                while pending:
+                    current = pending.pop()
+                    if current == identity:
+                        result.add(identity)
+                        break
+                    if current not in seen:
+                        seen.add(current)
+                        pending.extend(edges[current])
+        return result
 
     def eligible(self, obj):
         functions = [self.function(image, obj.addr(image)) for image in self.programs]
@@ -174,10 +171,9 @@ class InlineCandidates:
             for image, function in zip(self.programs, functions)
         ):
             return False
+        # The substituted body itself must be completely observed.
         return not any(
-            self.observation(image, obj.addr(image)) is None
-            or self.is_recursive(image, obj.addr(image))
-            for image in self.programs
+            self.observation(image, obj.addr(image)) is None for image in self.programs
         )
 
     def for_pair(self, entry):
@@ -216,7 +212,10 @@ class InlineCandidates:
                     if target is not None and self.eligible(target):
                         selected[identity] = target
                         pending.append(target)
-        return tuple(selected.values())
+        cyclic = self.recursive(selected)
+        return tuple(
+            obj for identity, obj in selected.items() if identity not in cyclic
+        )
 
     def reached(self, image, address, callees):
         """Selected callees whose bodies this side's substitution includes."""

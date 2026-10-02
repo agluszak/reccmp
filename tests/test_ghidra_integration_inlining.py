@@ -270,3 +270,103 @@ def test_native_inline_retry_follows_tail_call(pytestconfig):
     finally:
         for program in programs.values():
             program.release(consumer)
+
+
+def _create_cycle_functions(prog, image):
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.data import IntegerDataType, PointerDataType
+    from ghidra.program.model.listing import ParameterImpl, Function
+    from ghidra.program.model.symbol import SourceType
+    from ghidra.util.task import ConsoleTaskMonitor
+    from java.io import ByteArrayInputStream  # type: ignore[import-not-found]
+
+    api = FlatProgramAPI(prog)
+    transaction = prog.startTransaction("synthetic fixture")
+    try:
+        space = prog.getAddressFactory().getDefaultAddressSpace()
+        blob = bytearray(b"\x90" * 0x200)
+        # Caller(int *a) returns GetFoo(a) + 1. GetFoo calls the unpaired Back
+        # and then loads *a; Back calls GetFoo again. Retail expands GetFoo, so
+        # its Caller calls Back directly.
+        code = (
+            bytes.fromhex("ff742404e87701000083c4048b4424048b0040c3")
+            if image == ImageId.ORIG
+            else bytes.fromhex("ff742404e8f700000083c40440c3")
+        )
+        blob[: len(code)] = code
+        blob[0x100:0x113] = bytes.fromhex("ff742404e87700000083c4048b4424048b00c3")
+        blob[0x180:0x18D] = bytes.fromhex("ff742404e877ffffff83c404c3")
+        prog.getMemory().createInitializedBlock(
+            "text",
+            space.getAddress(0x1000),
+            ByteArrayInputStream(bytes(blob)),
+            len(blob),
+            ConsoleTaskMonitor(),
+            False,
+        )
+        for address, name in [(0x1000, "Caller"), (0x1100, "GetFoo"), (0x1180, "Back")]:
+            api.disassemble(space.getAddress(address))
+            function = api.createFunction(space.getAddress(address), name)
+            function.setCallingConvention("__cdecl")
+            function.setReturnType(IntegerDataType.dataType, SourceType.USER_DEFINED)
+            function.replaceParameters(
+                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                True,
+                SourceType.USER_DEFINED,
+                ParameterImpl("a", PointerDataType(IntegerDataType.dataType), prog),
+            )
+    finally:
+        prog.endTransaction(transaction, True)
+
+
+def test_native_inline_retry_through_cycle_left_as_call(pytestconfig):
+    """A cycle through a function the retry does not mark inline stays one
+    ordinary call deep, so the callee on that cycle is still substituted."""
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native decompiler test requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.util import DefaultLanguageService
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from java.lang import Object  # type: ignore[import-not-found]
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    programs = {}
+    entry = FunctionEntry(0x1000, 0x1000, "Caller", PairBasis.ANNOTATION, None, False)
+    binary = BinaryInput(Path("synthetic-x86"), "fixture")
+    helper = NamedObject(
+        0x1100, 0x1100, "GetFoo", EntityType.FUNCTION, 19, 19, PairBasis.ANNOTATION
+    )
+    manifest = Manifest("T", binary, binary, (entry,), (helper,), ())
+    engine = NativeFixtureEngine(manifest, threaded=False)
+    try:
+        for image in ImageId:
+            prog = ProgramDB(
+                image.name,
+                lang,
+                lang.getCompilerSpecByID(CompilerSpecID("windows")),
+                consumer,
+            )
+            programs[image] = prog
+            _create_cycle_functions(prog, image)
+            engine.register_side(prog, image)
+        old, new = programs[ImageId.ORIG], programs[ImageId.RECOMP]
+        engine.setup_decompliers(old, new, pair_count=1)
+        for program in programs.values():
+            caller = program.getFunctionManager().getFunctionAt(
+                program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000)
+            )
+            assert engine.decompile_func(program, caller).completed
+        engine.shutdown_decompilers(old, new)
+        assert engine.results()[0].outcome == Outcome.DIFFERENCES
+        engine.normalize_inlining(programs)
+        result = engine.results()[0]
+        assert result.inline_callees == (0x1100,)
+        assert not result.failures
+        assert result.outcome == Outcome.NO_DIFFERENCES
+    finally:
+        for program in programs.values():
+            program.release(consumer)
