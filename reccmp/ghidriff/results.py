@@ -34,6 +34,7 @@ class FailureKind(enum.Enum):
     DECOMPILE_ERROR = "decompile-error"
     # The differ produced no decompilation for this side.
     NOT_DECOMPILED = "not-decompiled"
+    SWITCH_ANALYSIS = "switch-analysis"
 
 
 @dataclass(frozen=True)

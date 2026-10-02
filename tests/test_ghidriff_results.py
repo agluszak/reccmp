@@ -1,6 +1,9 @@
 """Outcomes and data findings of a code comparison."""
 
 from pathlib import PurePath
+import sys
+from types import SimpleNamespace as NS
+from typing import Any, cast
 
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import FunctionEntry, SourceLocation
@@ -22,6 +25,7 @@ from reccmp.ghidriff.results import (
     consistent,
 )
 from reccmp.types import ImageId
+from reccmp.ghidriff.preparation import recover_requested_switches
 
 
 def _entry(recomp_addr: int | None = 0x2000) -> FunctionEntry:
@@ -64,6 +68,54 @@ def test_missing_decompilation_is_an_analysis_failure():
     assert result.failures == (
         AnalysisFailure(FailureKind.NOT_DECOMPILED, ImageId.RECOMP),
     )
+
+
+def test_switch_decompilation_failure_is_returned_per_function(monkeypatch):
+    result = NS(
+        decompileCompleted=lambda: False,
+        getErrorMessage=lambda: "process timeout",
+    )
+    decompiler = NS(
+        openProgram=lambda _program: True,
+        decompileFunction=lambda _function, _timeout, _monitor: result,
+        resetDecompiler=lambda: None,
+        dispose=lambda: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.decompiler",
+        NS(DecompInterface=lambda: decompiler),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.plugin.core.analysis",
+        NS(
+            SwitchAnalysisDecompileConfigurer=lambda _program: NS(
+                configure=lambda _d: None
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.cmd.function",
+        NS(DecompilerSwitchAnalysisCmd=lambda _result: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.util.task",
+        NS(TaskMonitor=NS(DUMMY=object())),
+    )
+    function = NS(getEntryPoint=lambda: "00001000")
+    program = NS(
+        getFunctionManager=lambda: NS(getFunctionAt=lambda _address: function),
+        getAddressFactory=lambda: NS(
+            getDefaultAddressSpace=lambda: NS(getAddress=lambda address: address)
+        ),
+    )
+
+    assert recover_requested_switches(cast(Any, program), [0x1000], 90) == {
+        0x1000: "Switch analysis failed at 00001000: process timeout"
+    }
 
 
 def test_entry_conflict_is_kept_as_the_reason():

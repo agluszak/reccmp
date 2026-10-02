@@ -409,7 +409,7 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
                 engine.prepare_program(orig, ImageId.ORIG)
             with _stage("prepare recompiled"):
                 engine.prepare_program(recomp, ImageId.RECOMP)
-            if not args.no_cache:
+            if not args.no_cache and not engine.preparation_failed:
                 with _stage("save prepared programs"):
                     save_prepared(engine.project, prepared_stamp, prepared_key)
         with _stage("decompile and diff"):

@@ -9,7 +9,7 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.engine import _canonical_parameter_names
+from reccmp.ghidriff.names import canonical_parameter_names
 from reccmp.ghidriff.names import (
     canonical_names,
     paired_reference_tokens,
@@ -162,7 +162,7 @@ def test_default_parameter_names_use_reccmp_numbering():
         '  puts("param_1 stays");\n',
         "  return param_1 + param_12 + xparam_1;\n",
     ]
-    _canonical_parameter_names(code)
+    canonical_parameter_names(code)
     assert code == [
         "void __cdecl F(int param0,int param0)\n",
         "{\n",
