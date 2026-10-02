@@ -1,6 +1,9 @@
 """Outcomes and data findings of a code comparison."""
 
 from pathlib import PurePath
+import sys
+from types import SimpleNamespace as NS
+from typing import TYPE_CHECKING, cast
 
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import FunctionEntry, SourceLocation
@@ -22,6 +25,11 @@ from reccmp.ghidriff.results import (
     consistent,
 )
 from reccmp.types import ImageId
+from reccmp.ghidriff.preparation import decompile_fresh, recover_requested_switches
+
+if TYPE_CHECKING:
+    from ghidriff import DecompileResult
+    from ghidra.program.model.listing import Function, Program
 
 
 def _entry(recomp_addr: int | None = 0x2000) -> FunctionEntry:
@@ -64,6 +72,111 @@ def test_missing_decompilation_is_an_analysis_failure():
     assert result.failures == (
         AnalysisFailure(FailureKind.NOT_DECOMPILED, ImageId.RECOMP),
     )
+
+
+def test_switch_decompilation_failure_is_returned_per_function(monkeypatch):
+    visited: list[tuple[str, int]] = []
+    lifecycle = []
+    result = NS(
+        decompileCompleted=lambda: False,
+        getErrorMessage=lambda: "process timeout",
+    )
+
+    def decompile(function, timeout, _monitor):
+        visited.append((function.getEntryPoint(), timeout))
+        return result
+
+    decompiler = NS(
+        openProgram=lambda _program: True,
+        decompileFunction=decompile,
+        resetDecompiler=lambda: lifecycle.append("reset"),
+        dispose=lambda: lifecycle.append("dispose"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.decompiler",
+        NS(DecompInterface=lambda: decompiler),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.plugin.core.analysis",
+        NS(
+            SwitchAnalysisDecompileConfigurer=lambda _program: NS(
+                configure=lambda _d: None
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.cmd.function",
+        NS(DecompilerSwitchAnalysisCmd=lambda _result: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.util.task",
+        NS(TaskMonitor=NS(DUMMY=object())),
+    )
+    program = NS(
+        getFunctionManager=lambda: NS(
+            getFunctionAt=lambda address: NS(getEntryPoint=lambda: f"{address:08x}")
+        ),
+        getAddressFactory=lambda: NS(
+            getDefaultAddressSpace=lambda: NS(getAddress=lambda address: address)
+        ),
+    )
+
+    assert recover_requested_switches(
+        cast("Program", program), [0x1000, 0x2000], 90
+    ) == {
+        0x1000: "Switch analysis failed at 00001000: process timeout",
+        0x2000: "Switch analysis failed at 00002000: process timeout",
+    }
+    assert visited == [("00001000", 90), ("00002000", 90)]
+    assert lifecycle == ["reset", "reset", "dispose"]
+
+
+def test_fresh_decompilation_uses_program_options_timeout_and_disposes(monkeypatch):
+    calls: list[tuple[object, ...]] = []
+    native_result = object()
+    converted = cast("DecompileResult", NS(code="int f(void) {}"))
+    program = cast("Program", object())
+    function = cast("Function", object())
+    options = NS(
+        grabFromProgram=lambda value: calls.append(("program", value)),
+        setMaxPayloadMBytes=lambda value: calls.append(("payload", value)),
+    )
+
+    def decompile(func, timeout, _monitor):
+        calls.append(("decompile", func, timeout))
+        return native_result
+
+    def convert(value):
+        assert value is native_result
+        return converted
+
+    decompiler = NS(
+        setOptions=lambda value: calls.append(("options", value)),
+        openProgram=lambda _program: True,
+        decompileFunction=decompile,
+        dispose=lambda: calls.append(("dispose",)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ghidra.app.decompiler",
+        NS(DecompInterface=lambda: decompiler, DecompileOptions=lambda: options),
+    )
+    monkeypatch.setitem(
+        sys.modules, "ghidra.util.task", NS(TaskMonitor=NS(DUMMY=object()))
+    )
+    result = decompile_fresh(program, function, 90, convert)
+    assert result is converted
+    assert calls == [
+        ("program", program),
+        ("payload", 100),
+        ("options", options),
+        ("decompile", function, 90),
+        ("dispose",),
+    ]
 
 
 def test_entry_conflict_is_kept_as_the_reason():

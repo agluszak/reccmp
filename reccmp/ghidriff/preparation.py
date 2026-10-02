@@ -4,10 +4,38 @@
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
 from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
 
 if TYPE_CHECKING:
+    from ghidriff import DecompileResult
+    from ghidra.app.decompiler import DecompileResults
     from ghidra.program.model.address import Address
-    from ghidra.program.model.listing import Program
+    from ghidra.program.model.listing import Function, Program
+
+
+def decompile_fresh(
+    program: "Program",
+    function: "Function",
+    timeout: int,
+    read_results: Callable[["DecompileResults"], "DecompileResult"],
+) -> "DecompileResult | None":
+    """Retry with a native process that has no cached earlier decompilations."""
+    from ghidra.app.decompiler import DecompInterface, DecompileOptions
+    from ghidra.util.task import TaskMonitor
+
+    decompiler = DecompInterface()
+    try:
+        options = DecompileOptions()
+        options.grabFromProgram(program)
+        options.setMaxPayloadMBytes(100)
+        decompiler.setOptions(options)
+        if not decompiler.openProgram(program):
+            return None
+        return read_results(
+            decompiler.decompileFunction(function, timeout, TaskMonitor.DUMMY)
+        )
+    finally:
+        decompiler.dispose()
 
 
 def apply_stack_probe_call_fixups(program: "Program", addresses: set[int]) -> None:
@@ -235,7 +263,9 @@ def infer_requested_callee_parameters(
         raise RuntimeError(f"Ghidra Parameter ID failed: {command.getStatusMsg()}")
 
 
-def recover_requested_switches(program: "Program", requested: list[int]) -> None:
+def recover_requested_switches(
+    program: "Program", requested: list[int], timeout: int
+) -> dict[int, str]:
     """Run Ghidra's switch command on the functions this run compares."""
     from ghidra.app.cmd.function import DecompilerSwitchAnalysisCmd
     from ghidra.app.decompiler import DecompInterface
@@ -245,6 +275,7 @@ def recover_requested_switches(program: "Program", requested: list[int]) -> None
     functions = program.getFunctionManager()
     space = program.getAddressFactory().getDefaultAddressSpace()
     decompiler = DecompInterface()
+    failures = {}
     try:
         SwitchAnalysisDecompileConfigurer(program).configure(decompiler)
         if not decompiler.openProgram(program):
@@ -253,19 +284,21 @@ def recover_requested_switches(program: "Program", requested: list[int]) -> None
             function = functions.getFunctionAt(space.getAddress(addr))
             if function is None:
                 continue
-            results = decompiler.decompileFunction(function, 60, TaskMonitor.DUMMY)
+            results = decompiler.decompileFunction(function, timeout, TaskMonitor.DUMMY)
             if not results.decompileCompleted():
-                raise RuntimeError(
-                    f"Switch analysis failed at {function.getEntryPoint()}"
+                failures[addr] = (
+                    f"Switch analysis failed at {function.getEntryPoint()}: "
+                    f"{results.getErrorMessage()}"
                 )
+                decompiler.resetDecompiler()
+                continue
             if not DecompilerSwitchAnalysisCmd(results).applyTo(
                 program, TaskMonitor.DUMMY
             ):
-                raise RuntimeError(
-                    f"Switch recovery failed at {function.getEntryPoint()}"
-                )
+                failures[addr] = f"Switch recovery failed at {function.getEntryPoint()}"
     finally:
         decompiler.dispose()
+    return failures
 
 
 def clear_data(program: "Program", address: "Address") -> None:

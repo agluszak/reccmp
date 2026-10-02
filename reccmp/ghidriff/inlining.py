@@ -3,7 +3,7 @@
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from capstone import x86_const  # type: ignore
 
@@ -314,7 +314,7 @@ class InlineNormalizationMixin:
                                 },
                             )
                             self.decompilers[self._program_key(program)][0].flushCache()
-                            result = cast(Any, super()).decompile_func(
+                            result = self._decompile_native(
                                 program, function, self.decompiler_timeout
                             )
                             self._inline_decompiled[(image, address)] = Decompiled(

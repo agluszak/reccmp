@@ -10,7 +10,6 @@ an inferred cdecl arity when retail independently agrees.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +36,7 @@ from .names import (
     paired_reference_tokens,
     replace_paired_raw_addresses,
     unquoted_raw_addresses,
+    canonical_parameter_names,
 )
 from .imports import import_locations, known_purge
 from .locations import (
@@ -59,6 +59,7 @@ from .preparation import (
     correct_import_purges,
     infer_requested_callee_parameters,
     recover_requested_switches,
+    decompile_fresh,
 )
 from .project_cache import _PRISTINE_FOLDER
 from .results import (
@@ -93,33 +94,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 24
-
-
-_DEFAULT_PARAMETER = re.compile(r"\bparam_(\d+)\b")
-_QUOTED = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""")
-
-
-def _canonical_parameter_names(code: list[str]) -> None:
-    """Spell Ghidra's default ``param_N`` as ``param{N-1}``.
-
-    Ghidra numbers an unnamed parameter from one; the parameters reccmp adds
-    when it corrects an inferred signature are named from zero. Only the
-    spelling differs, so one side's correction would otherwise show as a
-    difference in every use of the parameter.
-    """
-    for i, line in enumerate(code):
-        parts = _QUOTED.split(line)
-        code[i] = "".join(
-            (
-                part
-                if j % 2
-                else _DEFAULT_PARAMETER.sub(
-                    lambda m: f"param{int(m.group(1)) - 1}", part
-                )
-            )
-            for j, part in enumerate(parts)
-        )
+PREPARATION_REVISION = 25
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -151,6 +126,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             for image_id in (ImageId.ORIG, ImageId.RECOMP)
         }
         self._failures: dict[int, list[AnalysisFailure]] = {}
+        self.preparation_failed = False
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._inline_decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
@@ -201,7 +177,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         inline: bool = False,
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
-        _canonical_parameter_names(code)
+        canonical_parameter_names(code)
         side = ImageId.ORIG if is_old else ImageId.RECOMP
         if (
             entry_address is None
@@ -243,10 +219,26 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         """Skip Ghidriff's unused whole-image symbol inventory."""
         return [[], []]
 
-    def decompile_func(
-        self, prog: "Program", func: Any, timeout: int = 15
+    def _decompile_native(
+        self, prog: "Program", func: "Function", timeout: int = 15
     ) -> DecompileResult:
         result = super().decompile_func(prog, func, timeout)
+        if not result.completed and not result.cancelled:
+            self.logger.warning(
+                "Retrying decompilation of %s with a fresh process: %s",
+                func.getEntryPoint(),
+                result.error,
+            )
+            result = (
+                decompile_fresh(prog, func, timeout, self._read_decompile_results)
+                or result
+            )
+        return result
+
+    def decompile_func(
+        self, prog: "Program", func: "Function", timeout: int = 15
+    ) -> DecompileResult:
+        result = self._decompile_native(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
             self._decompiled[(side, func.getEntryPoint().getOffset())] = _Decompiled(
@@ -502,7 +494,21 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             try:
                 FlatProgramAPI(program).analyzeChanges(program)
                 if self.focused_switch_analysis:
-                    recover_requested_switches(program, requested)
+                    failures = recover_requested_switches(
+                        program, requested, self.decompiler_timeout
+                    )
+                    for entry in self._comparable_entries():
+                        message = failures.get(self._entry_addr(entry, image_id))
+                        if message is not None:
+                            self.preparation_failed = True
+                            self._fail(
+                                entry,
+                                AnalysisFailure(
+                                    FailureKind.SWITCH_ANALYSIS,
+                                    image_id,
+                                    message=message,
+                                ),
+                            )
                     FlatProgramAPI(program).analyzeChanges(program)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()

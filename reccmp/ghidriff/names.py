@@ -15,6 +15,24 @@ if TYPE_CHECKING:
 
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
+_DEFAULT_PARAMETER = re.compile(r"\bparam_(\d+)\b")
+_QUOTED = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""")
+
+
+def canonical_parameter_names(code: list[str]) -> None:
+    """Use zero-based parameter names without changing quoted literals."""
+    for i, line in enumerate(code):
+        parts = _QUOTED.split(line)
+        code[i] = "".join(
+            (
+                part
+                if j % 2
+                else _DEFAULT_PARAMETER.sub(
+                    lambda m: f"param{int(m.group(1)) - 1}", part
+                )
+            )
+            for j, part in enumerate(parts)
+        )
 
 
 def unquoted_raw_addresses(code: str) -> set[int]:
