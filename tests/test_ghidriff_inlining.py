@@ -8,7 +8,9 @@ import pytest
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest, NamedObject
 from reccmp.ghidriff.inlining import (
+    Decompiled,
     InlineCandidates,
+    InlineNormalizationMixin,
     decompiled_lines,
     temporary_inline,
 )
@@ -324,3 +326,21 @@ def test_only_successful_inline_notice_is_removed():
         "/* WARNING: Could not inline here */\n",
         "return 1;\n",
     ]
+
+
+def test_export_metadata_is_removed_after_address_normalization():
+    code = "                    /* 10054d10  1335  symbol */\nreturn 1;\n"
+
+    class Engine(InlineNormalizationMixin):
+        _inline_decompiled = {(ImageId.ORIG, 0x10054D10): Decompiled(code, None)}
+
+        def normalize_ghidra_decomp_for_side(
+            self, lines, _is_old, _address, _stack_setup, *, inline
+        ):
+            assert inline
+            lines[:] = [line.replace("10054d10", "RVA") for line in lines]
+
+        def normalized(self):
+            return self._normalized(ImageId.ORIG, 0x10054D10, inline=True)
+
+    assert Engine().normalized() == ["return 1;\n"]

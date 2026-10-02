@@ -31,7 +31,9 @@ def decompiled_lines(code):
                 line.startswith("/* WARNING: Inlined function: ")
                 and line.rstrip().endswith(" */")
             )
-            and not (line.lstrip().startswith("/* RVA ") and line.rstrip().endswith(" */"))
+            and not (
+                line.lstrip().startswith("/* RVA ") and line.rstrip().endswith(" */")
+            )
         )
         .lstrip("\n")
         .splitlines(True)
@@ -384,7 +386,7 @@ class InlineNormalizationMixin:
         self.normalize_ghidra_decomp_for_side(
             lines, image_id == ImageId.ORIG, addr, stack_setup, inline=inline
         )
-        return lines
+        return decompiled_lines("".join(lines))
 
     def results(self: Any) -> list[FunctionResult]:
         """One result for every function the manifest requested."""
