@@ -49,7 +49,11 @@ decompiler failed (`decompile-error`).
 
 After ordinary decompilation, an asymmetric direct-call set triggers one retry.
 Only reccmp-paired internal callees with fewer than 100 native instructions on
-both sides and no recursive direct-call SCC are eligible. For this caller pair
+both sides and no recursive direct-call SCC are eligible. A callee with calls
+or jumps stays out of the retry if the selected expansion would reach its body
+more than once: Ghidra's hard inline model requires a single expansion, and
+nested shared bodies can crash its native control-flow structuring. Straight-line
+leaves may still be expanded repeatedly. For this caller pair
 only, Ghidra temporarily marks the paired callees inline and decompiles again.
 Retries run serially, roll back program transactions, and flush decompiler
 caches before and after each pair. No inline hints are saved to either program.

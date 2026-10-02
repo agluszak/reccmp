@@ -27,6 +27,165 @@ class NativeFixtureEngine(ReccmpDiffEngine):
         raise AssertionError("Native fixture uses manifest pairs")
 
 
+def _create_shared_callee_functions(prog, image):
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.data import IntegerDataType, PointerDataType
+    from ghidra.program.model.listing import ParameterImpl, Function
+    from ghidra.program.model.symbol import SourceType
+    from ghidra.util.task import ConsoleTaskMonitor
+    from java.io import ByteArrayInputStream  # type: ignore[import-not-found]
+
+    api = FlatProgramAPI(prog)
+    transaction = prog.startTransaction("shared inline callee fixture")
+    try:
+        space = prog.getAddressFactory().getDefaultAddressSpace()
+        blob = bytearray(b"\x90" * 0x500)
+
+        def call(site, target):
+            return b"\xe8" + (target - site - 5).to_bytes(4, "little", signed=True)
+
+        def wrapper(address):
+            return (
+                bytes.fromhex("568b74240856")
+                + call(address + 6, 0x1200)
+                + bytes.fromhex("83c40456")
+                + call(address + 15, 0x1300)
+                + bytes.fromhex("83c4048b065ec3")
+            )
+
+        caller = (
+            wrapper(0x1000)
+            if image == ImageId.ORIG
+            else bytes.fromhex("ff742404")
+            + call(0x1004, 0x1100)
+            + bytes.fromhex("83c404c3")
+        )
+        code = {
+            0x1000: caller,
+            0x1100: wrapper(0x1100),
+            0x1200: (
+                bytes.fromhex("568b742408833e00740956")
+                + call(0x120B, 0x1300)
+                + bytes.fromhex("83c4048b065ec3")
+            ),
+            0x1300: (
+                bytes.fromhex("8b442404833800750650")
+                + call(0x130A, 0x1400)
+                + bytes.fromhex("c3")
+            ),
+            0x1400: bytes.fromhex("cc"),
+        }
+        for address, body in code.items():
+            blob[address - 0x1000 : address - 0x1000 + len(body)] = body
+        prog.getMemory().createInitializedBlock(
+            "text",
+            space.getAddress(0x1000),
+            ByteArrayInputStream(bytes(blob)),
+            len(blob),
+            ConsoleTaskMonitor(),
+            False,
+        )
+        for address, name in [
+            (0x1400, "Abort"),
+            (0x1300, "SetState"),
+            (0x1200, "Read"),
+            (0x1100, "Wrapper"),
+            (0x1000, "Caller"),
+        ]:
+            api.disassemble(space.getAddress(address))
+            function = api.createFunction(space.getAddress(address), name)
+            function.setCallingConvention("__cdecl")
+            function.setReturnType(IntegerDataType.dataType, SourceType.USER_DEFINED)
+            function.replaceParameters(
+                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                True,
+                SourceType.USER_DEFINED,
+                ParameterImpl("a", PointerDataType(IntegerDataType.dataType), prog),
+            )
+            if address == 0x1400:
+                function.setNoReturn(True)
+    finally:
+        prog.endTransaction(transaction, True)
+
+
+def test_nested_inline_callees_with_shared_branching_body(pytestconfig):
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native decompiler test requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.util import DefaultLanguageService
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from java.lang import Object  # type: ignore[import-not-found]
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    programs = {}
+    entry = FunctionEntry(0x1000, 0x1000, "Caller", PairBasis.ANNOTATION, None, False)
+    binary = BinaryInput(Path("synthetic-x86"), "shared-callee")
+    manifest = Manifest(
+        "T",
+        binary,
+        binary,
+        (entry,),
+        tuple(
+            NamedObject(
+                address,
+                address,
+                name,
+                EntityType.FUNCTION,
+                32,
+                32,
+                PairBasis.ANNOTATION,
+            )
+            for address, name in [
+                (0x1100, "Wrapper"),
+                (0x1200, "Read"),
+                (0x1300, "SetState"),
+            ]
+        ),
+        (),
+    )
+    engine = NativeFixtureEngine(manifest, threaded=False)
+    try:
+        for image in ImageId:
+            prog = ProgramDB(
+                image.name,
+                lang,
+                lang.getCompilerSpecByID(CompilerSpecID("windows")),
+                consumer,
+            )
+            programs[image] = prog
+            _create_shared_callee_functions(prog, image)
+            engine.register_side(prog, image)
+        old, new = programs[ImageId.ORIG], programs[ImageId.RECOMP]
+        engine.setup_decompliers(old, new, pair_count=1)
+        for program in programs.values():
+            caller = program.getFunctionManager().getFunctionAt(
+                program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000)
+            )
+            assert engine.decompile_func(program, caller).completed
+        engine.shutdown_decompilers(old, new)
+        engine.normalize_inlining(programs)
+        result = engine.results()[0]
+        assert result.normal_diff
+        assert result.inline_callees == (0x1100, 0x1200)
+        assert result.inline_normalized_diff is not None
+        assert not result.failures
+        for program in programs.values():
+            space = program.getAddressFactory().getDefaultAddressSpace()
+            assert all(
+                not program.getFunctionManager()
+                .getFunctionAt(space.getAddress(address))
+                .isInline()
+                for address in (0x1100, 0x1200, 0x1300)
+            )
+    finally:
+        for program in programs.values():
+            program.release(consumer)
+
+
 def _create_functions(prog, image, changed):
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.data import IntegerDataType, PointerDataType
