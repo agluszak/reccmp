@@ -286,11 +286,26 @@ def test_static_local_belongs_to_the_marked_function():
     )
 
 
-def test_static_local_without_a_marked_function():
-    _, alerts = _read(
+def test_static_local_without_a_marked_function_keeps_its_symbol():
+    symbols, alerts = _read(
         _block(
             "// GLOBAL: TEST 0x2000",
             candidates=(_variable("s_x", local_static=True, enclosing="?g@@YAXXZ"),),
+        )
+    )
+    assert not alerts
+    variable = symbols[0]
+    assert isinstance(variable, ParserVariable)
+    assert (variable.parent_function, variable.parent_symbol) == (None, "?g@@YAXXZ")
+
+
+def test_static_local_in_an_unmanglable_function_is_orphaned():
+    _, alerts = _read(
+        _block(
+            "// GLOBAL: TEST 0x2000",
+            candidates=(
+                _variable("s_x", local_static=True, enclosing="FunctionDecl:g:void ()"),
+            ),
         )
     )
     assert alerts == [(AlertCode.ORPHANED_STATIC_VARIABLE, 2)]

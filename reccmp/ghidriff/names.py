@@ -269,9 +269,10 @@ def name_identical_code(
 
     The linker folds identical functions (ICF); a build compared without ICF
     keeps them apart, and the code cannot tell equal bytes apart. Such a body
-    takes the name of the one pair whose two bodies have those bytes, or else
-    a name derived from the bytes. Paired functions keep their names, and a
-    body only one program contains keeps Ghidra's placeholder."""
+    takes the name of the one pair whose two bodies have those bytes. When
+    several pairs have them, those pairs and the unpaired bodies all take a
+    name derived from the bytes, alike in both programs. A body only one
+    program contains keeps its name or Ghidra's placeholder."""
     programs = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
     bodies = {
         image: {
@@ -283,6 +284,7 @@ def name_identical_code(
     }
     paired = {image: paired_function_entries(manifest, image) for image in programs}
     canonical: dict[bytes, set[str]] = {}
+    members: dict[bytes, dict[ImageId, set[int]]] = {}
     for obj in manifest.objects:
         if obj.entity_type not in FUNCTION_TYPES:
             continue
@@ -290,6 +292,9 @@ def name_identical_code(
         right = bodies[ImageId.RECOMP].get(obj.recomp_addr)
         if left is not None and right is not None and left[1] == right[1]:
             canonical.setdefault(left[1], set()).add(names[obj.orig_addr])
+            group = members.setdefault(left[1], {image: set() for image in programs})
+            group[ImageId.ORIG].add(obj.orig_addr)
+            group[ImageId.RECOMP].add(obj.recomp_addr)
     shared = {body for _, body in bodies[ImageId.ORIG].values()} & {
         body for _, body in bodies[ImageId.RECOMP].values()
     }
@@ -297,9 +302,12 @@ def name_identical_code(
         transaction = program.startTransaction("reccmp identical code")
         try:
             for address, (function, body) in bodies[image].items():
-                if address in paired[image] or body not in shared:
+                if body not in shared:
                     continue
                 candidates = canonical.get(body, set())
+                ambiguous = len(candidates) > 1 and address in members[body][image]
+                if address in paired[image] and not ambiguous:
+                    continue
                 rename_function(
                     function,
                     (

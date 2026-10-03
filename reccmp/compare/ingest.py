@@ -286,6 +286,13 @@ def load_markers(
                     static_var=True,
                     parent_function=var.parent_function,
                 )
+            elif var.is_static and var.parent_symbol is not None:
+                batch.set(
+                    ImageId.ORIG,
+                    var.offset,
+                    static_var=True,
+                    parent_symbol=var.parent_symbol,
+                )
 
         vtables_by_offset: dict[int, list[ParserVtable]] = {}
         for tbl in codebase.iter_vtables():

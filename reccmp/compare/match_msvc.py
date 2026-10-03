@@ -1,7 +1,7 @@
 import re
 
 from reccmp.types import EntityType
-from reccmp.compare.db import EntityDb, PairBasis
+from reccmp.compare.db import EntityDb, PairBasis, ReccmpEntity
 from reccmp.compare.lines import LinesDb
 from reccmp.compare.event import (
     ReccmpEvent,
@@ -388,9 +388,25 @@ def match_static_variables(
     orig_variables = [
         ent for ent in db.unmatched(ImageId.ORIG) if ent.get("static_var")
     ]
+    # An enclosing function without a marker is named by its symbol.
+    by_symbol: dict[str, list[int]] = {}
+    if any(ent.get("parent_symbol") for ent in orig_variables):
+        for recomp_fn in db.all(ImageId.RECOMP):
+            symbol = recomp_fn.get("symbol")
+            if symbol and recomp_fn.recomp_addr is not None:
+                by_symbol.setdefault(symbol, []).append(recomp_fn.recomp_addr)
+
+    def recomp_parent(ent: ReccmpEntity) -> int | None:
+        parent_addr = ent.get("parent_function")
+        if parent_addr is not None:
+            parent_match = db.get_one_match(parent_addr)
+            return parent_match.recomp_addr if parent_match is not None else None
+        found = by_symbol.get(ent.get("parent_symbol") or "", [])
+        return found[0] if len(found) == 1 else None
+
     orig_counts: dict[tuple[int, str], int] = {}
     for ent in orig_variables:
-        parent = ent.get("parent_function")
+        parent = recomp_parent(ent)
         name = ent.get("name")
         if parent is not None and name:
             key = (parent, name)
@@ -401,23 +417,20 @@ def match_static_variables(
             variable_addr = variable_ent.orig_addr
             assert variable_addr is not None
             variable_name = variable_ent.get("name")
-            parent_addr = variable_ent.get("parent_function")
-            parent_match = (
-                db.get_one_match(parent_addr) if parent_addr is not None else None
-            )
-            if not variable_name or parent_match is None:
+            parent = recomp_parent(variable_ent)
+            if not variable_name or parent is None:
                 report(
                     ReccmpEvent.NO_MATCH,
                     variable_addr,
                     msg=f"No matched function for static variable '{variable_name}'",
                 )
                 continue
-            candidates = static_index.get((parent_match.recomp_addr, variable_name), [])
-            if len(candidates) != 1 or orig_counts[(parent_addr, variable_name)] != 1:
+            candidates = static_index.get((parent, variable_name), [])
+            if len(candidates) != 1 or orig_counts[(parent, variable_name)] != 1:
                 report(
                     ReccmpEvent.NO_MATCH,
                     variable_addr,
-                    msg=f"Expected one static variable '{variable_name}' in function 0x{parent_match.recomp_addr:x}; found {len(candidates)}",
+                    msg=f"Expected one static variable '{variable_name}' in function 0x{parent:x}; found {len(candidates)}",
                 )
                 continue
             batch.match(variable_addr, candidates[0], basis=PairBasis.ANNOTATION)

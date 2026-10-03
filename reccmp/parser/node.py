@@ -80,6 +80,9 @@ class ParserFunction(ParserSymbol):
 class ParserVariable(ParserSymbol):
     is_static: bool = False
     parent_function: int | None = None
+    # The enclosing function's symbol, when it has no marker of its own
+    # (for example a function every caller inlines).
+    parent_symbol: str | None = None
     semantic_id: str | None = None
 
 

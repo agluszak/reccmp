@@ -597,13 +597,17 @@ def read_marker_blocks(
     for reader in readers.values():
         for static in reader.static_locals:
             parent = function_ids.get((static.symbol.module, static.enclosing_function))
-            if parent is None:
+            if parent is not None:
+                static.symbol.parent_function = parent
+            elif ":" not in static.enclosing_function:
+                # A mangled symbol still names the enclosing function in the
+                # recompiled PDB; an unmanglable one names nothing there.
+                static.symbol.parent_symbol = static.enclosing_function
+            else:
                 reader.alert(
                     AlertCode.ORPHANED_STATIC_VARIABLE, static.symbol.line_number
                 )
                 reader.symbols.remove(static.symbol)
-            else:
-                static.symbol.parent_function = parent
 
     return [
         ReccmpParserResult(

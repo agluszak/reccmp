@@ -554,6 +554,37 @@ def test_match_static_var(db):
     assert db.get(ImageId.ORIG, 600).recomp_addr == 500
 
 
+def test_match_static_var_of_an_unmarked_function_by_symbol(db):
+    """An inlined enclosing function has no pair; its symbol names it."""
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP,
+            300,
+            type=EntityType.FUNCTION,
+            symbol="_ShutdownPlatform",
+        )
+        batch.set(
+            ImageId.RECOMP,
+            500,
+            name="Reenter",
+            parent_function=300,
+            static_var=True,
+            type=EntityType.DATA,
+        )
+        batch.set(
+            ImageId.ORIG,
+            600,
+            name="Reenter",
+            parent_symbol="_ShutdownPlatform",
+            static_var=True,
+            type=EntityType.DATA,
+        )
+
+    match_static_variables(db)
+
+    assert db.get(ImageId.ORIG, 600).recomp_addr == 500
+
+
 def test_match_static_var_rejects_same_name_in_other_function(db):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 200, type=EntityType.FUNCTION)
