@@ -156,3 +156,54 @@ def test_load_csv_with_fatal_error(db: EntityDb):
 
     assert db.get(ImageId.ORIG, 0x1234) is None
     assert db.get(ImageId.ORIG, 0x4321) is None
+
+
+def test_csv_recomp_selector_keeps_retail_name_separate(db: EntityDb):
+    from reccmp.compare.match_msvc import match_annotation_selectors
+
+    load_csv(
+        db,
+        TextFile(
+            PurePath("emissions.csv"),
+            "address|name|type|recomp_selector|selector_is_symbol\n"
+            "00401000|Container<T>::retained destructor|synthetic|??_G?$Container@H@@UAEPAXI@Z|true\n",
+        ),
+    )
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP,
+            0x501000,
+            type=EntityType.FUNCTION,
+            name="Container<int>::`scalar deleting destructor'",
+            symbol="??_G?$Container@H@@UAEPAXI@Z",
+        )
+    match_annotation_selectors(db)
+    entity = db.get(ImageId.ORIG, 0x401000)
+    assert entity is not None
+    assert entity.recomp_addr == 0x501000
+    assert entity.fact(ImageId.ORIG, "name") == "Container<T>::retained destructor"
+    assert entity.fact(ImageId.ORIG, "symbol") is None
+
+
+def test_csv_family_description_is_not_a_matching_wildcard(db: EntityDb):
+    from reccmp.compare.match_msvc import match_annotation_selectors
+
+    load_csv(
+        db,
+        TextFile(
+            PurePath("emissions.csv"),
+            "address|name|type|recomp_selector|selector_is_symbol\n"
+            "00401000|Container<T>::retained destructor|synthetic|Container<T>::destructor family|false\n",
+        ),
+    )
+    with db.batch() as batch:
+        batch.set(
+            ImageId.RECOMP,
+            0x501000,
+            type=EntityType.FUNCTION,
+            name="Container<int>::~Container<int>",
+        )
+    match_annotation_selectors(db)
+    entity = db.get(ImageId.ORIG, 0x401000)
+    assert entity is not None
+    assert entity.recomp_addr is None

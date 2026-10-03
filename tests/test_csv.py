@@ -534,3 +534,13 @@ def test_size_invalid_hex_prefix_only():
     """Throw for hex prefix without any digits."""
     with pytest.raises(CsvInvalidNumberError):
         list(csv_parse("address,size\n1000,0x"))
+
+
+def test_selector_boolean_is_explicit():
+    from reccmp.compare.csv import CsvInvalidBooleanError
+
+    reader = csv_parse("address|name|selector_is_symbol\n00401000|name|false\n")
+    assert next(reader)[1]["selector_is_symbol"] is False
+    reader = csv_parse("address|name|selector_is_symbol\n00401000|name|perhaps\n")
+    with pytest.raises(CsvInvalidBooleanError):
+        next(reader)

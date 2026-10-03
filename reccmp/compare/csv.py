@@ -58,6 +58,10 @@ class CsvInvalidNumberError(ReccmpCsvParserError):
     """The string value is not a valid hex or decimal number."""
 
 
+class CsvInvalidBooleanError(ReccmpCsvParserError):
+    """The value is not an explicit true/false selector flag."""
+
+
 CsvValueOptions = int | str | bool | EntityType
 
 
@@ -66,6 +70,8 @@ class CsvValuesType(TypedDict):
     name: NotRequired[str]
     size: NotRequired[int]
     symbol: NotRequired[str]
+    recomp_selector: NotRequired[str]
+    selector_is_symbol: NotRequired[bool]
 
     # Set implicitly via type for now
     stub: NotRequired[bool]
@@ -142,6 +148,15 @@ def _convert_attrs(values: Iterable[tuple[str, str]]) -> CsvValuesType:
 
         if key == "name":
             output["name"] = value
+
+        if key == "recomp_selector":
+            output["recomp_selector"] = value
+
+        if key == "selector_is_symbol":
+            normalized = value.strip().lower()
+            if normalized not in {"true", "false", "1", "0"}:
+                raise CsvInvalidBooleanError(value)
+            output["selector_is_symbol"] = normalized in {"true", "1"}
 
         if key == "size":
             output["size"] = decimal_or_hex(value)

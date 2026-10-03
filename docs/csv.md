@@ -132,3 +132,21 @@ These fields can appear in the CSV file:
 | `size` | Size of the entity in bytes | Decimal number, or hex number with `0x` prefix |
 
 All other fields are ignored.
+
+### Recompiled selectors
+
+An inferred original display name can remain separate from the current
+reconstruction's PDB identity. `recomp_selector` uses the same exact matching
+rules as a source annotation's `RECOMP:` identity. `selector_is_symbol` selects
+a linker symbol (`true`/`1`) or a function name (`false`/`0`). Invalid flags are
+parser errors. A selector is a reconstruction hypothesis, not an independent
+original symbol, and descriptive families are not wildcard matches.
+
+```text
+address|name|type|recomp_selector|selector_is_symbol
+00401000|Container<T>::retained destructor|synthetic|??_G?$Container@H@@UAEPAXI@Z|true
+```
+
+This pairs the original function by the PDB symbol without storing that symbol
+as an original-binary fact. The ordinary `symbol` column remains available for
+independently established original identities.
