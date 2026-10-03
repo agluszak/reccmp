@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 
 from reccmp.compare.manifest import FunctionEntry
 from reccmp.types import ImageId
+from .build_context import is_source_path
 
 
 class Outcome(enum.Enum):
@@ -228,6 +229,10 @@ def consistent(left: Contents, right: Contents) -> bool:
     if _zero_filled(left) and _zero_filled(right):
         return True
     match left, right:
+        case (StringValue(a), StringValue(b)) if is_source_path(a) and is_source_path(
+            b
+        ):
+            return True
         case (StringValue(text), RawBytes(data, extent_known=known)) | (
             RawBytes(data, extent_known=known),
             StringValue(text),
@@ -336,7 +341,12 @@ def classify_inline(
     orig_refs: tuple[DataReference, ...],
     recomp_refs: tuple[DataReference, ...],
 ) -> FunctionResult:
-    """Use the retry without score selection, retaining the ordinary diff."""
+    """Use the retry without score selection, retaining the ordinary diff.
+
+    The retry removes inlining differences; it cannot qualify an ordinary
+    result that already has none."""
+    if normal.outcome == Outcome.NO_DIFFERENCES:
+        return normal
     retry = classify(
         normal.entry,
         failures=code.failures,

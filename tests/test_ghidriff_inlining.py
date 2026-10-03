@@ -344,3 +344,20 @@ def test_export_metadata_is_removed_after_address_normalization():
             return self._normalized(ImageId.ORIG, 0x10054D10, inline=True)
 
     assert Engine().normalized() == ["return 1;\n"]
+
+
+def test_retry_does_not_override_a_clean_ordinary_result():
+    entry, _, _, _ = fixture_model()
+    code = ["return a->foo + 1;\n"]
+    normal = classify(
+        entry,
+        failures=(),
+        orig_code=code,
+        recomp_code=code,
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    retried = classify_inline(
+        normal, InlineCode(code, ["return 2;\n"], (0x1100,)), (), ()
+    )
+    assert retried == normal

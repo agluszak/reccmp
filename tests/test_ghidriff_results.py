@@ -344,3 +344,11 @@ def test_zero_filled_regions_are_consistent_whatever_their_extent():
         RawBytes(b"\x00\x00", False, extent_known=True),
         RawBytes(b"\x00\x01", False, extent_known=True),
     )
+
+
+def test_source_path_strings_are_consistent_build_context():
+    assert consistent(
+        StringValue(r"C:\Projects\SGP\DirectDraw Calls.c"),
+        StringValue(r"Z:\repo\src\sgp\DirectDraw Calls.c"),
+    )
+    assert not consistent(StringValue(r"C:\a.c"), StringValue("a.c"))

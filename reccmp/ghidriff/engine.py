@@ -37,6 +37,10 @@ from .names import (
     replace_paired_raw_addresses,
     unquoted_raw_addresses,
     canonical_parameter_names,
+    label_source_paths,
+    name_identical_code,
+    normalize_source_locations,
+    FUNCTION_TYPES as _FUNCTION_TYPES,
 )
 from .imports import import_locations, known_purge
 from .locations import (
@@ -82,7 +86,6 @@ if TYPE_CHECKING:
 
 # Ghidra names imports itself, the same way in both programs.
 _UNNAMED_TYPES = (EntityType.IMPORT, EntityType.IMPORT_THUNK)
-_FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 # Code the catalog knows starts a function. An import thunk is one too: left
 # alone, Ghidra reads a jump to it as part of the function that jumps.
 _ENTRY_TYPES = (*_FUNCTION_TYPES, EntityType.IMPORT_THUNK)
@@ -178,6 +181,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
         canonical_parameter_names(code)
+        normalize_source_locations(code)
         side = ImageId.ORIG if is_old else ImageId.RECOMP
         if (
             entry_address is None
@@ -533,6 +537,8 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 apply_stack_probe_call_fixups(program, probes)
                 self._infer_requested_prototypes(program, image_id)
                 self._apply_names(program, image_id)
+                label_source_paths(program)
+                name_identical_code(program)
                 self._collect_references(program, image_id)
             finally:
                 program.endTransaction(transaction, True)

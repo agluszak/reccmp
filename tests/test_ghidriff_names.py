@@ -9,7 +9,12 @@ from reccmp.compare.manifest import (
     NamedObject,
     UnpairedEntity,
 )
-from reccmp.ghidriff.names import canonical_parameter_names
+from reccmp.ghidriff.build_context import is_source_path
+from reccmp.ghidriff.names import (
+    canonical_parameter_names,
+    identical_code_name,
+    normalize_source_locations,
+)
 from reccmp.ghidriff.names import (
     canonical_names,
     paired_reference_tokens,
@@ -169,3 +174,32 @@ def test_default_parameter_names_use_reccmp_numbering():
         '  puts("param_1 stays");\n',
         "  return param0 + param11 + xparam_1;\n",
     ]
+
+
+def test_source_path_literals_and_their_lines_are_build_context():
+    code = [
+        "  DirectXAttempt(iVar0,0x6b,SOURCE_FILE);",
+        '  _assert("p != 0","Z:\\\\repo\\\\src\\\\a.c",42);',
+        '  Log(7,"not a path",3);',
+        "  Mix(SOURCE_FILE,0x10,x + 1);",
+    ]
+    normalize_source_locations(code)
+    assert code == [
+        "  DirectXAttempt(iVar0,SOURCE_LINE,SOURCE_FILE);",
+        '  _assert("p != 0",SOURCE_FILE,SOURCE_LINE);',
+        '  Log(7,"not a path",3);',
+        "  Mix(SOURCE_FILE,SOURCE_LINE,x + 1);",
+    ]
+
+
+def test_source_paths_are_absolute_source_files():
+    assert is_source_path(r"C:\Projects\SGP\DirectDraw Calls.c")
+    assert is_source_path("/repo/src/sgp/input.c")
+    assert is_source_path(r"\\server\share\x.cpp")
+    assert not is_source_path("DirectDraw Calls.c")
+    assert not is_source_path(r"C:\Windows\system.ini")
+
+
+def test_identical_code_names_depend_only_on_bytes():
+    assert identical_code_name(b"\xc3") == identical_code_name(bytes([0xC3]))
+    assert identical_code_name(b"\xc3") != identical_code_name(b"\x32\xc0\xc3")

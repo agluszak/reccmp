@@ -1,5 +1,6 @@
 """Canonical catalog names in Ghidra rendering."""
 
+import hashlib
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -7,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from ghidriff import GhidraDiffEngine
 from reccmp.compare.manifest import Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
+from .build_context import SOURCE_FILE, SOURCE_LINE, is_source_path
 from .results import DataReference, ObjectOffset
 
 if TYPE_CHECKING:
@@ -14,6 +16,7 @@ if TYPE_CHECKING:
     from ghidra.program.model.address import Address
 
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
+FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
 _DEFAULT_PARAMETER = re.compile(r"\bparam_(\d+)\b")
 _QUOTED = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""")
@@ -190,3 +193,82 @@ def name_end(program: "Program", instruction: Any, ref: Any, end: ObjectOffset) 
     equate = equates.getEquate(name) or equates.createEquate(name, value)
     if equate.getValue() == value:
         equate.addReference(instruction.getAddress(), ref.getOperandIndex())
+
+
+_INTEGER = r"(?:0x[0-9a-fA-F]+|\d+)"
+_LINE_BEFORE_FILE = re.compile(rf"(?<=[(,])(\s*){_INTEGER}(?=\s*,\s*{SOURCE_FILE}\b)")
+_LINE_AFTER_FILE = re.compile(rf"(\b{SOURCE_FILE}\s*,\s*){_INTEGER}(?=\s*[,)])")
+
+
+def _unquoted(literal: str) -> str:
+    return re.sub(r"\\(.)", r"\1", literal[1:-1])
+
+
+def normalize_source_locations(code: list[str]) -> None:
+    """Show ``__FILE__``/``__LINE__`` arguments as build context."""
+    for index, line in enumerate(code):
+        if line.lstrip().startswith(("/*", "//", "*")):
+            continue
+        parts = GhidraDiffEngine.QUOTED_LITERAL.split(line)
+        for part_index in range(1, len(parts), 2):
+            if parts[part_index].startswith('"') and is_source_path(
+                _unquoted(parts[part_index])
+            ):
+                parts[part_index] = SOURCE_FILE
+        line = "".join(parts)
+        if SOURCE_FILE in line:
+            line = _LINE_BEFORE_FILE.sub(rf"\1{SOURCE_LINE}", line)
+            line = _LINE_AFTER_FILE.sub(rf"\1{SOURCE_LINE}", line)
+        code[index] = line
+
+
+def label_source_paths(program: "Program") -> None:
+    """Give every absolute source-path string the shared ``SOURCE_FILE`` name."""
+    for data in program.getListing().getDefinedData(True):
+        if not data.hasStringValue():
+            continue
+        value = data.getValue()
+        if value is not None and is_source_path(str(value)):
+            label(program, data.getAddress(), SOURCE_FILE)
+
+
+def identical_code_name(body: bytes) -> str:
+    """The name an unpaired reference-free body receives in both programs.
+
+    The linker folds identical functions (ICF); a build compared without ICF
+    keeps them apart. Equal bytes without references are the same function
+    under either layout, so equal bodies get one name."""
+    return f"ICF_{hashlib.sha1(body).hexdigest()[:12]}"
+
+
+# Folded stubs are small; the bound keeps a whole-program pass cheap.
+_IDENTICAL_CODE_MAX_SIZE = 64
+
+
+def reference_free_body(program: "Program", function: Any) -> bytes | None:
+    """The bytes of a small contiguous function body that refers to nothing."""
+    body = function.getBody()
+    if body.getNumAddressRanges() != 1:
+        return None
+    size = int(body.getNumAddresses())
+    if not 0 < size <= _IDENTICAL_CODE_MAX_SIZE:
+        return None
+    references = program.getReferenceManager()
+    for address in body.getAddresses(True):
+        if len(references.getReferencesFrom(address)) != 0:
+            return None
+    buffer = bytearray(size)
+    program.getMemory().getBytes(body.getMinAddress(), buffer)
+    return bytes(buffer)
+
+
+def name_identical_code(program: "Program") -> None:
+    """Name small reference-free functions by their bytes.
+
+    Both programs name equal bytes alike, paired or not: a build linked with
+    identical-code folding keeps one of them, a build without keeps them all,
+    and the code cannot tell them apart."""
+    for function in list(program.getFunctionManager().getFunctions(True)):
+        body = reference_free_body(program, function)
+        if body is not None:
+            rename_function(function, identical_code_name(body))
