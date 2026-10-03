@@ -262,13 +262,64 @@ def reference_free_body(program: "Program", function: Any) -> bytes | None:
     return bytes(buffer)
 
 
-def name_identical_code(program: "Program") -> None:
-    """Name small reference-free functions by their bytes.
+def name_identical_code(
+    orig: "Program", recomp: "Program", manifest: Manifest, names: dict[int, str]
+) -> None:
+    """Name unpaired reference-free bodies whose bytes both programs contain.
 
-    Both programs name equal bytes alike, paired or not: a build linked with
-    identical-code folding keeps one of them, a build without keeps them all,
-    and the code cannot tell them apart."""
-    for function in list(program.getFunctionManager().getFunctions(True)):
-        body = reference_free_body(program, function)
-        if body is not None:
-            rename_function(function, identical_code_name(body))
+    The linker folds identical functions (ICF); a build compared without ICF
+    keeps them apart, and the code cannot tell equal bytes apart. Such a body
+    takes the name of the one pair whose two bodies have those bytes, or else
+    a name derived from the bytes. Paired functions keep their names, and a
+    body only one program contains keeps Ghidra's placeholder."""
+    programs = {ImageId.ORIG: orig, ImageId.RECOMP: recomp}
+    bodies = {
+        image: {
+            function.getEntryPoint().getOffset(): (function, body)
+            for function in program.getFunctionManager().getFunctions(True)
+            if (body := reference_free_body(program, function)) is not None
+        }
+        for image, program in programs.items()
+    }
+    paired = {image: paired_function_entries(manifest, image) for image in programs}
+    canonical: dict[bytes, set[str]] = {}
+    for obj in manifest.objects:
+        if obj.entity_type not in FUNCTION_TYPES:
+            continue
+        left = bodies[ImageId.ORIG].get(obj.orig_addr)
+        right = bodies[ImageId.RECOMP].get(obj.recomp_addr)
+        if left is not None and right is not None and left[1] == right[1]:
+            canonical.setdefault(left[1], set()).add(names[obj.orig_addr])
+    shared = {body for _, body in bodies[ImageId.ORIG].values()} & {
+        body for _, body in bodies[ImageId.RECOMP].values()
+    }
+    for image, program in programs.items():
+        transaction = program.startTransaction("reccmp identical code")
+        try:
+            for address, (function, body) in bodies[image].items():
+                if address in paired[image] or body not in shared:
+                    continue
+                candidates = canonical.get(body, set())
+                rename_function(
+                    function,
+                    (
+                        next(iter(candidates))
+                        if len(candidates) == 1
+                        else identical_code_name(body)
+                    ),
+                )
+        finally:
+            program.endTransaction(transaction, True)
+
+
+def paired_function_entries(manifest: Manifest, image_id: ImageId) -> set[int]:
+    """Entries whose names come from the catalog, in one image."""
+    paired = {
+        obj.addr(image_id)
+        for obj in manifest.objects
+        if obj.entity_type in FUNCTION_TYPES
+    }
+    paired.update(
+        alias.addr for alias in manifest.aliases if alias.image_id == image_id
+    )
+    return paired

@@ -409,6 +409,8 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
                 engine.prepare_program(orig, ImageId.ORIG)
             with _stage("prepare recompiled"):
                 engine.prepare_program(recomp, ImageId.RECOMP)
+            with _stage("align identical code"):
+                engine.align_identical_code(orig, recomp)
             if not args.no_cache and not engine.preparation_failed:
                 with _stage("save prepared programs"):
                     save_prepared(engine.project, prepared_stamp, prepared_key)

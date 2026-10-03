@@ -11,6 +11,8 @@ an inferred cdecl arity when retail independently agrees.
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
 from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
@@ -97,7 +99,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 25
+PREPARATION_REVISION = 26
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -399,6 +401,28 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 recomp=True,
             )
 
+    @contextmanager
+    def _both_programs(self, orig: Path, recomp: Path) -> Iterator[list[Any]]:
+        """Open both programs, saving and closing them afterwards."""
+        programs = [
+            self.project.openProgram("/", self.gen_proj_bin_name_from_path(path), False)
+            for path in (orig, recomp)
+        ]
+        try:
+            yield programs
+            for program in programs:
+                self.project.save(program)
+        finally:
+            for program in programs:
+                self.project.close(program)
+
+    def align_identical_code(self, orig: Path, recomp: Path) -> None:
+        """Name identical folded and unfolded stubs alike in both programs."""
+        with self._both_programs(orig, recomp) as (orig_program, recomp_program):
+            name_identical_code(
+                orig_program, recomp_program, self.manifest, self._names
+            )
+
     def align_import_purges(self, orig: Path, recomp: Path) -> None:
         """Give an import whose stack purge one program does not know the
         purge the other program has for it.
@@ -410,11 +434,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         only. An imported function pops the same arguments whichever binary
         calls it. Runs before analysis, which the purges shape, and again
         after the pristine-project reset, which can restore an unknown purge."""
-        programs = [
-            self.project.openProgram("/", self.gen_proj_bin_name_from_path(path), False)
-            for path in (orig, recomp)
-        ]
-        try:
+        with self._both_programs(orig, recomp) as programs:
             imports = [import_locations(program) for program in programs]
             for program, own, other in (
                 (programs[0], imports[0], imports[1]),
@@ -433,10 +453,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                         function.setStackPurgeSize(purge)
                 finally:
                     program.endTransaction(transaction, True)
-                self.project.save(program)
-        finally:
-            for program in programs:
-                self.project.close(program)
 
     def align_memory_permissions(self, orig: Path, recomp: Path) -> None:
         """Give the original's memory blocks the write permission of the
@@ -447,21 +463,11 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         into its value, so the same instruction would show a constant in one
         program and a name in the other. The recompiled image is the
         linker's own output, so its permissions are the ones both get."""
-        recomp_program = self.project.openProgram(
-            "/", self.gen_proj_bin_name_from_path(recomp), True
-        )
-        try:
+        with self._both_programs(orig, recomp) as (program, recomp_program):
             writable = {
                 block.getName(): block.isWrite()
                 for block in recomp_program.getMemory().getBlocks()
             }
-        finally:
-            self.project.close(recomp_program)
-
-        program = self.project.openProgram(
-            "/", self.gen_proj_bin_name_from_path(orig), False
-        )
-        try:
             transaction = program.startTransaction("reccmp permissions")
             try:
                 for block in program.getMemory().getBlocks():
@@ -470,9 +476,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                         block.setWrite(write)
             finally:
                 program.endTransaction(transaction, True)
-            self.project.save(program)
-        finally:
-            self.project.close(program)
 
     def prepare_program(self, path: Path, image_id: ImageId) -> None:
         """Give one analyzed program reccmp's functions and names, and record
@@ -538,7 +541,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 self._infer_requested_prototypes(program, image_id)
                 self._apply_names(program, image_id)
                 label_source_paths(program)
-                name_identical_code(program)
                 self._collect_references(program, image_id)
             finally:
                 program.endTransaction(transaction, True)
