@@ -80,6 +80,22 @@ Names that begin with `?` are assumed to be [MSVC-like symbols](https://en.wikiv
 // __strlwr
 ```
 
+Names and `SYMBOL` spellings select candidates from the recomp image. They are
+pairing metadata, not independent evidence of original symbols or template
+arguments. To describe a body without claiming exact arguments, separate its
+display name from the recomp selector:
+
+```c++
+// TEMPLATE: TEST 0x10002000
+// NAME: Vector<T>::Grow
+// RECOMP: ?Grow@?$Vector@H@@QAEXH@Z
+```
+
+`NAME:` precedes `RECOMP:` in the same comment block. The selector follows the
+same decorated-symbol/`SYMBOL` rules as legacy name comments. Missing or
+ambiguous selectors remain unmatched; they do not fall back to the display name.
+`TEMPLATE` may also annotate a primary-template definition directly.
+
 ### Code folding
 
 The compiler may combine redundant functions that produce the same instructions. If this occurs, the functions will share the same address. In MSVC, this is controlled by the [`/OPT:ICF`](https://learn.microsoft.com/en-us/cpp/build/reference/opt-optimizations?view=msvc-170) option.

@@ -844,3 +844,65 @@ def test_cached_read_keeps_reader_maps_independent(tmp_path: Path) -> None:
     second = SourceIndex.read(path)
     assert second.source_digests == {"a.cpp": "aaa"}
     assert second.unit_dependencies == {}
+
+
+def test_source_marker_keeps_display_and_recomp_selector_separate(tmp_path: Path):
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _marker_block(
+            "a.cpp",
+            1,
+            "// TEMPLATE: TEST 0x1000",
+            "// NAME: Vec<T>::Grow",
+            "// RECOMP: ?Grow@?$Vec@H@@QAEXH@Z",
+        ),
+        unit_id="a.cpp",
+    )
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"a.cpp"})
+    marker = index.markers[0]
+    assert marker.marker_name == "Vec<T>::Grow"
+    assert marker.recomp_selector == "?Grow@?$Vec@H@@QAEXH@Z"
+    assert marker.selector_is_symbol
+    assert marker.declaration is None
+    path = tmp_path / "index.json"
+    index.write(path)
+    assert SourceIndex.read(path).markers == index.markers
+
+
+def test_function_selector_keeps_its_header_definition(tmp_path: Path) -> None:
+    collector = SourceCollector(tmp_path)
+    collector.collect_record(
+        _declaration(
+            semantic_id="??0Widget@@QAE@XZ",
+            qualified_name="Widget::Widget",
+            semantic_kind="constructor",
+            calling_convention="__thiscall",
+            owning_class="Widget",
+            source_file="include/widget.h",
+            line=4,
+            end_line=7,
+        ),
+        unit_id="a.cpp",
+    )
+    collector.collect_record(
+        _marker_block(
+            "include/widget.h",
+            1,
+            "// FUNCTION: TEST 0x1000",
+            "// NAME: Widget::Widget",
+            "// RECOMP: ??0Widget@@QAE@XZ",
+            candidates=(_function_candidate("??0Widget@@QAE@XZ", "Widget::Widget", 4),),
+        ),
+        unit_id="a.cpp",
+    )
+    index = SourceIndex.from_collector("TEST", collector, unit_ids={"a.cpp"})
+    marker = index.markers[0]
+    assert marker.declaration is not None
+    assert marker.declaration.is_definition
+    assert marker.declaration.qualified_name == "Widget::Widget"
+    assert marker.line == 4
+    assert marker.recomp_selector == "??0Widget@@QAE@XZ"
+    assert marker.selector_is_symbol
+    path = tmp_path / "index.json"
+    index.write(path)
+    assert SourceIndex.read(path).markers == index.markers

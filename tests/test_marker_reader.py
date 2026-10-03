@@ -449,3 +449,66 @@ def test_blocks_seen_by_several_units_merge_their_candidates():
     merged = first.merged(second)
     assert merged.anchor is not None
     assert [c.semantic_id for c in merged.anchor.candidates] == ["a", "b"]
+
+
+def test_display_name_is_not_the_recomp_selector():
+    symbols, alerts = _read(
+        _block(
+            "// TEMPLATE: TEST 0x1000",
+            "// NAME: Vector<T>::Grow (element type unresolved)",
+            "// RECOMP: ?Grow@?$Vector@H@@QAEXH@Z",
+        )
+    )
+    assert not alerts
+    symbol = symbols[0]
+    assert symbol.name == "Vector<T>::Grow (element type unresolved)"
+    assert symbol.selector == "?Grow@?$Vector@H@@QAEXH@Z"
+    assert symbol.selector_is_symbol
+
+
+def test_function_selector_retains_the_compiler_body_anchor():
+    symbols, alerts = _read(
+        _block(
+            "// FUNCTION: TEST 0x1000",
+            "// NAME: Widget::Widget",
+            "// RECOMP: ??0Widget@@QAE@XZ",
+            candidates=(
+                _function("??0Widget@@QAE@XZ", "Widget::Widget", line=4, end_line=7),
+            ),
+        )
+    )
+    assert not alerts
+    function = symbols[0]
+    assert isinstance(function, ParserFunction)
+    assert function.is_nameref()
+    assert function.selector == "??0Widget@@QAE@XZ"
+    assert function.definitions == ("??0Widget@@QAE@XZ",)
+    assert (function.line_number, function.end_line) == (4, 7)
+
+
+def test_function_selector_does_not_promote_a_declaration_to_a_body():
+    symbols, alerts = _read(
+        _block(
+            "// FUNCTION: TEST 0x1000",
+            "// NAME: Widget::Widget",
+            "// RECOMP: ??0Widget@@QAE@XZ",
+            candidates=(_function(is_definition=False),),
+        )
+    )
+    assert not alerts
+    function = symbols[0]
+    assert isinstance(function, ParserFunction)
+    assert function.is_nameref()
+    assert not function.definitions
+
+
+def test_primary_template_definition_can_anchor_a_template_marker():
+    symbols, alerts = _read(
+        _block(
+            "// TEMPLATE: TEST 0x1000",
+            candidates=(_function("template:f", "f<T>"),),
+        )
+    )
+    assert not alerts
+    assert symbols[0].definitions == ("template:f",)
+    assert not symbols[0].is_nameref()

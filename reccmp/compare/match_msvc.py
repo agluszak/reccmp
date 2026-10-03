@@ -40,6 +40,81 @@ class EntityIndex:
         return value
 
 
+def match_annotation_selectors(
+    db: EntityDb,
+    report: ReccmpReportProtocol = reccmp_report_nop,
+    *,
+    truncate: bool = False,
+) -> None:
+    """Resolve recovered selectors against recomp facts, never retail symbols.
+
+    Both sides must identify one candidate. Decorated selectors distinguish
+    overloads; family/member descriptions and evidence prose are not wildcards.
+    """
+    indexes = {True: EntityIndex(), False: EntityIndex()}
+    for ent in db.unmatched(ImageId.RECOMP):
+        if ent.get("type") not in (None, EntityType.FUNCTION):
+            continue
+        assert ent.recomp_addr is not None
+        symbol = ent.fact(ImageId.RECOMP, "symbol")
+        name = ent.fact(ImageId.RECOMP, "name")
+        public_names = ent.fact(ImageId.RECOMP, "public_names", ())
+        for is_symbol, values in (
+            (True, (symbol,) if symbol else ()),
+            (False, (*public_names, *((name,) if name else ()))),
+        ):
+            for value in values:
+                key = value[:255] if truncate else value
+                if not is_symbol:
+                    key = match_name(key)
+                if ent.recomp_addr not in indexes[is_symbol].get(key):
+                    indexes[is_symbol].add(key, ent.recomp_addr)
+
+    selectors = []
+    counts: dict[tuple[bool, str], int] = {}
+    for ent in db.unmatched(ImageId.ORIG):
+        selector = ent.fact(ImageId.ORIG, "recomp_selector")
+        if not selector:
+            continue
+        is_symbol = bool(ent.fact(ImageId.ORIG, "selector_is_symbol"))
+        key = selector[:255] if truncate else selector
+        if not is_symbol:
+            key = match_name(key)
+        selectors.append((ent, is_symbol, key))
+        counts[is_symbol, key] = counts.get((is_symbol, key), 0) + 1
+
+    # A recomp address may have several public names. Count proposals before
+    # binding, rather than selecting the first alias/overload seen.
+    proposals: dict[int, list[int]] = {}
+    for ent, is_symbol, key in selectors:
+        assert ent.orig_addr is not None
+        candidates = indexes[is_symbol].get(key)
+        if len(candidates) == 1 and counts[is_symbol, key] == 1:
+            proposals.setdefault(candidates[0], []).append(ent.orig_addr)
+    with db.batch() as batch:
+        for ent, is_symbol, key in selectors:
+            assert ent.orig_addr is not None
+            candidates = indexes[is_symbol].get(key)
+            if not candidates:
+                report(
+                    ReccmpEvent.NO_MATCH,
+                    ent.orig_addr,
+                    msg=f"No recomp candidate for recovered selector '{key}'",
+                )
+            elif (
+                len(candidates) != 1
+                or counts[is_symbol, key] != 1
+                or len(proposals.get(candidates[0], ())) != 1
+            ):
+                report(
+                    ReccmpEvent.AMBIGUOUS_MATCH,
+                    ent.orig_addr,
+                    msg=f"Ambiguous recovered selector '{key}' ({len(candidates)} recomp candidates)",
+                )
+            else:
+                batch.match(ent.orig_addr, candidates[0], basis=PairBasis.ANNOTATION)
+
+
 def match_symbols(
     db: EntityDb,
     report: ReccmpReportProtocol = reccmp_report_nop,
@@ -67,7 +142,7 @@ def match_symbols(
             assert ent.orig_addr is not None
             symbol = ent.get("symbol")
 
-            if not symbol:
+            if ent.fact(ImageId.ORIG, "recomp_selector") or not symbol:
                 continue
 
             # Repeat the truncate for our match search
@@ -165,7 +240,9 @@ def match_functions(
     orig_entities = [
         ent
         for ent in db.unmatched(ImageId.ORIG)
-        if ent.get("type") == EntityType.FUNCTION and ent.get("name")
+        if ent.get("type") == EntityType.FUNCTION
+        and ent.get("name")
+        and not ent.fact(ImageId.ORIG, "recomp_selector")
     ]
     normalized_names: dict[int, str] = {}
     orig_name_count: dict[str, int] = {}

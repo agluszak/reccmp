@@ -22,7 +22,7 @@ from .results import (
 
 
 def decompiled_lines(code):
-    """Discard only Ghidra's inline-expansion notice, not analysis warnings."""
+    """Discard Ghidra metadata, not code or analysis warnings."""
     return (
         "".join(
             line
@@ -30,6 +30,9 @@ def decompiled_lines(code):
             if not (
                 line.startswith("/* WARNING: Inlined function: ")
                 and line.rstrip().endswith(" */")
+            )
+            and not (
+                line.lstrip().startswith("/* RVA ") and line.rstrip().endswith(" */")
             )
         )
         .lstrip("\n")
@@ -176,6 +179,36 @@ class InlineCandidates:
             self.observation(image, obj.addr(image)) is None for image in self.programs
         )
 
+    def repeated_nonleaf(self, entry, callees):
+        """Ghidra's hard inline model requires one expansion per body."""
+        selected = {f"pair:{obj.orig_addr:#x}": obj for obj in callees}
+        rejected = set()
+        for image, program in self.programs.items():
+            address = entry.orig_addr if image == ImageId.ORIG else entry.recomp_addr
+            reached = self.reached(image, address, callees)
+            owners = [address] + [
+                obj.addr(image) for obj in callees if obj.orig_addr in reached
+            ]
+            counts = Counter(
+                call["identity"]
+                for owner in owners
+                for call in self.continued(image, owner) or ()
+                if call["identity"] in selected
+            )
+            for identity, count in counts.items():
+                if count < 2:
+                    continue
+                function = self.function(image, selected[identity].addr(image))
+                if any(
+                    instruction.getFlowType().isCall()
+                    or instruction.getFlowType().isJump()
+                    for instruction in program.getListing().getInstructions(
+                        function.getBody(), True
+                    )
+                ):
+                    rejected.add(identity)
+        return rejected
+
     def for_pair(self, entry):
         """Asymmetric callees, closed over their tail-call continuations.
 
@@ -213,8 +246,14 @@ class InlineCandidates:
                         selected[identity] = target
                         pending.append(target)
         cyclic = self.recursive(selected)
+        selected = {
+            identity: obj
+            for identity, obj in selected.items()
+            if identity not in cyclic
+        }
+        repeated = self.repeated_nonleaf(entry, tuple(selected.values()))
         return tuple(
-            obj for identity, obj in selected.items() if identity not in cyclic
+            obj for identity, obj in selected.items() if identity not in repeated
         )
 
     def reached(self, image, address, callees):
@@ -232,9 +271,9 @@ class InlineCandidates:
                 continue
             reached.add(obj.orig_addr)
             pending.extend(
-                tail["identity"]
-                for tail in self.tail_calls(image, obj.addr(image))
-                if tail["identity"] in selected
+                call["identity"]
+                for call in self.continued(image, obj.addr(image)) or ()
+                if call["identity"] in selected
             )
         return reached
 
@@ -347,7 +386,7 @@ class InlineNormalizationMixin:
         self.normalize_ghidra_decomp_for_side(
             lines, image_id == ImageId.ORIG, addr, stack_setup, inline=inline
         )
-        return lines
+        return decompiled_lines("".join(lines))
 
     def results(self: Any) -> list[FunctionResult]:
         """One result for every function the manifest requested."""

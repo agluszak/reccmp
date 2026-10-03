@@ -8,7 +8,9 @@ import pytest
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest, NamedObject
 from reccmp.ghidriff.inlining import (
+    Decompiled,
     InlineCandidates,
+    InlineNormalizationMixin,
     decompiled_lines,
     temporary_inline,
 )
@@ -17,7 +19,7 @@ from reccmp.ghidriff.results import InlineCode, Outcome, classify, classify_inli
 from reccmp.types import EntityType, ImageId
 
 
-def fixture_model(size=3, entity_type=EntityType.FUNCTION):
+def fixture_model(size=3, entity_type=EntityType.FUNCTION, branching=False):
     obj = NamedObject(0x1100, 0x2100, "helper", entity_type, 1, 1, PairBasis.ANNOTATION)
     entry = FunctionEntry(0x1000, 0x2000, "caller", PairBasis.ANNOTATION, None, False)
     binary = BinaryInput(Path("unused"), "a")
@@ -48,7 +50,16 @@ def fixture_model(size=3, entity_type=EntityType.FUNCTION):
                 getDefaultAddressSpace=lambda: NS(getAddress=lambda a: a)
             ),
             getFunctionManager=lambda fn=fn: NS(getFunctionAt=lambda _a: fn),
-            getListing=lambda: NS(getInstructions=lambda _body, _forward: range(size)),
+            getListing=lambda: NS(
+                getInstructions=lambda _body, _forward: [
+                    NS(
+                        getFlowType=lambda: NS(
+                            isCall=lambda: False, isJump=lambda: branching
+                        )
+                    )
+                    for _ in range(size)
+                ]
+            ),
             startTransaction=start,
             endTransaction=end,
         )
@@ -101,6 +112,20 @@ def test_equal_repeated_call_counts_are_not_candidates():
     ] * 2
     candidates.calls[ImageId.RECOMP, 0x2000] *= 2
     assert not candidates.for_pair(entry)
+
+
+def test_repeated_branching_callee_stays_as_a_call():
+    entry, _, candidates, _ = fixture_model(branching=True)
+    candidates.calls[ImageId.RECOMP, 0x2000] *= 2
+    assert not candidates.for_pair(entry)
+
+
+def test_repeated_unreachable_body_does_not_prevent_inline():
+    entry, obj, candidates, _ = fixture_model(branching=True)
+    candidates.calls[ImageId.RECOMP, 0x3000] = (
+        candidates.calls[ImageId.RECOMP, 0x2000] * 2
+    )
+    assert candidates.for_pair(entry) == (obj,)
 
 
 @pytest.mark.parametrize("size", [100, 101])
@@ -213,6 +238,16 @@ def test_nested_direct_call_of_candidate_is_not_candidate():
     assert candidates.for_pair(entry) == (obj,)
 
 
+def test_selected_nested_direct_calls_are_reached():
+    entry, obj, nested, candidates = nested_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = candidates.tails[ImageId.RECOMP, 0x2100]
+    candidates.tails[ImageId.RECOMP, 0x2100] = []
+    assert candidates.reached(ImageId.RECOMP, entry.recomp_addr, (obj, nested)) == {
+        obj.orig_addr,
+        nested.orig_addr,
+    }
+
+
 def test_unpaired_or_non_function_identity_is_not_candidate():
     entry, _, candidates, _ = fixture_model()
     candidates.calls[ImageId.RECOMP, 0x2000] = [
@@ -281,8 +316,31 @@ def test_no_retry_is_distinct_from_empty_retry_diff():
 
 
 def test_only_successful_inline_notice_is_removed():
-    code = "\n/* WARNING: Inlined function: Foo */\n\n/* WARNING: Could not inline here */\nreturn 1;\n"
+    code = (
+        "\n/* WARNING: Inlined function: Foo */\n"
+        "/* RVA 1335: Ghidra metadata */\n"
+        "                    /* RVA  1335  ?getWorldSpaceMatrix@srNode@@ */\n"
+        "\n/* WARNING: Could not inline here */\nreturn 1;\n"
+    )
     assert decompiled_lines(code) == [
         "/* WARNING: Could not inline here */\n",
         "return 1;\n",
     ]
+
+
+def test_export_metadata_is_removed_after_address_normalization():
+    code = "                    /* 10054d10  1335  symbol */\nreturn 1;\n"
+
+    class Engine(InlineNormalizationMixin):
+        _inline_decompiled = {(ImageId.ORIG, 0x10054D10): Decompiled(code, None)}
+
+        def normalize_ghidra_decomp_for_side(
+            self, lines, _is_old, _address, _stack_setup, *, inline
+        ):
+            assert inline
+            lines[:] = [line.replace("10054d10", "RVA") for line in lines]
+
+        def normalized(self):
+            return self._normalized(ImageId.ORIG, 0x10054D10, inline=True)
+
+    assert Engine().normalized() == ["return 1;\n"]

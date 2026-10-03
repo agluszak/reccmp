@@ -41,8 +41,19 @@ class ParserFunction(ParserSymbol):
     # referenced by name, but only if this flag is true.
     lookup_by_name: bool = False
 
-    # True if the annotation name is the linker name (symbol) for this entity.
+    # SYMBOL selects a recomp linker spelling, never independent retail provenance.
     name_is_symbol: bool = False
+
+    # Explicit RECOMP selector; name may instead describe a template family/member.
+    recomp_selector: str | None = None
+
+    @property
+    def selector(self) -> str:
+        return self.recomp_selector if self.recomp_selector is not None else self.name
+
+    @property
+    def selector_is_symbol(self) -> bool:
+        return self.name_is_symbol or self.selector.startswith("?")
 
     # True if this address is used by many identical functions.
     is_folded: bool = False
@@ -58,9 +69,10 @@ class ParserFunction(ParserSymbol):
         return self.type == MarkerType.LIBRARY
 
     def is_nameref(self) -> bool:
-        return (
-            self.type in (MarkerType.SYNTHETIC, MarkerType.TEMPLATE, MarkerType.LIBRARY)
-            or self.lookup_by_name
+        return self.lookup_by_name or (
+            not self.definitions
+            and self.type
+            in (MarkerType.SYNTHETIC, MarkerType.TEMPLATE, MarkerType.LIBRARY)
         )
 
 

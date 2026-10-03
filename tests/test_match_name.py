@@ -3,7 +3,14 @@
 import pytest
 
 from reccmp.compare.db import EntityDb
-from reccmp.compare.match_msvc import match_name, match_vtables
+from reccmp.compare.match_msvc import (
+    match_name,
+    match_vtables,
+    match_annotation_selectors,
+    match_symbols,
+    match_functions,
+)
+from reccmp.compare.event import ReccmpEvent
 from reccmp.types import EntityType, ImageId
 
 
@@ -69,3 +76,67 @@ def test_match_name_spells_template_arguments_tight():
     assert match_name("f<T *, U &>") == "f<T*,U&>"
     # An identifier that merely ends in a keyword is left alone.
     assert match_name("Holder<myclass X>") == "Holder<myclass X>"
+
+
+def test_recovered_selector_preserves_original_export_and_overload(db):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            100,
+            type=EntityType.FUNCTION,
+            symbol="original_export",
+            source_name="f<T>::member",
+            recomp_selector="?f@@YAXH@Z",
+            selector_is_symbol=True,
+        )
+        batch.set(
+            ImageId.RECOMP, 200, type=EntityType.FUNCTION, name="f", symbol="?f@@YAXH@Z"
+        )
+        batch.set(
+            ImageId.RECOMP, 210, type=EntityType.FUNCTION, name="f", symbol="?f@@YAXM@Z"
+        )
+    match_annotation_selectors(db)
+    entity = db.get(ImageId.ORIG, 100)
+    assert entity.recomp_addr == 200
+    assert entity.fact(ImageId.ORIG, "symbol") == "original_export"
+    assert entity.fact(ImageId.RECOMP, "symbol") == "?f@@YAXH@Z"
+
+
+@pytest.mark.parametrize(
+    "duplicate_orig,duplicate_recomp", [(True, False), (False, True)]
+)
+def test_ambiguous_selector_has_no_guessed_fallback(
+    db, duplicate_orig, duplicate_recomp
+):
+    with db.batch() as batch:
+        batch.set(
+            ImageId.ORIG,
+            100,
+            type=EntityType.FUNCTION,
+            name="f",
+            symbol="?f@@YAXH@Z",
+            recomp_selector="f",
+        )
+        if duplicate_orig:
+            batch.set(ImageId.ORIG, 110, type=EntityType.FUNCTION, recomp_selector="f")
+        batch.set(
+            ImageId.RECOMP, 200, type=EntityType.FUNCTION, name="f", symbol="?f@@YAXH@Z"
+        )
+        if duplicate_recomp:
+            batch.set(
+                ImageId.RECOMP,
+                210,
+                type=EntityType.FUNCTION,
+                name="f",
+                symbol="?f@@YAXM@Z",
+            )
+    events = []
+
+    def report(event: ReccmpEvent, addr: int, /, msg: str = "") -> None:
+        events.append((event, addr, msg))
+
+    match_annotation_selectors(db, report)
+    match_symbols(db)
+    match_functions(db)
+    assert any(event == ReccmpEvent.AMBIGUOUS_MATCH for event, _, _ in events)
+    assert db.get(ImageId.ORIG, 100).recomp_addr is None
