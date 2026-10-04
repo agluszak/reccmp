@@ -20,6 +20,7 @@ from ghidriff import DecompileResult, FunctionMatch, GhidraDiffEngine
 from reccmp.compare.manifest import FunctionEntry, Manifest
 from reccmp.types import EntityType, ImageId
 
+from .focused import FocusedAnalysisMixin
 from .inlining import Decompiled as _Decompiled, InlineNormalizationMixin
 
 from .contents import (
@@ -99,21 +100,24 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 27
+PREPARATION_REVISION = 28
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
-class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
+class ReccmpDiffEngine(
+    FocusedAnalysisMixin, InlineNormalizationMixin, GhidraDiffEngine
+):
     """A GhidraDiffEngine whose function matches come from a manifest."""
 
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, manifest: Manifest, *args: Any, **kwargs: Any) -> None:
         self.manifest = manifest
-        # A focused comparison needs switch recovery only for its requested
-        # functions. Ghidra's whole-image switch pass dominates cold analysis.
+        self._init_focused_analysis()
+        # Tiny comparisons recover switches explicitly rather than running the
+        # decompiler switch analyzer across the image.
         self.focused_switch_analysis = len(manifest.functions) <= 32
         self._names = canonical_names(manifest.objects)
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
@@ -252,32 +256,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 error=result.error,
             )
         return result
-
-    def analyze_program(
-        self,
-        df_or_prog: Any,
-        require_symbols: bool,
-        force_analysis: bool = False,
-        verbose_analysis: bool = False,
-    ) -> Any:
-        """Correct the imports' stack purge before Ghidra's first analysis."""
-        from ghidra.program.util import GhidraProgramUtilities
-
-        # ghidriff closes the program it is handed.
-        program = self.project.openProgram("/", df_or_prog.getName(), False)
-        if GhidraProgramUtilities.shouldAskToAnalyze(program):
-            transaction = program.startTransaction("reccmp import purges")
-            try:
-                correct_import_purges(program)
-                if self.focused_switch_analysis:
-                    self.set_analysis_option(
-                        program, "Decompiler Switch Analysis", False
-                    )
-            finally:
-                program.endTransaction(transaction, True)
-        return super().analyze_program(
-            program, require_symbols, force_analysis, verbose_analysis
-        )
 
     # --- program preparation ----------------------------------------------
 
@@ -587,6 +565,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
             }
         )
+        known = self._focused_known_entries(program, image_id, requested, known)
         split = []
         for addr in sorted(known | requested.keys()):
             address = space.getAddress(addr)
