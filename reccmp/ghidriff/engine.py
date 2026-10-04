@@ -10,6 +10,7 @@ an inferred cdecl arity when retail independently agrees.
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
+import hashlib
 from pathlib import Path
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -99,7 +100,8 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 27
+PREPARATION_REVISION = 28
+_FOCUSED_ANALYSIS_MAX_FUNCTIONS = 256
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -112,8 +114,16 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
 
     def __init__(self, manifest: Manifest, *args: Any, **kwargs: Any) -> None:
         self.manifest = manifest
-        # A focused comparison needs switch recovery only for its requested
-        # functions. Ghidra's whole-image switch pass dominates cold analysis.
+        # Small selected comparisons should scale with their requested bodies,
+        # not with the size of the whole executable.
+        self.focused_analysis = (
+            0 < len(manifest.functions) <= _FOCUSED_ANALYSIS_MAX_FUNCTIONS
+        )
+        selection = ",".join(f"{entry.orig_addr:x}" for entry in manifest.functions)
+        self._focused_analysis_key = hashlib.sha256(selection.encode("ascii")).hexdigest()[:12]
+        self._objects_by_orig = {obj.orig_addr: obj for obj in manifest.objects}
+        # Tiny comparisons recover switches explicitly rather than running the
+        # decompiler switch analyzer across the image.
         self.focused_switch_analysis = len(manifest.functions) <= 32
         self._names = canonical_names(manifest.objects)
         self._unpaired_names = unpaired_names(manifest, set(self._names.values()))
@@ -164,6 +174,41 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         """Neither program gets debug information: the comparison is of the
         binaries as Ghidra sees them, under reccmp's names only."""
         return None
+
+    def gen_proj_bin_name_from_path(self, path: Path):
+        """Keep focused recomp programs separate by selected function set."""
+        name = super().gen_proj_bin_name_from_path(path)
+        if (
+            self.focused_analysis
+            and Path(path).resolve() == self.manifest.recomp.path.resolve()
+        ):
+            return f"{name}-focus-{self._focused_analysis_key}"
+        return name
+
+    def _image_for_program(self, program: "Program") -> ImageId:
+        name = program.getName()
+        if name == self.gen_proj_bin_name_from_path(self.manifest.orig.path):
+            return ImageId.ORIG
+        if name == self.gen_proj_bin_name_from_path(self.manifest.recomp.path):
+            return ImageId.RECOMP
+        raise ValueError(f"program is not one of this comparison's images: {name}")
+
+    def analysis_scope(self, program: "Program"):
+        """Analyze only selected recomp function extents on focused runs."""
+        if not self.focused_analysis or self._image_for_program(program) != ImageId.RECOMP:
+            return None
+
+        from ghidra.program.model.address import AddressSet
+
+        scope = AddressSet()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        for entry in self._comparable_entries():
+            obj = self._objects_by_orig.get(entry.orig_addr)
+            address = space.getAddress(entry.recomp_addr)
+            size = obj.extent(ImageId.RECOMP) if obj is not None else None
+            end = address.add(size - 1) if size is not None and size > 0 else address
+            scope.addRange(address, end)
+        return scope
 
     def function_matches(self) -> list[FunctionMatch]:
         """Every requested pair that has a function on both sides."""
@@ -265,18 +310,25 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
 
         # ghidriff closes the program it is handed.
         program = self.project.openProgram("/", df_or_prog.getName(), False)
-        if GhidraProgramUtilities.shouldAskToAnalyze(program):
-            transaction = program.startTransaction("reccmp import purges")
+        image_id = self._image_for_program(program)
+        needs_analysis = GhidraProgramUtilities.shouldAskToAnalyze(program)
+        if needs_analysis or (self.focused_analysis and image_id == ImageId.RECOMP):
+            transaction = program.startTransaction("reccmp analysis setup")
             try:
                 correct_import_purges(program)
                 if self.focused_switch_analysis:
                     self.set_analysis_option(
                         program, "Decompiler Switch Analysis", False
                     )
+                if self.focused_analysis and image_id == ImageId.RECOMP:
+                    self._create_functions(program, image_id)
             finally:
                 program.endTransaction(transaction, True)
         return super().analyze_program(
-            program, require_symbols, force_analysis, verbose_analysis
+            program,
+            require_symbols,
+            force_analysis or (self.focused_analysis and image_id == ImageId.RECOMP),
+            verbose_analysis,
         )
 
     # --- program preparation ----------------------------------------------
@@ -587,6 +639,23 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
             }
         )
+        if self.focused_analysis and image_id == ImageId.RECOMP:
+            # Seed only requested functions before initial analysis. Once their
+            # bodies exist, include direct catalogued flow targets so prototype
+            # recovery sees the same callees as a whole-program run.
+            focused = set(requested)
+            listing = program.getListing()
+            for addr in requested:
+                root = functions.getFunctionAt(space.getAddress(addr))
+                if root is None:
+                    continue
+                for instruction in listing.getInstructions(root.getBody(), True):
+                    focused.update(
+                        int(target.getOffset())
+                        for target in instruction.getFlows()
+                        if int(target.getOffset()) in known
+                    )
+            known = focused
         split = []
         for addr in sorted(known | requested.keys()):
             address = space.getAddress(addr)
