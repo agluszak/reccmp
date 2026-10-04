@@ -88,7 +88,22 @@ def direct_call_target(insn: CsInsn) -> int | None:
     return None
 
 
-def code_signature(code: bytes, address: int) -> tuple[bytes | tuple[str, int], ...]:
+SignatureElement = bytes | tuple[str, int]
+
+
+def _signature_element(insn: CsInsn, address: int, end: int) -> SignatureElement:
+    relative = (
+        insn.group(x86_const.X86_GRP_JUMP) or insn.group(x86_const.X86_GRP_CALL)
+    ) and any(operand.type == x86_const.X86_OP_IMM for operand in insn.operands)
+    if not relative:
+        return bytes(insn.bytes)
+    target = insn.operands[0].imm & 0xFFFFFFFF
+    if address <= target < end:
+        return ("inside", target - address)
+    return ("at", target)
+
+
+def code_signature(code: bytes, address: int) -> tuple[SignatureElement, ...]:
     """What a function body is, independent of where it was placed.
 
     Instruction bytes, except that a relative branch is described by its
@@ -97,17 +112,26 @@ def code_signature(code: bytes, address: int) -> tuple[bytes | tuple[str, int], 
     with one signature are the same code, which identical-code folding would
     have kept once."""
     end = address + len(code)
-    signature: list[bytes | tuple[str, int]] = []
-    for insn in instructions(code, address):
-        relative = (
-            insn.group(x86_const.X86_GRP_JUMP) or insn.group(x86_const.X86_GRP_CALL)
-        ) and any(operand.type == x86_const.X86_OP_IMM for operand in insn.operands)
-        if not relative:
-            signature.append(bytes(insn.bytes))
-            continue
-        target = insn.operands[0].imm & 0xFFFFFFFF
-        if address <= target < end:
-            signature.append(("inside", target - address))
-        else:
-            signature.append(("at", target))
-    return tuple(signature)
+    return tuple(
+        _signature_element(insn, address, end) for insn in instructions(code, address)
+    )
+
+
+def leading_signature_element(code: bytes, address: int) -> SignatureElement | None:
+    """The first element of ``code_signature(code, address)``, decoding
+    only the first instruction."""
+    insn = next(instructions(code, address), None)
+    if insn is None:
+        return None
+    return _signature_element(insn, address, address + len(code))
+
+
+def signature_prefix(signature: tuple[SignatureElement, ...]) -> bytes:
+    """The bytes every body with this code signature starts with: its
+    instructions up to the first relative branch."""
+    prefix = bytearray()
+    for element in signature:
+        if not isinstance(element, bytes):
+            break
+        prefix += element
+    return bytes(prefix)

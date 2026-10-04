@@ -31,6 +31,7 @@ from reccmp.compare.analyze import (
     classify_exact_vtable_aliases,
     classify_synthetic_jump_aliases,
     match_unpaired_direct_callees,
+    classify_folded_function_aliases,
     classify_folded_vtable_aliases,
     match_inferred_vtables_by_slots,
 )
@@ -787,6 +788,67 @@ def test_classify_exact_vtable_aliases(db: EntityDb):
     classify_exact_vtable_aliases(db, orig_bin, recomp_bin)
 
     assert db.alias_canonical_orig(ImageId.ORIG, 0x1100) == 0x1000
+
+
+def _calling_body(addr: int, target: int) -> bytes:
+    """push ebp; call target; ret"""
+    return b"\x55\xe8" + struct.pack("<i", target - (addr + 6)) + b"\xc3"
+
+
+def test_classify_folded_function_aliases_by_code_signature(db: EntityDb):
+    with db.batch() as batch:
+        for orig_addr, recomp_addr in ((0x1000, 0x2000), (0x1100, 0x2200)):
+            batch.set(ImageId.ORIG, orig_addr, type=EntityType.FUNCTION, size=7)
+            batch.set(ImageId.RECOMP, recomp_addr, type=EntityType.FUNCTION, size=7)
+            batch.match(orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
+        batch.set(ImageId.RECOMP, 0x2100, type=EntityType.FUNCTION, size=7)
+
+    # The unexplained body calls the same target as the 0x2000 pair through a
+    # different displacement; the 0x2200 pair is other code.
+    code = {
+        0x1000: _calling_body(0x1000, 0x8000),
+        0x1100: b"\x90" * 7,
+        0x2000: _calling_body(0x2000, 0x9000),
+        0x2100: _calling_body(0x2100, 0x9000),
+        0x2200: b"\x90" * 7,
+    }
+    orig_bin = Mock(spec=PEImage)
+    recomp_bin = Mock(spec=PEImage)
+    orig_bin.read.side_effect = lambda addr, size: code[addr][:size]
+    recomp_bin.read.side_effect = lambda addr, size: code[addr][:size]
+
+    classify_folded_function_aliases(db, orig_bin, recomp_bin)
+
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x2100) == 0x1000
+
+
+def test_classify_folded_function_aliases_of_jump_thunks(db: EntityDb):
+    with db.batch() as batch:
+        for orig_addr, recomp_addr in ((0x1000, 0x2000), (0x1100, 0x2200)):
+            batch.set(ImageId.ORIG, orig_addr, type=EntityType.FUNCTION, size=5)
+            batch.set(ImageId.RECOMP, recomp_addr, type=EntityType.FUNCTION, size=5)
+            batch.match(orig_addr, recomp_addr, basis=PairBasis.ANNOTATION)
+        batch.set(ImageId.RECOMP, 0x2100, type=EntityType.FUNCTION, size=5)
+
+    def jump(addr: int, target: int) -> bytes:
+        return b"\xe9" + struct.pack("<i", target - (addr + 5))
+
+    # Only the 0x2000 pair jumps where the unexplained thunk does.
+    code = {
+        0x1000: jump(0x1000, 0x8000),
+        0x1100: jump(0x1100, 0x8100),
+        0x2000: jump(0x2000, 0x9000),
+        0x2100: jump(0x2100, 0x9000),
+        0x2200: jump(0x2200, 0x9100),
+    }
+    orig_bin = Mock(spec=PEImage)
+    recomp_bin = Mock(spec=PEImage)
+    orig_bin.read.side_effect = lambda addr, size: code[addr][:size]
+    recomp_bin.read.side_effect = lambda addr, size: code[addr][:size]
+
+    classify_folded_function_aliases(db, orig_bin, recomp_bin)
+
+    assert db.alias_canonical_orig(ImageId.RECOMP, 0x2100) == 0x1000
 
 
 def test_classify_folded_vtable_aliases_by_paired_slots(db: EntityDb):

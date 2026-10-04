@@ -5,7 +5,7 @@ These functions update the entity database based on analysis of the binary files
 import logging
 import re
 import struct
-from typing import Mapping
+from typing import Iterable, Iterator, Mapping, TypeVar
 from reccmp.formats import Image, PEImage
 from reccmp.formats.exceptions import (
     InvalidVirtualAddressError,
@@ -24,7 +24,13 @@ from reccmp.analysis import (
     is_likely_latin1,
     is_likely_widechar,
 )
-from reccmp.analysis.x86 import code_signature, direct_call_target, instructions
+from reccmp.analysis.x86 import (
+    code_signature,
+    direct_call_target,
+    instructions,
+    leading_signature_element,
+    signature_prefix,
+)
 from reccmp.analysis.crt_startup import (
     detect_crt_startup_arrays,
     get_crt_function_name,
@@ -598,16 +604,74 @@ def match_inferred_vtables_by_slots(
     db.bulk_match(pairs, basis=PairBasis.DERIVED)
 
 
-def _function_signature(
+def _function_code(
     binfile: PEImage, addr: int | None, size: int | None
-) -> tuple | None:
+) -> bytes | None:
     if addr is None or size is None or size <= 0:
         return None
     try:
-        code = bytes(binfile.read(addr, size))
+        return bytes(binfile.read(addr, size))
     except (InvalidVirtualAddressError, InvalidVirtualReadError):
         return None
+
+
+def _function_signature(
+    binfile: PEImage, addr: int | None, size: int | None
+) -> tuple | None:
+    code = _function_code(binfile, addr, size)
+    if code is None:
+        return None
+    assert addr is not None
     return code_signature(code, addr)
+
+
+_T = TypeVar("_T")
+
+
+class _SignaturePrefixes:
+    """Rule out bodies that cannot have one of the wanted code signatures
+    without decoding them: a body with a signature starts with its prefix.
+    A signature that starts with a relative branch has no prefix; a body
+    can have it only when its first instruction is that same branch."""
+
+    def __init__(self, signatures: Iterable[tuple]) -> None:
+        self._prefixes = set()
+        self._branches = set()
+        for signature in signatures:
+            prefix = signature_prefix(signature)
+            if prefix:
+                self._prefixes.add(prefix)
+            else:
+                self._branches.add(signature[0])
+        self._lengths = sorted({len(prefix) for prefix in self._prefixes})
+
+    def may_match(self, code: bytes, address: int) -> bool:
+        if any(code[:length] in self._prefixes for length in self._lengths):
+            return True
+        return (
+            bool(self._branches)
+            and leading_signature_element(code, address) in self._branches
+        )
+
+
+def _signatures_among(
+    binfile: PEImage,
+    bodies: Iterable[tuple[_T, int | None, int | None]],
+    wanted: set[tuple],
+) -> Iterator[tuple[_T, tuple]]:
+    """(key, signature) of each (key, address, size) body whose code
+    signature is wanted."""
+    prefixes = _SignaturePrefixes(wanted)
+    for key, addr, size in bodies:
+        code = _function_code(binfile, addr, size)
+        if code is None:
+            continue
+        assert addr is not None
+        if not prefixes.may_match(code, addr):
+            continue
+        signature = code_signature(code, addr)
+        if signature in wanted:
+            yield key, signature
 
 
 def classify_folded_function_aliases(
@@ -627,23 +691,35 @@ def classify_folded_function_aliases(
     empty bodies apart, for one. When another function of the original
     starts with the pair's code, the folded copy could be either, so it
     keeps no identity."""
-    canonical: dict[tuple, set[int]] = {}
-    for pair in db.get_matches_by_type(EntityType.FUNCTION):
-        signature = _function_signature(
-            recomp_bin, pair.recomp_addr, pair.size(ImageId.RECOMP)
-        )
-        if signature:
-            canonical.setdefault(signature, set()).add(pair.orig_addr)
-
-    folded: dict[int, list[tuple[int, int]]] = {}
+    # Few recompiled functions are unexplained; decode only the bodies that
+    # could share one of their signatures.
+    candidates: list[tuple[int, int, tuple]] = []
     for candidate in tuple(db.unexplained(ImageId.RECOMP)):
         if candidate.get("type") != EntityType.FUNCTION:
             continue
         addr = candidate.addr(ImageId.RECOMP)
         size = candidate.size(ImageId.RECOMP)
         signature = _function_signature(recomp_bin, addr, size)
-        identities = canonical.get(signature, set()) if signature else set()
-        if addr is not None and size is not None and len(identities) == 1:
+        if signature and addr is not None and size is not None:
+            candidates.append((addr, size, signature))
+    if not candidates:
+        return
+
+    canonical: dict[tuple, set[int]] = {}
+    for orig_addr, signature in _signatures_among(
+        recomp_bin,
+        (
+            (pair.orig_addr, pair.recomp_addr, pair.size(ImageId.RECOMP))
+            for pair in db.get_matches_by_type(EntityType.FUNCTION)
+        ),
+        {signature for _, _, signature in candidates},
+    ):
+        canonical.setdefault(signature, set()).add(orig_addr)
+
+    folded: dict[int, list[tuple[int, int]]] = {}
+    for addr, size, signature in candidates:
+        identities = canonical.get(signature, set())
+        if len(identities) == 1:
             folded.setdefault(size, []).append((addr, next(iter(identities))))
     if not folded:
         return
@@ -654,15 +730,20 @@ def classify_folded_function_aliases(
         if entity.get("type") == EntityType.FUNCTION
         and (addr := entity.addr(ImageId.ORIG)) is not None
     ]
-    for size, candidates in folded.items():
+    for size, entries in folded.items():
+        targets = [
+            (addr, orig_addr, _function_signature(orig_bin, orig_addr, size))
+            for addr, orig_addr in entries
+        ]
         # Original bodies at this length, compared within the original.
         bodies: dict[tuple, int] = {}
-        for addr in originals:
-            signature = _function_signature(orig_bin, addr, size)
-            if signature:
-                bodies[signature] = bodies.get(signature, 0) + 1
-        for addr, orig_addr in candidates:
-            signature = _function_signature(orig_bin, orig_addr, size)
+        for _, signature in _signatures_among(
+            orig_bin,
+            ((addr, addr, size) for addr in originals),
+            {signature for _, _, signature in targets if signature},
+        ):
+            bodies[signature] = bodies.get(signature, 0) + 1
+        for addr, orig_addr, signature in targets:
             if signature and bodies.get(signature) == 1:
                 db.set_alias(ImageId.RECOMP, addr, orig_addr)
 
