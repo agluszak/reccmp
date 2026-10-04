@@ -18,7 +18,9 @@ class FocusedAnalysisMixin:
         self.focused_analysis = (
             0 < len(self.manifest.functions) <= _FOCUSED_ANALYSIS_MAX_FUNCTIONS
         )
-        selection = ",".join(f"{entry.orig_addr:x}" for entry in self.manifest.functions)
+        selection = ",".join(
+            f"{entry.orig_addr:x}" for entry in self.manifest.functions
+        )
         self._focused_analysis_key = hashlib.sha256(
             selection.encode("ascii")
         ).hexdigest()[:12]
