@@ -62,6 +62,40 @@ class FocusedAnalysisMixin:
             scope.addRange(address, end)
         return scope
 
+    def analyze_program(
+        self,
+        df_or_prog: Any,
+        require_symbols: bool,
+        force_analysis: bool = False,
+        verbose_analysis: bool = False,
+    ) -> Any:
+        """Prepare the rebuilt image before Ghidriff runs scoped analysis."""
+        from ghidra.program.util import GhidraProgramUtilities
+
+        from .preparation import correct_import_purges
+
+        program = self.project.openProgram("/", df_or_prog.getName(), False)
+        image_id = self._image_for_program(program)
+        focused_recomp = self.focused_analysis and image_id == ImageId.RECOMP
+        if GhidraProgramUtilities.shouldAskToAnalyze(program) or focused_recomp:
+            transaction = program.startTransaction("reccmp analysis setup")
+            try:
+                correct_import_purges(program)
+                if self.focused_switch_analysis:
+                    self.set_analysis_option(
+                        program, "Decompiler Switch Analysis", False
+                    )
+                if focused_recomp:
+                    self._create_functions(program, image_id)
+            finally:
+                program.endTransaction(transaction, True)
+        return super().analyze_program(
+            program,
+            require_symbols,
+            force_analysis or focused_recomp,
+            verbose_analysis,
+        )
+
     def _focused_known_entries(
         self,
         program: Any,
