@@ -106,7 +106,9 @@ PREPARATION_REVISION = 28
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
 # unused matcher raises NotImplementedError, which pylint reads as abstract.
 # pylint: disable-next=abstract-method
-class ReccmpDiffEngine(FocusedAnalysisMixin, InlineNormalizationMixin, GhidraDiffEngine):
+class ReccmpDiffEngine(
+    FocusedAnalysisMixin, InlineNormalizationMixin, GhidraDiffEngine
+):
     """A GhidraDiffEngine whose function matches come from a manifest."""
 
     # pylint: disable=too-many-instance-attributes
@@ -254,39 +256,6 @@ class ReccmpDiffEngine(FocusedAnalysisMixin, InlineNormalizationMixin, GhidraDif
                 error=result.error,
             )
         return result
-
-    def analyze_program(
-        self,
-        df_or_prog: Any,
-        require_symbols: bool,
-        force_analysis: bool = False,
-        verbose_analysis: bool = False,
-    ) -> Any:
-        """Correct the imports' stack purge before Ghidra's first analysis."""
-        from ghidra.program.util import GhidraProgramUtilities
-
-        # ghidriff closes the program it is handed.
-        program = self.project.openProgram("/", df_or_prog.getName(), False)
-        image_id = self._image_for_program(program)
-        needs_analysis = GhidraProgramUtilities.shouldAskToAnalyze(program)
-        if needs_analysis or (self.focused_analysis and image_id == ImageId.RECOMP):
-            transaction = program.startTransaction("reccmp analysis setup")
-            try:
-                correct_import_purges(program)
-                if self.focused_switch_analysis:
-                    self.set_analysis_option(
-                        program, "Decompiler Switch Analysis", False
-                    )
-                if self.focused_analysis and image_id == ImageId.RECOMP:
-                    self._create_functions(program, image_id)
-            finally:
-                program.endTransaction(transaction, True)
-        return super().analyze_program(
-            program,
-            require_symbols,
-            force_analysis or (self.focused_analysis and image_id == ImageId.RECOMP),
-            verbose_analysis,
-        )
 
     # --- program preparation ----------------------------------------------
 
