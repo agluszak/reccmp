@@ -6,6 +6,8 @@ jobs:
   python-format:
     name: 'Python Format'
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: '3.15'
 
     steps:
     - uses: actions/checkout@v7
@@ -13,7 +15,8 @@ jobs:
 
     - uses: actions/setup-python@v7
       with:
-        python-version: '3.14'
+        python-version: '3.15'
+        allow-prereleases: true
 
     - name: Install python libraries
       shell: bash
