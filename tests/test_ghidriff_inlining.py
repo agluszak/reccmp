@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
+from ghidriff.code import normalize_code
 
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest, NamedObject
@@ -68,6 +69,7 @@ def fixture_model(size=3, entity_type=EntityType.FUNCTION, branching=False):
                     for _ in range(size)
                 ]
             ),
+            getReferenceManager=lambda: NS(getReferencesTo=lambda _target: []),
             startTransaction=start,
             endTransaction=end,
         )
@@ -345,6 +347,9 @@ def test_only_successful_inline_notice_is_removed():
         "\n/* WARNING: Could not inline here */\nreturn 1;\n"
     )
     assert decompiled_lines(code) == [
+        "/* RVA 1335: Ghidra metadata */\n",
+        "                    /* RVA  1335  ?getWorldSpaceMatrix@srNode@@ */\n",
+        "\n",
         "/* WARNING: Could not inline here */\n",
         "return 1;\n",
     ]
@@ -360,7 +365,8 @@ def test_export_metadata_is_removed_after_address_normalization():
             self, lines, _is_old, _address, _stack_setup, *, inline
         ):
             assert inline
-            lines[:] = [line.replace("10054d10", "RVA") for line in lines]
+
+            normalize_code(lines)
 
         def normalized(self):
             return self._normalized(ImageId.ORIG, 0x10054D10, inline=True)

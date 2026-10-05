@@ -17,6 +17,7 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
     selection_sha256: str
     reccmp_version: str
     ghidra_version: str
+    decompiler_sha256: str
     ghidriff_version: str
     analysis_key: str
     preparation_key: str
@@ -36,9 +37,11 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
         from .engine import ANALYSIS_REVISION, PREPARATION_REVISION
 
         ghidra_version = str(engine.get_ghidra_version())
+        decompiler_sha256 = native_decompiler_digest(Path(engine.launcher.install_dir))
         analysis_key = (
             f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
-            f"-ghidra{ghidra_version}-ghidriff{ghidriff.__version__}"
+            f"-ghidra{ghidra_version}-native{decompiler_sha256[:12]}"
+            f"-ghidriff{ghidriff.__version__}"
             f"-reccmp{ANALYSIS_REVISION}"
             f"{'-switchfocus1' if engine.focused_switch_analysis else ''}"
         )
@@ -61,6 +64,7 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
                     preparation_key,
                     analysis_key,
                     normalization_key,
+                    decompiler_sha256,
                     args.decompiler_timeout,
                     args.threaded,
                     args.max_ram_percent,
@@ -77,6 +81,7 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
             selection_sha256,
             reccmp.VERSION,
             ghidra_version,
+            decompiler_sha256,
             ghidriff.__version__,
             analysis_key,
             preparation_key,
@@ -91,3 +96,21 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
 
     def to_json(self) -> dict:
         return asdict(self)
+
+
+def native_decompiler_digest(install_dir: Path) -> str:
+    """Native patches can change output without changing the Ghidra version."""
+    # pylint: disable=import-outside-toplevel,import-error
+    from ghidra.framework import Platform
+
+    platform = Platform.CURRENT_PLATFORM
+    path = (
+        install_dir
+        / "Ghidra"
+        / "Features"
+        / "Decompiler"
+        / "os"
+        / str(platform.getDirectoryName())
+    )
+    path /= "decompile" + str(platform.getExecutableExtension())
+    return hashlib.sha256(path.read_bytes()).hexdigest()

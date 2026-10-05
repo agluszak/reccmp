@@ -33,9 +33,6 @@ def decompiled_lines(code):
                 line.startswith("/* WARNING: Inlined function: ")
                 and line.rstrip().endswith(" */")
             )
-            and not (
-                line.lstrip().startswith("/* RVA ") and line.rstrip().endswith(" */")
-            )
         )
         .lstrip("\n")
         .splitlines(True)
@@ -295,6 +292,41 @@ def temporary_inline(programs, candidates, decompilers=()):
                     space.getAddress(obj.addr(image))
                 )
                 function.setInline(True)
+            # A direct jump into an inline callee is a tail call: retain its
+            # existing machine stack and terminate the caller after expansion.
+            # CALL_RETURN tells Ghidra this explicitly instead of leaving an
+            # inferred CALL without a continuation. Transaction rollback also
+            # restores every instruction override.
+            listing = program.getListing()
+            references = program.getReferenceManager()
+            for obj in candidates:
+                target = space.getAddress(obj.addr(image))
+                for reference in references.getReferencesTo(target):
+                    instruction = listing.getInstructionAt(reference.getFromAddress())
+                    if instruction is None:
+                        continue
+                    # JVM packages become available only after startup.
+                    # pylint: disable=import-outside-toplevel,import-error
+                    from ghidra.program.model.listing import FlowOverride
+
+                    if instruction.getFlowOverride() not in (
+                        FlowOverride.NONE,
+                        FlowOverride.CALL,
+                    ):
+                        continue
+                    flow = instruction.getPrototype().getFlowType(
+                        instruction.getInstructionContext()
+                    )
+                    if not flow.isJump() or flow.isConditional():
+                        continue
+                    flows = instruction.getFlows()
+                    if len(flows) != 1 or flows[0] != target:
+                        continue
+                    owner = program.getFunctionManager().getFunctionContaining(
+                        instruction.getAddress()
+                    )
+                    if owner is not None and not owner.getBody().contains(target):
+                        instruction.setFlowOverride(FlowOverride.CALL_RETURN)
         for decompiler in decompilers:
             decompiler.flushCache()
         yield

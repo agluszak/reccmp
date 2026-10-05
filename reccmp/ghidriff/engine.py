@@ -36,8 +36,8 @@ from .names import (
     unpaired_names,
     canonical_names,
     paired_reference_tokens,
+    paired_displayed_data_tokens,
     replace_paired_raw_addresses,
-    unquoted_raw_addresses,
     label_source_paths,
     name_identical_code,
     normalize_source_locations,
@@ -53,6 +53,7 @@ from .locations import (
     bitwise_scalar_operand,
     only_compared,
     register_operand,
+    string_start,
 )
 from .preparation import (
     clear_data,
@@ -61,6 +62,7 @@ from .preparation import (
     apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
     correct_recompiled_signatures,
+    correct_legacy_crt_signatures,
     correct_import_purges,
     infer_requested_callee_parameters,
     recover_requested_switches,
@@ -98,7 +100,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 29
+PREPARATION_REVISION = 30
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -209,14 +211,15 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             and original.code
             and recompiled.code
         ):
-            orig_raw = unquoted_raw_addresses(original.code)
-            recomp_raw = unquoted_raw_addresses(recompiled.code)
-            for address in orig_raw & self._paired_data_addrs.keys():
-                paired = self._paired_data_addrs[address]
-                if paired in recomp_raw and address != paired:
-                    token = f"PAIRED_DATA_{address:x}_0"
-                    orig_tokens[address] = token
-                    recomp_tokens[paired] = token
+            pointer_orig, pointer_recomp = paired_displayed_data_tokens(
+                original.code,
+                recompiled.code,
+                self._extents[ImageId.ORIG],
+                self._extents[ImageId.RECOMP],
+                self._paired_data_addrs,
+            )
+            orig_tokens.update(pointer_orig)
+            recomp_tokens.update(pointer_recomp)
         replace_paired_raw_addresses(
             code, orig_tokens if side == ImageId.ORIG else recomp_tokens
         )
@@ -348,6 +351,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             if alias.image_id == image_id
             and self._pair_type(alias.canonical_orig) in _FUNCTION_TYPES
         )
+        correct_legacy_crt_signatures(program)
         requested = [
             self._entry_addr(entry, image_id) for entry in self._comparable_entries()
         ]
@@ -790,7 +794,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                             image_id, instruction, operand, to
                         )
                     if bound is None and access is None:
-                        to = self._string_start(program, image_id, to)
+                        to = string_start(program, self._extents[image_id], to)
                     targets.setdefault(Use(to.getOffset(), bound, access), to)
             collected[(image_id, entry.orig_addr)] = tuple(
                 self._reference(program, image_id, to, use)
@@ -804,26 +808,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 )
             )
         return collected
-
-    def _string_start(
-        self, program: "Program", image_id: ImageId, address: "Address"
-    ) -> "Address":
-        """The string an address inside a string belongs to.
-
-        Scanning a string, as an inlined strlen does, leaves Ghidra's
-        constant propagation with a reference a byte or so into it; the
-        function refers to the string, not to its tail."""
-        from ghidra.program.model.data import StringDataInstance
-
-        located = self._extents[image_id].containing(address.getOffset())
-        if located is not None:
-            if located.entity_type in STRING_TYPES:
-                return address.subtract(located.offset)
-            return address
-        data = program.getListing().getDataContaining(address)
-        if data is not None and StringDataInstance.isString(data):
-            return data.getMinAddress()
-        return address
 
     def _compared_end(
         self, image_id: ImageId, instruction: Any, operand: int, to: "Address"

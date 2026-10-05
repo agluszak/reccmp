@@ -77,6 +77,53 @@ def preparation_corrections(program) -> tuple[PreparationCorrection, ...]:
     return tuple(corrections)
 
 
+def correct_legacy_crt_signatures(program: "Program") -> None:
+    """MSVCRT's swprintf predates the size-taking ISO C signature.
+
+    The PE import identifies this ABI; UCRT and non-Windows swprintf are
+    deliberately excluded. On x86 it is cdecl (buffer, format, ...), with
+    two UTF-16 pointer parameters. A size-taking prototype consumes caller
+    stack state as a third argument, including an inline call's return address.
+    """
+    from ghidra.program.model.data import (
+        IntegerDataType,
+        PointerDataType,
+        WideChar16DataType,
+    )
+    from ghidra.program.model.listing import Function, ParameterImpl
+    from ghidra.program.model.symbol import SourceType
+    from .imports import import_locations
+
+    if (
+        program.getDefaultPointerSize() != 4
+        or str(program.getLanguage().getProcessor()) != "x86"
+    ):
+        return
+    for (library, name), location in import_locations(program).items():
+        if library != "MSVCRT.DLL" or name != "swprintf":
+            continue
+        function = location.getFunction() or location.createFunction()
+        before = _signature(function)
+        wide_pointer = PointerDataType(WideChar16DataType.dataType)
+        function.setCallingConvention("__cdecl")
+        function.setReturnType(IntegerDataType.dataType, SourceType.IMPORTED)
+        function.replaceParameters(
+            Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+            True,
+            SourceType.IMPORTED,
+            ParameterImpl("buffer", wide_pointer, program),
+            ParameterImpl("format", wide_pointer, program),
+        )
+        function.setVarArgs(True)
+        function.setStackPurgeSize(0)
+        _record_correction(
+            program,
+            function,
+            before,
+            "MSVCRT.DLL legacy swprintf ABI: buffer, format, ...",
+        )
+
+
 def decompile_fresh(
     program: "Program",
     function: "Function",

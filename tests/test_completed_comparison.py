@@ -29,13 +29,20 @@ def fixture_prepared_comparison(tmp_path, monkeypatch):
     monkeypatch.setattr(ghidriff, "__file__", str(module))
     state: dict[str, Any] = {
         "version": "12.1.4",
+        "native": "release-decompiler",
         "reviewed": {},
         "runs": 0,
         "failed": False,
     }
 
+    monkeypatch.setattr(
+        "reccmp.ghidriff.inputs.native_decompiler_digest",
+        lambda _install_dir: state["native"],
+    )
+
     class Engine:
         focused_switch_analysis = False
+        launcher = SimpleNamespace(install_dir=tmp_path)
 
         def __init__(self, *_args, **_kwargs):
             pass
@@ -108,6 +115,7 @@ def test_completed_comparison_reuses_results_and_regenerates_report(
         "timeout",
         "reviewed",
         "ghidra",
+        "native",
         "implementation",
         "no-cache",
     ],
@@ -117,6 +125,7 @@ def test_changed_comparison_inputs_invalidate_completed_result(
 ):
     args, manifest, state, module = prepared_comparison
     _run_engine(args, manifest)
+    initial = json.loads((args.output / "summary.json").read_text())["inputs"]
     if change == "binary":
         manifest = replace(manifest, recomp=replace(manifest.recomp, sha256="c" * 64))
     elif change == "identity":
@@ -129,12 +138,18 @@ def test_changed_comparison_inputs_invalidate_completed_result(
         state["reviewed"] = {0x1000: "unsigned long"}
     elif change == "ghidra":
         state["version"] = "12.2"
+    elif change == "native":
+        state["native"] = "patched-decompiler"
     elif change == "implementation":
         module.write_text("# changed implementation")
     elif change == "no-cache":
         args.no_cache = True
     _run_engine(args, manifest)
     assert state["runs"] == 2
+    if change == "native":
+        changed = json.loads((args.output / "summary.json").read_text())["inputs"]
+        assert changed["analysis_key"] != initial["analysis_key"]
+        assert changed["comparison_key"] != initial["comparison_key"]
 
 
 def test_analysis_failure_is_retried(prepared_comparison):

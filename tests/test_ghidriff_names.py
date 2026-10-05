@@ -17,6 +17,7 @@ from reccmp.ghidriff.names import (
 from reccmp.ghidriff.names import (
     canonical_names,
     paired_reference_tokens,
+    paired_displayed_data_tokens,
     replace_paired_raw_addresses,
     unquoted_raw_addresses,
     unpaired_names,
@@ -194,3 +195,26 @@ def test_source_paths_are_absolute_source_files():
 def test_identical_code_names_depend_only_on_bytes():
     assert identical_code_name(b"\xc3") == identical_code_name(bytes([0xC3]))
     assert identical_code_name(b"\xc3") != identical_code_name(b"\x32\xc0\xc3")
+
+
+def test_displayed_pointer_offsets_require_exact_paired_data_identity():
+    obj = NamedObject(
+        0x5000, 0x6000, "samples", EntityType.DATA, 0x80, 0x80, PairBasis.ANNOTATION
+    )
+    binary = BinaryInput(Path("x"), "0")
+    manifest = Manifest("T", binary, binary, (), (obj,), ())
+    original = Extents(manifest, ImageId.ORIG)
+    recomp = Extents(manifest, ImageId.RECOMP)
+    old, new = paired_displayed_data_tokens(
+        "if ((int *)0x5017 < p) {}", "if ((int *)0x6017 < p) {}", original, recomp, {}
+    )
+    assert old == {0x5017: "PAIRED_DATA_5000_17"}
+    assert new == {0x6017: "PAIRED_DATA_5000_17"}
+    for a, b in [
+        ("(int *)0x5017", "(int *)0x6018"),
+        ("x = 0x5017", "x = 0x6017"),
+        ("(int *)0x5080", "(int *)0x6080"),
+        ('"(int *)0x5017"', '"(int *)0x6017"'),
+        ("/* (int *)0x5017 */", "/* (int *)0x6017 */"),
+    ]:
+        assert paired_displayed_data_tokens(a, b, original, recomp, {}) == ({}, {})

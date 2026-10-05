@@ -10,6 +10,7 @@ from reccmp.compare.manifest import Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
 from .build_context import SOURCE_FILE, SOURCE_LINE, is_source_path
 from .results import DataReference, ObjectOffset
+from .locations import Extents
 
 if TYPE_CHECKING:
     from ghidra.program.model.listing import Program
@@ -110,6 +111,64 @@ def paired_reference_tokens(
         orig_tokens[orig_addr] = token
         recomp_tokens[recomp_addr] = token
     return orig_tokens, recomp_tokens
+
+
+def paired_displayed_data_tokens(
+    orig_code: str,
+    recomp_code: str,
+    orig_extents: Extents,
+    recomp_extents: Extents,
+    paired_data_addrs: dict[int, int],
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Identify displayed pointers inside paired data even without references.
+
+    Ghidra can shift comparison constants by one byte and drop their memory
+    reference. Only explicit pointer casts at the same catalog offset on both
+    sides establish identity here; integers and unknown endpoints stay unknown.
+    """
+    pointer = re.compile(
+        r"\((?:[A-Za-z_]\w*\s+)*[A-Za-z_]\w*\s*\*+\s*\)\s*(0x[0-9a-fA-F]+)(?![\w])"
+    )
+    addresses = [
+        {
+            int(m[1], 16)
+            for kind, part in code_tokens(code)
+            if kind == "code"
+            for m in pointer.finditer(part)
+        }
+        for code in (orig_code, recomp_code)
+    ]
+    old, new = {}, {}
+    for address in addresses[0]:
+        located = orig_extents.containing(address)
+        if (
+            located is None
+            or located.named is None
+            or located.entity_type != EntityType.DATA
+        ):
+            continue
+        paired = located.named.recomp_addr + located.offset
+        counterpart = recomp_extents.containing(paired)
+        if (
+            paired not in addresses[1]
+            or counterpart is None
+            or counterpart.named != located.named
+            or counterpart.offset != located.offset
+        ):
+            continue
+        token = f"PAIRED_DATA_{located.named.orig_addr:x}_{located.offset:x}"
+        old[address] = token
+        new[paired] = token
+    # Existing exact-base matching also handles integer-rendered addresses.
+    orig_raw = unquoted_raw_addresses(orig_code)
+    recomp_raw = unquoted_raw_addresses(recomp_code)
+    for address in orig_raw & paired_data_addrs.keys():
+        paired = paired_data_addrs[address]
+        if paired in recomp_raw and address != paired:
+            token = f"PAIRED_DATA_{address:x}_0"
+            old[address] = token
+            new[paired] = token
+    return old, new
 
 
 def canonical_names(objects: tuple[NamedObject, ...]) -> dict[int, str]:

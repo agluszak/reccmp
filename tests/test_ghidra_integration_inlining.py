@@ -18,6 +18,10 @@ from reccmp.types import EntityType, ImageId
 class NativeFixtureEngine(ReccmpDiffEngine):
     """Register in-memory programs normally registered during preparation."""
 
+    def inline_code(self, image, address):
+        """Read native retry text for the synthetic fixture."""
+        return self._inline_decompiled[(image, address)].code
+
     def register_side(self, program, image):
         """Use the same program identity as production decompilation pools."""
         self._sides[self._program_key(program)] = image
@@ -319,7 +323,7 @@ def test_native_inline_retry(pytestconfig, changed):
             program.release(consumer)
 
 
-def _create_tail_call_functions(prog, image):
+def _create_tail_call_functions(prog, image, branching=False):
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.data import IntegerDataType, PointerDataType
     from ghidra.program.model.listing import ParameterImpl, Function
@@ -335,13 +339,27 @@ def _create_tail_call_functions(prog, image):
         # Caller(int *a): retail stores a[0] = 2 and a[1] = 3 directly; rebuild
         # calls Pair(a), which stores a[0] and tail-jumps to Overlay(a).
         code = (
-            bytes.fromhex("8b442404c70002000000c7400403000000c3")
+            bytes.fromhex(
+                "8b442404c74008020000008338007408c7400403000000c3c7400404000000c3"
+                if branching
+                else "8b442404c70002000000c7400403000000c3"
+            )
             if image == ImageId.ORIG
             else bytes.fromhex("ff742404e8f700000083c404c3")
         )
         blob[: len(code)] = code
-        blob[0x100:0x10F] = bytes.fromhex("8b442404c70002000000e9f1000000")
-        blob[0x200:0x20C] = bytes.fromhex("8b442404c7400403000000c3")
+        pair = bytes.fromhex(
+            "8b442404c7400802000000e9f0000000"
+            if branching
+            else "8b442404c70002000000e9f1000000"
+        )
+        blob[0x100 : 0x100 + len(pair)] = pair
+        overlay = bytes.fromhex(
+            "8b4424048338007408c7400403000000c3c7400404000000c3"
+            if branching
+            else "8b442404c7400403000000c3"
+        )
+        blob[0x200 : 0x200 + len(overlay)] = overlay
         prog.getMemory().createInitializedBlock(
             "text",
             space.getAddress(0x1000),
@@ -372,7 +390,8 @@ def _create_tail_call_functions(prog, image):
     return functions
 
 
-def test_native_inline_retry_follows_tail_call(pytestconfig):
+@pytest.mark.parametrize("branching", [False, True])
+def test_native_inline_retry_follows_tail_call(pytestconfig, branching):
     if not pytestconfig.getoption("--require-ghidra"):
         pytest.skip("Native decompiler test requires --require-ghidra")
     HeadlessPyGhidraLauncher().start()
@@ -403,7 +422,10 @@ def test_native_inline_retry_follows_tail_call(pytestconfig):
                 size,
                 PairBasis.ANNOTATION,
             )
-            for address, name, size in [(0x1100, "Pair", 15), (0x1200, "Overlay", 12)]
+            for address, name, size in [
+                (0x1100, "Pair", 16 if branching else 15),
+                (0x1200, "Overlay", 25 if branching else 12),
+            ]
         ),
         (),
     )
@@ -417,7 +439,7 @@ def test_native_inline_retry_follows_tail_call(pytestconfig):
                 consumer,
             )
             programs[image] = prog
-            _create_tail_call_functions(prog, image)
+            _create_tail_call_functions(prog, image, branching)
             engine.register_side(prog, image)
         old, new = programs[ImageId.ORIG], programs[ImageId.RECOMP]
         engine.setup_decompliers(old, new, pair_count=1)
@@ -433,7 +455,31 @@ def test_native_inline_retry_follows_tail_call(pytestconfig):
         assert set(result.inline_callees) == {0x1100, 0x1200}
         assert result.inline is not None
         assert result.inline.text is not None
-        assert result.outcome == Outcome.NO_DIFFERENCES, result.inline.text.body_diff
+        if branching:
+            # Hard inline expansion can choose a different if/return layout.
+            # Check the native body, rather than treating that layout as equal.
+            code = engine.inline_code(ImageId.RECOMP, 0x1000)
+            assert code is not None
+            assert "Overlay(" not in code and "Pair(" not in code
+            assert "if  {" not in code
+            assert "a[2] = 2" in code
+            assert "a[1] = 3" in code and "a[1] = 4" in code
+            assert "*a == 0" in code
+            assert not any(
+                "prevents inlining" in w.message for w in result.inline.warnings
+            )
+        else:
+            assert result.outcome == Outcome.NO_DIFFERENCES, "".join(
+                result.inline.text.body_diff
+            )
+        from ghidra.program.model.listing import FlowOverride
+
+        instruction = new.getListing().getInstructionAt(
+            new.getAddressFactory()
+            .getDefaultAddressSpace()
+            .getAddress(0x110B if branching else 0x110A)
+        )
+        assert instruction.getFlowOverride() == FlowOverride.NONE
     finally:
         for program in programs.values():
             program.release(consumer)
@@ -610,3 +656,67 @@ def test_native_tail_only_callee_parameter_inference(pytestconfig):
         finally:
             program.endTransaction(transaction, False)
             program.release(consumer)
+
+
+def test_legacy_msvcrt_swprintf_signature(pytestconfig):
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native prototype test requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.util import DefaultLanguageService
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from ghidra.program.model.data import IntegerDataType
+    from ghidra.program.model.listing import ParameterImpl, Function
+    from ghidra.program.model.symbol import SourceType
+    from java.lang import Object  # type: ignore[import-not-found]
+    from reccmp.ghidriff.preparation import (
+        correct_legacy_crt_signatures,
+        preparation_corrections,
+    )
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    program = ProgramDB(
+        "legacy-crt",
+        lang,
+        lang.getCompilerSpecByID(CompilerSpecID("windows")),
+        consumer,
+    )
+    transaction = program.startTransaction("import prototype fixture")
+    try:
+        functions = {}
+        for library in ("MSVCRT.DLL", "ucrtbase.dll"):
+            location = program.getExternalManager().addExtFunction(  # type: ignore[call-overload]
+                library, "swprintf", None, SourceType.IMPORTED
+            )
+            function = location.getFunction()
+            function.replaceParameters(
+                Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                True,
+                SourceType.IMPORTED,
+                *(
+                    ParameterImpl(name, IntegerDataType.dataType, program)
+                    for name in ("buffer", "size", "format")
+                ),
+            )
+            functions[library] = function
+        correct_legacy_crt_signatures(program)
+        legacy = functions["MSVCRT.DLL"]
+        assert legacy.getParameterCount() == 2
+        assert legacy.getCallingConventionName() == "__cdecl"
+        assert legacy.hasVarArgs()
+        assert legacy.getStackPurgeSize() == 0
+        assert all(
+            p.getDataType().getDataType().getLength() == 2
+            for p in legacy.getParameters()
+        )
+        assert functions["ucrtbase.dll"].getParameterCount() == 3
+        corrections = preparation_corrections(program)
+        assert len(corrections) == 1
+        correct_legacy_crt_signatures(program)
+        assert preparation_corrections(program) == corrections
+    finally:
+        program.endTransaction(transaction, False)
+        program.release(consumer)

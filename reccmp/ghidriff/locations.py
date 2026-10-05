@@ -224,3 +224,22 @@ def bitwise_scalar_operand(instruction: Any, operand: int, value: int) -> bool:
         return False
     scalar = instruction.getScalar(operand)
     return scalar is not None and scalar.getUnsignedValue() == value
+
+
+def string_start(program: Any, extents: Extents, address: Any) -> Any:
+    """The string an address inside a string belongs to.
+
+    Scanning a string, as an inlined strlen does, leaves Ghidra's
+    constant propagation with a reference a byte or so into it; the
+    function refers to the string, not to its tail."""
+    from ghidra.program.model.data import StringDataInstance
+
+    located = extents.containing(address.getOffset())
+    if located is not None:
+        if located.entity_type in STRING_TYPES:
+            return address.subtract(located.offset)
+        return address
+    data = program.getListing().getDataContaining(address)
+    if data is not None and StringDataInstance.isString(data):
+        return data.getMinAddress()
+    return address
