@@ -39,6 +39,19 @@ An empty decompiled diff is not a proof of equivalence, and a changed
 decompilation is not necessarily a bug. The results say what the analyzed
 output shows. The exit status does not depend on them.
 
+Body comparison uses Ghidriff's signature-free view of the normalized function.
+`signature_diff` records inferred declaration changes separately, including
+parameter and return types; these remain reviewable in JSON and detailed CLI
+output, but do not alone make the body/data outcome `differences`. The full
+decompilations, including leading warnings, remain in Ghidriff's artifacts.
+This separation does not establish ABI equivalence.
+
+`code_change_kind: scalar-signedness` identifies a body difference consisting
+only of `int`/`uint` token substitutions outside comments and quoted strings.
+It is a triage tag: the difference remains in `code_diff` and the mismatch
+outcome. Signed comparisons may change behavior. Other spelling changes,
+operators, widths and literals do not qualify for this tag.
+
 Analysis failures name their cause: Ghidra has no function at the entry and
 could not create one (`no-function`); the entry lies inside a function Ghidra
 starts elsewhere (`entry-conflict`, with that function's address; the entry is

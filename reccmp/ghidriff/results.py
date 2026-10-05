@@ -9,6 +9,7 @@ import difflib
 import enum
 from collections import Counter
 from dataclasses import dataclass, replace
+from ghidriff.code import body_change_kind, decompilation_parts
 
 from reccmp.compare.manifest import FunctionEntry
 from reccmp.types import ImageId
@@ -272,6 +273,8 @@ class FunctionResult:
     failures: tuple[AnalysisFailure, ...] = ()
     unidentified_references: int = 0
     inline: InlineDiff | None = None
+    signature_diff: tuple[str, ...] = ()
+    code_change_kind: str | None = None
 
     @property
     def code_diff(self) -> tuple[str, ...]:
@@ -323,13 +326,17 @@ def classify(
         return FunctionResult(entry, Outcome.ANALYSIS_FAILED, failures=failures)
     assert orig_code is not None and recomp_code is not None
 
-    diff = code_diff(orig_code, recomp_code, entry.name)
+    orig_signature, orig_body = decompilation_parts(orig_code)
+    recomp_signature, recomp_body = decompilation_parts(recomp_code)
+    diff = code_diff(orig_body, recomp_body, entry.name)
     findings = compare_references(orig_refs, recomp_refs)
     unidentified = sum(1 for ref in (*orig_refs, *recomp_refs) if ref.object is None)
     return FunctionResult(
         entry,
         Outcome.DIFFERENCES if diff or findings else Outcome.NO_DIFFERENCES,
         normal_diff=diff,
+        signature_diff=code_diff(orig_signature, recomp_signature, entry.name),
+        code_change_kind=body_change_kind(orig_body, recomp_body),
         data_findings=findings,
         unidentified_references=unidentified,
     )
@@ -358,6 +365,7 @@ def classify_inline(
     return replace(
         retry,
         normal_diff=normal.normal_diff,
+        signature_diff=normal.signature_diff,
         inline=InlineDiff(
             retry.normal_diff if not retry.failures else None, code.callees
         ),

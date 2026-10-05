@@ -130,6 +130,8 @@ def result_json(result: FunctionResult) -> dict[str, Any]:
         "outcome": result.outcome.value,
         "code_diff": list(result.code_diff),
         "normal_diff": list(result.normal_diff),
+        "signature_diff": list(result.signature_diff),
+        "code_change_kind": result.code_change_kind,
         "inline_normalized_diff": (
             list(result.inline_normalized_diff)
             if result.inline_normalized_diff is not None
@@ -186,10 +188,11 @@ def comparison_changes(
         elif new is None:
             changes[address] = "only-previous"
         elif any(
-            old[key] != new[key]
+            old.get(key) != new.get(key)
             for key in (
                 "outcome",
                 "code_diff",
+                "signature_diff",
                 "data",
                 "failures",
                 "unidentified_references",
@@ -246,6 +249,10 @@ def print_result(result: FunctionResult, *, details: bool) -> None:
             print(f"      + {contents_text(contents)}")
     for line in result.code_diff:
         print("    " + line.rstrip("\n"))
+    if result.signature_diff:
+        print("    Inferred declaration difference:")
+        for line in result.signature_diff:
+            print("    " + line.rstrip("\n"))
 
 
 def print_summary(results: list[FunctionResult], *, details: bool) -> None:
@@ -268,9 +275,19 @@ def print_summary(results: list[FunctionResult], *, details: bool) -> None:
             print(_heading(result))
         print()
 
+    declarations_only = [
+        result for result in by_outcome[Outcome.NO_DIFFERENCES] if result.signature_diff
+    ]
+    if details and declarations_only:
+        print("Inferred declaration differences with unchanged bodies/data:")
+        for result in declarations_only:
+            print_result(result, details=True)
+        print()
+
     counts = outcome_counts(results)
     print(f"Requested functions: {len(results)}")
     print(f"  differences found:       {counts[Outcome.DIFFERENCES.value]}")
     print(f"  no differences found:    {counts[Outcome.NO_DIFFERENCES.value]}")
     print(f"  unpaired:                {counts[Outcome.UNPAIRED.value]}")
     print(f"  analysis failed:         {counts[Outcome.ANALYSIS_FAILED.value]}")
+    print(f"  declaration differences: {sum(bool(r.signature_diff) for r in results)}")

@@ -99,7 +99,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 27
+PREPARATION_REVISION = 28
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's

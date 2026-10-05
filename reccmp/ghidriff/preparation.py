@@ -146,7 +146,10 @@ def correct_recompiled_signatures(
     space = program.getAddressFactory().getDefaultAddressSpace()
     for address, (symbol, retail_count, retail_convention) in symbols.items():
         function = functions.getFunctionAt(space.getAddress(address))
-        if function is None or function.getParameterCount() == retail_count:
+        if function is None or (
+            function.getParameterCount() == retail_count
+            and function.getCallingConventionName() == retail_convention
+        ):
             continue
         if function.getSignatureSource() not in (
             SourceType.DEFAULT,
@@ -170,6 +173,7 @@ def correct_recompiled_signatures(
             continue
         if (
             demangled.getCallingConvention() != "__cdecl"
+            or retail_convention != "__cdecl"
             or any(parameter.getType().isVarArgs() for parameter in parameters)
             or len(parameters) != retail_count
         ):

@@ -352,3 +352,75 @@ def test_source_path_strings_are_consistent_build_context():
         StringValue(r"Z:\repo\src\sgp\DirectDraw Calls.c"),
     )
     assert not consistent(StringValue(r"C:\a.c"), StringValue("a.c"))
+
+
+def test_signature_only_changes_keep_evidence_without_body_regression():
+    result = classify(
+        _entry(),
+        failures=(),
+        orig_code=["void constructor(uint param0)\n", "{\n", "  use(param0);\n", "}\n"],
+        recomp_code=[
+            "void constructor(int param0)\n",
+            "{\n",
+            "  use(param0);\n",
+            "}\n",
+        ],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    assert result.outcome == Outcome.NO_DIFFERENCES
+    assert not result.code_diff
+    assert result.signature_diff
+    assert result.code_change_kind is None
+
+
+def test_signature_only_findings_survive_serialization_and_cli(capsys):
+    from reccmp.ghidriff.report import print_summary, result_json
+
+    result = classify(
+        _entry(),
+        failures=(),
+        orig_code=["void f(uint x)\n", "{\n", "  use(x);\n", "}\n"],
+        recomp_code=["void f(int x)\n", "{\n", "  use(x);\n", "}\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    row = result_json(result)
+    assert row["outcome"] == "no-differences"
+    assert row["signature_diff"] == list(result.signature_diff)
+    assert row["code_diff"] == []
+    print_summary([result], details=True)
+    output = capsys.readouterr().out
+    assert "unchanged bodies/data" in output
+    assert "-void f(uint x)" in output
+    assert "+void f(int x)" in output
+
+
+def test_unsigned_condition_comparison_remains_a_difference():
+    result = classify(
+        _entry(),
+        failures=(),
+        orig_code=["int f(void)\n", "{\n", "  return *(uint *)p < 18;\n", "}\n"],
+        recomp_code=["int f(void)\n", "{\n", "  return *(int *)p < 18;\n", "}\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    assert result.outcome == Outcome.DIFFERENCES
+    assert result.code_change_kind == "scalar-signedness"
+    assert result.code_diff
+    assert not result.signature_diff
+
+
+def test_signature_only_change_does_not_hide_referenced_data():
+    result = classify(
+        _entry(),
+        failures=(),
+        orig_code=["void f(uint x)\n", "{\n", "  use(x);\n", "}\n"],
+        recomp_code=["void f(int x)\n", "{\n", "  use(x);\n", "}\n"],
+        orig_refs=(_ref(StringValue("old")),),
+        recomp_refs=(_ref(StringValue("new")),),
+    )
+    assert result.outcome == Outcome.DIFFERENCES
+    assert not result.code_diff
+    assert result.data_findings
+    assert result.signature_diff
