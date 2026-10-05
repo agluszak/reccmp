@@ -165,7 +165,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         )
         super().__init__(*args, **kwargs)
 
-
     def get_pdb(self, prog: "Program", allow_remote: bool = True) -> None:
         """Neither program gets debug information: the comparison is of the
         binaries as Ghidra sees them, under reccmp's names only."""
@@ -290,7 +289,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         return super().analyze_program(
             program, require_symbols, force_analysis, verbose_analysis
         )
-
 
     def _pair_type(self, orig_addr: int) -> EntityType | None:
         return self._pair_types.get(orig_addr)
