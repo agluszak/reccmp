@@ -15,8 +15,9 @@ from reccmp.ghidriff.inlining import (
     InlineNormalizationMixin,
     decompiled_lines,
     temporary_inline,
+    native_warning,
 )
-from reccmp.ghidriff.report import result_json
+from reccmp.ghidriff.report import result_json, inline_warning_groups
 from reccmp.ghidriff.results import (
     DataReference,
     StringValue,
@@ -124,10 +125,10 @@ def test_equal_repeated_call_counts_are_not_candidates():
     assert not candidates.for_pair(entry)
 
 
-def test_repeated_branching_callee_stays_as_a_call():
-    entry, _, candidates, _ = fixture_model(branching=True)
+def test_repeated_branching_callee_is_an_inline_candidate():
+    entry, obj, candidates, _ = fixture_model(branching=True)
     candidates.calls[ImageId.RECOMP, 0x2000] *= 2
-    assert not candidates.for_pair(entry)
+    assert candidates.for_pair(entry) == (obj,)
 
 
 def test_repeated_unreachable_body_does_not_prevent_inline():
@@ -569,3 +570,54 @@ def test_unpaired_result_does_not_resolve_an_absent_recomp_address():
     comparison = Engine().results()[0]
     assert comparison.outcome == Outcome.UNPAIRED
     assert result_json(comparison)["passes"]["ordinary"]["similarity"] is None
+
+
+def test_inline_warning_identity_is_metadata_and_strings_stay_literal():
+
+    message = "Could not inline here [inline callee=0x1200 reason=recursive-call]"
+    warning = native_warning(ImageId.RECOMP, message)
+    assert warning.callee == 0x1200
+    assert warning.reason == "recursive-call"
+    assert warning.message == message
+    code = (
+        'char *s = " [inline callee=0x1200 reason=recursive-call]";\n'
+        f"/* WARNING: {message} */\n"
+    )
+    text = "".join(decompiled_lines(code))
+    assert '" [inline callee=0x1200 reason=recursive-call]"' in text
+    assert "/* WARNING: Could not inline here */" in text
+    assert native_warning(ImageId.ORIG, "different native warning").callee is None
+
+
+def test_inline_warning_groups_preserve_callers_and_image_identity():
+
+    entry, obj, _, _ = fixture_model()
+    binary = BinaryInput(Path("unused"), "a")
+    manifest = Manifest("T", binary, binary, (entry,), (obj,), ())
+    warning = native_warning(
+        ImageId.RECOMP,
+        "Could not inline here [inline callee=0x2100 reason=recursive-call]",
+    )
+    ordinary = classify_pass(
+        entry,
+        failures=(),
+        orig_code=["return 1;\n"],
+        recomp_code=["return 1;\n"],
+        orig_refs=(),
+        recomp_refs=(),
+        warnings=(warning, warning),
+    )
+    second = replace(entry, orig_addr=0x1001)
+    results = [FunctionResult(entry, ordinary), FunctionResult(second, ordinary)]
+    groups = inline_warning_groups(manifest, results)
+    assert groups == [
+        {
+            "image": "recomp",
+            "reason": "recursive-call",
+            "callee": "0x2100",
+            "name": "helper",
+            "occurrences": 4,
+            "callers": ["0x1000", "0x1001"],
+        }
+    ]
+    assert all(result.outcome == Outcome.NO_DIFFERENCES for result in results)

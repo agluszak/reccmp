@@ -175,11 +175,16 @@ def test_nested_inline_callees_with_shared_branching_body(pytestconfig):
         result = engine.results()[0]
         assert result.ordinary.text is not None
         assert result.ordinary.text.body_diff
-        assert result.inline_callees == (0x1100, 0x1200)
+        assert result.inline_callees == (0x1100, 0x1200, 0x1300)
         assert result.inline is not None
         assert result.inline.text is not None
         assert result.inline.text.body_diff is not None
         assert not result.selected.failures
+        code = engine.inline_code(ImageId.RECOMP, 0x1000)
+        assert "Read(" not in code and "SetState(" not in code, code
+        assert "Abort(" in code, code
+        assert not any("inline here" in w.message for w in result.inline.warnings)
+
         for program in programs.values():
             space = program.getAddressFactory().getDefaultAddressSpace()
             assert all(
@@ -720,3 +725,125 @@ def test_legacy_msvcrt_swprintf_signature(pytestconfig):
     finally:
         program.endTransaction(transaction, False)
         program.release(consumer)
+
+
+def _repeated_callee_bytes(loop):
+    def call(site):
+        return b"\xe8" + (0x1200 - site - 5).to_bytes(4, "little", signed=True)
+
+    recomp = (
+        bytes.fromhex("568b74240856")
+        + call(0x1006)
+        + bytes.fromhex("83c4048d460850")
+        + call(0x1012)
+        + bytes.fromhex("83c4048b460403460c5ec3")
+    )
+    helper = bytes.fromhex("8b4424048b0885c97406ff40044975fac3") if loop else None
+    original = bytes.fromhex(
+        "8b4424048b0885c97406ff40044975fa"
+        "8b480885c97406ff400c4975fa8b480403480c8bc1c3"
+        if loop
+        else "8b4424048338007409c7400403000000eb07c7400404000000"
+        "837808007409c7400c03000000eb07c7400c040000008b480403480c8bc1c3"
+    )
+    return original, recomp, helper
+
+
+def _create_repeated_callee_functions(prog, image, loop):
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.address import AddressSet
+
+    _create_tail_call_functions(prog, image, True)
+    original, recomp, helper = _repeated_callee_bytes(loop)
+    transaction = prog.startTransaction("repeated caller fixture")
+    try:
+        api = FlatProgramAPI(prog)
+        space = prog.getAddressFactory().getDefaultAddressSpace()
+        for address, code in [
+            (0x1000, original if image == ImageId.ORIG else recomp),
+            (0x1200, helper),
+        ]:
+            if code is None:
+                continue
+            start = space.getAddress(address)
+            function = prog.getFunctionManager().getFunctionAt(start)
+            prog.getListing().clearCodeUnits(start, start.add(0x80), False)
+            prog.getMemory().setBytes(start, code)
+            api.disassemble(start)
+            function.setBody(AddressSet(start, start.add(len(code) - 1)))
+    finally:
+        prog.endTransaction(transaction, True)
+
+
+@pytest.mark.parametrize("loop", [False, True])
+def test_native_retry_expands_repeated_branching_callee(pytestconfig, loop):
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native decompiler fixture requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from ghidra.program.util import DefaultLanguageService
+    from java.lang import Object
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    programs = {}
+    entry = FunctionEntry(0x1000, 0x1000, "Caller", PairBasis.ANNOTATION, None, False)
+    binary = BinaryInput(Path("synthetic-x86"), "repeated-branch")
+    manifest = Manifest(
+        "T",
+        binary,
+        binary,
+        (entry,),
+        (
+            NamedObject(
+                0x1200,
+                0x1200,
+                "Overlay",
+                EntityType.FUNCTION,
+                32,
+                32,
+                PairBasis.ANNOTATION,
+            ),
+        ),
+        (),
+    )
+    engine = NativeFixtureEngine(manifest, threaded=False)
+    try:
+        for image in ImageId:
+            prog = ProgramDB(
+                image.name,
+                lang,
+                lang.getCompilerSpecByID(CompilerSpecID("windows")),
+                consumer,
+            )
+            programs[image] = prog
+            _create_repeated_callee_functions(prog, image, loop)
+            engine.register_side(prog, image)
+        old, new = programs[ImageId.ORIG], programs[ImageId.RECOMP]
+        engine.setup_decompliers(old, new, pair_count=1)
+        for prog in programs.values():
+            caller = prog.getFunctionManager().getFunctionAt(
+                prog.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000)
+            )
+            assert engine.decompile_func(prog, caller).completed
+        engine.shutdown_decompilers(old, new)
+        engine.normalize_inlining(programs)
+        result = engine.results()[0]
+        assert result.inline is not None
+        assert not result.inline.failures
+        assert not any(
+            "inline here" in w.message or "prevents inlining" in w.message
+            for w in result.inline.warnings
+        )
+        code = engine.inline_code(ImageId.RECOMP, 0x1000)
+        assert "Overlay(" not in code and "if  {" not in code, code
+        assert "return a[1] + a[3];" in code, code
+        for slot in [1, 3]:
+            for value in ([f"a[{slot}] + 1"] if loop else ["3", "4"]):
+                assert f"a[{slot}] = {value};" in code, code
+    finally:
+        for prog in programs.values():
+            prog.release(consumer)

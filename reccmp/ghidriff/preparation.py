@@ -4,10 +4,11 @@
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
 import json
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from typing import TYPE_CHECKING, Any
-from collections.abc import Callable
 
 if TYPE_CHECKING:
     from ghidriff import DecompileResult
@@ -322,6 +323,79 @@ def correct_recompiled_signatures(
         _record_correction(
             program, function, before, "retail-analysis-and-recomp-symbol"
         )
+
+
+def apply_recompiled_scalar_parameters(
+    program: "Program", symbols: list[tuple[int, str]]
+) -> None:
+    """Constrain inferred parameters using this binary's own decorated symbols.
+
+    Reused argument slots can make Parameter ID infer a count as a pointer.
+    Only explicit primitive parameters with matching convention, arity and
+    width are imported. Retail analysis and aggregate/template types stay separate.
+    """
+    from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+    from ghidra.program.model.data import (
+        AbstractIntegerDataType,
+        AbstractFloatDataType,
+        BooleanDataType,
+    )
+    from ghidra.program.model.symbol import SourceType
+
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    counts = Counter(address for address, _ in symbols)
+    for address, symbol in symbols:
+        if counts[address] != 1:
+            continue
+        function = functions.getFunctionAt(space.getAddress(address))
+        if function is None or function.getSignatureSource() not in (
+            SourceType.DEFAULT,
+            SourceType.ANALYSIS,
+        ):
+            continue
+        demangled = DemanglerUtil.demangle(symbol)
+        if not isinstance(demangled, DemangledFunction) or (
+            demangled.getCallingConvention() != function.getCallingConventionName()
+        ):
+            continue
+        expected = list(demangled.getParameters())
+        actual = [p for p in function.getParameters() if not p.isAutoParameter()]
+        if len(expected) != len(actual):
+            continue
+        before = _signature(function)
+        changed = False
+        for parameter, original in zip(actual, expected):
+            declared = original.getType()
+            if any(
+                (
+                    declared.isPointer(),
+                    declared.isReference(),
+                    declared.isArray(),
+                    declared.isClass(),
+                    declared.isStruct(),
+                    declared.isUnion(),
+                    declared.isEnum(),
+                )
+            ):
+                continue
+            data_type = declared.getDataType(program.getDataTypeManager())
+            if (
+                not isinstance(
+                    data_type,
+                    (AbstractIntegerDataType, AbstractFloatDataType, BooleanDataType),
+                )
+                or data_type.getLength() != parameter.getDataType().getLength()
+            ):
+                continue
+            if not parameter.getDataType().isEquivalent(data_type):
+                parameter.setDataType(data_type, SourceType.IMPORTED)
+                changed = True
+        if changed:
+            function.setSignatureSource(SourceType.IMPORTED)
+            _record_correction(
+                program, function, before, "recomp-decorated-scalar-parameter"
+            )
 
 
 def correct_import_purges(program: "Program") -> None:

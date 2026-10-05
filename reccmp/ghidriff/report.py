@@ -5,6 +5,7 @@ from typing import Any
 
 from reccmp.compare.manifest import FunctionEntry, Manifest
 from reccmp.utils import format_address
+from reccmp.types import ImageId
 from .inputs import RunInputs
 from .results import (
     AnalysisFailure,
@@ -126,7 +127,12 @@ def _pass_json(result: ComparisonPass) -> dict[str, Any]:
         "failures": [_failure_json(f) for f in result.failures],
         "unidentified_references": result.unidentified_references,
         "warnings": [
-            {"image": w.image.name.lower(), "message": w.message}
+            {
+                "image": w.image.name.lower(),
+                "message": w.message,
+                "reason": w.reason,
+                "callee": _address(w.callee),
+            }
             for w in result.warnings
         ],
     }
@@ -155,6 +161,41 @@ def outcome_counts(results: list[FunctionResult]) -> dict[str, int]:
     return {outcome.value: counts[outcome] for outcome in Outcome}
 
 
+def inline_warning_groups(
+    manifest: Manifest, results: list[FunctionResult]
+) -> list[dict[str, Any]]:
+    """Group native incomplete expansions without changing comparison outcomes."""
+    names = {
+        (image, address): obj.name
+        for obj in manifest.objects
+        for image, address in (
+            (ImageId.ORIG, obj.orig_addr),
+            (ImageId.RECOMP, obj.recomp_addr),
+        )
+    }
+    groups: dict[tuple[ImageId, str, int | None], list[int]] = {}
+    for result in results:
+        for warning in result.selected.warnings:
+            if warning.reason is not None:
+                groups.setdefault(
+                    (warning.image, warning.reason, warning.callee), []
+                ).append(result.entry.orig_addr)
+    return [
+        {
+            "image": image.name.lower(),
+            "reason": reason,
+            "callee": _address(callee),
+            "name": names.get((image, callee)) if callee is not None else None,
+            "occurrences": len(callers),
+            "callers": [_address(address) for address in sorted(set(callers))],
+        }
+        for (image, reason, callee), callers in sorted(
+            groups.items(),
+            key=lambda item: (item[0][0].name, item[0][1], item[0][2] or 0),
+        )
+    ]
+
+
 def summary_json(
     manifest: Manifest, inputs: RunInputs, results: list[FunctionResult]
 ) -> dict[str, Any]:
@@ -170,6 +211,7 @@ def summary_json(
         },
         "requested": len(results),
         "counts": outcome_counts(results),
+        "inline_warnings": inline_warning_groups(manifest, results),
         "functions": [result_json(result) for result in results],
     }
 

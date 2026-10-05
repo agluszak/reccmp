@@ -4,6 +4,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+import re
 
 from ghidriff.code import code_tokens
 
@@ -22,21 +23,30 @@ from .results import (
     Outcome,
 )
 
+_INLINE_WARNING = re.compile(r" \[inline callee=(0x[0-9a-fA-F]+) reason=([a-z-]+)\]")
+
+
+def native_warning(image: ImageId, message: str) -> AnalysisWarning:
+    """Keep native diagnostics and expose the inliner's own failure identity."""
+    match = _INLINE_WARNING.search(message)
+    return AnalysisWarning(
+        image,
+        message,
+        match[2] if match else None,
+        int(match[1], 16) if match else None,
+    )
+
 
 def decompiled_lines(code):
-    """Discard Ghidra metadata, not code or analysis warnings."""
-    return (
-        "".join(
-            line
-            for line in code.splitlines(True)
-            if not (
-                line.startswith("/* WARNING: Inlined function: ")
-                and line.rstrip().endswith(" */")
-            )
-        )
-        .lstrip("\n")
-        .splitlines(True)
-    )
+    """Remove inline metadata while retaining code and analysis warning text."""
+    tokens = []
+    for kind, token in code_tokens(code):
+        if kind == "comment":
+            if token.startswith("/* WARNING: Inlined function: "):
+                continue
+            token = _INLINE_WARNING.sub("", token)
+        tokens.append(token)
+    return "".join(tokens).lstrip("\n").splitlines(True)
 
 
 class InlineCandidates:
@@ -178,36 +188,6 @@ class InlineCandidates:
             self.observation(image, obj.addr(image)) is None for image in self.programs
         )
 
-    def repeated_nonleaf(self, entry, callees):
-        """Ghidra's hard inline model requires one expansion per body."""
-        selected = {f"pair:{obj.orig_addr:#x}": obj for obj in callees}
-        rejected = set()
-        for image, program in self.programs.items():
-            address = entry.orig_addr if image == ImageId.ORIG else entry.recomp_addr
-            reached = self.reached(image, address, callees)
-            owners = [address] + [
-                obj.addr(image) for obj in callees if obj.orig_addr in reached
-            ]
-            counts = Counter(
-                call["identity"]
-                for owner in owners
-                for call in self.continued(image, owner) or ()
-                if call["identity"] in selected
-            )
-            for identity, count in counts.items():
-                if count < 2:
-                    continue
-                function = self.function(image, selected[identity].addr(image))
-                if any(
-                    instruction.getFlowType().isCall()
-                    or instruction.getFlowType().isJump()
-                    for instruction in program.getListing().getInstructions(
-                        function.getBody(), True
-                    )
-                ):
-                    rejected.add(identity)
-        return rejected
-
     def for_pair(self, entry):
         """Asymmetric callees, closed over their tail-call continuations.
 
@@ -250,10 +230,7 @@ class InlineCandidates:
             for identity, obj in selected.items()
             if identity not in cyclic
         }
-        repeated = self.repeated_nonleaf(entry, tuple(selected.values()))
-        return tuple(
-            obj for identity, obj in selected.items() if identity not in repeated
-        )
+        return tuple(selected.values())
 
     def reached(self, image, address, callees):
         """Selected callees whose bodies this side's substitution includes."""
@@ -463,7 +440,7 @@ class InlineNormalizationMixin:
         return {
             "failures": tuple(failures),
             "warnings": tuple(
-                AnalysisWarning(image, warning)
+                native_warning(image, warning)
                 for image, address in (
                     (ImageId.ORIG, entry.orig_addr),
                     (ImageId.RECOMP, entry.recomp_addr),

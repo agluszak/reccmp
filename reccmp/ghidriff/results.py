@@ -253,6 +253,8 @@ def consistent(left: Contents, right: Contents) -> bool:
 class AnalysisWarning:
     image: ImageId
     message: str
+    reason: str | None = None
+    callee: int | None = None
 
 
 @dataclass(frozen=True)

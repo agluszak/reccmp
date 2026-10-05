@@ -2,9 +2,9 @@
 
 Ghidra analyzes and decompiles both programs; ghidriff diffs and reports.
 reccmp contributes what only the reconstruction knows: which functions
-correspond, under which names, and where their source is. Both programs are
-analyzed without imported debug types. A recompiled PDB symbol may correct
-an inferred cdecl arity when retail independently agrees.
+correspond, under which names, and where their source is. Retail analysis does not import recomp debug types. This image's decorated
+symbols constrain recomp primitive parameters; a cdecl arity correction also
+requires independent retail agreement.
 """
 
 # pylint: disable=import-outside-toplevel,import-error
@@ -62,6 +62,7 @@ from .preparation import (
     apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
     correct_recompiled_signatures,
+    apply_recompiled_scalar_parameters,
     correct_legacy_crt_signatures,
     correct_import_purges,
     infer_requested_callee_parameters,
@@ -100,7 +101,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 30
+PREPARATION_REVISION = 31
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -393,6 +394,14 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                     and obj.orig_addr in self._retail_signatures
                     and obj.recomp_symbol
                 },
+            )
+            apply_recompiled_scalar_parameters(
+                program,
+                [
+                    (obj.recomp_addr, obj.recomp_symbol)
+                    for obj in self.manifest.objects
+                    if obj.entity_type == EntityType.FUNCTION and obj.recomp_symbol
+                ],
             )
             apply_reviewed_scalar_returns(
                 program,
