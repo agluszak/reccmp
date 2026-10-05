@@ -38,7 +38,6 @@ from .names import (
     paired_reference_tokens,
     replace_paired_raw_addresses,
     unquoted_raw_addresses,
-    canonical_parameter_names,
     label_source_paths,
     name_identical_code,
     normalize_source_locations,
@@ -182,7 +181,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         inline: bool = False,
     ) -> None:
         super().normalize_ghidra_decomp(code, entry_address, stack_setup)
-        canonical_parameter_names(code)
         normalize_source_locations(code)
         side = ImageId.ORIG if is_old else ImageId.RECOMP
         if (

@@ -5,7 +5,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 # pylint: disable=import-outside-toplevel,import-error
-from ghidriff import GhidraDiffEngine
+from ghidriff.code import code_tokens, rewrite_code
 from reccmp.compare.manifest import Manifest, NamedObject
 from reccmp.types import EntityType, ImageId
 from .build_context import SOURCE_FILE, SOURCE_LINE, is_source_path
@@ -18,38 +18,16 @@ if TYPE_CHECKING:
 _LITERAL_TYPES = (EntityType.STRING, EntityType.WIDECHAR, EntityType.FLOAT)
 FUNCTION_TYPES = (EntityType.FUNCTION, EntityType.VTORDISP, EntityType.THUNK)
 _RAW_ADDRESS = re.compile(r"(?<![\w])0x[0-9a-fA-F]+(?![\w])")
-_DEFAULT_PARAMETER = re.compile(r"\bparam_(\d+)\b")
-_QUOTED = re.compile(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""")
-
-
-def canonical_parameter_names(code: list[str]) -> None:
-    """Use zero-based parameter names without changing quoted literals."""
-    for i, line in enumerate(code):
-        parts = _QUOTED.split(line)
-        code[i] = "".join(
-            (
-                part
-                if j % 2
-                else _DEFAULT_PARAMETER.sub(
-                    lambda m: f"param{int(m.group(1)) - 1}", part
-                )
-            )
-            for j, part in enumerate(parts)
-        )
 
 
 def unquoted_raw_addresses(code: str) -> set[int]:
     """Collect displayed addresses without treating strings/comments as code."""
-    found: set[int] = set()
-    for line in code.splitlines():
-        if line.lstrip().startswith(("/*", "//", "*")):
-            continue
-        for index, part in enumerate(GhidraDiffEngine.QUOTED_LITERAL.split(line)):
-            if index % 2 == 0:
-                found.update(
-                    int(match.group(), 16) for match in _RAW_ADDRESS.finditer(part)
-                )
-    return found
+    return {
+        int(match.group(), 16)
+        for kind, part in code_tokens(code)
+        if kind == "code"
+        for match in _RAW_ADDRESS.finditer(part)
+    }
 
 
 def unpaired_names(
@@ -88,14 +66,9 @@ def replace_paired_raw_addresses(code: list[str], tokens: dict[int, str]) -> Non
     def rename(match: re.Match[str]) -> str:
         return tokens.get(int(match.group(), 16), match.group())
 
-    for index, line in enumerate(code):
-        if line.lstrip().startswith(("/*", "//", "*")):
-            continue
-        parts = GhidraDiffEngine.QUOTED_LITERAL.split(line)
-        code[index] = "".join(
-            part if part_index % 2 else _RAW_ADDRESS.sub(rename, part)
-            for part_index, part in enumerate(parts)
-        )
+    code[:] = rewrite_code(
+        "".join(code), lambda text: _RAW_ADDRESS.sub(rename, text)
+    ).splitlines(True)
 
 
 def paired_reference_tokens(
@@ -206,20 +179,23 @@ def _unquoted(literal: str) -> str:
 
 def normalize_source_locations(code: list[str]) -> None:
     """Show ``__FILE__``/``__LINE__`` arguments as build context."""
-    for index, line in enumerate(code):
-        if line.lstrip().startswith(("/*", "//", "*")):
-            continue
-        parts = GhidraDiffEngine.QUOTED_LITERAL.split(line)
-        for part_index in range(1, len(parts), 2):
-            if parts[part_index].startswith('"') and is_source_path(
-                _unquoted(parts[part_index])
-            ):
-                parts[part_index] = SOURCE_FILE
-        line = "".join(parts)
-        if SOURCE_FILE in line:
-            line = _LINE_BEFORE_FILE.sub(rf"\1{SOURCE_LINE}", line)
-            line = _LINE_AFTER_FILE.sub(rf"\1{SOURCE_LINE}", line)
-        code[index] = line
+    # Only quoted source paths are build context. Comments retain their content.
+    text = "".join(
+        (
+            SOURCE_FILE
+            if kind == "quoted"
+            and part.startswith('"')
+            and is_source_path(_unquoted(part))
+            else part
+        )
+        for kind, part in code_tokens("".join(code))
+    )
+    code[:] = rewrite_code(
+        text,
+        lambda part: _LINE_AFTER_FILE.sub(
+            rf"\1{SOURCE_LINE}", _LINE_BEFORE_FILE.sub(rf"\1{SOURCE_LINE}", part)
+        ),
+    ).splitlines(True)
 
 
 def label_source_paths(program: "Program") -> None:

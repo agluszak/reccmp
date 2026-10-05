@@ -11,7 +11,6 @@ from reccmp.compare.manifest import (
 )
 from reccmp.ghidriff.build_context import is_source_path
 from reccmp.ghidriff.names import (
-    canonical_parameter_names,
     identical_code_name,
     normalize_source_locations,
 )
@@ -118,6 +117,13 @@ def test_raw_address_candidates_ignore_strings_and_comments():
     assert unquoted_raw_addresses(code) == {0x6550A0}
 
 
+def test_paired_addresses_ignore_multiline_comment_contents():
+    code = ["/* addresses\n", "0x1000\n", "*/\n", "use(0x1000);\n"]
+    assert unquoted_raw_addresses("".join(code)) == {0x1000}
+    replace_paired_raw_addresses(code, {0x1000: "paired"})
+    assert code == ["/* addresses\n", "0x1000\n", "*/\n", "use(paired);\n"]
+
+
 def _data(orig_addr: int, name: str, size: int, entity_type=EntityType.DATA):
     return NamedObject(
         orig_addr=orig_addr,
@@ -160,22 +166,6 @@ def test_a_paired_object_at_a_bound_past_the_end_is_itself():
     assert extents.bound_at(0x100 + 2 * 0x48) is None
 
 
-def test_default_parameter_names_use_reccmp_numbering():
-    code = [
-        "void __cdecl F(int param_1,int param0)\n",
-        "{\n",
-        '  puts("param_1 stays");\n',
-        "  return param_1 + param_12 + xparam_1;\n",
-    ]
-    canonical_parameter_names(code)
-    assert code == [
-        "void __cdecl F(int param0,int param0)\n",
-        "{\n",
-        '  puts("param_1 stays");\n',
-        "  return param0 + param11 + xparam_1;\n",
-    ]
-
-
 def test_source_path_literals_and_their_lines_are_build_context():
     code = [
         "  DirectXAttempt(iVar0,0x6b,SOURCE_FILE);",
@@ -183,8 +173,9 @@ def test_source_path_literals_and_their_lines_are_build_context():
         '  Log(7,"not a path",3);',
         "  Mix(SOURCE_FILE,0x10,x + 1);",
     ]
+    code = [line + "\n" for line in code]
     normalize_source_locations(code)
-    assert code == [
+    assert [line.rstrip("\n") for line in code] == [
         "  DirectXAttempt(iVar0,SOURCE_LINE,SOURCE_FILE);",
         '  _assert("p != 0",SOURCE_FILE,SOURCE_LINE);',
         '  Log(7,"not a path",3);',

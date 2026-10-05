@@ -40,6 +40,11 @@ decompilation is not necessarily a bug. The results say what the analyzed
 output shows. The exit status does not depend on them.
 
 Body comparison uses Ghidriff's signature-free view of the normalized function.
+Ghidriff's pure text-comparison operation produces the declaration/body diffs
+and body similarity from that same view. Its generic identifier normalization
+preserves literals and multiline comment contents. reccmp adds catalog-dependent
+address identity and referenced-data findings; it does not maintain a second
+text differ.
 `signature_diff` records inferred declaration changes separately, including
 parameter and return types; these remain reviewable in JSON and detailed CLI
 output, but do not alone make the body/data outcome `differences`. The full

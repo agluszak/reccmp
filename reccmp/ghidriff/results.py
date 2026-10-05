@@ -5,11 +5,10 @@ decompilation is not a demonstrated bug. The outcomes only say whether the
 analyzed output shows a difference, and whether the analysis happened.
 """
 
-import difflib
 import enum
 from collections import Counter
 from dataclasses import dataclass, replace
-from ghidriff.code import body_change_kind, decompilation_parts
+from ghidriff.code import compare_code
 
 from reccmp.compare.manifest import FunctionEntry
 from reccmp.types import ImageId
@@ -289,14 +288,6 @@ class FunctionResult:
         return self.inline.callees if self.inline is not None else ()
 
 
-def code_diff(orig: list[str], recomp: list[str], name: str) -> tuple[str, ...]:
-    return tuple(
-        difflib.unified_diff(
-            orig, recomp, fromfile=f"orig/{name}", tofile=f"recomp/{name}"
-        )
-    )
-
-
 def classify(
     entry: FunctionEntry,
     *,
@@ -326,17 +317,18 @@ def classify(
         return FunctionResult(entry, Outcome.ANALYSIS_FAILED, failures=failures)
     assert orig_code is not None and recomp_code is not None
 
-    orig_signature, orig_body = decompilation_parts(orig_code)
-    recomp_signature, recomp_body = decompilation_parts(recomp_code)
-    diff = code_diff(orig_body, recomp_body, entry.name)
+    comparison = compare_code(
+        orig_code, recomp_code, f"orig/{entry.name}", f"recomp/{entry.name}"
+    )
+    diff = comparison.body_diff
     findings = compare_references(orig_refs, recomp_refs)
     unidentified = sum(1 for ref in (*orig_refs, *recomp_refs) if ref.object is None)
     return FunctionResult(
         entry,
         Outcome.DIFFERENCES if diff or findings else Outcome.NO_DIFFERENCES,
         normal_diff=diff,
-        signature_diff=code_diff(orig_signature, recomp_signature, entry.name),
-        code_change_kind=body_change_kind(orig_body, recomp_body),
+        signature_diff=comparison.signature_diff,
+        code_change_kind=comparison.change_kind,
         data_findings=findings,
         unidentified_references=unidentified,
     )
