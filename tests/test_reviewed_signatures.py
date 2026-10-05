@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import json
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -140,15 +141,32 @@ def test_reviewed_integer_width_repairs_only_narrow_retail(monkeypatch):
     )
     changed = []
     functions = {}
+    return_types = {}
+    records: dict[int, str] = {}
+
+    def set_return_type(address, dtype):
+        return_types[address] = dtype
+        changed.append((address, dtype))
+
     for address, width in ((1, 1), (2, 4), (3, 4), (4, 1)):
         dtype = SimpleNamespace(
             getName=lambda: "undefined", getLength=lambda w=width: w
         )
+        return_types[address] = dtype
         functions[address] = SimpleNamespace(
-            getReturnType=lambda d=dtype: d,
-            setReturnType=lambda dt, source, a=address: changed.append((a, dt)),
+            getReturnType=lambda a=address: return_types[a],
+            setReturnType=lambda dt, source, a=address: set_return_type(a, dt),
+            getCallingConventionName=lambda: "__cdecl",
+            getParameters=lambda: [],
+            getEntryPoint=lambda a=address: a,
         )
     program: Any = SimpleNamespace(
+        getUsrPropertyManager=lambda: SimpleNamespace(
+            getStringPropertyMap=lambda _: SimpleNamespace(
+                add=records.__setitem__,
+                getString=records.get,
+            )
+        ),
         getFunctionManager=lambda: SimpleNamespace(getFunctionAt=functions.get),
         getAddressFactory=lambda: SimpleNamespace(
             getDefaultAddressSpace=lambda: SimpleNamespace(getAddress=lambda a: a)
@@ -159,3 +177,8 @@ def test_reviewed_integer_width_repairs_only_narrow_retail(monkeypatch):
     assert not changed
     apply_reviewed_scalar_returns(program, returns)
     assert changed == [(1, int_type), (3, byte_type)]
+    assert records.keys() == {1, 3}
+    assert all(
+        json.loads(record)[0]["before"] != json.loads(record)[0]["after"]
+        for record in records.values()
+    )

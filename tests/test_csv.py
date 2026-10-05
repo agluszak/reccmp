@@ -9,6 +9,7 @@ from reccmp.compare.csv import (
     CsvNoDelimiterError,
     CsvInvalidEntityTypeError,
     CsvInvalidNumberError,
+    CsvInvalidBooleanError,
     ReccmpCsvParserError,
 )
 
@@ -537,8 +538,6 @@ def test_size_invalid_hex_prefix_only():
 
 
 def test_selector_boolean_is_explicit():
-    from reccmp.compare.csv import CsvInvalidBooleanError
-
     reader = csv_parse("address|name|selector_is_symbol\n00401000|name|false\n")
     assert next(reader)[1]["selector_is_symbol"] is False
     reader = csv_parse("address|name|selector_is_symbol\n00401000|name|perhaps\n")

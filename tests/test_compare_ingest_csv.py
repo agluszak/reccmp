@@ -3,6 +3,7 @@ from pathlib import PurePath
 import pytest
 from reccmp.compare.db import EntityDb
 from reccmp.compare.ingest import load_csv, load_data_sources
+from reccmp.compare.match_msvc import match_annotation_selectors
 from reccmp.types import EntityType, ImageId
 from reccmp.formats import TextFile
 
@@ -159,8 +160,6 @@ def test_load_csv_with_fatal_error(db: EntityDb):
 
 
 def test_csv_recomp_selector_keeps_retail_name_separate(db: EntityDb):
-    from reccmp.compare.match_msvc import match_annotation_selectors
-
     load_csv(
         db,
         TextFile(
@@ -186,8 +185,6 @@ def test_csv_recomp_selector_keeps_retail_name_separate(db: EntityDb):
 
 
 def test_csv_family_description_is_not_a_matching_wildcard(db: EntityDb):
-    from reccmp.compare.match_msvc import match_annotation_selectors
-
     load_csv(
         db,
         TextFile(
