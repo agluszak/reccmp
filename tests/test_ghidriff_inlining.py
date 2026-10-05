@@ -1,5 +1,6 @@
 """Inline retries use catalog identity and preserve ordinary comparison evidence."""
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -541,3 +542,24 @@ def test_clean_ordinary_pass_is_not_sent_to_candidate_discovery(monkeypatch):
 
     Engine().normalize_inlining(dict.fromkeys(ImageId))
     assert calls == ["setup", "shutdown"]
+
+
+def test_unpaired_result_does_not_resolve_an_absent_recomp_address():
+    entry, _, _, _ = fixture_model()
+    unpaired = replace(entry, recomp_addr=None)
+
+    class Engine(InlineNormalizationMixin):
+        manifest = NS(functions=(unpaired,))
+        _failures = {}
+        _decompiled = {}
+        _inline_decompiled = {}
+        _inline_callees = {}
+        _references = {}
+        _inline_references = {}
+
+        def _entry_addr(self, *_args):
+            raise AssertionError("Unpaired evidence must not resolve a recomp address")
+
+    comparison = Engine().results()[0]
+    assert comparison.outcome == Outcome.UNPAIRED
+    assert result_json(comparison)["passes"]["ordinary"]["similarity"] is None

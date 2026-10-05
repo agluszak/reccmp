@@ -1,11 +1,11 @@
 """Serialized and printed forms of a comparison run."""
 
 from collections import Counter
-from dataclasses import dataclass
 from typing import Any
 
 from reccmp.compare.manifest import FunctionEntry, Manifest
 from reccmp.utils import format_address
+from .inputs import RunInputs
 from .results import (
     AnalysisFailure,
     Contents,
@@ -21,17 +21,6 @@ from .results import (
     Uninitialized,
     UnknownExtent,
 )
-
-
-@dataclass(frozen=True)
-class RunInputs:
-    """Everything that decides a run's output besides the source tree."""
-
-    manifest_sha256: str
-    reccmp_version: str
-    ghidra_version: str
-    ghidriff_version: str
-    ghidra_project: str
 
 
 def _address(addr: int | None) -> str | None:
@@ -177,11 +166,7 @@ def summary_json(
                 "path": str(manifest.recomp.path),
                 "sha256": manifest.recomp.sha256,
             },
-            "manifest_sha256": inputs.manifest_sha256,
-            "reccmp": inputs.reccmp_version,
-            "ghidra": inputs.ghidra_version,
-            "ghidriff": inputs.ghidriff_version,
-            "ghidra_project": inputs.ghidra_project,
+            **inputs.to_json(),
         },
         "requested": len(results),
         "counts": outcome_counts(results),

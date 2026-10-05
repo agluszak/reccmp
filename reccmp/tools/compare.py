@@ -14,7 +14,7 @@ from typing import Any
 import colorama
 
 import reccmp
-from reccmp.analysis_cache import AnalysisCache, fingerprint_files
+from reccmp.analysis_cache import AnalysisCache
 from reccmp.compare import Compare
 from reccmp.compare.db import ReccmpEntity
 from reccmp.compare.manifest import Manifest, build_manifest
@@ -46,7 +46,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {reccmp.VERSION}"
     )
-    argparse_add_project_target_args(parser)
+    inputs = argparse_add_project_target_args(parser)
+    inputs.add_argument(
+        "--manifest",
+        type=Path,
+        help="Saved comparison manifest with explicit binaries and selection",
+    )
     parser.add_argument(
         "--orig-address",
         metavar="<offset>",
@@ -230,22 +235,15 @@ def _reviewed_signatures(
         project.close()
 
 
-def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manifest):
+def _run_engine(args: argparse.Namespace, manifest: Manifest):
     # pylint: disable=import-outside-toplevel
     # Importing the engine does not start the JVM, but it does need ghidriff.
-    import ghidriff
-    from reccmp.ghidriff.engine import (
-        ANALYSIS_REVISION,
-        PREPARATION_REVISION,
-        ReccmpDiffEngine,
-    )
-    from reccmp.ghidriff.report import RunInputs, print_summary, summary_json
+    from reccmp.ghidriff.engine import ReccmpDiffEngine
+    from reccmp.ghidriff.inputs import RunInputs
+    from reccmp.ghidriff.report import print_summary, summary_json
     from reccmp.ghidriff.results import Outcome
 
     output: Path = args.output
-    projects = args.ghidra_projects or (
-        target.recompiled_pdb.parent / ".reccmp-cache" / "ghidra"
-    )
     engine = ReccmpDiffEngine(
         manifest,
         args=args,
@@ -271,38 +269,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
             ]
         ).encode()
     ).hexdigest()
-    ghidra_version = str(engine.get_ghidra_version())
-    # One project per original binary and analyzer: the original's analysis
-    # is reused across recompiled builds, whose programs replace each other.
-    project_name = (
-        f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
-        f"-ghidra{ghidra_version}-ghidriff{ghidriff.__version__}"
-        f"-reccmp{ANALYSIS_REVISION}"
-        f"{'-switchfocus1' if engine.focused_switch_analysis else ''}"
-    )
-    prepared_key = (
-        f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
-    )
-    # Hash the installed Python implementations as well as version strings:
-    # local edits in either fork must invalidate completed results too.
-    completed_key = fingerprint_files(
-        [
-            *Path(reccmp.__file__).parent.rglob("*.py"),
-            *Path(ghidriff.__file__).parent.rglob("*.py"),
-        ],
-        context=json.dumps(
-            [
-                manifest.digest(),
-                prepared_key,
-                project_name,
-                args.decompiler_timeout,
-                args.threaded,
-                args.max_ram_percent,
-                reccmp.VERSION,
-                ghidriff.__version__,
-            ]
-        ),
-    )
+    inputs = RunInputs.create(manifest, engine, args, reviewed_digest)
+    completed_key = inputs.comparison_key
+    projects = Path(inputs.ghidra_project).parent
     cache = AnalysisCache(projects / "completed", enabled=not args.no_cache)
     cached: tuple[Any, Any, Any, Any] | None = cache.load(
         "comparison-" + completed_key, completed_key
@@ -314,8 +283,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         pdiff, results, calls, corrections = _compare_programs(
             engine,
             args,
-            project_name=project_name,
-            prepared_key=prepared_key,
+            inputs=inputs,
         )
         if all(result.outcome != Outcome.ANALYSIS_FAILED for result in results):
             cache.store(
@@ -351,16 +319,8 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
             md_title=f"{manifest.target_id}: reconstructed functions with differences",
         )
 
-    inputs = RunInputs(
-        manifest_sha256=manifest.digest(),
-        reccmp_version=reccmp.VERSION,
-        ghidra_version=ghidra_version,
-        ghidriff_version=ghidriff.__version__,
-        ghidra_project=str(projects / project_name),
-    )
     summary = summary_json(manifest, inputs, results)
     summary["preparation"] = corrections
-    summary["inputs"]["comparison_key"] = completed_key
     summary["cache"] = {"reused": cached is not None}
     summary_path = output / "summary.json"
     summary_path.write_text(
@@ -371,7 +331,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
     print(f"Report: {summary_path}")
 
 
-def _compare_programs(engine, args, *, project_name, prepared_key):
+def _compare_programs(engine, args, *, inputs):
     """Analyze and compare only on a completed-result cache miss."""
     # pylint: disable=import-outside-toplevel
     from reccmp.ghidriff.project_cache import (
@@ -381,9 +341,9 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
     )
 
     output = args.output
-    projects = args.ghidra_projects or (
-        engine.manifest.recomp.path.parent / ".reccmp-cache" / "ghidra"
-    )
+    projects = Path(inputs.ghidra_project).parent
+    project_name = inputs.analysis_key
+    prepared_key = inputs.preparation_key
     prepared_stamp = projects / project_name / "prepared-key.txt"
     orig, recomp = engine.manifest.orig.path, engine.manifest.recomp.path
     try:
@@ -453,37 +413,38 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
 
 def main() -> int:
     args = parse_args()
-    try:
-        target = argparse_parse_project_target(args)
-    except RecCmpProjectException as e:
-        logger.error(e.args[0])
-        return 1
-
-    try:
-        catalog = Compare.from_target(
-            target, orig_addrs=args.orig_address, use_cache=not args.no_cache
+    if args.manifest is not None:
+        if args.orig_address or args.filter or args.nolib:
+            logger.error("A manifest already records the complete function selection")
+            return 1
+        manifest = Manifest.from_json(json.loads(args.manifest.read_text()))
+        manifest.validate_binaries()
+    else:
+        try:
+            target = argparse_parse_project_target(args)
+            catalog = Compare.from_target(
+                target, orig_addrs=args.orig_address, use_cache=not args.no_cache
+            )
+        except (RecCmpProjectException, SourceIndexError) as error:
+            logger.error("%s", error)
+            return 1
+        manifest = build_manifest(
+            catalog,
+            target_id=target.target_id,
+            orig_path=target.original_path,
+            recomp_path=target.recompiled_path,
+            select=_selection(args, target),
         )
-    except SourceIndexError as e:
-        logger.error("%s", e)
-        return 1
-
-    args.output = args.output or Path.cwd() / f"reccmp-{target.target_id}"
+    args.output = args.output or Path.cwd() / f"reccmp-{manifest.target_id}"
     args.output.mkdir(parents=True, exist_ok=True)
-    manifest = build_manifest(
-        catalog,
-        target_id=target.target_id,
-        orig_path=target.original_path,
-        recomp_path=target.recompiled_path,
-        select=_selection(args, target),
-    )
     (args.output / "manifest.json").write_text(
         json.dumps(manifest.to_json(), indent=1) + "\n", encoding="utf-8"
     )
-    if args.orig_address and not manifest.functions:
+    if (args.orig_address or args.manifest is not None) and not manifest.functions:
         logger.error("No function at the requested original addresses")
         return 1
 
-    _run_engine(args, target, manifest)
+    _run_engine(args, manifest)
     return 0
 
 

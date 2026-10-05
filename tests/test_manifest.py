@@ -1,12 +1,17 @@
 """The pairs and names reccmp hands to the code differ."""
 
+import json
 from dataclasses import replace
 from pathlib import Path, PurePath
 from unittest.mock import Mock
 
+import pytest
+
 from reccmp.compare import Compare
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import (
+    Alias,
+    Manifest,
     NamedObject,
     SourceLocation,
     build_manifest,
@@ -15,6 +20,7 @@ from reccmp.compare.manifest import (
 from reccmp.cvdump import CvdumpAnalysis
 from reccmp.ghidriff.locations import Extents
 from reccmp.types import EntityType, ImageId
+from reccmp.tools import compare
 from .raw_image import RawImage
 
 
@@ -160,3 +166,43 @@ def test_unpaired_import_slot_is_not_compared_as_literal_data(tmp_path: Path):
     extents = Extents(manifest, ImageId.ORIG)
     assert not extents.is_data(0x90)
     assert extents.is_data(0x94)
+
+
+def test_saved_manifest_roundtrip_preserves_pairing_and_alias_extent(tmp_path: Path):
+    manifest = _manifest(tmp_path, _catalog())
+    manifest = replace(manifest, aliases=(Alias(ImageId.RECOMP, 0x123, 0x10, 7),))
+    restored = Manifest.from_json(manifest.to_json())
+    assert restored == manifest
+    assert restored.digest() == manifest.digest()
+    assert restored.aliases[0].size == 7
+    restored.validate_binaries()
+    restored.recomp.path.write_bytes(b"replaced product")
+    with pytest.raises(ValueError, match="Comparison binary changed"):
+        restored.validate_binaries()
+
+
+def test_manifest_cli_replays_saved_inputs_without_current_catalog(
+    tmp_path: Path, monkeypatch
+):
+    manifest = _manifest(tmp_path, _catalog())
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest.to_json()))
+    calls = []
+    monkeypatch.setattr(
+        "sys.argv",
+        ["compare", "--manifest", str(path), "--output", str(tmp_path / "report")],
+    )
+    monkeypatch.setattr(
+        compare, "_run_engine", lambda _args, saved: calls.append(saved)
+    )
+    monkeypatch.setattr(
+        compare,
+        "argparse_parse_project_target",
+        lambda _: pytest.fail("Replay must not resolve a current project"),
+    )
+    assert compare.main() == 0
+    assert calls == [manifest]
+    manifest.recomp.path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="Comparison binary changed"):
+        compare.main()
+    assert calls == [manifest]

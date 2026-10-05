@@ -522,6 +522,8 @@ def argparse_add_project_target_args(parser: argparse.ArgumentParser):
         help="The original binary, the recompiled binary, the PDB of the recompiled binary, and the source root",
     )
 
+    return target_group
+
 
 def argparse_parse_project_target(
     args: argparse.Namespace,

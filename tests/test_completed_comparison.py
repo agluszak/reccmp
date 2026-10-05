@@ -1,16 +1,15 @@
 """Completed comparisons are reused only under identical analysis inputs."""
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
 
 
 import ghidriff
 import pytest
 
 import reccmp
-from reccmp.project.detect import RecCmpTarget
 from reccmp.compare.db import PairBasis
 from reccmp.compare.manifest import BinaryInput, FunctionEntry, Manifest
 from reccmp.ghidriff import engine
@@ -92,10 +91,10 @@ def test_completed_comparison_reuses_results_and_regenerates_report(
     prepared_comparison,
 ):
     args, manifest, state, _ = prepared_comparison
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     first = (args.output / "summary.json").read_text()
     (args.output / "summary.json").unlink()
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     assert state["runs"] == 1
     assert '"reused": false' in first
     assert '"reused": true' in (args.output / "summary.json").read_text()
@@ -117,7 +116,7 @@ def test_changed_comparison_inputs_invalidate_completed_result(
     prepared_comparison, change
 ):
     args, manifest, state, module = prepared_comparison
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     if change == "binary":
         manifest = replace(manifest, recomp=replace(manifest.recomp, sha256="c" * 64))
     elif change == "identity":
@@ -134,16 +133,16 @@ def test_changed_comparison_inputs_invalidate_completed_result(
         module.write_text("# changed implementation")
     elif change == "no-cache":
         args.no_cache = True
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     assert state["runs"] == 2
 
 
 def test_analysis_failure_is_retried(prepared_comparison):
     args, manifest, state, _ = prepared_comparison
     state["failed"] = True
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     state["failed"] = False
-    _run_engine(args, Mock(spec=RecCmpTarget), manifest)
+    _run_engine(args, manifest)
     assert state["runs"] == 2
 
 
@@ -185,3 +184,20 @@ def test_report_delta_distinguishes_resolved_and_unselected_functions():
     }
     with pytest.raises(ValueError, match="different targets"):
         comparison_changes(dict(after, target="OTHER"), before)
+
+
+def test_report_records_exact_cache_keys_and_configuration(prepared_comparison):
+    args, manifest, state, _ = prepared_comparison
+    _run_engine(args, manifest)
+    first = json.loads((args.output / "summary.json").read_text())
+    inputs = first["inputs"]
+    assert inputs["manifest_sha256"] == manifest.digest()
+    assert inputs["analysis_key"] in inputs["ghidra_project"]
+    assert manifest.preparation_digest() in inputs["preparation_key"]
+    assert inputs["normalization_key"]
+    assert inputs["selection_sha256"]
+    assert inputs["decompiler_timeout"] == args.decompiler_timeout
+    _run_engine(args, manifest)
+    second = json.loads((args.output / "summary.json").read_text())
+    assert first["inputs"] == second["inputs"]
+    assert state["runs"] == 1

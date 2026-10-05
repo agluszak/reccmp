@@ -165,10 +165,75 @@ class Manifest:
                     "image": alias.image_id.name.lower(),
                     "addr": f"{alias.addr:#x}",
                     "canonical": f"{alias.canonical_orig:#x}",
+                    "size": alias.size,
                 }
                 for alias in self.aliases
             ],
         }
+
+    @classmethod
+    def from_json(cls, document: dict) -> "Manifest":
+        """Restore the canonical comparison input without rebuilding a catalog."""
+        return cls(
+            document["target"],
+            BinaryInput(Path(document["orig"]["path"]), document["orig"]["sha256"]),
+            BinaryInput(Path(document["recomp"]["path"]), document["recomp"]["sha256"]),
+            tuple(
+                FunctionEntry(
+                    int(row["orig"], 16),
+                    int(row["recomp"], 16) if row["recomp"] is not None else None,
+                    row["name"],
+                    PairBasis(row["basis"]) if row["basis"] is not None else None,
+                    (
+                        SourceLocation(
+                            PurePath(row["source"]["path"]), row["source"]["line"]
+                        )
+                        if row["source"] is not None
+                        else None
+                    ),
+                    row["library"],
+                )
+                for row in document["functions"]
+            ),
+            tuple(
+                NamedObject(
+                    int(row["orig"], 16),
+                    int(row["recomp"], 16),
+                    row["name"],
+                    EntityType[row["type"]] if row["type"] is not None else None,
+                    row["orig_size"],
+                    row["recomp_size"],
+                    PairBasis(row["basis"]),
+                    row.get("recomp_symbol"),
+                )
+                for row in document["objects"]
+            ),
+            tuple(
+                UnpairedEntity(
+                    ImageId[row["image"].upper()],
+                    int(row["addr"], 16),
+                    row["size"],
+                    EntityType[row["type"]],
+                    row["name"],
+                )
+                for row in document["unpaired"]
+            ),
+            tuple(
+                Alias(
+                    ImageId[row["image"].upper()],
+                    int(row["addr"], 16),
+                    int(row["canonical"], 16),
+                    row["size"],
+                )
+                for row in document["aliases"]
+            ),
+        )
+
+    def validate_binaries(self) -> None:
+        """A saved manifest must never silently analyze replaced products."""
+        for binary in (self.orig, self.recomp):
+            if file_sha256(binary.path) != binary.sha256:
+                raise ValueError(f"Comparison binary changed: {binary.path}")
 
     def digest(self) -> str:
         """Identity of the metadata a comparison ran with."""

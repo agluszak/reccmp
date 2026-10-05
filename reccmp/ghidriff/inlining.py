@@ -432,9 +432,12 @@ class InlineNormalizationMixin:
             "failures": tuple(failures),
             "warnings": tuple(
                 AnalysisWarning(image, warning)
-                for image in (ImageId.ORIG, ImageId.RECOMP)
-                if (raw := raw_results.get((image, self._entry_addr(entry, image))))
-                is not None
+                for image, address in (
+                    (ImageId.ORIG, entry.orig_addr),
+                    (ImageId.RECOMP, entry.recomp_addr),
+                )
+                if address is not None
+                and (raw := raw_results.get((image, address))) is not None
                 for warning in raw.warnings
             ),
             "orig_code": self._normalized(ImageId.ORIG, entry.orig_addr, inline=inline),
