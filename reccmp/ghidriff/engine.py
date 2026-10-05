@@ -159,9 +159,12 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         self._retail_signatures: dict[int, tuple[int, str]] = {}
         self.reviewed_cdecl_signatures: dict[int, int] = {}
         self.reviewed_scalar_returns: dict[int, str] = {}
+        log_path = kwargs.get("engine_log_path")
+        self._native_debug_dir = (
+            Path(log_path).parent / "native-debug" if log_path is not None else None
+        )
         super().__init__(*args, **kwargs)
 
-    # --- ghidriff hooks ---------------------------------------------------
 
     def get_pdb(self, prog: "Program", allow_remote: bool = True) -> None:
         """Neither program gets debug information: the comparison is of the
@@ -239,8 +242,14 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 func.getEntryPoint(),
                 result.error,
             )
+            debug_path = None
+            if self._native_debug_dir is not None:
+                name = f"{prog.getName()}-{func.getEntryPoint()}.xml"
+                debug_path = self._native_debug_dir / name
             result = (
-                decompile_fresh(prog, func, timeout, self._read_decompile_results)
+                decompile_fresh(
+                    prog, func, timeout, self._read_decompile_results, debug_path
+                )
                 or result
             )
         return result
@@ -282,7 +291,6 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             program, require_symbols, force_analysis, verbose_analysis
         )
 
-    # --- program preparation ----------------------------------------------
 
     def _pair_type(self, orig_addr: int) -> EntityType | None:
         return self._pair_types.get(orig_addr)

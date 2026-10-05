@@ -847,3 +847,47 @@ def test_native_retry_expands_repeated_branching_callee(pytestconfig, loop):
     finally:
         for prog in programs.values():
             prog.release(consumer)
+
+
+def test_fresh_retry_emits_native_debug_snapshot(pytestconfig, tmp_path):
+    """A failed analysis retry must leave the exact native input in its report."""
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native decompiler test requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.util import DefaultLanguageService
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from java.lang import Object  # type: ignore[import-not-found]
+    from reccmp.ghidriff.preparation import decompile_fresh
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    program = ProgramDB(
+        "debug-fixture",
+        lang,
+        lang.getCompilerSpecByID(CompilerSpecID("windows")),
+        consumer,
+    )
+    try:
+        _create_shared_callee_functions(program, ImageId.ORIG)
+        caller = program.getFunctionManager().getFunctionAt(
+            program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000)
+        )
+        debug_path = tmp_path / "native-debug" / "caller.xml"
+        result = decompile_fresh(
+            program,
+            caller,
+            15,
+            lambda result: result,
+            debug_path,
+        )
+        assert result is not None and result.decompileCompleted()
+        import xml.etree.ElementTree as ET
+
+        snapshot = ET.parse(debug_path).getroot()
+        assert snapshot.tag == "xml_savefile"
+        assert snapshot.find("binaryimage") is not None
+    finally:
+        program.release(consumer)

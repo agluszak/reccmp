@@ -7,6 +7,7 @@ import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from typing import TYPE_CHECKING, Any
 
@@ -130,6 +131,7 @@ def decompile_fresh(
     function: "Function",
     timeout: int,
     read_results: Callable[["DecompileResults"], "DecompileResult"],
+    debug_path: Path | None = None,
 ) -> "DecompileResult | None":
     """Retry with a native process that has no cached earlier decompilations."""
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
@@ -143,6 +145,11 @@ def decompile_fresh(
         decompiler.setOptions(options)
         if not decompiler.openProgram(program):
             return None
+        if debug_path is not None:
+            import jpype
+
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            decompiler.enableDebug(jpype.JClass("java.io.File")(str(debug_path)))
         return read_results(
             decompiler.decompileFunction(function, timeout, TaskMonitor.DUMMY)
         )
