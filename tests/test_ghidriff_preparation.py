@@ -1,11 +1,19 @@
 """ABI preparation guards without starting Ghidra."""
 
 import sys
+from typing import TYPE_CHECKING, cast
+
+# These fakes implement Ghidra's Java method names.
+# pylint: disable=invalid-name
+
 from types import SimpleNamespace as NS
 
 import pytest
 
 from reccmp.ghidriff.preparation import correct_recompiled_signatures
+
+if TYPE_CHECKING:
+    from ghidra.program.model.listing import Program
 
 
 @pytest.mark.parametrize(
@@ -32,6 +40,12 @@ def test_equal_arity_does_not_skip_independently_confirmed_convention(
 
         def getParameterCount(self):
             return 1
+
+        def getReturnType(self):
+            return NS(getName=lambda: "void")
+
+        def getParameters(self):
+            return [NS(getDataType=lambda: NS(getName=lambda: "int"))]
 
         def getCallingConventionName(self):
             return self.convention
@@ -61,6 +75,9 @@ def test_equal_arity_does_not_skip_independently_confirmed_convention(
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        "reccmp.ghidriff.preparation._record_correction", lambda *_: None
+    )
     program = NS(
         getFunctionManager=lambda: NS(getFunctionAt=lambda _: function),
         getAddressFactory=lambda: NS(
@@ -68,6 +85,6 @@ def test_equal_arity_does_not_skip_independently_confirmed_convention(
         ),
     )
     correct_recompiled_signatures(
-        program, {0x1000: ("decorated", 1, retail_convention)}
+        cast("Program", program), {0x1000: ("decorated", 1, retail_convention)}
     )
     assert function.convention == expected

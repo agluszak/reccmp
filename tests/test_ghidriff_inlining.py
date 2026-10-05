@@ -15,7 +15,14 @@ from reccmp.ghidriff.inlining import (
     temporary_inline,
 )
 from reccmp.ghidriff.report import result_json
-from reccmp.ghidriff.results import InlineCode, Outcome, classify, classify_inline
+from reccmp.ghidriff.results import (
+    DataReference,
+    StringValue,
+    FunctionResult,
+    Outcome,
+    classify,
+    classify_pass,
+)
 from reccmp.types import EntityType, ImageId
 
 
@@ -276,8 +283,18 @@ def result(entry, inline_code=None):
         recomp_refs=(),
     )
     return (
-        classify_inline(
-            normal, InlineCode(inline_code[0], inline_code[1], (0x1100,)), (), ()
+        FunctionResult(
+            entry,
+            normal.ordinary,
+            classify_pass(
+                entry,
+                failures=(),
+                orig_code=inline_code[0],
+                recomp_code=inline_code[1],
+                orig_refs=(),
+                recomp_refs=(),
+            ),
+            (0x1100,),
         )
         if inline_code is not None
         else normal
@@ -289,10 +306,13 @@ def test_retry_controls_outcome_and_both_diffs_are_reported():
     code = ["return a->foo + 1;\n"]
     normalized = result(entry, (code, code))
     assert normalized.outcome == Outcome.NO_DIFFERENCES
-    assert normalized.normal_diff
-    assert normalized.inline_normalized_diff == normalized.code_diff == ()
+    assert normalized.ordinary.text.body_diff
+    assert normalized.inline.text.body_diff == normalized.selected.text.body_diff == ()
     row = result_json(normalized)
-    assert row["normal_diff"] and row["inline_normalized_diff"] == []
+    assert (
+        row["passes"]["ordinary"]["body_diff"]
+        and row["passes"]["inline"]["body_diff"] == []
+    )
     assert row["inline_callees"] == ["0x1100"]
 
 
@@ -300,19 +320,20 @@ def test_changed_value_survives_retry():
     entry, _, _, _ = fixture_model()
     normalized = result(entry, (["return a->foo + 1;\n"], ["return a->foo + 2;\n"]))
     assert normalized.outcome == Outcome.DIFFERENCES
-    assert normalized.code_diff == normalized.inline_normalized_diff
+    assert normalized.selected.text.body_diff == normalized.inline.text.body_diff
 
 
-def test_failed_retry_is_analysis_failure_with_normal_diff_retained():
+def test_failed_retry_gates_analysis_and_retains_ordinary_evidence():
     entry, _, _, _ = fixture_model()
     normalized = result(entry, (["return 1;\n"], None))
     assert normalized.outcome == Outcome.ANALYSIS_FAILED
-    assert normalized.normal_diff and normalized.failures
+    assert normalized.selected_pass == "inline"
+    assert normalized.ordinary.text.body_diff and normalized.inline.failures
 
 
 def test_no_retry_is_distinct_from_empty_retry_diff():
     entry, _, _, _ = fixture_model()
-    assert result(entry).inline_normalized_diff is None
+    assert result(entry).inline is None
 
 
 def test_only_successful_inline_notice_is_removed():
@@ -357,7 +378,166 @@ def test_retry_does_not_override_a_clean_ordinary_result():
         orig_refs=(),
         recomp_refs=(),
     )
-    retried = classify_inline(
-        normal, InlineCode(code, ["return 2;\n"], (0x1100,)), (), ()
+    retried = FunctionResult(
+        entry,
+        normal.ordinary,
+        classify_pass(
+            entry,
+            failures=(),
+            orig_code=code,
+            recomp_code=["return 2;\n"],
+            orig_refs=(),
+            recomp_refs=(),
+        ),
+        (0x1100,),
     )
-    assert retried == normal
+    assert retried.selected == normal.ordinary
+    assert retried.selected_pass == "ordinary"
+
+
+def test_pass_score_and_declaration_follow_retry():
+    entry, _, _, _ = fixture_model()
+    ordinary = classify(
+        entry,
+        failures=(),
+        orig_code=["uint f()\n", "{\n", "return 1;\n", "}\n"],
+        recomp_code=["int f()\n", "{\n", "return helper();\n", "}\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    code = ["int f()\n", "{\n", "return 1;\n", "}\n"]
+    retry = classify_pass(
+        entry,
+        failures=(),
+        orig_code=code,
+        recomp_code=code,
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    row = result_json(FunctionResult(entry, ordinary.ordinary, retry, (0x1100,)))
+    assert row["selected_pass"] == "inline"
+    assert row["passes"]["ordinary"]["signature_diff"]
+    assert row["passes"]["ordinary"]["similarity"] < 1
+    assert row["passes"]["inline"]["signature_diff"] == []
+    assert row["passes"]["inline"]["similarity"] == 1
+
+
+def test_inline_transaction_flushes_before_retry_and_after_rollback():
+    _, obj, candidates, functions = fixture_model()
+    observations = []
+    cache = NS(
+        flushCache=lambda: observations.append(
+            tuple(fn.inline for fn in functions.values())
+        )
+    )
+    with (
+        pytest.raises(ValueError),
+        temporary_inline(candidates.programs, [obj], [cache]),
+    ):
+        raise ValueError("decompile failed")
+    assert observations == [(True, True), (False, False)]
+
+
+def test_native_and_embedded_warnings_are_preserved():
+    raw = Decompiled.from_native(
+        NS(
+            completed=True,
+            error=None,
+            warnings=("native warning",),
+            code="/* WARNING: Could not recover jumptable */\nvoid f() { return; }",
+        )
+    )
+    assert raw.warnings == ("native warning", "WARNING: Could not recover jumptable")
+    assert "WARNING" in raw.code
+
+
+def test_retry_keeps_ordinary_and_inline_reference_findings_separate():
+    entry, _, _, _ = fixture_model()
+
+    class Engine(InlineNormalizationMixin):
+        manifest = NS(functions=(entry,))
+        _failures = {}
+        _inline_callees = {entry.orig_addr: (0x1100,)}
+        _decompiled = {
+            (ImageId.ORIG, entry.orig_addr): Decompiled("void f() { return; }", None),
+            (ImageId.RECOMP, entry.recomp_addr): Decompiled(
+                "void f() { return; }", None
+            ),
+        }
+        _inline_decompiled = dict(_decompiled)
+        _references = {
+            (ImageId.ORIG, entry.orig_addr): (
+                DataReference(0x3000, None, StringValue("old")),
+            ),
+            (ImageId.RECOMP, entry.orig_addr): (
+                DataReference(0x4000, None, StringValue("new")),
+            ),
+        }
+        _inline_references = {
+            (image, entry.orig_addr): (
+                DataReference(0x5000, None, StringValue("helper")),
+            )
+            for image in ImageId
+        }
+
+        def _entry_addr(self, selected, image):
+            return selected.orig_addr if image == ImageId.ORIG else selected.recomp_addr
+
+        def normalize_ghidra_decomp_for_side(self, *_args, **_kwargs):
+            pass
+
+    engine = Engine()
+    comparison = engine.results()[0]
+    assert comparison.inline is not None
+    assert comparison.selected.text is not None
+    assert comparison.ordinary.outcome == Outcome.DIFFERENCES
+    assert comparison.ordinary.data_findings
+    assert comparison.inline.outcome == Outcome.NO_DIFFERENCES
+    assert not comparison.inline.data_findings
+    assert comparison.selected.text.similarity == 1
+    assert comparison.ordinary.data_findings[0].orig == (StringValue("old"),)
+
+
+def test_clean_ordinary_pass_is_not_sent_to_candidate_discovery(monkeypatch):
+    entry, _, _, _ = fixture_model()
+    calls = []
+
+    def discover(_entry):
+        raise AssertionError("Clean ordinary results do not need candidate discovery")
+
+    monkeypatch.setattr(
+        "reccmp.ghidriff.inlining.InlineCandidates", lambda *_: NS(for_pair=discover)
+    )
+
+    class Engine(InlineNormalizationMixin):
+        manifest = None
+        _failures = {}
+        _decompiled = {
+            (ImageId.ORIG, entry.orig_addr): Decompiled("return;", None),
+            (ImageId.RECOMP, entry.recomp_addr): Decompiled("return;", None),
+        }
+
+        def _entry_addr(self, selected, image):
+            return selected.orig_addr if image == ImageId.ORIG else selected.recomp_addr
+
+        def _comparable_entries(self):
+            return (entry,)
+
+        def _ordinary_result(self, entry):
+            return classify(
+                entry,
+                failures=(),
+                orig_code=["return;"],
+                recomp_code=["return;"],
+                orig_refs=(),
+                recomp_refs=(),
+            )
+
+        def setup_decompliers(self, *_args, **_kwargs):
+            calls.append("setup")
+
+        def shutdown_decompilers(self, *_args):
+            calls.append("shutdown")
+
+    Engine().normalize_inlining(dict.fromkeys(ImageId))
+    assert calls == ["setup", "shutdown"]

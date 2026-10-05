@@ -24,6 +24,7 @@ from reccmp.ghidriff.results import (
     compare_references,
     consistent,
 )
+from reccmp.ghidriff.report import print_summary, result_json
 from reccmp.types import ImageId
 from reccmp.ghidriff.preparation import decompile_fresh, recover_requested_switches
 
@@ -69,7 +70,7 @@ def test_missing_decompilation_is_an_analysis_failure():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.ANALYSIS_FAILED
-    assert result.failures == (
+    assert result.selected.failures == (
         AnalysisFailure(FailureKind.NOT_DECOMPILED, ImageId.RECOMP),
     )
 
@@ -192,7 +193,7 @@ def test_entry_conflict_is_kept_as_the_reason():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.ANALYSIS_FAILED
-    assert result.failures == (conflict,)
+    assert result.selected.failures == (conflict,)
 
 
 def test_one_sided_failure_is_the_whole_reason():
@@ -205,7 +206,7 @@ def test_one_sided_failure_is_the_whole_reason():
         orig_refs=(),
         recomp_refs=(),
     )
-    assert result.failures == (conflict,)
+    assert result.selected.failures == (conflict,)
 
 
 def test_equal_decompilation_has_no_differences():
@@ -219,7 +220,8 @@ def test_equal_decompilation_has_no_differences():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.NO_DIFFERENCES
-    assert not result.code_diff
+    assert result.selected.text is not None
+    assert not result.selected.text.body_diff
 
 
 def test_code_difference_carries_the_diff():
@@ -232,8 +234,9 @@ def test_code_difference_carries_the_diff():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.DIFFERENCES
-    assert "-  return a <= b;\n" in result.code_diff
-    assert "+  return a > b;\n" in result.code_diff
+    assert result.selected.text is not None
+    assert "-  return a <= b;\n" in result.selected.text.body_diff
+    assert "+  return a > b;\n" in result.selected.text.body_diff
 
 
 def test_equal_code_with_different_literal_is_a_difference():
@@ -248,7 +251,7 @@ def test_equal_code_with_different_literal_is_a_difference():
         recomp_refs=(_ref(StringValue("")),),
     )
     assert result.outcome == Outcome.DIFFERENCES
-    [finding] = result.data_findings
+    [finding] = result.selected.data_findings
     assert finding.kind == DataFindingKind.REFERENCED_CONTENTS
     assert finding.orig == (StringValue("?"),)
     assert finding.recomp == (StringValue(""),)
@@ -369,13 +372,13 @@ def test_signature_only_changes_keep_evidence_without_body_regression():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.NO_DIFFERENCES
-    assert not result.code_diff
-    assert result.signature_diff
-    assert result.code_change_kind is None
+    assert result.selected.text is not None
+    assert not result.selected.text.body_diff
+    assert result.selected.text.signature_diff
+    assert result.selected.text.change_kind is None
 
 
 def test_signature_only_findings_survive_serialization_and_cli(capsys):
-    from reccmp.ghidriff.report import print_summary, result_json
 
     result = classify(
         _entry(),
@@ -387,8 +390,11 @@ def test_signature_only_findings_survive_serialization_and_cli(capsys):
     )
     row = result_json(result)
     assert row["outcome"] == "no-differences"
-    assert row["signature_diff"] == list(result.signature_diff)
-    assert row["code_diff"] == []
+    assert result.selected.text is not None
+    assert row["passes"]["ordinary"]["signature_diff"] == list(
+        result.selected.text.signature_diff
+    )
+    assert row["passes"]["ordinary"]["body_diff"] == []
     print_summary([result], details=True)
     output = capsys.readouterr().out
     assert "unchanged bodies/data" in output
@@ -406,9 +412,10 @@ def test_unsigned_condition_comparison_remains_a_difference():
         recomp_refs=(),
     )
     assert result.outcome == Outcome.DIFFERENCES
-    assert result.code_change_kind == "scalar-signedness"
-    assert result.code_diff
-    assert not result.signature_diff
+    assert result.selected.text is not None
+    assert result.selected.text.change_kind == "scalar-signedness"
+    assert result.selected.text.body_diff
+    assert not result.selected.text.signature_diff
 
 
 def test_signature_only_change_does_not_hide_referenced_data():
@@ -421,6 +428,7 @@ def test_signature_only_change_does_not_hide_referenced_data():
         recomp_refs=(_ref(StringValue("new")),),
     )
     assert result.outcome == Outcome.DIFFERENCES
-    assert not result.code_diff
-    assert result.data_findings
-    assert result.signature_diff
+    assert result.selected.text is not None
+    assert not result.selected.text.body_diff
+    assert result.selected.data_findings
+    assert result.selected.text.signature_diff

@@ -98,7 +98,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 28
+PREPARATION_REVISION = 29
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -132,6 +132,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         self._failures: dict[int, list[AnalysisFailure]] = {}
         self.preparation_failed = False
         self._references: dict[tuple[ImageId, int], tuple[DataReference, ...]] = {}
+        self._inline_references = self._references.copy()
         self._decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._inline_decompiled: dict[tuple[ImageId, int], _Decompiled] = {}
         self._inline_callees: dict[int, tuple[int, ...]] = {}
@@ -188,9 +189,10 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             or (orig_addr := self._function_entries.get((side, entry_address))) is None
         ):
             return
+        references = self._inline_references if inline else self._references
         orig_tokens, recomp_tokens = paired_reference_tokens(
-            self._references.get((ImageId.ORIG, orig_addr), ()),
-            self._references.get((ImageId.RECOMP, orig_addr), ()),
+            references.get((ImageId.ORIG, orig_addr), ()),
+            references.get((ImageId.RECOMP, orig_addr), ()),
             self._paired_recomp_addrs,
         )
         decompiled = self._inline_decompiled if inline else self._decompiled
@@ -245,9 +247,8 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         result = self._decompile_native(prog, func, timeout)
         side = self._sides.get(self._program_key(prog))
         if side is not None:
-            self._decompiled[(side, func.getEntryPoint().getOffset())] = _Decompiled(
-                code=result.code if result.completed else None,
-                error=result.error,
+            self._decompiled[(side, func.getEntryPoint().getOffset())] = (
+                _Decompiled.from_native(result)
             )
         return result
 
@@ -317,7 +318,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
             transaction = program.startTransaction("reccmp references")
             try:
                 self._infer_requested_prototypes(program, image_id)
-                self._collect_references(program, image_id)
+                self._references.update(self._collect_references(program, image_id))
             finally:
                 program.endTransaction(transaction, True)
             self._sides[self._program_key(program)] = image_id
@@ -539,7 +540,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 self._infer_requested_prototypes(program, image_id)
                 self._apply_names(program, image_id)
                 label_source_paths(program)
-                self._collect_references(program, image_id)
+                self._references.update(self._collect_references(program, image_id))
             finally:
                 program.endTransaction(transaction, True)
             self._sides[self._program_key(program)] = image_id
@@ -740,7 +741,8 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         program: "Program",
         image_id: ImageId,
         bodies: dict[int, list[Any]] | None = None,
-    ) -> None:
+    ) -> dict[tuple[ImageId, int], tuple[DataReference, ...]]:
+        collected = {}
         functions = program.getFunctionManager()
         references = program.getReferenceManager()
         space = program.getAddressFactory().getDefaultAddressSpace()
@@ -790,7 +792,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                     if bound is None and access is None:
                         to = self._string_start(program, image_id, to)
                     targets.setdefault(Use(to.getOffset(), bound, access), to)
-            self._references[(image_id, entry.orig_addr)] = tuple(
+            collected[(image_id, entry.orig_addr)] = tuple(
                 self._reference(program, image_id, to, use)
                 for use, to in sorted(
                     targets.items(),
@@ -801,6 +803,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                     ),
                 )
             )
+        return collected
 
     def _string_start(
         self, program: "Program", image_id: ImageId, address: "Address"

@@ -7,8 +7,8 @@ analyzed output shows a difference, and whether the analysis happened.
 
 import enum
 from collections import Counter
-from dataclasses import dataclass, replace
-from ghidriff.code import compare_code
+from dataclasses import dataclass
+from ghidriff.code import TextComparison, compare_code
 
 from reccmp.compare.manifest import FunctionEntry
 from reccmp.types import ImageId
@@ -250,42 +250,95 @@ def consistent(left: Contents, right: Contents) -> bool:
 
 
 @dataclass(frozen=True)
-class InlineCode:
-    orig: list[str] | None
-    recomp: list[str] | None
-    callees: tuple[int, ...]
-    failures: tuple[AnalysisFailure, ...] = ()
+class AnalysisWarning:
+    image: ImageId
+    message: str
 
 
 @dataclass(frozen=True)
-class InlineDiff:
-    diff: tuple[str, ...] | None
-    callees: tuple[int, ...]
+class ComparisonPass:
+    """Evidence and classification from one complete analysis pass."""
+
+    outcome: Outcome
+    text: TextComparison | None = None
+    data_findings: tuple[DataFinding, ...] = ()
+    failures: tuple[AnalysisFailure, ...] = ()
+    unidentified_references: int = 0
+    warnings: tuple[AnalysisWarning, ...] = ()
 
 
 @dataclass(frozen=True)
 class FunctionResult:
     entry: FunctionEntry
-    outcome: Outcome
-    normal_diff: tuple[str, ...] = ()
-    data_findings: tuple[DataFinding, ...] = ()
-    failures: tuple[AnalysisFailure, ...] = ()
-    unidentified_references: int = 0
-    inline: InlineDiff | None = None
-    signature_diff: tuple[str, ...] = ()
-    code_change_kind: str | None = None
+    ordinary: ComparisonPass
+    inline: ComparisonPass | None = None
+    inline_callees: tuple[int, ...] = ()
 
     @property
-    def code_diff(self) -> tuple[str, ...]:
-        return (self.inline.diff or ()) if self.inline is not None else self.normal_diff
+    def selected_pass(self) -> str:
+        # Retry failure is a gating analysis failure; ordinary evidence stays intact.
+        return (
+            "inline"
+            if self.inline is not None and self.ordinary.outcome == Outcome.DIFFERENCES
+            else "ordinary"
+        )
 
     @property
-    def inline_normalized_diff(self) -> tuple[str, ...] | None:
-        return self.inline.diff if self.inline is not None else None
+    def selected(self) -> ComparisonPass:
+        if self.selected_pass == "inline":
+            assert self.inline is not None
+            return self.inline
+        return self.ordinary
 
     @property
-    def inline_callees(self) -> tuple[int, ...]:
-        return self.inline.callees if self.inline is not None else ()
+    def outcome(self) -> Outcome:
+        return self.selected.outcome
+
+
+def classify_pass(  # pylint: disable=too-many-arguments
+    entry: FunctionEntry,
+    *,
+    failures: tuple[AnalysisFailure, ...],
+    orig_code: list[str] | None,
+    recomp_code: list[str] | None,
+    orig_refs: tuple[DataReference, ...],
+    recomp_refs: tuple[DataReference, ...],
+    warnings: tuple[AnalysisWarning, ...] = (),
+) -> ComparisonPass:
+    """Classify normalized text and referenced data from the same pass."""
+    if entry.recomp_addr is None:
+        return ComparisonPass(Outcome.UNPAIRED)
+    if not failures:
+        failures = tuple(
+            AnalysisFailure(FailureKind.NOT_DECOMPILED, image)
+            for image, code in (
+                (ImageId.ORIG, orig_code),
+                (ImageId.RECOMP, recomp_code),
+            )
+            if code is None
+        )
+    if failures:
+        return ComparisonPass(
+            Outcome.ANALYSIS_FAILED, failures=failures, warnings=warnings
+        )
+    assert orig_code is not None and recomp_code is not None
+    comparison = compare_code(
+        orig_code, recomp_code, f"orig/{entry.name}", f"recomp/{entry.name}"
+    )
+    findings = compare_references(orig_refs, recomp_refs)
+    return ComparisonPass(
+        (
+            Outcome.DIFFERENCES
+            if comparison.body_diff or findings
+            else Outcome.NO_DIFFERENCES
+        ),
+        text=comparison,
+        warnings=warnings,
+        data_findings=findings,
+        unidentified_references=sum(
+            1 for ref in (*orig_refs, *recomp_refs) if ref.object is None
+        ),
+    )
 
 
 def classify(
@@ -297,68 +350,15 @@ def classify(
     orig_refs: tuple[DataReference, ...],
     recomp_refs: tuple[DataReference, ...],
 ) -> FunctionResult:
-    """The outcome for one requested function from its analyzed output.
-
-    ``*_code`` are normalized decompilation lines, or None when the side was
-    not decompiled."""
-    if entry.recomp_addr is None:
-        return FunctionResult(entry, Outcome.UNPAIRED)
-
-    if not failures:
-        failures = tuple(
-            AnalysisFailure(FailureKind.NOT_DECOMPILED, image)
-            for image, code in (
-                (ImageId.ORIG, orig_code),
-                (ImageId.RECOMP, recomp_code),
-            )
-            if code is None
-        )
-    if failures:
-        return FunctionResult(entry, Outcome.ANALYSIS_FAILED, failures=failures)
-    assert orig_code is not None and recomp_code is not None
-
-    comparison = compare_code(
-        orig_code, recomp_code, f"orig/{entry.name}", f"recomp/{entry.name}"
-    )
-    diff = comparison.body_diff
-    findings = compare_references(orig_refs, recomp_refs)
-    unidentified = sum(1 for ref in (*orig_refs, *recomp_refs) if ref.object is None)
+    """A requested function with ordinary evidence and no retry."""
     return FunctionResult(
         entry,
-        Outcome.DIFFERENCES if diff or findings else Outcome.NO_DIFFERENCES,
-        normal_diff=diff,
-        signature_diff=comparison.signature_diff,
-        code_change_kind=comparison.change_kind,
-        data_findings=findings,
-        unidentified_references=unidentified,
-    )
-
-
-def classify_inline(
-    normal: FunctionResult,
-    code: InlineCode,
-    orig_refs: tuple[DataReference, ...],
-    recomp_refs: tuple[DataReference, ...],
-) -> FunctionResult:
-    """Use the retry without score selection, retaining the ordinary diff.
-
-    The retry removes inlining differences; it cannot qualify an ordinary
-    result that already has none."""
-    if normal.outcome == Outcome.NO_DIFFERENCES:
-        return normal
-    retry = classify(
-        normal.entry,
-        failures=code.failures,
-        orig_code=code.orig,
-        recomp_code=code.recomp,
-        orig_refs=orig_refs,
-        recomp_refs=recomp_refs,
-    )
-    return replace(
-        retry,
-        normal_diff=normal.normal_diff,
-        signature_diff=normal.signature_diff,
-        inline=InlineDiff(
-            retry.normal_diff if not retry.failures else None, code.callees
+        classify_pass(
+            entry,
+            failures=failures,
+            orig_code=orig_code,
+            recomp_code=recomp_code,
+            orig_refs=orig_refs,
+            recomp_refs=recomp_refs,
         ),
     )

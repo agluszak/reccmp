@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from ghidriff.code import code_tokens
+
 from capstone import x86_const  # type: ignore
 
 from reccmp.analysis.x86 import decode_one
@@ -13,11 +15,11 @@ from reccmp.types import EntityType, ImageId
 
 from .results import (
     AnalysisFailure,
+    AnalysisWarning,
     FailureKind,
     FunctionResult,
-    InlineCode,
-    classify,
-    classify_inline,
+    classify_pass,
+    Outcome,
 )
 
 
@@ -279,7 +281,7 @@ class InlineCandidates:
 
 
 @contextmanager
-def temporary_inline(programs, candidates):
+def temporary_inline(programs, candidates, decompilers=()):
     """Rollback every program transaction, including after a failed retry."""
     transactions = []
     try:
@@ -293,10 +295,14 @@ def temporary_inline(programs, candidates):
                     space.getAddress(obj.addr(image))
                 )
                 function.setInline(True)
+        for decompiler in decompilers:
+            decompiler.flushCache()
         yield
     finally:
         for program, transaction in reversed(transactions):
             program.endTransaction(transaction, False)
+        for decompiler in decompilers:
+            decompiler.flushCache()
 
 
 @dataclass(frozen=True)
@@ -305,6 +311,20 @@ class Decompiled:
 
     code: str | None
     error: str | None
+    warnings: tuple[str, ...] = ()
+
+    @classmethod
+    def from_native(cls, result):
+        comments = tuple(
+            token.strip()[3:-2].strip()
+            for kind, token in code_tokens(result.code or "")
+            if kind == "comment" and token.lstrip().startswith("/* WARNING:")
+        )
+        return cls(
+            result.code if result.completed else None,
+            result.error,
+            tuple(dict.fromkeys((*result.warnings, *comments))),
+        )
 
 
 class InlineNormalizationMixin:
@@ -326,19 +346,25 @@ class InlineNormalizationMixin:
                     for image in programs
                 ):
                     continue
+                if self._ordinary_result(entry).outcome == Outcome.NO_DIFFERENCES:
+                    continue
                 callees = candidates.for_pair(entry)
                 if not callees:
                     continue
                 self._inline_callees[entry.orig_addr] = tuple(
                     obj.orig_addr for obj in callees
                 )
-                try:
-                    with temporary_inline(programs, callees):
-                        for image, program in programs.items():
-                            address = self._entry_addr(entry, image)
-                            function = candidates.function(image, address)
-                            # Include data reached through the substituted bodies;
-                            # normalization must not hide changed helper literals.
+                decompilers = tuple(
+                    self.decompilers[self._program_key(program)][0]
+                    for program in programs.values()
+                )
+                with temporary_inline(programs, callees, decompilers):
+                    for image, program in programs.items():
+                        address = self._entry_addr(entry, image)
+                        function = candidates.function(image, address)
+                        # Include data reached through the substituted bodies;
+                        # normalization must not hide changed helper literals.
+                        self._inline_references.update(
                             self._collect_references(
                                 program,
                                 image,
@@ -352,17 +378,13 @@ class InlineNormalizationMixin:
                                     ]
                                 },
                             )
-                            self.decompilers[self._program_key(program)][0].flushCache()
-                            result = self._decompile_native(
-                                program, function, self.decompiler_timeout
-                            )
-                            self._inline_decompiled[(image, address)] = Decompiled(
-                                result.code if result.completed else None, result.error
-                            )
-                finally:
-                    # The next pair must observe the restored program flags.
-                    for program in programs.values():
-                        self.decompilers[self._program_key(program)][0].flushCache()
+                        )
+                        result = self._decompile_native(
+                            program, function, self.decompiler_timeout
+                        )
+                        self._inline_decompiled[(image, address)] = (
+                            Decompiled.from_native(result)
+                        )
         finally:
             self.shutdown_decompilers(old, new)
 
@@ -388,60 +410,51 @@ class InlineNormalizationMixin:
         )
         return decompiled_lines("".join(lines))
 
+    def _ordinary_result(self: Any, entry) -> FunctionResult:
+        return FunctionResult(
+            entry, classify_pass(entry, **self._pass_evidence(entry, inline=False))
+        )
+
+    def _pass_evidence(self: Any, entry, *, inline: bool):
+        raw_results = self._inline_decompiled if inline else self._decompiled
+        references = self._inline_references if inline else self._references
+        failures = [] if inline else list(self._failures.get(entry.orig_addr, ()))
+        if entry.recomp_addr is not None and not failures:
+            for image in (ImageId.ORIG, ImageId.RECOMP):
+                raw = raw_results.get((image, self._entry_addr(entry, image)))
+                if raw is not None and raw.error is not None:
+                    failures.append(
+                        AnalysisFailure(
+                            FailureKind.DECOMPILE_ERROR, image, message=raw.error
+                        )
+                    )
+        return {
+            "failures": tuple(failures),
+            "warnings": tuple(
+                AnalysisWarning(image, warning)
+                for image in (ImageId.ORIG, ImageId.RECOMP)
+                if (raw := raw_results.get((image, self._entry_addr(entry, image))))
+                is not None
+                for warning in raw.warnings
+            ),
+            "orig_code": self._normalized(ImageId.ORIG, entry.orig_addr, inline=inline),
+            "recomp_code": self._normalized(
+                ImageId.RECOMP, entry.recomp_addr, inline=inline
+            ),
+            "orig_refs": references.get((ImageId.ORIG, entry.orig_addr), ()),
+            "recomp_refs": references.get((ImageId.RECOMP, entry.orig_addr), ()),
+        }
+
     def results(self: Any) -> list[FunctionResult]:
-        """One result for every function the manifest requested."""
+        """One result per requested function, retaining each pass's own evidence."""
         results = []
         for entry in self.manifest.functions:
-            failures = list(self._failures.get(entry.orig_addr, ()))
-            if entry.recomp_addr is not None and not failures:
-                for image_id in (ImageId.ORIG, ImageId.RECOMP):
-                    decompiled = self._decompiled.get(
-                        (image_id, self._entry_addr(entry, image_id))
-                    )
-                    if decompiled is not None and decompiled.error is not None:
-                        failures.append(
-                            AnalysisFailure(
-                                FailureKind.DECOMPILE_ERROR,
-                                image_id,
-                                message=decompiled.error,
-                            )
-                        )
-            orig_refs = self._references.get((ImageId.ORIG, entry.orig_addr), ())
-            recomp_refs = self._references.get((ImageId.RECOMP, entry.orig_addr), ())
-            result = classify(
-                entry,
-                failures=tuple(failures),
-                orig_code=self._normalized(ImageId.ORIG, entry.orig_addr),
-                recomp_code=self._normalized(ImageId.RECOMP, entry.recomp_addr),
-                orig_refs=orig_refs,
-                recomp_refs=recomp_refs,
+            ordinary = self._ordinary_result(entry)
+            callees = self._inline_callees.get(entry.orig_addr, ())
+            retry = (
+                classify_pass(entry, **self._pass_evidence(entry, inline=True))
+                if callees
+                else None
             )
-            if entry.orig_addr in self._inline_callees:
-                retry_failures = tuple(
-                    AnalysisFailure(
-                        FailureKind.DECOMPILE_ERROR, image, message=raw.error
-                    )
-                    for image in (ImageId.ORIG, ImageId.RECOMP)
-                    if (
-                        raw := self._inline_decompiled.get(
-                            (image, self._entry_addr(entry, image))
-                        )
-                    )
-                    is not None
-                    and raw.error is not None
-                )
-                result = classify_inline(
-                    result,
-                    InlineCode(
-                        self._normalized(ImageId.ORIG, entry.orig_addr, inline=True),
-                        self._normalized(
-                            ImageId.RECOMP, entry.recomp_addr, inline=True
-                        ),
-                        self._inline_callees[entry.orig_addr],
-                        retry_failures,
-                    ),
-                    orig_refs,
-                    recomp_refs,
-                )
-            results.append(result)
+            results.append(FunctionResult(entry, ordinary.ordinary, retry, callees))
         return results

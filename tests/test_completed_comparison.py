@@ -62,7 +62,7 @@ def fixture_prepared_comparison(tmp_path, monkeypatch):
             orig_refs=(),
             recomp_refs=(),
         )
-        return {"functions": {"modified": []}}, [result], {"functions": []}
+        return {"functions": {"modified": []}}, [result], {"functions": []}, []
 
     monkeypatch.setattr(compare, "_compare_programs", analyze)
     args = SimpleNamespace(
@@ -152,10 +152,8 @@ def test_report_delta_distinguishes_resolved_and_unselected_functions():
         return {
             "orig": hex(address),
             "outcome": outcome,
-            "code_diff": list(diff),
-            "data": [],
-            "failures": [],
-            "unidentified_references": 0,
+            "selected_pass": "ordinary",
+            "passes": {"ordinary": {"body_diff": list(diff), "outcome": outcome}},
             "name": "f",
             "basis": "annotation",
         }

@@ -169,10 +169,13 @@ def test_nested_inline_callees_with_shared_branching_body(pytestconfig):
         engine.shutdown_decompilers(old, new)
         engine.normalize_inlining(programs)
         result = engine.results()[0]
-        assert result.normal_diff
+        assert result.ordinary.text is not None
+        assert result.ordinary.text.body_diff
         assert result.inline_callees == (0x1100, 0x1200)
-        assert result.inline_normalized_diff is not None
-        assert not result.failures
+        assert result.inline is not None
+        assert result.inline.text is not None
+        assert result.inline.text.body_diff is not None
+        assert not result.selected.failures
         for program in programs.values():
             space = program.getAddressFactory().getDefaultAddressSpace()
             assert all(
@@ -293,9 +296,12 @@ def test_native_inline_retry(pytestconfig, changed):
         assert engine.results()[0].outcome == Outcome.DIFFERENCES
         engine.normalize_inlining(programs)
         result = engine.results()[0]
-        assert result.normal_diff
+        assert result.ordinary.text is not None
+        assert result.ordinary.text.body_diff
         assert result.inline_callees == (0x1100,)
-        assert result.inline_normalized_diff is not None
+        assert result.inline is not None
+        assert result.inline.text is not None
+        assert result.inline.text.body_diff is not None
         assert result.outcome == (
             Outcome.DIFFERENCES if changed else Outcome.NO_DIFFERENCES
         )
@@ -425,7 +431,9 @@ def test_native_inline_retry_follows_tail_call(pytestconfig):
         engine.normalize_inlining(programs)
         result = engine.results()[0]
         assert set(result.inline_callees) == {0x1100, 0x1200}
-        assert result.outcome == Outcome.NO_DIFFERENCES, result.inline_normalized_diff
+        assert result.inline is not None
+        assert result.inline.text is not None
+        assert result.outcome == Outcome.NO_DIFFERENCES, result.inline.text.body_diff
     finally:
         for program in programs.values():
             program.release(consumer)
@@ -524,8 +532,81 @@ def test_native_inline_retry_through_cycle_left_as_call(pytestconfig):
         engine.normalize_inlining(programs)
         result = engine.results()[0]
         assert result.inline_callees == (0x1100,)
-        assert not result.failures
+        assert not result.selected.failures
         assert result.outcome == Outcome.NO_DIFFERENCES
     finally:
         for program in programs.values():
+            program.release(consumer)
+
+
+def test_native_tail_only_callee_parameter_inference(pytestconfig):
+    """A focused tail caller infers ECX just as a larger selection does."""
+    if not pytestconfig.getoption("--require-ghidra"):
+        pytest.skip("Native decompiler test requires --require-ghidra")
+    HeadlessPyGhidraLauncher().start()
+    from ghidra.program.database import ProgramDB
+    from ghidra.program.util import DefaultLanguageService
+    from ghidra.program.model.lang import LanguageID, CompilerSpecID
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.symbol import SourceType
+    from ghidra.util.task import TaskMonitor
+    from java.io import ByteArrayInputStream  # type: ignore[import-not-found]
+    from java.lang import Object  # type: ignore[import-not-found]
+    from reccmp.ghidriff.preparation import infer_requested_callee_parameters
+
+    lang = DefaultLanguageService.getLanguageService().getLanguage(
+        LanguageID("x86:LE:32:default")
+    )
+    consumer = Object()
+    for requested in ([0x1000], [0x1000, 0x1100]):
+        program = ProgramDB(
+            "tail-only",
+            lang,
+            lang.getCompilerSpecByID(CompilerSpecID("windows")),
+            consumer,
+        )
+        transaction = program.startTransaction("authored tail caller")
+        try:
+            api = FlatProgramAPI(program)
+            blob = bytearray(b"\x90" * 0x200)
+            # Load the object into ECX, then jump to a field-reading callee.
+            blob[:11] = bytes.fromhex("8b0d00200000e9f5000000")
+            blob[0x100:0x104] = bytes.fromhex("8b412cc3")
+            space = program.getAddressFactory().getDefaultAddressSpace()
+            program.getMemory().createInitializedBlock(
+                "text",
+                space.getAddress(0x1000),
+                ByteArrayInputStream(bytes(blob)),
+                len(blob),
+                TaskMonitor.DUMMY,
+                False,
+            )
+            for address in (0x1000, 0x1100):
+                api.disassemble(space.getAddress(address))
+                api.createFunction(space.getAddress(address), f"f{address:x}")
+            callee = program.getFunctionManager().getFunctionAt(
+                space.getAddress(0x1100)
+            )
+            assert callee.getSignatureSource() == SourceType.DEFAULT
+            assert callee.getParameterCount() == 0
+            for _ in range(
+                2
+            ):  # Reuse prepared analysis without changing inferred parameters.
+                infer_requested_callee_parameters(program, requested, {0x1100})
+                assert callee.getSignatureSource() == SourceType.ANALYSIS
+                assert callee.getParameterCount() == 1
+                assert callee.getParameter(0).getRegister().getName() == "ECX"
+            from reccmp.ghidriff.preparation import (
+                apply_reviewed_scalar_returns,
+                preparation_corrections,
+            )
+
+            apply_reviewed_scalar_returns(program, {0x1100: "bool"})
+            [correction] = preparation_corrections(program)
+            assert correction.evidence == "reviewed-retail-return"
+            apply_reviewed_scalar_returns(program, {0x1100: "bool"})
+            callee.setName("catalogued_callee", SourceType.USER_DEFINED)
+            assert preparation_corrections(program) == (correction,)
+        finally:
+            program.endTransaction(transaction, False)
             program.release(consumer)

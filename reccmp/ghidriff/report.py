@@ -9,6 +9,7 @@ from reccmp.utils import format_address
 from .results import (
     AnalysisFailure,
     Contents,
+    ComparisonPass,
     DataFinding,
     FunctionResult,
     ObjectOffset,
@@ -124,23 +125,39 @@ def _entry_json(entry: FunctionEntry) -> dict[str, Any]:
     }
 
 
-def result_json(result: FunctionResult) -> dict[str, Any]:
+def _pass_json(result: ComparisonPass) -> dict[str, Any]:
+    text = result.text
     return {
-        **_entry_json(result.entry),
         "outcome": result.outcome.value,
-        "code_diff": list(result.code_diff),
-        "normal_diff": list(result.normal_diff),
-        "signature_diff": list(result.signature_diff),
-        "code_change_kind": result.code_change_kind,
-        "inline_normalized_diff": (
-            list(result.inline_normalized_diff)
-            if result.inline_normalized_diff is not None
-            else None
-        ),
-        "inline_callees": [_address(addr) for addr in result.inline_callees],
+        "body_diff": list(text.body_diff) if text is not None else None,
+        "signature_diff": list(text.signature_diff) if text is not None else None,
+        "similarity": text.similarity if text is not None else None,
+        "change_kind": text.change_kind if text is not None else None,
         "data": [_finding_json(f) for f in result.data_findings],
         "failures": [_failure_json(f) for f in result.failures],
         "unidentified_references": result.unidentified_references,
+        "warnings": [
+            {"image": w.image.name.lower(), "message": w.message}
+            for w in result.warnings
+        ],
+    }
+
+
+def selected_comparison(row: dict[str, Any]) -> dict[str, Any]:
+    """Read the producer-selected pass, never infer one from a score or diff."""
+    return row["passes"][row["selected_pass"]]
+
+
+def result_json(result: FunctionResult) -> dict[str, Any]:
+    passes = {"ordinary": _pass_json(result.ordinary)}
+    if result.inline is not None:
+        passes["inline"] = _pass_json(result.inline)
+    return {
+        **_entry_json(result.entry),
+        "outcome": result.outcome.value,
+        "selected_pass": result.selected_pass,
+        "passes": passes,
+        "inline_callees": [_address(addr) for addr in result.inline_callees],
     }
 
 
@@ -191,11 +208,9 @@ def comparison_changes(
             old.get(key) != new.get(key)
             for key in (
                 "outcome",
-                "code_diff",
-                "signature_diff",
-                "data",
-                "failures",
-                "unidentified_references",
+                "selected_pass",
+                "passes",
+                "inline_callees",
                 "name",
                 "basis",
             )
@@ -227,7 +242,7 @@ def _heading(result: FunctionResult) -> str:
 
 def print_result(result: FunctionResult, *, details: bool) -> None:
     print(_heading(result))
-    for failure in result.failures:
+    for failure in result.selected.failures:
         where = failure.image.name.lower()
         match failure.other_function:
             case int() as other:
@@ -238,20 +253,25 @@ def print_result(result: FunctionResult, *, details: bool) -> None:
                 print(
                     f"    {where}: {failure.kind.value} {failure.message or ''}".rstrip()
                 )
+    for warning in result.selected.warnings:
+        print(f"    {warning.image.name.lower()}: warning: {warning.message}")
     if not details:
         return
-    for finding in result.data_findings:
+    for finding in result.selected.data_findings:
         subject = finding.object.name if finding.object else "other referenced data"
         print(f"    data ({finding.kind.value}): {subject}")
         for contents in finding.orig:
             print(f"      - {contents_text(contents)}")
         for contents in finding.recomp:
             print(f"      + {contents_text(contents)}")
-    for line in result.code_diff:
+    text = result.selected.text
+    if text is None:
+        return
+    for line in text.body_diff:
         print("    " + line.rstrip("\n"))
-    if result.signature_diff:
+    if text.signature_diff:
         print("    Inferred declaration difference:")
-        for line in result.signature_diff:
+        for line in text.signature_diff:
             print("    " + line.rstrip("\n"))
 
 
@@ -276,7 +296,9 @@ def print_summary(results: list[FunctionResult], *, details: bool) -> None:
         print()
 
     declarations_only = [
-        result for result in by_outcome[Outcome.NO_DIFFERENCES] if result.signature_diff
+        result
+        for result in by_outcome[Outcome.NO_DIFFERENCES]
+        if result.selected.text is not None and result.selected.text.signature_diff
     ]
     if details and declarations_only:
         print("Inferred declaration differences with unchanged bodies/data:")
@@ -290,4 +312,6 @@ def print_summary(results: list[FunctionResult], *, details: bool) -> None:
     print(f"  no differences found:    {counts[Outcome.NO_DIFFERENCES.value]}")
     print(f"  unpaired:                {counts[Outcome.UNPAIRED.value]}")
     print(f"  analysis failed:         {counts[Outcome.ANALYSIS_FAILED.value]}")
-    print(f"  declaration differences: {sum(bool(r.signature_diff) for r in results)}")
+    print(
+        f"  declaration differences: {sum(bool(r.selected.text and r.selected.text.signature_diff) for r in results)}"
+    )

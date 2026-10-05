@@ -3,6 +3,9 @@
 # pylint: disable=import-outside-toplevel,import-error
 # Ghidra's Java packages exist only after the engine starts the JVM.
 
+import json
+from dataclasses import dataclass
+
 from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 
@@ -11,6 +14,67 @@ if TYPE_CHECKING:
     from ghidra.app.decompiler import DecompileResults
     from ghidra.program.model.address import Address
     from ghidra.program.model.listing import Function, Program
+
+
+_CORRECTIONS = "reccmp.preparation-corrections"
+
+
+@dataclass(frozen=True)
+class PreparationCorrection:
+    address: int
+    evidence: str
+    before: str
+    after: str
+
+
+def _signature(function) -> str:
+    # Names are presentation: later catalog labelling must not erase diagnostics.
+    return json.dumps(
+        [
+            str(function.getCallingConventionName()),
+            str(function.getReturnType().getName()),
+            [
+                str(parameter.getDataType().getName())
+                for parameter in function.getParameters()
+            ],
+        ]
+    )
+
+
+def _record_correction(program, function, before: str, evidence: str) -> None:
+    after = _signature(function)
+    if before == after:
+        return
+    properties = program.getUsrPropertyManager()
+    records = properties.getStringPropertyMap(_CORRECTIONS)
+    if records is None:
+        records = properties.createStringPropertyMap(_CORRECTIONS)
+    address = function.getEntryPoint()
+    existing = records.getString(address)
+    history = json.loads(str(existing)) if existing is not None else []
+    history.append({"evidence": evidence, "before": before, "after": after})
+    records.add(address, json.dumps(history))
+
+
+def preparation_corrections(program) -> tuple[PreparationCorrection, ...]:
+    """Read persisted preparation diagnostics, including after a cache restore."""
+    records = program.getUsrPropertyManager().getStringPropertyMap(_CORRECTIONS)
+    if records is None:
+        return ()
+    corrections: list[PreparationCorrection] = []
+    addresses = records.getPropertyIterator()
+    while addresses.hasNext():
+        address = addresses.next()
+        function = program.getFunctionManager().getFunctionAt(address)
+        history = json.loads(str(records.getString(address)))
+        # A later signature change makes this record stale, not new evidence.
+        if function is None or history[-1]["after"] != _signature(function):
+            continue
+        corrections.extend(
+            PreparationCorrection(int(address.getOffset()), **record)
+            for record in history
+        )
+    return tuple(corrections)
 
 
 def decompile_fresh(
@@ -75,6 +139,7 @@ def apply_reviewed_cdecl_signatures(
         # arity alone does not establish which private parameter to discard.
         if existing >= count:
             continue
+        before = _signature(function)
         function.setCallingConvention("__cdecl")
         if function.getParameterCount() > count:
             continue
@@ -84,6 +149,7 @@ def apply_reviewed_cdecl_signatures(
                 SourceType.USER_DEFINED,
             )
         function.setSignatureSource(SourceType.USER_DEFINED)
+        _record_correction(program, function, before, "reviewed-retail-cdecl")
 
 
 def apply_reviewed_scalar_returns(
@@ -124,7 +190,9 @@ def apply_reviewed_scalar_returns(
         ):
             continue
         if current != return_name:
+            before = _signature(function)
             function.setReturnType(data_types[return_name], SourceType.USER_DEFINED)
+            _record_correction(program, function, before, "reviewed-retail-return")
 
 
 def correct_recompiled_signatures(
@@ -162,6 +230,7 @@ def correct_recompiled_signatures(
         parameters = list(demangled.getParameters())
         if len(parameters) == 1 and str(parameters[0]) == "void":
             parameters = []
+        before = _signature(function)
         if (
             demangled.getCallingConvention() == "__thiscall"
             and retail_convention == "__thiscall"
@@ -170,6 +239,9 @@ def correct_recompiled_signatures(
         ):
             function.setCallingConvention("__thiscall")
             function.setSignatureSource(SourceType.USER_DEFINED)
+            _record_correction(
+                program, function, before, "retail-analysis-and-recomp-symbol"
+            )
             continue
         if (
             demangled.getCallingConvention() != "__cdecl"
@@ -200,6 +272,9 @@ def correct_recompiled_signatures(
                 SourceType.USER_DEFINED,
             )
         function.setSignatureSource(SourceType.USER_DEFINED)
+        _record_correction(
+            program, function, before, "retail-analysis-and-recomp-symbol"
+        )
 
 
 def correct_import_purges(program: "Program") -> None:
@@ -252,7 +327,21 @@ def infer_requested_callee_parameters(
         root = functions.getFunctionAt(space.getAddress(addr))
         if root is None:
             continue
-        for callee in root.getCalledFunctions(TaskMonitor.DUMMY):
+        callees = set(root.getCalledFunctions(TaskMonitor.DUMMY))
+        # A direct tail jump continues another function's body. Ghidra's
+        # getCalledFunctions only includes call-flow references, so otherwise
+        # a tail-only callee keeps its default signature in focused selections.
+        for instruction in program.getListing().getInstructions(root.getBody(), True):
+            flow = instruction.getFlowType()
+            if not flow.isJump() or not flow.isUnConditional() or flow.isComputed():
+                continue
+            for target in instruction.getFlows():
+                if root.getBody().contains(target):
+                    continue
+                callee = functions.getFunctionAt(target)
+                if callee is not None:
+                    callees.add(callee)
+        for callee in callees:
             if (
                 callee.getEntryPoint().getOffset() in known_callees
                 and callee.getSignatureSource() == SourceType.DEFAULT

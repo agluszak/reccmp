@@ -304,14 +304,14 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         ),
     )
     cache = AnalysisCache(projects / "completed", enabled=not args.no_cache)
-    cached: tuple[Any, Any, Any] | None = cache.load(
+    cached: tuple[Any, Any, Any, Any] | None = cache.load(
         "comparison-" + completed_key, completed_key
     )
     if cached is not None:
-        pdiff, results, calls = cached
+        pdiff, results, calls, corrections = cached
         print("[CACHE] Reusing completed comparison", file=sys.stderr)
     else:
-        pdiff, results, calls = _compare_programs(
+        pdiff, results, calls, corrections = _compare_programs(
             engine,
             args,
             project_name=project_name,
@@ -319,7 +319,9 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         )
         if all(result.outcome != Outcome.ANALYSIS_FAILED for result in results):
             cache.store(
-                "comparison-" + completed_key, completed_key, (pdiff, results, calls)
+                "comparison-" + completed_key,
+                completed_key,
+                (pdiff, results, calls, corrections),
             )
 
     (output / "direct-calls.json").write_text(
@@ -357,6 +359,7 @@ def _run_engine(args: argparse.Namespace, target: RecCmpTarget, manifest: Manife
         ghidra_project=str(projects / project_name),
     )
     summary = summary_json(manifest, inputs, results)
+    summary["preparation"] = corrections
     summary["inputs"]["comparison_key"] = completed_key
     summary["cache"] = {"reused": cached is not None}
     summary_path = output / "summary.json"
@@ -420,12 +423,21 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
             )
         from reccmp.compare.call_census import direct_call_census
 
+        from reccmp.ghidriff.preparation import preparation_corrections
+        from dataclasses import asdict
+
+        corrections = []
         programs = {}
         try:
             for image, path in ((ImageId.ORIG, orig), (ImageId.RECOMP, recomp)):
                 programs[image] = engine.project.openProgram(
                     "/", engine.gen_proj_bin_name_from_path(path), False
                 )
+            corrections = [
+                {"image": image.name.lower(), **asdict(correction)}
+                for image, program in programs.items()
+                for correction in preparation_corrections(program)
+            ]
             calls = direct_call_census(engine.manifest, programs)
             with _stage("inline-normalized retry"):
                 engine.normalize_inlining(programs)
@@ -436,7 +448,7 @@ def _compare_programs(engine, args, *, project_name, prepared_key):
                 engine.project.close(program)
     finally:
         engine.project.close()
-    return pdiff, results, calls
+    return pdiff, results, calls, corrections
 
 
 def main() -> int:
