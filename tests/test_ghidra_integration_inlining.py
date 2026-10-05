@@ -460,7 +460,7 @@ def test_native_inline_retry_follows_tail_call(pytestconfig, branching):
             # Check the native body, rather than treating that layout as equal.
             code = engine.inline_code(ImageId.RECOMP, 0x1000)
             assert code is not None
-            assert "Overlay(" not in code and "Pair(" not in code
+            assert "Overlay(" not in code and "Pair(" not in code, code
             assert "if  {" not in code
             assert "a[2] = 2" in code
             assert "a[1] = 3" in code and "a[1] = 4" in code

@@ -37,7 +37,7 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
         from .engine import ANALYSIS_REVISION, PREPARATION_REVISION
 
         ghidra_version = str(engine.get_ghidra_version())
-        decompiler_sha256 = native_decompiler_digest(Path(engine.launcher.install_dir))
+        decompiler_sha256 = native_decompiler_digest()
         analysis_key = (
             f"{manifest.target_id}-{manifest.orig.sha256[:12]}"
             f"-ghidra{ghidra_version}-native{decompiler_sha256[:12]}"
@@ -98,19 +98,11 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
         return asdict(self)
 
 
-def native_decompiler_digest(install_dir: Path) -> str:
-    """Native patches can change output without changing the Ghidra version."""
+def native_decompiler_digest() -> str:
+    """Hash the executable selected by Ghidra, including build/os overrides."""
     # pylint: disable=import-outside-toplevel,import-error
-    from ghidra.framework import Platform
+    from ghidra.framework import Application, Platform
 
-    platform = Platform.CURRENT_PLATFORM
-    path = (
-        install_dir
-        / "Ghidra"
-        / "Features"
-        / "Decompiler"
-        / "os"
-        / str(platform.getDirectoryName())
-    )
-    path /= "decompile" + str(platform.getExecutableExtension())
+    filename = "decompile" + str(Platform.CURRENT_PLATFORM.getExecutableExtension())
+    path = Path(str(Application.getOSFile("Decompiler", filename).getAbsolutePath()))
     return hashlib.sha256(path.read_bytes()).hexdigest()

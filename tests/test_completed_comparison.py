@@ -37,7 +37,7 @@ def fixture_prepared_comparison(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "reccmp.ghidriff.inputs.native_decompiler_digest",
-        lambda _install_dir: state["native"],
+        lambda: state["native"],
     )
 
     class Engine:
