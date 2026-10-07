@@ -7,8 +7,23 @@ from pathlib import Path
 
 import ghidriff
 import reccmp
-from reccmp.analysis_cache import fingerprint_files
 from reccmp.compare.manifest import Manifest
+
+
+def package_fingerprint(*packages) -> str:
+    """Hash package sources by package-relative name, not install location.
+
+    Two installations of the same revision must normalize identically, or
+    comparisons from different checkouts look like different policies.
+    """
+    digest = hashlib.sha256()
+    for package in packages:
+        root = Path(package.__file__).parent
+        for path in sorted(root.rglob("*.py")):
+            name = f"{package.__name__}/{path.relative_to(root).as_posix()}"
+            digest.update(b"\0path\0" + name.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0data\0" + path.read_bytes())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -48,12 +63,7 @@ class RunInputs:  # pylint: disable=too-many-instance-attributes
         preparation_key = (
             f"v{PREPARATION_REVISION}:{manifest.preparation_digest()}:{reviewed_digest}"
         )
-        normalization_key = fingerprint_files(
-            [
-                *Path(reccmp.__file__).parent.rglob("*.py"),
-                *Path(ghidriff.__file__).parent.rglob("*.py"),
-            ]
-        )
+        normalization_key = package_fingerprint(reccmp, ghidriff)
         selection_sha256 = hashlib.sha256(
             json.dumps(sorted(entry.orig_addr for entry in manifest.functions)).encode()
         ).hexdigest()
