@@ -51,7 +51,7 @@ from .analyze import (
     create_analysis_strings,
     create_analysis_widechars,
     create_analysis_vtordisps,
-    create_crt_functions,
+    annotate_crt_functions,
     create_seh_entities,
     complete_partial_floats,
     complete_partial_strings,
@@ -246,7 +246,7 @@ class Compare:
             create_seh_entities(self._db, img_id, binfile)
             create_thunks(self._db, img_id, binfile)
             create_analysis_vtordisps(self._db, img_id, binfile)
-            create_crt_functions(self._db, img_id, binfile)
+            annotate_crt_functions(self._db, img_id, binfile)
             import_sections(self._db, img_id, binfile)
 
         match_imports(self._db)

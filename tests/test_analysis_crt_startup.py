@@ -13,7 +13,7 @@ from reccmp.analysis.crt_startup import (
     unwrap_jump,
     find_initializer_atexit_helpers,
 )
-from reccmp.compare.analyze import create_imports
+from reccmp.compare.analyze import annotate_crt_functions, create_imports
 from reccmp.compare.db import EntityDb, PairBasis
 from reccmp.formats import PEImage
 from reccmp.formats.image import ImageImport
@@ -121,6 +121,41 @@ def test_get_function_fingerprint_indirect_call():
 
 
 XCA_XCZ_RANGE = range(0x100F0000, 0x100F0020)
+
+
+@pytest.mark.parametrize("image_id", [ImageId.ORIG, ImageId.RECOMP])
+def test_crt_annotation_preserves_declared_identities(image_id):
+    """An array must neither create anonymous bodies nor overwrite known labels."""
+    base = 0x400000
+    array_start = base + 0x100
+    known_body = base + 0x1000
+    unknown_body = base + 0x1020
+    known_data = base + 0x1040
+    code = bytearray(0x1100)
+    code[0x100:0x114] = struct.pack(
+        "<IIIII", 0, known_body, unknown_body, known_data, 0
+    )
+    code[0x1000] = code[0x1020] = code[0x1040] = 0xC3
+    image = RawImage.from_memory(bytes(code), base_addr=base)
+    db = EntityDb()
+    with db.batch() as batch:
+        batch.set(image_id, array_start, name="___xc_a")
+        batch.set(image_id, array_start + 16, name="___xc_z")
+        batch.set(
+            image_id, known_body, name="owner initializer", type=EntityType.FUNCTION
+        )
+        batch.set(image_id, known_data, name="declared data", type=EntityType.DATA)
+
+    annotate_crt_functions(db, image_id, image)
+
+    known = db.get(image_id, known_body, exact=True)
+    assert known.get("name") == "owner initializer"
+    assert known.entity_type == EntityType.FUNCTION
+    assert known.get("crt_startup_kind") == "CPP_INIT"
+    assert db.get(image_id, unknown_body, exact=True) is None
+    data = db.get(image_id, known_data, exact=True)
+    assert data.entity_type == EntityType.DATA
+    assert data.get("crt_startup_kind") is None
 
 
 def test_find_crt_startup_labels_empty():

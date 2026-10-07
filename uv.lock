@@ -206,9 +206,9 @@ wheels = [
 [[package]]
 name = "ghidra-stubs"
 version = "12.3"
-source = { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/ghidra_stubs-12.3-py3-none-any.whl" }
+source = { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/ghidra_stubs-12.3-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/ghidra_stubs-12.3-py3-none-any.whl", hash = "sha256:cbed293d9630179dd019ae6d6386ecb2836022d33bfdb50c419794bfcd3dc3a2" },
+    { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/ghidra_stubs-12.3-py3-none-any.whl", hash = "sha256:958ed006887f06167879d67d240be737dd7863ae15dec724663dcc11231e3d8e" },
 ]
 
 [[package]]
@@ -760,14 +760,14 @@ wheels = [
 [[package]]
 name = "pyghidra"
 version = "3.3.0"
-source = { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/pyghidra-3.3.0-py3-none-any.whl" }
+source = { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/pyghidra-3.3.0-py3-none-any.whl" }
 dependencies = [
     { name = "jpype1" },
     { name = "packaging" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/pyghidra-3.3.0-py3-none-any.whl", hash = "sha256:b715322973ea69e58f774f038a63ee0d799c0f616705e8cf1e3813c009f9ba1a" },
+    { url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/pyghidra-3.3.0-py3-none-any.whl", hash = "sha256:ba0e0f41404a695343505492da0e2843b06dc453c792ad4e470c22d570982ec4" },
 ]
 
 [package.metadata]
@@ -896,7 +896,7 @@ requires-dist = [
     { name = "ghidriff", url = "https://github.com/agluszak/ghidriff/archive/a1ddd07630bfb4ac9b56057a24808e92acc6ab97.tar.gz" },
     { name = "pydantic", specifier = "==2.13.5" },
     { name = "pydemumble", specifier = "==0.0.1" },
-    { name = "pyghidra", url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/pyghidra-3.3.0-py3-none-any.whl" },
+    { name = "pyghidra", url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/pyghidra-3.3.0-py3-none-any.whl" },
     { name = "ruamel-yaml", specifier = "==0.19.1" },
 ]
 
@@ -904,7 +904,7 @@ requires-dist = [
 dev = [
     { name = "black", specifier = "==26.5.1" },
     { name = "codespell", specifier = "==2.4.3" },
-    { name = "ghidra-stubs", url = "https://github.com/agluszak/ghidra/releases/download/wizardry-7de63e440dffd1c96c22fdebd9a59d974df8a543/ghidra_stubs-12.3-py3-none-any.whl" },
+    { name = "ghidra-stubs", url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/ghidra_stubs-12.3-py3-none-any.whl" },
     { name = "mypy", specifier = "==2.3.1" },
     { name = "pylint", specifier = "==4.0.8" },
     { name = "pytest", specifier = "==9.1.1" },

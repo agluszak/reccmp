@@ -37,18 +37,6 @@ _CRT_STARTUP_ARRAY_LABELS = [
 ]
 
 
-_CRT_FUNCTION_NAMES = {
-    CrtStartupArrayType.C_INIT: "$CRT_C_Initializer",
-    CrtStartupArrayType.CPP_INIT: "$CRT_CPP_Initializer",
-    CrtStartupArrayType.C_PRE_TERM: "$CRT_C_Pre-Terminator",
-    CrtStartupArrayType.C_TERM: "$CRT_C_Terminator",
-}
-
-
-def get_crt_function_name(type_: CrtStartupArrayType) -> str:
-    return _CRT_FUNCTION_NAMES[type_]
-
-
 class UsedHow(enum.Enum):
     READ = enum.auto()
     WRITE = enum.auto()
