@@ -721,43 +721,29 @@ class Indexer {
     emit(std::move(payload));
   }
 
-  template <typename Predicate>
-  static const Stmt* findDescendant(const Stmt* node, Predicate predicate) {
-    if (!node) return nullptr;
-    if (predicate(node)) return node;
-    for (const Stmt* child : node->children()) {
-      if (const Stmt* found = findDescendant(child, predicate)) return found;
-    }
-    return nullptr;
-  }
-
-  // `static_assert(sizeof(T) == N)` is the one place the recovered sources state
-  // a proven layout size, so it is indexed as an assertion about a class rather
-  // than left inside a function-free expression nobody reads.
-  //
-  // Parentheses are stepped over. Most of the recovered layout proofs are
-  // written `static_assert((sizeof(T) == N), ...)`, and reading the comparison
-  // through the AST-JSON shape missed every one of them, because the parentheses
-  // put a node between the assertion and its comparison.
   void emitSizeAssertion(const StaticAssertDecl* assertion) {
-    const auto* comparison = dyn_cast<BinaryOperator>(assertion->getAssertExpr()->IgnoreParens());
+    const auto* comparison =
+        dyn_cast<BinaryOperator>(assertion->getAssertExpr()->IgnoreParenImpCasts());
     if (!comparison || comparison->getOpcode() != BO_EQ) return;
-    const Stmt* sizeOf = findDescendant(comparison, [](const Stmt* node) {
-      const auto* trait = dyn_cast<UnaryExprOrTypeTraitExpr>(node);
-      return trait && trait->getKind() == UETT_SizeOf && trait->isArgumentType();
-    });
-    const Stmt* literal = findDescendant(
-        comparison, [](const Stmt* node) { return isa<IntegerLiteral>(node); });
-    if (!sizeOf || !literal) return;
+    const Expr* left = comparison->getLHS()->IgnoreParenImpCasts();
+    const Expr* right = comparison->getRHS()->IgnoreParenImpCasts();
+    const auto* sizeOf = dyn_cast<UnaryExprOrTypeTraitExpr>(left);
+    const auto* literal = dyn_cast<IntegerLiteral>(right);
+    if (!sizeOf || !literal) {
+      sizeOf = dyn_cast<UnaryExprOrTypeTraitExpr>(right);
+      literal = dyn_cast<IntegerLiteral>(left);
+    }
+    if (!sizeOf || sizeOf->getKind() != UETT_SizeOf ||
+        !sizeOf->isArgumentType() || !literal) return;
 
     const CXXRecordDecl* record =
-        cast<UnaryExprOrTypeTraitExpr>(sizeOf)->getArgumentType()->getAsCXXRecordDecl();
+        sizeOf->getArgumentType()->getAsCXXRecordDecl();
     if (!record) return;
     std::string name = qualify(scopeOf(record->getDeclContext()), component(record));
     emit(llvm::json::Object{
         {"record", "size-assertion"},
         {"qualified_name", name},
-        {"asserted_size", cast<IntegerLiteral>(literal)->getValue().getZExtValue()},
+        {"asserted_size", literal->getValue().getZExtValue()},
     });
   }
 

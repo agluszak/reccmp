@@ -253,7 +253,17 @@ def test_out_of_line_records_keep_semantic_owner_and_size(
         "  Inner item; int value; int get() const;\n"
         "};\n"
         "int N::Owner::Part::get() const { return item.count + value; }\n"
-        'static_assert(sizeof(N::Owner::Part) == 8, "size");\n',
+        'static_assert((sizeof(N::Owner::Part)) == (8), "size");\n'
+        'static_assert(8 == sizeof(N::Owner::Part), "reversed size");\n'
+        "struct Base { int first; };\n"
+        "struct Derived : Base { int last; };\n"
+        '#define BASE_END(D, B, M, N) static_assert(__builtin_offsetof(D, M) - sizeof(B) == N, "end")\n'
+        '#define BASE_TAIL(D, B, N) static_assert(sizeof(D) - sizeof(B) == N, "tail")\n'
+        "BASE_END(Derived, Base, last, 0);\n"
+        "BASE_TAIL(Derived, Base, 4);\n"
+        'static_assert(4 == sizeof(Derived) - sizeof(Base), "reversed tail");\n'
+        'static_assert(sizeof(Base) + 4 == 8, "sum");\n'
+        'static_assert(sizeof(Derived) == 2 * sizeof(Base), "ratio");\n',
         encoding="utf-8",
     )
     database = tmp_path / "compile_commands.json"
@@ -286,6 +296,10 @@ def test_out_of_line_records_keep_semantic_owner_and_size(
     assert inner.semantic_id == "record:N::Owner::Part::Inner"
     assert part.fields[0].record_semantic_id == inner.semantic_id
     assert index.class_named("Part", target="TEST") is None
+    base = index.class_named("Base", target="TEST")
+    derived = index.class_named("Derived", target="TEST")
+    assert base is not None and base.asserted_size is None
+    assert derived is not None and derived.asserted_size is None
 
 
 def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
