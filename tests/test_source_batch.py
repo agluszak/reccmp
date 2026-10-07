@@ -449,9 +449,9 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
         assert variables[("WIZ8", "gShared")].definition_kind == "declaration"
         assert variables[("WIZ8", "gShared")].is_external
         assert variables[("SURRENDER", "gSURRENDER")].is_external
-        assert not any(
-            item.qualified_name == "gLocal" for item in index.variables.values()
-        )
+        assert not variables[("WIZ8", "gLocal")].is_external
+        assert not variables[("SURRENDER", "gLocal")].is_external
+        assert variables[("WIZ8", "gLocal")].size == 4
         assert not index.conflicts
         declaration = index.functions_by_address(target="WIZ8")[0x401000].declaration
         assert declaration is not None
@@ -518,3 +518,82 @@ def test_native_batch_records_cache_and_errors(tmp_path: Path) -> None:
             os.environ.pop("RECCMP_SOURCE_ROOT", None)
         else:
             os.environ["RECCMP_SOURCE_ROOT"] = previous_root
+
+
+def test_global_storage_facts_come_from_target_layout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "globals.cpp"
+    source.write_text(
+        """\
+#pragma pack(push, 1)
+struct Packed { char tag; int value; };
+#pragma pack(pop)
+typedef void (*Callback)();
+enum { Count = 3 };
+// GLOBAL: TEST 0x1000
+static Packed records[Count];
+// GLOBAL: TEST 0x1020
+Callback callbacks[Count];
+// GLOBAL: TEST 0x1040
+extern const int initialized = 7;
+// GLOBAL: TEST 0x1060
+extern int incomplete[];
+// GLOBAL: TEST 0x1080
+const char* names[] = {"one", "two"};
+// GLOBAL: TEST 0x1090
+int& reference = records[0].value;
+// GLOBAL
+int unaddressed;
+// GLOBAL: TEST unresolved
+int unresolved;
+int counter() {
+  // GLOBAL: TEST 0x1100
+  static short count;
+  return ++count;
+}
+""",
+        encoding="utf-8",
+    )
+    database = tmp_path / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(source),
+                    "arguments": [
+                        _clang_cl(tmp_path),
+                        "--target=i686-pc-windows-msvc",
+                        "/c",
+                        str(source),
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RECCMP_SOURCE_ROOT", str(tmp_path))
+    index = SourceIndex.from_compile_database(
+        tmp_path, database, {"TEST": [source]}, cache_dir=tmp_path / "cache", jobs=1
+    )
+    # Round-trip the public projection: downstream checks read this, not the AST.
+    index = SourceIndex.read(_write(index, tmp_path))
+    variables = {v.qualified_name: v for v in index.variables.values()}
+    assert variables["records"].size == 15
+    assert variables["callbacks"].size == 12
+    assert variables["initialized"].size == 4
+    assert variables["incomplete"].size is None
+    assert variables["names"].size == 8
+    assert variables["reference"].size == 4
+    anchors = {
+        v.name: v
+        for block in index.marker_blocks
+        if block.anchor
+        for v in block.anchor.of_kind("variable")
+    }
+    assert anchors["initialized"].is_definition
+    assert not anchors["incomplete"].is_definition
+    assert anchors["count"].local_static and anchors["count"].size == 2
+    assert anchors["unaddressed"].is_definition
+    assert anchors["unresolved"].is_definition

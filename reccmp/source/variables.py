@@ -10,8 +10,8 @@ from dataclasses import dataclass
 class SourceVariable:
     """One semantic variable declaration or definition emitted by Clang.
 
-    Only external-linkage variables are collected: TU-local storage has no
-    legitimate cross-unit writer/reader disagreement for the consistency gate.
+    Internal storage is scoped by translation unit; it never participates in
+    cross-unit writer/reader consistency checks.
     """
 
     semantic_id: str
@@ -27,6 +27,7 @@ class SourceVariable:
     storage_kind: str
     # ``record:Qualified::Name`` when the variable type is (or points to) a record.
     record_semantic_id: str | None = None
+    size: int | None = None
 
     @property
     def signature(self) -> tuple[str, ...]:

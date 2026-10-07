@@ -56,12 +56,19 @@ def derive_namespace(
                 declarations, declaration.key(target, unit.unit_id), declaration
             )
         for variable in unit.variables:
-            identity = id(variable)
-            if identity in shared_variables:
-                continue
-            shared_variables.add(identity)
+            if variable.is_external:
+                identity = id(variable)
+                if identity in shared_variables:
+                    continue
+                shared_variables.add(identity)
             _add_observation(
-                variables, DeclarationKey(target, variable.semantic_id), variable
+                variables,
+                DeclarationKey(
+                    target,
+                    variable.semantic_id,
+                    None if variable.is_external else unit.unit_id,
+                ),
+                variable,
             )
         for source_class in unit.classes:
             identity = id(source_class)

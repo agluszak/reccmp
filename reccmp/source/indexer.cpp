@@ -606,6 +606,13 @@ class Indexer {
     return ("VarDecl:" + qualifiedName + "(" + canonicalName(variable->getType()) + ")").str();
   }
 
+  llvm::json::Value storageSize(QualType type) const {
+    if (type->isDependentType() || type->isIncompleteType() ||
+        type->isVariablyModifiedType()) return nullptr;
+    if (type->isReferenceType()) type = context_.getPointerType(type->getPointeeType());
+    return context_.getTypeSizeInChars(type).getQuantity();
+  }
+
   void emitVariable(const VarDecl* variable, const Location& location) {
     const DeclContext* context = variable->getDeclContext();
     std::string scope = scopeOf(context);
@@ -627,6 +634,7 @@ class Indexer {
     std::string recordId = recordSemanticId(variable->getType());
     if (!recordId.empty()) payload["record_semantic_id"] = recordId;
     payload["storage_kind"] = storageKind(variable->getType());
+    payload["size"] = storageSize(variable->getType());
     emit(std::move(payload));
   }
 
@@ -826,6 +834,11 @@ class Indexer {
           {"qualified_name", qualifiedName},
           {"name", variable->getNameAsString()},
           {"local_static", variable->isStaticLocal()},
+          {"is_definition", variable->isThisDeclarationADefinition() != VarDecl::DeclarationOnly},
+          {"line", locate(variable).line},
+          {"end_line", locate(variable).endLine},
+          {"type", canonicalName(variable->getType())},
+          {"size", storageSize(variable->getType())},
           {"enclosing_function", nullptr},
       };
       if (const auto* function =
@@ -926,7 +939,9 @@ class Indexer {
   static bool looksLikeMarker(llvm::StringRef text) {
     static const llvm::Regex pattern(
         "^//[[:space:]]*[[:alnum:]_]+:[[:space:]]*[[:alnum:]_]+[[:space:]]+0[xX][[:xdigit:]]+");
-    return pattern.match(text);
+    static const llvm::Regex unresolvedGlobal(
+        "^//[[:space:]]*GLOBAL([[:space:]]*:|[[:space:]]*$)", llvm::Regex::IgnoreCase);
+    return pattern.match(text) || unresolvedGlobal.match(text);
   }
 
   void emitMarkerBlock(FileID file, const std::vector<LineComment>& group) {

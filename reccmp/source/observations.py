@@ -101,8 +101,7 @@ class TranslationUnitRecords:
         elif kind == "declaration":
             self.declarations.append(fact)
         elif kind == "variable":
-            if fact.is_external:
-                self.variables.append(fact)
+            self.variables.append(fact)
         else:
             self.classes.append(fact)
 

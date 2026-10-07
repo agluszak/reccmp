@@ -240,14 +240,27 @@ def test_identical_header_spellings_do_not_conflict() -> None:
     ].source_file == "src/wiz8/a.cpp"
 
 
-def test_internal_variables_are_not_collected() -> None:
+def test_internal_variables_keep_sizes_and_distinct_unit_owners() -> None:
     collector = SourceCollector(Path("/repo"))
-    collector.collect_records(
-        _records({**VARIABLE, "linkage": "internal", "storage_class": "static"}),
-        unit_id="a.cpp",
-    )
-    assert not collector.variables
-    assert not collector.derive().variables
+    for unit, size in [("a.cpp", 4), ("b.cpp", 8)]:
+        collector.collect_records(
+            _records(
+                {
+                    **VARIABLE,
+                    "linkage": "internal",
+                    "storage_class": "static",
+                    "source_file": unit,
+                    "size": size,
+                }
+            ),
+            unit_id=unit,
+        )
+    index = collector.derive()
+    assert {(key.unit_id, item.size) for key, item in index.variables.items()} == {
+        ("a.cpp", 4),
+        ("b.cpp", 8),
+    }
+    assert not index.conflicts
 
 
 def test_static_and_external_linkage_conflict() -> None:

@@ -59,6 +59,8 @@ class AnchorCandidate:
     name: str = ""
     local_static: bool = False
     enclosing_function: str | None = None
+    type: str | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)
