@@ -332,6 +332,110 @@ def correct_recompiled_signatures(
         )
 
 
+def _reads_receiver_register(program: "Program", function: "Function") -> bool:
+    """Whether the body reads ECX before writing it or calling out.
+
+    MSVC reserves a local slot with ``push ecx``; that read is not an input.
+    """
+    from ghidra.program.model.lang import Register
+
+    for count, instruction in enumerate(
+        program.getListing().getInstructions(function.getBody(), True)
+    ):
+        if count >= 64 or instruction.getFlowType().isCall():
+            return False
+
+        def touches(objects) -> bool:
+            return any(
+                isinstance(item, Register) and item.getBaseRegister().getName() == "ECX"
+                for item in objects
+            )
+
+        if instruction.getMnemonicString().upper() == "PUSH" and touches(
+            instruction.getInputObjects()
+        ):
+            continue
+        if touches(instruction.getInputObjects()):
+            return True
+        if touches(instruction.getResultObjects()):
+            return False
+    return False
+
+
+def align_retail_receivers(program: "Program", objects) -> None:
+    """Give retail member functions the automatic receiver the recomp has.
+
+    Without a committed prototype the decompiler shows a retail thiscall's ECX
+    input as an ordinary first parameter, and Parameter ID commits it that
+    way too. The recompilation has Ghidra's automatic ``this``. Unless both
+    show the receiver alike, every later parameter and every field access
+    renders differently. The recomp symbol must declare ``__thiscall`` and
+    the retail body must independently read ECX as an input; parameter
+    inference and types stay with each image's own analysis.
+    """
+    from ghidra.app.util.demangler import DemangledFunction, DemanglerUtil
+    from ghidra.program.model.listing import Function as GhidraFunction
+    from ghidra.program.model.listing import ParameterImpl
+    from ghidra.program.model.symbol import SourceType
+
+    from reccmp.types import EntityType
+
+    functions = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for obj in objects:
+        if obj.entity_type != EntityType.FUNCTION or not obj.recomp_symbol:
+            continue
+        symbol = obj.recomp_symbol
+        function = functions.getFunctionAt(space.getAddress(obj.orig_addr))
+        if function is None or function.isThunk() or function.isExternal():
+            continue
+        demangled = DemanglerUtil.demangle(symbol)
+        if (
+            not isinstance(demangled, DemangledFunction)
+            or demangled.getCallingConvention() != "__thiscall"
+        ):
+            continue
+        source = function.getSignatureSource()
+        before = _signature(function)
+        if source == SourceType.DEFAULT:
+            if not _reads_receiver_register(program, function):
+                continue
+            function.setCallingConvention("__thiscall")
+            # Keep the prototype unlocked: the decompiler still infers the
+            # stack parameters and their types from the retail body.
+            function.setSignatureSource(SourceType.DEFAULT)
+        elif source == SourceType.ANALYSIS and function.getCallingConventionName() in (
+            "__thiscall",
+            "__fastcall",
+        ):
+            parameters = [
+                p for p in function.getParameters() if not p.isAutoParameter()
+            ]
+            if not parameters or not parameters[0].isRegisterVariable():
+                continue
+            if parameters[0].getRegister().getBaseRegister().getName() != "ECX":
+                continue
+            if any(p.isRegisterVariable() for p in parameters[1:]):
+                continue
+            explicit = [
+                ParameterImpl(p.getName(), p.getDataType(), program)
+                for p in parameters[1:]
+            ]
+            function.setCustomVariableStorage(False)
+            function.setCallingConvention("__thiscall")
+            function.replaceParameters(
+                GhidraFunction.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                True,
+                SourceType.ANALYSIS,
+                *explicit,
+            )
+        else:
+            continue
+        _record_correction(
+            program, function, before, "retail-receiver-and-recomp-symbol"
+        )
+
+
 def apply_recompiled_scalar_parameters(
     program: "Program", symbols: list[tuple[int, str]]
 ) -> None:

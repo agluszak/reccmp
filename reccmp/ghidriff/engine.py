@@ -62,6 +62,7 @@ from .preparation import (
     apply_reviewed_cdecl_signatures,
     apply_stack_probe_call_fixups,
     correct_recompiled_signatures,
+    align_retail_receivers,
     apply_recompiled_scalar_parameters,
     correct_legacy_crt_signatures,
     correct_import_purges,
@@ -101,7 +102,7 @@ _STACK_PROBE_NAMES = frozenset(
 # changes, so that analyses cached before the change are not reused.
 ANALYSIS_REVISION = 3
 # Bump when prepared-program mutations change; the key includes the manifest.
-PREPARATION_REVISION = 31
+PREPARATION_REVISION = 32
 
 
 # Matches come from the manifest through `diff_pairs` only; Ghidriff's
@@ -365,6 +366,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
         infer_requested_callee_parameters(program, requested, known_callees)
         if image_id == ImageId.ORIG:
             apply_reviewed_cdecl_signatures(program, self.reviewed_cdecl_signatures)
+            align_retail_receivers(program, self.manifest.objects)
             functions = program.getFunctionManager()
             space = program.getAddressFactory().getDefaultAddressSpace()
             self._retail_signatures = {
@@ -737,6 +739,7 @@ class ReccmpDiffEngine(InlineNormalizationMixin, GhidraDiffEngine):
                 (addr, name)
                 for (side, addr), name in self._unpaired_names.items()
                 if side == image_id
+                and not self._extents[image_id].paired_data.interior(addr)
             ]
             + [
                 # A duplicate has the identity of its pair, so its name too.

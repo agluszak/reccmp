@@ -34,6 +34,16 @@ class Located:
     named: NamedObject | None
 
 
+# Entities whose extent is code or an import, not data the code indexes.
+_NOT_DATA = (
+    EntityType.FUNCTION,
+    EntityType.VTORDISP,
+    EntityType.THUNK,
+    EntityType.IMPORT,
+    EntityType.IMPORT_THUNK,
+)
+
+
 class Extents:
     """Catalog entities of one image, by the address range they occupy."""
 
@@ -79,6 +89,7 @@ class Extents:
         )
         self._sized = sized
         self._sized_ends = [span.start + (span.size or 0) for span in sized]
+        self.paired_data = PairedDataSpans(manifest, image_id, _NOT_DATA)
 
     def containing(self, addr: int) -> Located | None:
         i = bisect.bisect_right(self._starts, addr) - 1
@@ -243,3 +254,37 @@ def string_start(program: Any, extents: Extents, address: Any) -> Any:
     if data is not None and StringDataInstance.isString(data):
         return data.getMinAddress()
     return address
+
+
+class PairedDataSpans:
+    """Paired data objects of one image, for finding addresses inside them.
+
+    One catalog can label the fields of an object the other models as a
+    single paired record. A field label would show on one side only; the
+    record name and offset show on both.
+    """
+
+    def __init__(self, manifest: Manifest, image_id: ImageId, excluded_types):
+        spans = []
+        for obj in manifest.objects:
+            start = obj.addr(image_id)
+            size = obj.extent(image_id)
+            if obj.entity_type in excluded_types or start is None or not size:
+                continue
+            if size > 1:
+                spans.append((start, size))
+        spans.sort()
+        self._spans = spans
+        self._reach = max((size for _, size in spans), default=0)
+
+    def interior(self, addr: int) -> bool:
+        """Whether `addr` lies past the start of a paired data object."""
+        i = bisect.bisect_left(self._spans, (addr,))
+        while i > 0:
+            i -= 1
+            start, size = self._spans[i]
+            if addr - start >= self._reach:
+                return False
+            if addr < start + size:
+                return True
+        return False
