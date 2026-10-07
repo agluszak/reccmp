@@ -100,7 +100,6 @@ def match_folded_function_aliases(
                 symbol.filename,
                 symbol.line_number,
                 symbol.end_line,
-                folded=True,
             )
             if recomp_addr is None:
                 continue

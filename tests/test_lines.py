@@ -231,3 +231,17 @@ def test_line_containing_an_instruction(local_path: PureWindowsPath | PurePosixP
         local_path,
         20,
     )
+
+
+def test_lookup_misses_are_quiet_but_ambiguous_line_data_is_reported(caplog):
+    lines = LinesDb()
+    local_path = LOCAL_PATHS[0]
+    lines.add_local_paths([local_path])
+    with caplog.at_level("ERROR"):
+        assert lines.find_function(local_path, 1, 10) is None
+        assert not caplog.records
+        lines.add_lines(PDB_PATH, [(2, 0x1234), (3, 0x1250)])
+        lines.mark_function_starts([0x1234, 0x1250])
+        assert lines.find_function(local_path, 2, 3) is None
+    assert len(caplog.records) == 1
+    assert "out of sync" in caplog.records[0].message
