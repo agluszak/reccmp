@@ -214,12 +214,12 @@ wheels = [
 [[package]]
 name = "ghidriff"
 version = "1.0.0"
-source = { url = "https://github.com/agluszak/ghidriff/archive/a1ddd07630bfb4ac9b56057a24808e92acc6ab97.tar.gz" }
+source = { url = "https://github.com/agluszak/ghidriff/archive/f30885eaf4cd734c0de588c0ef0aadf32c67a234.tar.gz" }
 dependencies = [
     { name = "mdutils" },
     { name = "pyghidra" },
 ]
-sdist = { hash = "sha256:90ddaf1f1fa31b8a1eb1c06373991b6f60c7be1d45b71574ea99eebe12d69e75" }
+sdist = { hash = "sha256:2aae96ef66ff87dec50c04474471ad30f1a5f32865979204da40be2b29a88602" }
 
 [package.metadata]
 requires-dist = [
@@ -893,7 +893,7 @@ dev = [
 requires-dist = [
     { name = "capstone", specifier = "==5.0.9" },
     { name = "colorama", specifier = ">=0.4.6" },
-    { name = "ghidriff", url = "https://github.com/agluszak/ghidriff/archive/a1ddd07630bfb4ac9b56057a24808e92acc6ab97.tar.gz" },
+    { name = "ghidriff", url = "https://github.com/agluszak/ghidriff/archive/f30885eaf4cd734c0de588c0ef0aadf32c67a234.tar.gz" },
     { name = "pydantic", specifier = "==2.13.5" },
     { name = "pydemumble", specifier = "==0.0.1" },
     { name = "pyghidra", url = "https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/pyghidra-3.3.0-py3-none-any.whl" },

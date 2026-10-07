@@ -32,7 +32,7 @@ dependencies = [
   "ruamel.yaml==0.19.1",
   "pydemumble==0.0.1",
   "pyghidra @ https://github.com/agluszak/ghidra/releases/download/wizardry-739398dee314ba97c20bbaf715f62cdb9a82b2e1/pyghidra-3.3.0-py3-none-any.whl",
-  "ghidriff @ https://github.com/agluszak/ghidriff/archive/a1ddd07630bfb4ac9b56057a24808e92acc6ab97.tar.gz",
+  "ghidriff @ https://github.com/agluszak/ghidriff/archive/f30885eaf4cd734c0de588c0ef0aadf32c67a234.tar.gz",
 ]
 
 [project.scripts]
