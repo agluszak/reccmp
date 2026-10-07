@@ -23,6 +23,8 @@ from .results import (
     Outcome,
 )
 
+# Bounds nested substitution; a longer chain of inlined helpers is unusual.
+_MAX_INLINE_DEPTH = 4
 _INLINE_WARNING = re.compile(r" \[inline callee=(0x[0-9a-fA-F]+) reason=([a-z-]+)\]")
 
 
@@ -212,6 +214,40 @@ class InlineCandidates:
             obj = self.pairs.get(int(identity.removeprefix("pair:"), 16))
             if obj is not None and self.eligible(obj):
                 selected[identity] = obj
+        self._close_tails(selected)
+        # Retail may have inlined a callee that had itself inlined another.
+        # Substituting the outer callee exposes the inner call on one side
+        # only, so close the selection over the expanded bodies.
+        addresses = (entry.orig_addr, entry.recomp_addr)
+        for _ in range(_MAX_INLINE_DEPTH):
+            expanded = [
+                self.expanded(image, address, selected)
+                for image, address in zip((ImageId.ORIG, ImageId.RECOMP), addresses)
+            ]
+            added = False
+            for identity in sorted(expanded[0].keys() | expanded[1].keys()):
+                if (
+                    identity in selected
+                    or expanded[0][identity] == expanded[1][identity]
+                ):
+                    continue
+                obj = self.pairs.get(int(identity.removeprefix("pair:"), 16))
+                if obj is not None and self.eligible(obj):
+                    selected[identity] = obj
+                    added = True
+            if not added:
+                break
+            self._close_tails(selected)
+        cyclic = self.recursive(selected)
+        selected = {
+            identity: obj
+            for identity, obj in selected.items()
+            if identity not in cyclic
+        }
+        return tuple(selected.values())
+
+    def _close_tails(self, selected):
+        """Add the tail-call continuations of selected callees."""
         pending = list(selected.values())
         while pending:
             obj = pending.pop()
@@ -224,13 +260,29 @@ class InlineCandidates:
                     if target is not None and self.eligible(target):
                         selected[identity] = target
                         pending.append(target)
-        cyclic = self.recursive(selected)
-        selected = {
-            identity: obj
-            for identity, obj in selected.items()
-            if identity not in cyclic
-        }
-        return tuple(selected.values())
+
+    def expanded(self, image, address, selected, depth=0):
+        """Paired calls of a body after substituting the selected callees."""
+        result: Counter = Counter()
+        for call in self.continued(image, address) or ():
+            if not call["paired"]:
+                continue
+            identity = call["identity"]
+            obj = selected.get(identity)
+            if obj is None or depth >= _MAX_INLINE_DEPTH:
+                result[identity] += 1
+            else:
+                result.update(
+                    self.expanded(image, obj.addr(image), selected, depth + 1)
+                )
+        return result
+
+    def resolves(self, entry, callees):
+        """Whether substituting these callees leaves both sides the same calls."""
+        selected = {f"pair:{obj.orig_addr:#x}": obj for obj in callees}
+        return self.expanded(ImageId.ORIG, entry.orig_addr, selected) == self.expanded(
+            ImageId.RECOMP, entry.recomp_addr, selected
+        )
 
     def reached(self, image, address, callees):
         """Selected callees whose bodies this side's substitution includes."""
@@ -341,6 +393,7 @@ class InlineNormalizationMixin:
 
     def normalize_inlining(self: Any, programs):
         """Retry pairs serially; flush caches before and after rollback."""
+        self._inline_resolved = {}
         candidates = InlineCandidates(self.manifest, programs)
         old, new = programs[ImageId.ORIG], programs[ImageId.RECOMP]
         self.setup_decompliers(old, new, pair_count=1)
@@ -362,6 +415,9 @@ class InlineNormalizationMixin:
                     continue
                 self._inline_callees[entry.orig_addr] = tuple(
                     obj.orig_addr for obj in callees
+                )
+                self._inline_resolved[entry.orig_addr] = candidates.resolves(
+                    entry, callees
                 )
                 decompilers = tuple(
                     self.decompilers[self._program_key(program)][0]
@@ -468,5 +524,13 @@ class InlineNormalizationMixin:
                 if callees
                 else None
             )
-            results.append(FunctionResult(entry, ordinary.ordinary, retry, callees))
+            results.append(
+                FunctionResult(
+                    entry,
+                    ordinary.ordinary,
+                    retry,
+                    callees,
+                    getattr(self, "_inline_resolved", {}).get(entry.orig_addr, True),
+                )
+            )
         return results

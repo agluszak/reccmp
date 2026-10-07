@@ -153,6 +153,7 @@ def result_json(result: FunctionResult) -> dict[str, Any]:
         "selected_pass": result.selected_pass,
         "passes": passes,
         "inline_callees": [_address(addr) for addr in result.inline_callees],
+        "inline_resolved": result.inline_resolved,
     }
 
 

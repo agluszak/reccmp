@@ -275,13 +275,19 @@ class FunctionResult:
     ordinary: ComparisonPass
     inline: ComparisonPass | None = None
     inline_callees: tuple[int, ...] = ()
+    # Substituting the callees left both bodies with the same paired calls.
+    inline_resolved: bool = True
 
     @property
     def selected_pass(self) -> str:
         # Retry failure is a gating analysis failure; ordinary evidence stays intact.
+        # A substitution that does not account for the call asymmetry is
+        # evidence, not the comparison's verdict.
         return (
             "inline"
-            if self.inline is not None and self.ordinary.outcome == Outcome.DIFFERENCES
+            if self.inline is not None
+            and self.inline_resolved
+            and self.ordinary.outcome == Outcome.DIFFERENCES
             else "ordinary"
         )
 

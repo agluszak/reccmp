@@ -242,11 +242,18 @@ def test_entry_tail_call_is_candidate():
     assert candidates.reached(ImageId.RECOMP, 0x2000, (obj,)) == {0x1100}
 
 
-def test_nested_direct_call_of_candidate_is_not_candidate():
+def test_nested_direct_call_exposed_on_one_side_is_candidate():
+    entry, obj, nested, candidates = nested_model()
+    candidates.calls[ImageId.RECOMP, 0x2100] = candidates.tails[ImageId.RECOMP, 0x2100]
+    candidates.tails[ImageId.RECOMP, 0x2100] = []
+    assert candidates.for_pair(entry) == (obj, nested)
+
+
+def test_substitution_that_leaves_a_call_asymmetry_does_not_resolve():
     entry, obj, _, candidates = nested_model()
     candidates.calls[ImageId.RECOMP, 0x2100] = candidates.tails[ImageId.RECOMP, 0x2100]
     candidates.tails[ImageId.RECOMP, 0x2100] = []
-    assert candidates.for_pair(entry) == (obj,)
+    assert not candidates.resolves(entry, (obj,))
 
 
 def test_selected_nested_direct_calls_are_reached():
@@ -466,6 +473,7 @@ def test_retry_keeps_ordinary_and_inline_reference_findings_separate():
         manifest = NS(functions=(entry,))
         _failures = {}
         _inline_callees = {entry.orig_addr: (0x1100,)}
+        _inline_resolved = {entry.orig_addr: True}
         _decompiled = {
             (ImageId.ORIG, entry.orig_addr): Decompiled("void f() { return; }", None),
             (ImageId.RECOMP, entry.recomp_addr): Decompiled(
@@ -561,6 +569,7 @@ def test_unpaired_result_does_not_resolve_an_absent_recomp_address():
         _decompiled = {}
         _inline_decompiled = {}
         _inline_callees = {}
+        _inline_resolved = {}
         _references = {}
         _inline_references = {}
 
@@ -621,3 +630,51 @@ def test_inline_warning_groups_preserve_callers_and_image_identity():
         }
     ]
     assert all(result.outcome == Outcome.NO_DIFFERENCES for result in results)
+
+
+def test_selection_closes_over_calls_exposed_by_substitution():
+    # Retail inlined helper together with the inner call it had inlined.
+    entry, obj, candidates, _ = fixture_model()
+    inner = NamedObject(
+        0x1200, 0x2200, "inner", EntityType.FUNCTION, 1, 1, PairBasis.ANNOTATION
+    )
+    candidates.pairs[0x1200] = inner
+    candidates.calls[ImageId.RECOMP, 0x2100] = [
+        {"identity": "pair:0x1200", "paired": True, "target": "0x2200"}
+    ]
+    candidates.calls[ImageId.ORIG, 0x1200] = []
+    candidates.calls[ImageId.RECOMP, 0x2200] = []
+    candidates.tails[ImageId.ORIG, 0x1200] = []
+    candidates.tails[ImageId.RECOMP, 0x2200] = []
+    selected = candidates.for_pair(entry)
+    assert set(selected) == {obj, inner}
+    assert candidates.resolves(entry, selected)
+    assert not candidates.resolves(entry, (obj,))
+
+
+def test_unresolved_substitution_keeps_the_ordinary_verdict():
+    entry = FunctionEntry(0x1000, 0x2000, "caller", PairBasis.ANNOTATION, None, False)
+    ordinary = classify_pass(
+        entry,
+        failures=(),
+        orig_code=["a\n"],
+        recomp_code=["b\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    inline = classify_pass(
+        entry,
+        failures=(),
+        orig_code=["a\n"],
+        recomp_code=["c\n"],
+        orig_refs=(),
+        recomp_refs=(),
+    )
+    assert (
+        FunctionResult(entry, ordinary, inline, (0x1100,), True).selected_pass
+        == "inline"
+    )
+    assert (
+        FunctionResult(entry, ordinary, inline, (0x1100,), False).selected_pass
+        == "ordinary"
+    )
