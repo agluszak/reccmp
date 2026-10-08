@@ -334,12 +334,15 @@ def test_changed_value_survives_retry():
     assert normalized.selected.text.body_diff == normalized.inline.text.body_diff
 
 
-def test_failed_retry_gates_analysis_and_retains_ordinary_evidence():
+def test_failed_optional_retry_preserves_ordinary_comparison_and_records_failure():
     entry, _, _, _ = fixture_model()
     normalized = result(entry, (["return 1;\n"], None))
-    assert normalized.outcome == Outcome.ANALYSIS_FAILED
-    assert normalized.selected_pass == "inline"
+    assert normalized.outcome == Outcome.DIFFERENCES
+    assert normalized.selected_pass == "ordinary"
     assert normalized.ordinary.text.body_diff and normalized.inline.failures
+    row = result_json(normalized)
+    assert row["outcome"] == "differences"
+    assert row["passes"]["inline"]["outcome"] == "analysis-failed"
 
 
 def test_no_retry_is_distinct_from_empty_retry_diff():
