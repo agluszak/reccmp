@@ -1,10 +1,9 @@
 """Ghidriff engine driven by reccmp's pairs and names.
 
 Ghidra analyzes and decompiles both programs; ghidriff diffs and reports.
-reccmp contributes what only the reconstruction knows: which functions
-correspond, under which names, and where their source is. Retail analysis does not import recomp debug types. This image's decorated
-symbols constrain recomp primitive parameters; a cdecl arity correction also
-requires independent retail agreement.
+reccmp owns pairs, names, and source locations. Retail Ghidra analysis does
+not import recomp debug types. Decorated recomp symbols constrain primitive
+parameters; cdecl arity changes still require independent retail evidence.
 """
 
 # pylint: disable=import-outside-toplevel,import-error

@@ -142,7 +142,7 @@ def get_function_fingerprint(
     return tuple(normalized_addrs)
 
 
-def read_crt_array(binfile: PEImage, span: range) -> Iterator[int]:
+def read_crt_array(binfile: Image, span: range) -> Iterator[int]:
     """Read 4-byte (dword) pointers from the specified range.
     Excludes the first element, a zero."""
     try:
@@ -196,7 +196,7 @@ def unwrap_jump(binfile: Image, addr: int) -> tuple[bool, int]:
     return (False, addr)
 
 
-def read_crt_functions(binfile: PEImage, span: range) -> CrtStartupArray:
+def read_crt_functions(binfile: Image, span: range) -> CrtStartupArray:
     """Create the CRT array structure using the given range of addresses.
     For each function in the array that matches a known thunk pattern,
     "unwrap" the indirection so we can search the most likely place for
@@ -235,7 +235,7 @@ def iter_crt_array_ranges(
 
 
 def detect_crt_startup_arrays(
-    db: EntityDb, image_id: ImageId, binfile: PEImage
+    db: EntityDb, image_id: ImageId, binfile: Image
 ) -> dict[CrtStartupArrayType, CrtStartupArray]:
     """Return a map of CRT startup array types to each list of functions."""
     return {
