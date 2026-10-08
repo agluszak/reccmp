@@ -149,11 +149,13 @@ def test_crt_annotation_preserves_declared_identities(image_id):
     annotate_crt_functions(db, image_id, image)
 
     known = db.get(image_id, known_body, exact=True)
+    assert known is not None
     assert known.get("name") == "owner initializer"
     assert known.entity_type == EntityType.FUNCTION
     assert known.get("crt_startup_kind") == "CPP_INIT"
     assert db.get(image_id, unknown_body, exact=True) is None
     data = db.get(image_id, known_data, exact=True)
+    assert data is not None
     assert data.entity_type == EntityType.DATA
     assert data.get("crt_startup_kind") is None
 

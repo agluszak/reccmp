@@ -63,7 +63,7 @@ def match_entry(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
         batch.match(orig_bin.entry, recomp_bin.entry, basis=PairBasis.DERIVED)
 
 
-def annotate_crt_functions(db: EntityDb, image_id: ImageId, binfile: PEImage):
+def annotate_crt_functions(db: EntityDb, image_id: ImageId, binfile: Image):
     """Record CRT participation on independently declared function identities.
 
     Startup array entries identify calls, not authored function boundaries.

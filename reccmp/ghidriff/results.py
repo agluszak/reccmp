@@ -280,13 +280,15 @@ class FunctionResult:
 
     @property
     def selected_pass(self) -> str:
-        # Retry failure is a gating analysis failure; ordinary evidence stays intact.
+        # An unsuccessful optional inline retry does not invalidate the completed
+        # ordinary comparison. Keep the failed retry in the report for diagnosis.
         # A substitution that does not account for the call asymmetry is
         # evidence, not the comparison's verdict.
         return (
             "inline"
             if self.inline is not None
             and self.inline_resolved
+            and self.inline.outcome != Outcome.ANALYSIS_FAILED
             and self.ordinary.outcome == Outcome.DIFFERENCES
             else "ordinary"
         )
